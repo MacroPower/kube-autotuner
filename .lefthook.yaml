@@ -1,0 +1,22 @@
+# yaml-language-server: $schema=https://json.schemastore.org/lefthook.json
+
+pre-commit:
+  piped: true
+  commands:
+    ruff-check:
+      priority: 1
+      glob: "*.py"
+      run: ruff check --fix {staged_files}
+      stage_fixed: true
+    ruff-format:
+      priority: 2
+      glob: "*.py"
+      run: ruff format {staged_files}
+      stage_fixed: true
+
+pre-push:
+  commands:
+    test:
+      run: task test
+    typecheck:
+      run: task typecheck

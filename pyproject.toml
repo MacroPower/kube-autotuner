@@ -1,0 +1,132 @@
+[project]
+name = "kube-autotuner"
+version = "0.1.0"
+description = "Benchmark-driven kernel parameter tuning for Kubernetes nodes"
+readme = "README.md"
+requires-python = ">=3.14"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Jacob Colvin", email = "jacobcolvin1@gmail.com" },
+]
+dependencies = [
+    "typer>=0.15.0",
+]
+
+[project.scripts]
+kube-autotuner = "kube_autotuner.cli:app"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-cov>=6.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.11,<0.12"]
+build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 88
+indent-width = 4
+target-version = "py314"
+extend-exclude = [".task"]
+preview = true
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    "COM812",
+    "ISC001",
+    "D203",
+    "D213",
+    "CPY001",
+    "TD002",
+    "TD003",
+    "FIX002",
+]
+fixable = ["ALL"]
+unfixable = []
+dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = [
+    "S101",
+    "D1",
+    "PLR2004",
+    "SLF001",
+    "ANN",
+    "INP001",
+]
+"**/__init__.py" = [
+    "D104",
+    "F401",
+]
+"**/cli.py" = [
+    "FBT",
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.mccabe]
+max-complexity = 12
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "all"
+
+[tool.ruff.lint.flake8-type-checking]
+strict = true
+
+[tool.ruff.lint.flake8-annotations]
+suppress-none-returning = false
+allow-star-arg-any = false
+mypy-init-return = false
+
+[tool.ruff.lint.pylint]
+max-args = 6
+max-branches = 12
+max-returns = 6
+max-statements = 40
+
+[tool.ruff.lint.isort]
+known-first-party = ["kube_autotuner"]
+combine-as-imports = true
+force-sort-within-sections = true
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+docstring-code-format = true
+docstring-code-line-length = "dynamic"
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+    "--cov=kube_autotuner",
+    "--cov-report=term-missing",
+]
+testpaths = ["tests"]
+
+[tool.ty.src]
+include = ["src", "tests"]
+
+[tool.ty.rules]
+all = "error"
+
+[tool.ty.environment]
+python-version = "3.14"
+python-platform = "linux"
+root = ["src"]
+
+[[tool.ty.overrides]]
+include = ["tests/**"]
+
+[tool.ty.overrides.rules]
+possibly-unresolved-reference = "warn"
+unused-ignore-comment = "warn"
