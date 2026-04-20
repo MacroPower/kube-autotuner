@@ -20,6 +20,7 @@ kube-autotuner = "kube_autotuner.cli:app"
 dev = [
     "pytest>=8.3",
     "pytest-cov>=6.0",
+    "pytest-timeout>=2.0",
 ]
 
 [build-system]
@@ -110,7 +111,14 @@ addopts = [
     "--strict-config",
     "--cov=kube_autotuner",
     "--cov-report=term-missing",
+    "-m",
+    "not integration",
 ]
+markers = [
+    "integration: requires a Talos Docker cluster",
+    "requires_real_sysctl_write: requires a cluster where privileged pods can write host sysctls",
+]
+timeout = 120
 testpaths = ["tests"]
 
 [tool.ty.src]
