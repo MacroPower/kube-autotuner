@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import json
 import shutil
+import threading
+import time
 from unittest.mock import MagicMock
 
 import pytest
 import yaml
 
+from kube_autotuner.benchmark import runner as runner_module
 from kube_autotuner.benchmark.runner import CLIENT_LABEL, BenchmarkRunner
 from kube_autotuner.experiment import IperfArgs, IperfSection, Patch, PatchTarget
+from kube_autotuner.k8s.client import K8sApiError
 from kube_autotuner.models import BenchmarkConfig, NodePair
 
 
@@ -198,7 +202,26 @@ def test_patches_applied_to_server_yaml():
     assert dep["spec"]["replicas"] == 3
 
 
-def test_memory_tagging_applied_to_all_client_results():
+def _slow_logs(delay_seconds: float, logs_by_job: dict[str, str]):
+    """Build a ``client.logs`` side_effect that waits before returning.
+
+    Gives the background memory sampler time to poll at least once
+    during the otherwise-instant mocked iteration.
+
+    Returns:
+        A callable matching the ``client.logs`` signature.
+    """
+
+    def _impl(_kind, name, _ns):
+        time.sleep(delay_seconds)
+        return logs_by_job[name]
+
+    return _impl
+
+
+def test_memory_tagging_applied_to_all_client_results(monkeypatch):
+    monkeypatch.setattr(runner_module, "SAMPLE_INTERVAL_S", 0.001)
+
     node_pair = NodePair(
         source="kmain07",
         target="kmain08",
@@ -212,6 +235,7 @@ def test_memory_tagging_applied_to_all_client_results():
         "iperf3-client-kmain09-p5202": _fake_iperf_json(5e9),
     }
     client = _make_client(logs)
+    client.logs.side_effect = _slow_logs(0.05, logs)
     client.get_pod_name.return_value = "iperf3-server-xxx"
     client.top_pod_containers.return_value = [
         {"container": "iperf3-server-5201", "cpu": "10m", "memory": "50Mi"},
@@ -224,3 +248,126 @@ def test_memory_tagging_applied_to_all_client_results():
     assert len(results) == 2
     for r in results:
         assert r.memory_used_bytes == (50 + 30) * 1024 * 1024
+
+
+def test_memory_peak_not_last(monkeypatch):
+    monkeypatch.setattr(runner_module, "SAMPLE_INTERVAL_S", 0.001)
+
+    node_pair = NodePair(source="kmain07", target="kmain08", hardware_class="10g")
+    config = BenchmarkConfig(duration=1, iterations=1, modes=["tcp"])
+
+    logs = {"iperf3-client-kmain07-p5201": _fake_iperf_json(1e9)}
+    client = _make_client(logs)
+    client.logs.side_effect = _slow_logs(0.1, logs)
+    client.get_pod_name.return_value = "iperf3-server-xxx"
+
+    series = iter([
+        [{"container": "s", "cpu": "0", "memory": "50Mi"}],
+        [{"container": "s", "cpu": "0", "memory": "200Mi"}],
+        [{"container": "s", "cpu": "0", "memory": "100Mi"}],
+    ])
+    tail = [{"container": "s", "cpu": "0", "memory": "100Mi"}]
+
+    def _top(_name, _ns):
+        return next(series, tail)
+
+    client.top_pod_containers.side_effect = _top
+
+    runner = BenchmarkRunner(node_pair, config, client=client)
+    results = runner.run()
+
+    assert len(results) == 1
+    assert results[0].memory_used_bytes == 200 * 1024 * 1024
+
+
+def test_memory_none_when_metrics_empty(monkeypatch):
+    monkeypatch.setattr(runner_module, "SAMPLE_INTERVAL_S", 0.001)
+
+    node_pair = NodePair(source="kmain07", target="kmain08", hardware_class="10g")
+    config = BenchmarkConfig(duration=1, iterations=1, modes=["tcp"])
+
+    logs = {"iperf3-client-kmain07-p5201": _fake_iperf_json(1e9)}
+    client = _make_client(logs)
+    client.logs.side_effect = _slow_logs(0.05, logs)
+    client.get_pod_name.return_value = "iperf3-server-xxx"
+    client.top_pod_containers.return_value = []
+
+    runner = BenchmarkRunner(node_pair, config, client=client)
+    results = runner.run()
+
+    assert len(results) == 1
+    assert results[0].memory_used_bytes is None
+
+
+def test_memory_skips_poll_when_pod_name_empty(monkeypatch):
+    monkeypatch.setattr(runner_module, "SAMPLE_INTERVAL_S", 0.001)
+
+    node_pair = NodePair(source="kmain07", target="kmain08", hardware_class="10g")
+    config = BenchmarkConfig(duration=1, iterations=1, modes=["tcp"])
+
+    logs = {"iperf3-client-kmain07-p5201": _fake_iperf_json(1e9)}
+    client = _make_client(logs)
+    client.logs.side_effect = _slow_logs(0.05, logs)
+    client.get_pod_name.return_value = ""
+
+    runner = BenchmarkRunner(node_pair, config, client=client)
+    results = runner.run()
+
+    assert len(results) == 1
+    assert results[0].memory_used_bytes is None
+    assert client.top_pod_containers.call_count == 0
+
+
+def test_memory_sampler_survives_api_error(monkeypatch):
+    monkeypatch.setattr(runner_module, "SAMPLE_INTERVAL_S", 0.001)
+
+    node_pair = NodePair(source="kmain07", target="kmain08", hardware_class="10g")
+    config = BenchmarkConfig(duration=1, iterations=1, modes=["tcp"])
+
+    logs = {"iperf3-client-kmain07-p5201": _fake_iperf_json(1e9)}
+    client = _make_client(logs)
+    client.logs.side_effect = _slow_logs(0.1, logs)
+    client.get_pod_name.return_value = "iperf3-server-xxx"
+
+    calls = {"n": 0}
+    rows = [{"container": "s", "cpu": "0", "memory": "75Mi"}]
+
+    def _top(_name, _ns):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise K8sApiError(
+                op="top pods",
+                status=503,
+                reason="ServiceUnavailable",
+                message="metrics-server down",
+            )
+        return rows
+
+    client.top_pod_containers.side_effect = _top
+
+    runner = BenchmarkRunner(node_pair, config, client=client)
+    results = runner.run()
+
+    assert len(results) == 1
+    assert results[0].memory_used_bytes == 75 * 1024 * 1024
+    assert calls["n"] >= 2, "sampler thread did not survive initial API error"
+
+
+def test_memory_sampler_thread_is_cleaned_up(monkeypatch):
+    monkeypatch.setattr(runner_module, "SAMPLE_INTERVAL_S", 0.001)
+
+    node_pair = NodePair(source="kmain07", target="kmain08", hardware_class="10g")
+    config = BenchmarkConfig(duration=1, iterations=2, modes=["tcp"])
+
+    logs = {"iperf3-client-kmain07-p5201": _fake_iperf_json(1e9)}
+    client = _make_client(logs)
+    client.get_pod_name.return_value = "iperf3-server-xxx"
+    client.top_pod_containers.return_value = [
+        {"container": "s", "cpu": "0", "memory": "10Mi"},
+    ]
+
+    runner = BenchmarkRunner(node_pair, config, client=client)
+    runner.run()
+
+    lingering = [t for t in threading.enumerate() if t.name.startswith("mem-sampler-")]
+    assert lingering == []

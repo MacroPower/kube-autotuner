@@ -700,8 +700,8 @@ class K8sClient:
         Returns:
             The first pod name, or ``""`` when the selector matches
             nothing. Never raises on empty lists — callers (notably
-            :meth:`BenchmarkRunner._collect_server_memory`) rely on
-            that shape during shutdown windows.
+            :meth:`BenchmarkRunner._sample_server_memory_loop`) rely
+            on that shape during startup and shutdown windows.
 
         Raises:
             K8sApiError: The list call itself failed.

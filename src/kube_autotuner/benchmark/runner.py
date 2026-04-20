@@ -27,6 +27,8 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import logging
+import queue
+import threading
 from typing import TYPE_CHECKING, Literal
 
 from kube_autotuner.benchmark.client_spec import build_client_yaml
@@ -45,6 +47,7 @@ logger = logging.getLogger(__name__)
 CLIENT_LABEL = "app.kubernetes.io/name=iperf3-client"
 _IPERF_BASE_PORT = 5201
 _CLIENT_WAIT_TIMEOUT_SECONDS = 180
+SAMPLE_INTERVAL_S = 5.0
 
 
 class BenchmarkRunner:
@@ -170,37 +173,57 @@ class BenchmarkRunner:
                 msg = f"cleanup of client job {job_name} failed"
                 raise RuntimeError(msg) from cleanup_err
 
-    def _collect_server_memory(self) -> int | None:
-        """Best-effort sum of memory across server-pod containers.
+    def _sample_server_memory_loop(
+        self,
+        stop: threading.Event,
+        sink: queue.Queue[int],
+    ) -> None:
+        """Poll metrics-server for server-pod memory until ``stop`` is set.
 
-        Returns:
-            The summed memory in bytes across every server container,
-            or ``None`` when the server pod cannot be located or the
-            metrics-server returns no rows. This path is informational
-            and must not abort a benchmark iteration.
+        Re-resolves the server pod name on every tick so a pod restart
+        or late readiness does not strand the sampler on a dead name.
+        Empty rows (no scrape yet) and empty pod names are silently
+        skipped; poisoning the peak with ``0`` would be wrong. The
+        loop body catches :class:`Exception` broadly and logs at
+        ``warning``: this is a daemon thread, and an uncaught exception
+        would terminate it silently and leave the operator with no
+        sampling and no signal. Parsing errors from
+        :func:`parse_k8s_memory` (``ValueError``) or malformed row
+        dicts (``KeyError``) are therefore explicitly tolerated.
+
+        Args:
+            stop: Event signalling shutdown. The loop blocks on
+                ``stop.wait(SAMPLE_INTERVAL_S)`` so shutdown is prompt.
+            sink: Thread-safe queue receiving one per-pod byte total
+                per successful poll.
         """
-        try:
-            pod_name = self.client.get_pod_name(
-                self._server_label,
-                self.node_pair.namespace,
-            )
-            rows = self.client.top_pod_containers(
-                pod_name,
-                self.node_pair.namespace,
-            )
-        except K8sApiError:
-            logger.warning("Failed to collect memory for server pod", exc_info=True)
-            return None
-        if not rows:
-            return None
-        return sum(parse_k8s_memory(r["memory"]) for r in rows if r.get("memory"))
+        ns = self.node_pair.namespace
+        while not stop.is_set():
+            try:
+                name = self.client.get_pod_name(self._server_label, ns)
+                if name:
+                    rows = self.client.top_pod_containers(name, ns)
+                    if rows:
+                        total = sum(
+                            parse_k8s_memory(r["memory"])
+                            for r in rows
+                            if r.get("memory")
+                        )
+                        sink.put(total)
+            except Exception:
+                logger.warning(
+                    "Memory sampler poll failed; continuing",
+                    exc_info=True,
+                )
+            stop.wait(SAMPLE_INTERVAL_S)
 
     def run(self) -> list[BenchmarkResult]:
         """Run all configured benchmark iterations and modes.
 
         Returns:
             Every :class:`BenchmarkResult` recorded across iterations
-            and modes, tagged with server memory when available.
+            and modes, tagged with the peak server memory observed
+            during each iteration when sampling produced any data.
         """
         results: list[BenchmarkResult] = []
         for mode in self.config.modes:
@@ -213,11 +236,30 @@ class BenchmarkRunner:
                     self._clients,
                     self.node_pair.target,
                 )
-                iter_results = self._run_iteration(mode, i)
-                memory = self._collect_server_memory()
-                if memory is not None:
+                stop = threading.Event()
+                sink: queue.Queue[int] = queue.Queue()
+                sampler = threading.Thread(
+                    target=self._sample_server_memory_loop,
+                    args=(stop, sink),
+                    name=f"mem-sampler-{mode}-{i}",
+                    daemon=True,
+                )
+                sampler.start()
+                try:
+                    iter_results = self._run_iteration(mode, i)
+                finally:
+                    stop.set()
+                    sampler.join(timeout=SAMPLE_INTERVAL_S * 2)
+                samples: list[int] = []
+                while True:
+                    try:
+                        samples.append(sink.get_nowait())
+                    except queue.Empty:
+                        break
+                if samples:
+                    peak = max(samples)
                     for r in iter_results:
-                        r.memory_used_bytes = memory
+                        r.memory_used_bytes = peak
                 results.extend(iter_results)
         return results
 

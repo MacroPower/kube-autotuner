@@ -113,7 +113,10 @@ class BenchmarkResult(BaseModel):
     jitter_ms: float | None = None
     memory_used_bytes: int | None = Field(
         default=None,
-        description="Populated from metrics.k8s.io/v1beta1 PodMetrics.",
+        description=(
+            "Peak memory observed on the server pod during the iteration, "
+            "sampled from metrics.k8s.io/v1beta1 PodMetrics."
+        ),
     )
     client_node: str = ""
     iteration: int = 0
