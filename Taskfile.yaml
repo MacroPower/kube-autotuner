@@ -139,8 +139,12 @@ tasks:
       - "{{.DIR}}/bash-completion/completions/kube-autotuner"
       - "{{.DIR}}/zsh/site-functions/_kube-autotuner"
       - "{{.DIR}}/fish/vendor_completions.d/kube-autotuner.fish"
+    status:
+      - test -s {{.DIR}}/bash-completion/completions/kube-autotuner
+      - test -s {{.DIR}}/zsh/site-functions/_kube-autotuner
+      - test -s {{.DIR}}/fish/vendor_completions.d/kube-autotuner.fish
     cmds:
       - mkdir -p {{.DIR}}/bash-completion/completions {{.DIR}}/fish/vendor_completions.d {{.DIR}}/zsh/site-functions
-      - _KUBE_AUTOTUNER_COMPLETE=source_bash kube-autotuner > {{.DIR}}/bash-completion/completions/kube-autotuner
-      - _KUBE_AUTOTUNER_COMPLETE=source_zsh kube-autotuner > {{.DIR}}/zsh/site-functions/_kube-autotuner
-      - _KUBE_AUTOTUNER_COMPLETE=source_fish kube-autotuner > {{.DIR}}/fish/vendor_completions.d/kube-autotuner.fish
+      - _KUBE_AUTOTUNER_COMPLETE=source_bash uv run kube-autotuner > {{.DIR}}/bash-completion/completions/kube-autotuner
+      - _KUBE_AUTOTUNER_COMPLETE=source_zsh uv run kube-autotuner > {{.DIR}}/zsh/site-functions/_kube-autotuner
+      - _KUBE_AUTOTUNER_COMPLETE=source_fish uv run kube-autotuner > {{.DIR}}/fish/vendor_completions.d/kube-autotuner.fish
