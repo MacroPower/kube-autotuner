@@ -43,7 +43,8 @@ def _make_results(n: int = 3) -> list[BenchmarkResult]:
             retransmits=5 + i,
             bytes_sent=1_000_000_000,
             cpu_utilization_percent=30.0 + i,
-            memory_used_bytes=100_000_000,
+            node_memory_used_bytes=100_000_000,
+            cni_memory_used_bytes=10_000_000,
             client_node="kmain07",
             iteration=i,
         )
@@ -438,26 +439,39 @@ class TestIterationsOneSEMFallback:
 class TestBuildAxObjective:
     def test_default_section(self) -> None:
         objective, constraints = build_ax_objective(ObjectivesSection())
-        assert objective == "throughput, -cpu, -retransmit_rate, -memory"
+        assert (
+            objective == "throughput, -cpu, -retransmit_rate, -node_memory, -cni_memory"
+        )
         assert constraints == [
             "throughput >= 1e6",
             "cpu <= 200",
             "retransmit_rate <= 1e-6",
-            "memory <= 1e10",
+            "node_memory <= 1e10",
         ]
 
     def test_reduced_two_metric_section(self) -> None:
         section = ObjectivesSection(
             pareto=[
                 ParetoObjective(metric="throughput", direction="maximize"),
-                ParetoObjective(metric="memory", direction="minimize"),
+                ParetoObjective(metric="node_memory", direction="minimize"),
             ],
             constraints=["throughput >= 1e6"],
-            recommendation_weights={"memory": 0.5},
+            recommendation_weights={"node_memory": 0.5},
         )
         objective, constraints = build_ax_objective(section)
-        assert objective == "throughput, -memory"
+        assert objective == "throughput, -node_memory"
         assert constraints == ["throughput >= 1e6"]
+
+
+class TestComputeMetricsMemory:
+    def test_node_and_cni_keys_present(self) -> None:
+        results = _make_results(2)
+        metrics = _compute_metrics(results)
+        assert "node_memory" in metrics
+        assert "cni_memory" in metrics
+        assert "memory" not in metrics
+        assert metrics["node_memory"][0] == pytest.approx(100_000_000)
+        assert metrics["cni_memory"][0] == pytest.approx(10_000_000)
 
 
 class TestComputeMetricsRate:

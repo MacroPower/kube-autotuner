@@ -10,7 +10,7 @@ nodes is the measurement. An Ax-platform multi-objective Bayesian
 optimizer proposes the next configuration, the tool applies it, and the
 benchmark runs again. The loop repeats until it converges on a
 Pareto-optimal set of trade-offs between throughput, TCP retransmit
-rate, CPU, and memory.
+rate, CPU, target-node memory, and CNI data-plane memory.
 
 ## How it works
 
@@ -94,6 +94,15 @@ iperf:
   server:
     extraArgs: ["--forceflush"]
 
+# Selector for the CNI pods on the target node whose memory is summed
+# into the cni_memory objective, sampled from metrics.k8s.io per tick
+# alongside whole-node memory. Set enabled: false to skip CNI sampling;
+# drop cni_memory from objectives / constraints to match.
+cni:
+  enabled: true
+  namespace: kube-system
+  labelSelector: k8s-app=cilium
+
 # Kustomize patches layered onto the generated client/server manifests.
 # `patch:` accepts a Strategic Merge Patch body (dict), a JSON6902 op
 # list, or a pre-rendered patch string. Do not set target.namespace or
@@ -124,16 +133,17 @@ objectives:
     - { metric: throughput, direction: maximize }
     - { metric: cpu, direction: minimize }
     - { metric: retransmit_rate, direction: minimize }
-    - { metric: memory, direction: minimize }
+    - { metric: node_memory, direction: minimize }
+    - { metric: cni_memory, direction: minimize }
   constraints:
     - "throughput >= 1e6"
     - "cpu <= 200"
     - "retransmit_rate <= 1e-6"   # retransmits per byte sent; 1e-6 ≈ 1 retx/MB
-    - "memory <= 1e10"
+    - "node_memory <= 1e10"
   recommendationWeights:
     cpu: 0.15
     retransmit_rate: 0.3
-    memory: 0.15
+    node_memory: 0.15
 
 output: out/results.jsonl
 ```
@@ -141,8 +151,12 @@ output: out/results.jsonl
 Supplying `constraints:` or `recommendationWeights:` replaces the
 default list wholesale rather than extending it. Weights are only valid
 on minimize-direction metrics and must reference a metric present in
-`pareto`. Valid metric names: `throughput`, `cpu`, `memory`,
-`retransmit_rate`. `retransmit_rate` is measured as retransmits per
+`pareto`. Valid metric names: `throughput`, `cpu`, `node_memory`,
+`cni_memory`, `retransmit_rate`. `node_memory` is whole-node memory on
+the iperf target, sampled from `metrics.k8s.io/v1beta1 nodes/<name>`.
+`cni_memory` is memory summed across the CNI pods selected by the
+`cni:` section on the target node; it is what most sysctl tweaks
+actually move on the data-plane side. `retransmit_rate` is measured as retransmits per
 byte sent — it is scale-invariant across throughput levels, which is
 what keeps a high-throughput / high-loss configuration from winning
 on normalized absolute retransmit counts alone. UDP-only benchmarks

@@ -118,11 +118,18 @@ class BenchmarkResult(BaseModel):
     cpu_utilization_percent: float = 0.0
     cpu_server_percent: float | None = None
     jitter_ms: float | None = None
-    memory_used_bytes: int | None = Field(
+    node_memory_used_bytes: int | None = Field(
         default=None,
         description=(
-            "Peak memory observed on the server pod during the iteration, "
-            "sampled from metrics.k8s.io/v1beta1 PodMetrics."
+            "Peak memory observed on the iperf target node during the "
+            "iteration, sampled from metrics.k8s.io/v1beta1 nodes/<name>."
+        ),
+    )
+    cni_memory_used_bytes: int | None = Field(
+        default=None,
+        description=(
+            "Peak memory summed across CNI pods on the target node during "
+            "the iteration, selected via the experiment's cni selector."
         ),
     )
     client_node: str = ""
@@ -302,20 +309,45 @@ class TrialResult(BaseModel):
             return 0.0
         return sum(per_iter_means) / len(per_iter_means)
 
-    def mean_memory(self) -> float:
-        """Return the mean pod memory usage in bytes.
+    def mean_node_memory(self) -> float:
+        """Return the mean target-node memory usage in bytes.
 
-        Takes the per-iteration mean across records that reported memory,
-        then averages across iterations.
+        Takes the per-iteration mean across records that reported
+        node memory, then averages across iterations.
 
         Returns:
-            The averaged memory in bytes, or ``0.0`` when no results
-            report memory.
+            The averaged node memory in bytes, or ``0.0`` when no
+            results report node memory.
         """
         per_iter_means: list[float] = []
         for group in _group_by_iteration(self.results).values():
             vals = [
-                r.memory_used_bytes for r in group if r.memory_used_bytes is not None
+                r.node_memory_used_bytes
+                for r in group
+                if r.node_memory_used_bytes is not None
+            ]
+            if vals:
+                per_iter_means.append(sum(vals) / len(vals))
+        if not per_iter_means:
+            return 0.0
+        return sum(per_iter_means) / len(per_iter_means)
+
+    def mean_cni_memory(self) -> float:
+        """Return the mean CNI memory usage in bytes on the target node.
+
+        Takes the per-iteration mean across records that reported CNI
+        memory, then averages across iterations.
+
+        Returns:
+            The averaged CNI memory in bytes, or ``0.0`` when no
+            results report CNI memory.
+        """
+        per_iter_means: list[float] = []
+        for group in _group_by_iteration(self.results).values():
+            vals = [
+                r.cni_memory_used_bytes
+                for r in group
+                if r.cni_memory_used_bytes is not None
             ]
             if vals:
                 per_iter_means.append(sum(vals) / len(vals))

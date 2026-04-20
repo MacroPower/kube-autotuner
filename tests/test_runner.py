@@ -13,7 +13,13 @@ import yaml
 
 from kube_autotuner.benchmark import runner as runner_module
 from kube_autotuner.benchmark.runner import CLIENT_LABEL, BenchmarkRunner
-from kube_autotuner.experiment import IperfArgs, IperfSection, Patch, PatchTarget
+from kube_autotuner.experiment import (
+    CniSection,
+    IperfArgs,
+    IperfSection,
+    Patch,
+    PatchTarget,
+)
 from kube_autotuner.k8s.client import K8sApiError
 from kube_autotuner.models import BenchmarkConfig, NodePair
 
@@ -48,7 +54,13 @@ def _make_client(logs_by_job: dict[str, str]) -> MagicMock:
 
     client.logs.side_effect = _logs
     client.top_pod_containers.return_value = []
+    client.top_node.return_value = {}
+    client.list_pods_by_selector_on_node.return_value = []
     return client
+
+
+def _cni_disabled() -> CniSection:
+    return CniSection(enabled=False)
 
 
 def test_single_client_single_iteration():
@@ -223,7 +235,7 @@ def _slow_logs(delay_seconds: float, logs_by_job: dict[str, str]):
     return _impl
 
 
-def test_memory_tagging_applied_to_all_client_results(monkeypatch):
+def test_node_memory_tagging_applied_to_all_client_results(monkeypatch):
     monkeypatch.setattr(runner_module, "SAMPLE_INTERVAL_S", 0.001)
 
     node_pair = NodePair(
@@ -240,21 +252,18 @@ def test_memory_tagging_applied_to_all_client_results(monkeypatch):
     }
     client = _make_client(logs)
     client.logs.side_effect = _slow_logs(0.05, logs)
-    client.get_pod_name.return_value = "iperf3-server-xxx"
-    client.top_pod_containers.return_value = [
-        {"container": "iperf3-server-5201", "cpu": "10m", "memory": "50Mi"},
-        {"container": "iperf3-server-5202", "cpu": "20m", "memory": "30Mi"},
-    ]
+    client.top_node.return_value = {"cpu": "500m", "memory": "8000000Ki"}
 
-    runner = BenchmarkRunner(node_pair, config, client=client)
+    runner = BenchmarkRunner(node_pair, config, client=client, cni=_cni_disabled())
     results = runner.run()
 
     assert len(results) == 2
     for r in results:
-        assert r.memory_used_bytes == (50 + 30) * 1024 * 1024
+        assert r.node_memory_used_bytes == 8_000_000 * 1024
+        assert r.cni_memory_used_bytes is None
 
 
-def test_memory_peak_not_last(monkeypatch):
+def test_node_memory_peak_not_last(monkeypatch):
     monkeypatch.setattr(runner_module, "SAMPLE_INTERVAL_S", 0.001)
 
     node_pair = NodePair(source="kmain07", target="kmain08", hardware_class="10g")
@@ -263,28 +272,27 @@ def test_memory_peak_not_last(monkeypatch):
     logs = {"iperf3-client-kmain07-p5201": _fake_iperf_json(1e9)}
     client = _make_client(logs)
     client.logs.side_effect = _slow_logs(0.1, logs)
-    client.get_pod_name.return_value = "iperf3-server-xxx"
 
     series = iter([
-        [{"container": "s", "cpu": "0", "memory": "50Mi"}],
-        [{"container": "s", "cpu": "0", "memory": "200Mi"}],
-        [{"container": "s", "cpu": "0", "memory": "100Mi"}],
+        {"cpu": "0", "memory": "50Mi"},
+        {"cpu": "0", "memory": "200Mi"},
+        {"cpu": "0", "memory": "100Mi"},
     ])
-    tail = [{"container": "s", "cpu": "0", "memory": "100Mi"}]
+    tail = {"cpu": "0", "memory": "100Mi"}
 
-    def _top(_name, _ns):
+    def _top_node(_name):
         return next(series, tail)
 
-    client.top_pod_containers.side_effect = _top
+    client.top_node.side_effect = _top_node
 
-    runner = BenchmarkRunner(node_pair, config, client=client)
+    runner = BenchmarkRunner(node_pair, config, client=client, cni=_cni_disabled())
     results = runner.run()
 
     assert len(results) == 1
-    assert results[0].memory_used_bytes == 200 * 1024 * 1024
+    assert results[0].node_memory_used_bytes == 200 * 1024 * 1024
 
 
-def test_memory_none_when_metrics_empty(monkeypatch):
+def test_node_memory_none_when_metrics_empty(monkeypatch):
     monkeypatch.setattr(runner_module, "SAMPLE_INTERVAL_S", 0.001)
 
     node_pair = NodePair(source="kmain07", target="kmain08", hardware_class="10g")
@@ -293,33 +301,14 @@ def test_memory_none_when_metrics_empty(monkeypatch):
     logs = {"iperf3-client-kmain07-p5201": _fake_iperf_json(1e9)}
     client = _make_client(logs)
     client.logs.side_effect = _slow_logs(0.05, logs)
-    client.get_pod_name.return_value = "iperf3-server-xxx"
-    client.top_pod_containers.return_value = []
+    client.top_node.return_value = {}
 
-    runner = BenchmarkRunner(node_pair, config, client=client)
+    runner = BenchmarkRunner(node_pair, config, client=client, cni=_cni_disabled())
     results = runner.run()
 
     assert len(results) == 1
-    assert results[0].memory_used_bytes is None
-
-
-def test_memory_skips_poll_when_pod_name_empty(monkeypatch):
-    monkeypatch.setattr(runner_module, "SAMPLE_INTERVAL_S", 0.001)
-
-    node_pair = NodePair(source="kmain07", target="kmain08", hardware_class="10g")
-    config = BenchmarkConfig(duration=1, iterations=1, modes=["tcp"])
-
-    logs = {"iperf3-client-kmain07-p5201": _fake_iperf_json(1e9)}
-    client = _make_client(logs)
-    client.logs.side_effect = _slow_logs(0.05, logs)
-    client.get_pod_name.return_value = ""
-
-    runner = BenchmarkRunner(node_pair, config, client=client)
-    results = runner.run()
-
-    assert len(results) == 1
-    assert results[0].memory_used_bytes is None
-    assert client.top_pod_containers.call_count == 0
+    assert results[0].node_memory_used_bytes is None
+    assert results[0].cni_memory_used_bytes is None
 
 
 def test_memory_sampler_survives_api_error(monkeypatch):
@@ -331,29 +320,27 @@ def test_memory_sampler_survives_api_error(monkeypatch):
     logs = {"iperf3-client-kmain07-p5201": _fake_iperf_json(1e9)}
     client = _make_client(logs)
     client.logs.side_effect = _slow_logs(0.1, logs)
-    client.get_pod_name.return_value = "iperf3-server-xxx"
 
     calls = {"n": 0}
-    rows = [{"container": "s", "cpu": "0", "memory": "75Mi"}]
 
-    def _top(_name, _ns):
+    def _top_node(_name):
         calls["n"] += 1
         if calls["n"] == 1:
             raise K8sApiError(
-                op="top pods",
+                op="top node",
                 status=503,
                 reason="ServiceUnavailable",
                 message="metrics-server down",
             )
-        return rows
+        return {"cpu": "100m", "memory": "75Mi"}
 
-    client.top_pod_containers.side_effect = _top
+    client.top_node.side_effect = _top_node
 
-    runner = BenchmarkRunner(node_pair, config, client=client)
+    runner = BenchmarkRunner(node_pair, config, client=client, cni=_cni_disabled())
     results = runner.run()
 
     assert len(results) == 1
-    assert results[0].memory_used_bytes == 75 * 1024 * 1024
+    assert results[0].node_memory_used_bytes == 75 * 1024 * 1024
     assert calls["n"] >= 2, "sampler thread did not survive initial API error"
 
 
@@ -365,13 +352,63 @@ def test_memory_sampler_thread_is_cleaned_up(monkeypatch):
 
     logs = {"iperf3-client-kmain07-p5201": _fake_iperf_json(1e9)}
     client = _make_client(logs)
-    client.get_pod_name.return_value = "iperf3-server-xxx"
-    client.top_pod_containers.return_value = [
-        {"container": "s", "cpu": "0", "memory": "10Mi"},
-    ]
+    client.top_node.return_value = {"cpu": "10m", "memory": "10Mi"}
 
-    runner = BenchmarkRunner(node_pair, config, client=client)
+    runner = BenchmarkRunner(node_pair, config, client=client, cni=_cni_disabled())
     runner.run()
 
     lingering = [t for t in threading.enumerate() if t.name.startswith("mem-sampler-")]
     assert lingering == []
+
+
+def test_cni_memory_populated_when_enabled(monkeypatch):
+    monkeypatch.setattr(runner_module, "SAMPLE_INTERVAL_S", 0.001)
+
+    node_pair = NodePair(source="kmain07", target="kmain08", hardware_class="10g")
+    config = BenchmarkConfig(duration=1, iterations=1, modes=["tcp"])
+
+    logs = {"iperf3-client-kmain07-p5201": _fake_iperf_json(1e9)}
+    client = _make_client(logs)
+    client.logs.side_effect = _slow_logs(0.05, logs)
+    client.top_node.return_value = {"cpu": "1000m", "memory": "4194304Ki"}
+    client.list_pods_by_selector_on_node.return_value = ["cilium-abc"]
+    client.top_pod_containers.return_value = [
+        {"container": "cilium-agent", "cpu": "100m", "memory": "64Mi"},
+    ]
+
+    cni = CniSection(
+        enabled=True,
+        namespace="kube-system",
+        label_selector="k8s-app=cilium",
+    )
+    runner = BenchmarkRunner(node_pair, config, client=client, cni=cni)
+    results = runner.run()
+
+    assert len(results) == 1
+    assert results[0].node_memory_used_bytes == 4_194_304 * 1024
+    assert results[0].cni_memory_used_bytes == 64 * 1024 * 1024
+    client.list_pods_by_selector_on_node.assert_called()
+    args = client.list_pods_by_selector_on_node.call_args
+    assert args.args[0] == "k8s-app=cilium"
+    assert args.args[1] == "kube-system"
+    assert args.args[2] == "kmain08"
+
+
+def test_cni_memory_skipped_when_disabled(monkeypatch):
+    monkeypatch.setattr(runner_module, "SAMPLE_INTERVAL_S", 0.001)
+
+    node_pair = NodePair(source="kmain07", target="kmain08", hardware_class="10g")
+    config = BenchmarkConfig(duration=1, iterations=1, modes=["tcp"])
+
+    logs = {"iperf3-client-kmain07-p5201": _fake_iperf_json(1e9)}
+    client = _make_client(logs)
+    client.logs.side_effect = _slow_logs(0.05, logs)
+    client.top_node.return_value = {"cpu": "1000m", "memory": "1048576Ki"}
+
+    runner = BenchmarkRunner(node_pair, config, client=client, cni=_cni_disabled())
+    results = runner.run()
+
+    assert len(results) == 1
+    assert results[0].node_memory_used_bytes == 1_048_576 * 1024
+    assert results[0].cni_memory_used_bytes is None
+    assert client.list_pods_by_selector_on_node.call_count == 0

@@ -202,6 +202,20 @@ class IperfSection(BaseModel):
     server: IperfArgs = Field(default_factory=IperfArgs)
 
 
+class CniSection(BaseModel):
+    """Selector for CNI pods to track on the target node."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        alias_generator=to_camel,
+        populate_by_name=True,
+    )
+
+    enabled: bool = True
+    namespace: str = "kube-system"
+    label_selector: str = "k8s-app=cilium"
+
+
 class NodesSection(BaseModel):
     """Source/target node topology for an experiment."""
 
@@ -241,7 +255,13 @@ class TrialSection(BaseModel):
     sysctls: dict[str, str | int] = Field(default_factory=dict)
 
 
-Metric = Literal["throughput", "cpu", "memory", "retransmit_rate"]
+Metric = Literal[
+    "throughput",
+    "cpu",
+    "retransmit_rate",
+    "node_memory",
+    "cni_memory",
+]
 Direction = Literal["maximize", "minimize"]
 
 _CONSTRAINT_RE = re.compile(
@@ -253,12 +273,12 @@ _DEFAULT_CONSTRAINTS: list[str] = [
     "throughput >= 1e6",
     "cpu <= 200",
     "retransmit_rate <= 1e-6",
-    "memory <= 1e10",
+    "node_memory <= 1e10",
 ]
 
 _DEFAULT_WEIGHTS: dict[str, float] = {
     "cpu": 0.15,
-    "memory": 0.15,
+    "node_memory": 0.15,
     "retransmit_rate": 0.3,
 }
 
@@ -280,14 +300,15 @@ def _default_pareto() -> list[ParetoObjective]:
     """Return the default Pareto objective list.
 
     Returns:
-        Four objectives: throughput (max), cpu (min), retransmit_rate
-        (min), memory (min).
+        Five objectives: throughput (max), cpu (min), retransmit_rate
+        (min), node_memory (min), cni_memory (min).
     """
     return [
         ParetoObjective(metric="throughput", direction="maximize"),
         ParetoObjective(metric="cpu", direction="minimize"),
         ParetoObjective(metric="retransmit_rate", direction="minimize"),
-        ParetoObjective(metric="memory", direction="minimize"),
+        ParetoObjective(metric="node_memory", direction="minimize"),
+        ParetoObjective(metric="cni_memory", direction="minimize"),
     ]
 
 
@@ -353,7 +374,13 @@ class ObjectivesSection(BaseModel):
                     "on minimize-direction metrics"
                 )
                 raise ValueError(msg)
-        known = {"throughput", "cpu", "memory", "retransmit_rate"}
+        known = {
+            "throughput",
+            "cpu",
+            "retransmit_rate",
+            "node_memory",
+            "cni_memory",
+        }
         for constraint in self.constraints:
             match = _CONSTRAINT_RE.match(constraint)
             if match is None:
@@ -383,6 +410,7 @@ class ExperimentConfig(BaseModel):
     optimize: OptimizeSection | None = None
     trial: TrialSection | None = None
     iperf: IperfSection = Field(default_factory=IperfSection)
+    cni: CniSection = Field(default_factory=CniSection)
     patches: list[Patch] = Field(default_factory=list)
     objectives: ObjectivesSection = Field(default_factory=ObjectivesSection)
     output: str = "results.jsonl"

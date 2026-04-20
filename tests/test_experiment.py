@@ -793,8 +793,19 @@ class TestObjectivesSection:
             ("throughput", "maximize"),
             ("cpu", "minimize"),
             ("retransmit_rate", "minimize"),
-            ("memory", "minimize"),
+            ("node_memory", "minimize"),
+            ("cni_memory", "minimize"),
         ]
+
+    def test_legacy_memory_metric_rejected(self) -> None:
+        with pytest.raises(Exception, match="memory"):
+            ObjectivesSection.model_validate(
+                {
+                    "pareto": [{"metric": "memory", "direction": "minimize"}],
+                    "constraints": [],
+                    "recommendationWeights": {},
+                },
+            )
 
     def test_default_constraints_include_retransmit_rate(self) -> None:
         section = ObjectivesSection()
@@ -809,13 +820,17 @@ class TestObjectivesSection:
     def test_weight_on_unknown_metric_rejected(self) -> None:
         with pytest.raises(ValueError, match="not in pareto objectives"):
             ObjectivesSection(
-                recommendation_weights={"nosuch": 0.1, "cpu": 0.15, "memory": 0.15},
+                recommendation_weights={
+                    "nosuch": 0.1,
+                    "cpu": 0.15,
+                    "node_memory": 0.15,
+                },
             )
 
     def test_negative_weight_rejected(self) -> None:
         with pytest.raises(ValueError, match="non-negative"):
             ObjectivesSection(
-                recommendation_weights={"cpu": -0.1, "memory": 0.15},
+                recommendation_weights={"cpu": -0.1, "node_memory": 0.15},
             )
 
     def test_malformed_constraint_rejected(self) -> None:
@@ -835,14 +850,14 @@ class TestObjectivesSection:
             {
                 "recommendationWeights": {
                     "cpu": 0.2,
-                    "memory": 0.2,
+                    "node_memory": 0.2,
                     "retransmit_rate": 0.4,
                 },
             },
         )
         assert section.recommendation_weights == {
             "cpu": 0.2,
-            "memory": 0.2,
+            "node_memory": 0.2,
             "retransmit_rate": 0.4,
         }
 
@@ -850,13 +865,13 @@ class TestObjectivesSection:
         section = ObjectivesSection(
             pareto=[
                 ParetoObjective(metric="throughput", direction="maximize"),
-                ParetoObjective(metric="memory", direction="minimize"),
+                ParetoObjective(metric="node_memory", direction="minimize"),
             ],
             constraints=[],
-            recommendation_weights={"memory": 0.5},
+            recommendation_weights={"node_memory": 0.5},
         )
         assert len(section.pareto) == 2
-        assert section.recommendation_weights == {"memory": 0.5}
+        assert section.recommendation_weights == {"node_memory": 0.5}
 
 
 def test_experiment_config_default_objectives() -> None:

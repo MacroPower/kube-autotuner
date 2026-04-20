@@ -52,11 +52,18 @@ def plot_pareto_scatter_matrix(
             Pareto-optimal rows.
 
     Returns:
-        A :class:`plotly.graph_objects.Figure` rendering a 4-objective
-        scatter matrix (throughput, CPU, memory, retransmit_rate).
+        A :class:`plotly.graph_objects.Figure` rendering a 5-objective
+        scatter matrix (throughput, CPU, node memory, CNI memory,
+        retransmit_rate).
     """
     px, _ = _require_plotly()
-    cols = ["mean_throughput", "mean_cpu", "mean_memory", "retransmit_rate"]
+    cols = [
+        "mean_throughput",
+        "mean_cpu",
+        "mean_node_memory",
+        "mean_cni_memory",
+        "retransmit_rate",
+    ]
     plot_df = df[[*cols, "trial_id"]].copy()
     plot_df["pareto"] = pareto_mask.map({True: "pareto", False: "other"})
     fig = px.scatter_matrix(

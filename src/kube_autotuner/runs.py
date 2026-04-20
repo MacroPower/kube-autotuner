@@ -198,6 +198,7 @@ def run_baseline(ctx: RunContext) -> None:
             client=ctx.client,
             iperf_args=exp.iperf,
             patches=exp.patches,
+            cni=exp.cni,
         )
         try:
             runner.setup_server()
@@ -216,9 +217,12 @@ def run_baseline(ctx: RunContext) -> None:
     logger.info("Wrote %d results to %s", len(results), ctx.output)
     logger.info("Mean throughput: %.1f Mbps", trial.mean_throughput() / 1e6)
     logger.info("Mean CPU: %.1f%%", trial.mean_cpu())
-    mem = trial.mean_memory()
-    if mem > 0:
-        logger.info("Mean memory: %.1f MiB", mem / 1024 / 1024)
+    nmem = trial.mean_node_memory()
+    if nmem > 0:
+        logger.info("Mean node memory: %.1f MiB", nmem / 1024 / 1024)
+    cmem = trial.mean_cni_memory()
+    if cmem > 0:
+        logger.info("Mean CNI memory: %.1f MiB", cmem / 1024 / 1024)
 
 
 def run_trial(ctx: RunContext) -> None:
@@ -276,6 +280,7 @@ def run_trial(ctx: RunContext) -> None:
             client=ctx.client,
             iperf_args=exp.iperf,
             patches=exp.patches,
+            cni=exp.cni,
         )
         try:
             runner.setup_server()
@@ -299,9 +304,12 @@ def run_trial(ctx: RunContext) -> None:
         trial_result.mean_throughput() / 1e6,
     )
     logger.info("Mean CPU: %.1f%%", trial_result.mean_cpu())
-    mem = trial_result.mean_memory()
-    if mem > 0:
-        logger.info("Mean memory: %.1f MiB", mem / 1024 / 1024)
+    nmem = trial_result.mean_node_memory()
+    if nmem > 0:
+        logger.info("Mean node memory: %.1f MiB", nmem / 1024 / 1024)
+    cmem = trial_result.mean_cni_memory()
+    if cmem > 0:
+        logger.info("Mean CNI memory: %.1f MiB", cmem / 1024 / 1024)
 
 
 def run_optimize(ctx: RunContext) -> None:
@@ -354,6 +362,7 @@ def run_optimize(ctx: RunContext) -> None:
         iperf_args=exp.iperf,
         patches=exp.patches,
         objectives=exp.objectives,
+        cni=exp.cni,
     )
     trials = loop.run()
     logger.info("Completed %d trials. Results in %s", len(trials), ctx.output)

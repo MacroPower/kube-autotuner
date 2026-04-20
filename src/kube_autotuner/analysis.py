@@ -39,7 +39,8 @@ _SYSCTL_COLUMNS: list[str] = PARAM_SPACE.param_names()
 METRIC_TO_DF_COLUMN: dict[str, str] = {
     "throughput": "mean_throughput",
     "cpu": "mean_cpu",
-    "memory": "mean_memory",
+    "node_memory": "mean_node_memory",
+    "cni_memory": "mean_cni_memory",
     "retransmit_rate": "retransmit_rate",
 }
 
@@ -47,7 +48,8 @@ DEFAULT_OBJECTIVES: list[tuple[str, str]] = [
     (METRIC_TO_DF_COLUMN["throughput"], "maximize"),
     (METRIC_TO_DF_COLUMN["cpu"], "minimize"),
     (METRIC_TO_DF_COLUMN["retransmit_rate"], "minimize"),
-    (METRIC_TO_DF_COLUMN["memory"], "minimize"),
+    (METRIC_TO_DF_COLUMN["node_memory"], "minimize"),
+    (METRIC_TO_DF_COLUMN["cni_memory"], "minimize"),
 ]
 
 _FRAME_BASE_COLUMNS: list[str] = [
@@ -58,7 +60,8 @@ _FRAME_BASE_COLUMNS: list[str] = [
     "target_zone",
     "mean_throughput",
     "mean_cpu",
-    "mean_memory",
+    "mean_node_memory",
+    "mean_cni_memory",
     "retransmit_rate",
 ]
 
@@ -201,7 +204,8 @@ def trials_to_dataframe(
             "target_zone": t.node_pair.target_zone,
             "mean_throughput": t.mean_throughput(),
             "mean_cpu": t.mean_cpu(),
-            "mean_memory": t.mean_memory(),
+            "mean_node_memory": t.mean_node_memory(),
+            "mean_cni_memory": t.mean_cni_memory(),
             "retransmit_rate": t.retransmit_rate(),
         }
         for key in _SYSCTL_COLUMNS:
@@ -452,9 +456,9 @@ def recommend_configs(
     where each term is min-max normalized across the Pareto set.
     Maximize metrics always contribute ``+1.0 * norm`` and cannot be
     re-weighted. The default weights are
-    ``{cpu: 0.15, memory: 0.15, retransmit_rate: 0.3}``, reproducing
-    the formula ``tp_norm - 0.15 * cpu_norm - 0.15 * mem_norm -
-    0.3 * rate_norm``.
+    ``{cpu: 0.15, node_memory: 0.15, retransmit_rate: 0.3}``,
+    reproducing the formula ``tp_norm - 0.15 * cpu_norm - 0.15 *
+    node_mem_norm - 0.3 * rate_norm``.
 
     Args:
         trials: Input trial records (any number of hardware classes).
@@ -473,11 +477,11 @@ def recommend_configs(
 
     Returns:
         A list of recommendation dicts. Each dict always contains
-        ``rank``, ``trial_id``, ``sysctl_values``, the four base
+        ``rank``, ``trial_id``, ``sysctl_values``, the five base
         metric values (``mean_throughput``, ``mean_cpu``,
-        ``mean_memory``, ``retransmit_rate``) regardless of the
-        configured Pareto set, and a ``score``. Returns an empty list
-        when no trials match.
+        ``mean_node_memory``, ``mean_cni_memory``,
+        ``retransmit_rate``) regardless of the configured Pareto set,
+        and a ``score``. Returns an empty list when no trials match.
     """
     pd = _require_pandas()
     from kube_autotuner.experiment import ObjectivesSection  # noqa: PLC0415
@@ -533,7 +537,8 @@ def recommend_configs(
                 "sysctl_values": trial.sysctl_values,
                 "mean_throughput": row["mean_throughput"],
                 "mean_cpu": row["mean_cpu"],
-                "mean_memory": row["mean_memory"],
+                "mean_node_memory": row["mean_node_memory"],
+                "mean_cni_memory": row["mean_cni_memory"],
                 "retransmit_rate": (None if pd.isna(rate_val) else float(rate_val)),
                 "score": round(row["score"], 4),
             },

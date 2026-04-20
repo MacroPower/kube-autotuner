@@ -4,7 +4,8 @@ This module wraps `ax-platform`'s multi-objective Bayesian optimizer
 around the :class:`~kube_autotuner.benchmark.runner.BenchmarkRunner`.
 Each trial proposes a sysctl parameterization, applies it to the target
 (and optionally every source) node, runs iperf3, and reports the
-resulting throughput / CPU / retransmit rate / memory back to Ax.
+resulting throughput / CPU / retransmit rate / node memory / CNI
+memory back to Ax.
 
 ``ax-platform`` is a heavyweight optional dependency that lives in the
 ``optimize`` dependency group, not in ``dev``. Every Ax symbol is
@@ -43,7 +44,12 @@ if TYPE_CHECKING:
     from ax.api.client import Client
     from ax.api.configs import ChoiceParameterConfig
 
-    from kube_autotuner.experiment import IperfSection, ObjectivesSection, Patch
+    from kube_autotuner.experiment import (
+        CniSection,
+        IperfSection,
+        ObjectivesSection,
+        Patch,
+    )
     from kube_autotuner.models import (
         BenchmarkConfig,
         BenchmarkResult,
@@ -216,6 +222,19 @@ def _cpu_value(r: BenchmarkResult) -> float | None:
     return r.cpu_utilization_percent
 
 
+def _memory_mean_sem(
+    results: list[BenchmarkResult],
+    field: Callable[[BenchmarkResult], int | None],
+) -> tuple[float, float]:
+    """Return ``(mean, SEM)`` for a per-record memory field across iterations."""
+    vals = _aggregate_by_iteration(
+        results,
+        lambda r: float(v) if (v := field(r)) else None,
+        statistics.mean,
+    )
+    return _mean_sem(vals)
+
+
 def _compute_metrics(
     results: list[BenchmarkResult],
 ) -> dict[str, tuple[float, float]]:
@@ -241,8 +260,9 @@ def _compute_metrics(
 
     Returns:
         A dict keyed by ``"throughput"`` / ``"cpu"`` /
-        ``"retransmit_rate"`` / ``"memory"`` with ``(mean, SEM)``
-        values ready for :meth:`ax.api.client.Client.complete_trial`.
+        ``"retransmit_rate"`` / ``"node_memory"`` / ``"cni_memory"``
+        with ``(mean, SEM)`` values ready for
+        :meth:`ax.api.client.Client.complete_trial`.
     """
     throughput_vals = _aggregate_by_iteration(
         results,
@@ -251,11 +271,6 @@ def _compute_metrics(
     )
     cpu_vals = _aggregate_by_iteration(results, _cpu_value, statistics.mean)
     rate_vals = retransmit_rate_by_iteration(results)
-    memory_vals = _aggregate_by_iteration(
-        results,
-        lambda r: float(r.memory_used_bytes) if r.memory_used_bytes else None,
-        statistics.mean,
-    )
 
     throughput_mean, throughput_sem = _mean_sem(throughput_vals)
     cpu_mean, cpu_sem = _mean_sem(cpu_vals)
@@ -263,7 +278,6 @@ def _compute_metrics(
         rate_mean, rate_sem = _mean_sem(rate_vals)
     else:
         rate_mean, rate_sem = float("nan"), 0.0
-    memory_mean, memory_sem = _mean_sem(memory_vals)
 
     if len(throughput_vals) == 1 and len(results) > 1:
         raw = [r.bits_per_second for r in results]
@@ -277,7 +291,8 @@ def _compute_metrics(
         "throughput": (throughput_mean, throughput_sem),
         "cpu": (cpu_mean, cpu_sem),
         "retransmit_rate": (rate_mean, rate_sem),
-        "memory": (memory_mean, memory_sem),
+        "node_memory": _memory_mean_sem(results, lambda r: r.node_memory_used_bytes),
+        "cni_memory": _memory_mean_sem(results, lambda r: r.cni_memory_used_bytes),
     }
 
 
@@ -392,6 +407,7 @@ class OptimizationLoop:
         iperf_args: IperfSection | None = None,
         patches: list[Patch] | None = None,
         objectives: ObjectivesSection,
+        cni: CniSection | None = None,
     ) -> None:
         """Wire up the Ax client, benchmark runner, and sysctl setters.
 
@@ -412,6 +428,8 @@ class OptimizationLoop:
                 rendered benchmark manifests.
             objectives: Pareto objectives and outcome constraints
                 handed to Ax via :func:`build_ax_objective`.
+            cni: Selector for CNI pods tracked by the benchmark
+                runner's resource sampler on the target node.
         """
         self.node_pair: NodePair = node_pair
         self.config: BenchmarkConfig = config
@@ -422,6 +440,7 @@ class OptimizationLoop:
         self.apply_source: bool = apply_source
         self.iperf_args: IperfSection | None = iperf_args
         self.patches: list[Patch] | None = patches
+        self.cni: CniSection | None = cni
 
         unobservable: set[str] = set()
         if "tcp" not in config.modes:
@@ -482,6 +501,7 @@ class OptimizationLoop:
             client=self.k8s_client,
             iperf_args=iperf_args,
             patches=patches,
+            cni=cni,
         )
         self._completed: list[TrialResult] = []
 

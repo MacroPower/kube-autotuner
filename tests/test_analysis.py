@@ -225,7 +225,8 @@ class TestParetoFront:
                 "trial_id": ["A", "B", "C", "D"],
                 "mean_throughput": [100, 80, 60, 50],
                 "mean_cpu": [10, 5, 30, 20],
-                "mean_memory": [1e8, 2e8, 3e8, 5e8],
+                "mean_node_memory": [1e8, 2e8, 3e8, 5e8],
+                "mean_cni_memory": [1e7, 2e7, 3e7, 5e7],
                 "retransmit_rate": [1, 2, 0, 5],
             },
         )
@@ -240,7 +241,8 @@ class TestParetoFront:
                 "trial_id": ["A", "B"],
                 "mean_throughput": [100, 50],
                 "mean_cpu": [50, 10],
-                "mean_memory": [1e8, 2e8],
+                "mean_node_memory": [1e8, 2e8],
+                "mean_cni_memory": [1e7, 2e7],
                 "retransmit_rate": [5, 5],
             },
         )
@@ -253,7 +255,8 @@ class TestParetoFront:
                 "trial_id": ["A"],
                 "mean_throughput": [100],
                 "mean_cpu": [10],
-                "mean_memory": [1e8],
+                "mean_node_memory": [1e8],
+                "mean_cni_memory": [1e7],
                 "retransmit_rate": [1],
             },
         )
@@ -265,7 +268,8 @@ class TestParetoFront:
                 "trial_id": ["A", "B"],
                 "mean_throughput": [100, 100],
                 "mean_cpu": [10, 10],
-                "mean_memory": [1e8, 5e7],
+                "mean_node_memory": [1e8, 5e7],
+                "mean_cni_memory": [1e7, 1e7],
                 "retransmit_rate": [1, 1],
             },
         )
@@ -278,16 +282,18 @@ class TestParetoFront:
                 "trial_id",
                 "mean_throughput",
                 "mean_cpu",
-                "mean_memory",
+                "mean_node_memory",
+                "mean_cni_memory",
                 "retransmit_rate",
             ],
         )
         assert pareto_front(df).empty
 
     def test_default_objectives_shape(self) -> None:
-        assert len(DEFAULT_OBJECTIVES) == 4
+        assert len(DEFAULT_OBJECTIVES) == 5
         names = [n for n, _ in DEFAULT_OBJECTIVES]
-        assert "mean_memory" in names
+        assert "mean_node_memory" in names
+        assert "mean_cni_memory" in names
 
     def test_drops_nan_rows_with_warning(
         self,
@@ -298,7 +304,8 @@ class TestParetoFront:
                 "trial_id": ["A", "B"],
                 "mean_throughput": [100, 50],
                 "mean_cpu": [10, 20],
-                "mean_memory": [1e8, 2e8],
+                "mean_node_memory": [1e8, 2e8],
+                "mean_cni_memory": [1e7, 2e7],
                 "retransmit_rate": [1e-7, float("nan")],
             },
         )
@@ -313,7 +320,8 @@ class TestParetoFront:
                 "trial_id": ["A", "B"],
                 "mean_throughput": [100, 50],
                 "mean_cpu": [10, 20],
-                "mean_memory": [1e8, 2e8],
+                "mean_node_memory": [1e8, 2e8],
+                "mean_cni_memory": [1e7, 2e7],
                 "retransmit_rate": [float("nan"), float("nan")],
             },
         )
@@ -403,14 +411,15 @@ class TestRecommendConfigs:
             if t.trial_id in rec_ids:
                 assert t.topology == "intra-az"
 
-    def test_output_includes_mean_memory(
+    def test_output_includes_memory_fields(
         self,
         mixed_trials: list[TrialResult],
     ) -> None:
         recs = recommend_configs(mixed_trials, "10g", n=5)
         assert recs, "expected at least one recommendation"
         for r in recs:
-            assert "mean_memory" in r
+            assert "mean_node_memory" in r
+            assert "mean_cni_memory" in r
 
     def test_default_scoring_snapshot(self) -> None:
         """Pin default scores against the baseline formula.
@@ -445,7 +454,7 @@ class TestRecommendConfigs:
                         retransmits=5,
                         bytes_sent=1_000_000_000,
                         cpu_utilization_percent=20.0,
-                        memory_used_bytes=mem_mib * 1024 * 1024,
+                        node_memory_used_bytes=mem_mib * 1024 * 1024,
                     ),
                 ],
             )
@@ -486,7 +495,7 @@ class TestRecommendConfigs:
                         retransmits=retx,
                         bytes_sent=bytes_,
                         cpu_utilization_percent=20.0,
-                        memory_used_bytes=100 * 1024 * 1024,
+                        node_memory_used_bytes=100 * 1024 * 1024,
                     ),
                 ],
             )
@@ -504,7 +513,13 @@ class TestRecommendConfigs:
     def test_metric_to_df_column_covers_default_objectives(self) -> None:
         expected = {
             METRIC_TO_DF_COLUMN[m]
-            for m in ("throughput", "cpu", "memory", "retransmit_rate")
+            for m in (
+                "throughput",
+                "cpu",
+                "node_memory",
+                "cni_memory",
+                "retransmit_rate",
+            )
         }
         default_cols = {col for col, _ in DEFAULT_OBJECTIVES}
         assert default_cols == expected
@@ -518,7 +533,7 @@ class TestRecommendConfigs:
             mixed_trials,
             "10g",
             n=5,
-            weights={"cpu": 5.0, "memory": 0.15, "retransmit_rate": 0.3},
+            weights={"cpu": 5.0, "node_memory": 0.15, "retransmit_rate": 0.3},
         )
         assert default_recs != heavy_cpu_recs or all(
             a["score"] != b["score"]
@@ -531,28 +546,29 @@ class TestRecommendConfigs:
     ) -> None:
         reduced = [
             ParetoObjective(metric="throughput", direction="maximize"),
-            ParetoObjective(metric="memory", direction="minimize"),
+            ParetoObjective(metric="node_memory", direction="minimize"),
         ]
         recs = recommend_configs(
             mixed_trials,
             "10g",
             n=5,
             objectives=reduced,
-            weights={"memory": 0.15},
+            weights={"node_memory": 0.15},
         )
         assert recs
         for r in recs:
             assert set(r.keys()) >= {
                 "mean_throughput",
                 "mean_cpu",
-                "mean_memory",
+                "mean_node_memory",
+                "mean_cni_memory",
                 "retransmit_rate",
             }
 
     def test_lower_memory_outranks_higher(self) -> None:
-        """Trials identical except memory: the lower-memory one wins.
+        """Trials identical except node memory: the lower-memory one wins.
 
-        Memory is a Pareto minimize-objective, so the higher-memory
+        node_memory is a Pareto minimize-objective, so the higher-memory
         twin is strictly dominated and drops out of the frontier before
         scoring runs, leaving only the lower-memory trial.
         """
@@ -571,7 +587,7 @@ class TestRecommendConfigs:
                         retransmits=3,
                         bytes_sent=1_000_000_000,
                         cpu_utilization_percent=25.0,
-                        memory_used_bytes=mem,
+                        node_memory_used_bytes=mem,
                     ),
                 ],
             )
@@ -611,10 +627,10 @@ class TestPlots:
         fig = plot_pareto_2d(df, front, "mean_throughput", "mean_cpu")
         assert fig is not None
 
-    def test_2d_memory_axis(self, mixed_trials: list[TrialResult]) -> None:
+    def test_2d_node_memory_axis(self, mixed_trials: list[TrialResult]) -> None:
         df, _ = trials_to_dataframe(mixed_trials, hardware_class="10g")
         front = pareto_front(df)
-        fig = plot_pareto_2d(df, front, "mean_throughput", "mean_memory")
+        fig = plot_pareto_2d(df, front, "mean_throughput", "mean_node_memory")
         assert fig is not None
 
     def test_importance(self, mixed_trials: list[TrialResult]) -> None:
@@ -760,7 +776,7 @@ class TestCLIAnalyze:
                         retransmits=5,
                         bytes_sent=1_000_000_000,
                         cpu_utilization_percent=20.0,
-                        memory_used_bytes=mem_mib * 1024 * 1024,
+                        node_memory_used_bytes=mem_mib * 1024 * 1024,
                     ),
                 ],
             )
@@ -773,10 +789,10 @@ class TestCLIAnalyze:
         section = ObjectivesSection(
             pareto=[
                 ParetoObjective(metric="throughput", direction="maximize"),
-                ParetoObjective(metric="memory", direction="minimize"),
+                ParetoObjective(metric="node_memory", direction="minimize"),
             ],
             constraints=[],
-            recommendation_weights={"memory": 5.0},
+            recommendation_weights={"node_memory": 5.0},
         )
         TrialLog.write_metadata(jsonl, section)
 

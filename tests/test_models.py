@@ -227,13 +227,16 @@ def test_benchmark_result_with_memory():
         timestamp=datetime.now(UTC),
         mode="tcp",
         bits_per_second=9_000_000_000,
-        memory_used_bytes=47185920,
+        node_memory_used_bytes=47185920,
+        cni_memory_used_bytes=12582912,
     )
-    assert result.memory_used_bytes == 47185920
+    assert result.node_memory_used_bytes == 47185920
+    assert result.cni_memory_used_bytes == 12582912
     # Round-trip through JSON.
     data = result.model_dump_json()
     restored = BenchmarkResult.model_validate_json(data)
-    assert restored.memory_used_bytes == 47185920
+    assert restored.node_memory_used_bytes == 47185920
+    assert restored.cni_memory_used_bytes == 12582912
 
 
 def test_node_pair_all_sources_and_zone_for():
@@ -484,13 +487,13 @@ def test_trial_result_mean_jitter_ms_multi_client():
     assert trial.mean_jitter_ms() == pytest.approx(0.25)
 
 
-def test_trial_result_mean_memory_single_client():
+def test_trial_result_mean_node_memory_single_client():
     results = [
         BenchmarkResult(
             timestamp=datetime.now(UTC),
             mode="tcp",
             bits_per_second=1e9,
-            memory_used_bytes=100_000_000,
+            node_memory_used_bytes=100_000_000,
             client_node="n",
             iteration=0,
         ),
@@ -498,7 +501,7 @@ def test_trial_result_mean_memory_single_client():
             timestamp=datetime.now(UTC),
             mode="tcp",
             bits_per_second=1e9,
-            memory_used_bytes=200_000_000,
+            node_memory_used_bytes=200_000_000,
             client_node="n",
             iteration=1,
         ),
@@ -509,16 +512,16 @@ def test_trial_result_mean_memory_single_client():
         config=BenchmarkConfig(),
         results=results,
     )
-    assert trial.mean_memory() == pytest.approx(150_000_000)
+    assert trial.mean_node_memory() == pytest.approx(150_000_000)
 
 
-def test_trial_result_mean_memory_multi_client():
+def test_trial_result_mean_node_memory_multi_client():
     def _r(mem, client, itr):
         return BenchmarkResult(
             timestamp=datetime.now(UTC),
             mode="tcp",
             bits_per_second=1e9,
-            memory_used_bytes=mem,
+            node_memory_used_bytes=mem,
             client_node=client,
             iteration=itr,
         )
@@ -541,17 +544,17 @@ def test_trial_result_mean_memory_multi_client():
         results=results,
     )
     # Iter 0 mean = 2e8, Iter 1 mean = 3e8 -> overall 2.5e8.
-    assert trial.mean_memory() == pytest.approx(250_000_000)
+    assert trial.mean_node_memory() == pytest.approx(250_000_000)
 
 
-def test_trial_result_mean_memory_skips_none_per_group():
-    """Records with None memory are skipped within each iteration."""
+def test_trial_result_mean_node_memory_skips_none_per_group():
+    """Records with None node memory are skipped within each iteration."""
     results = [
         BenchmarkResult(
             timestamp=datetime.now(UTC),
             mode="tcp",
             bits_per_second=1e9,
-            memory_used_bytes=None,
+            node_memory_used_bytes=None,
             client_node="c1",
             iteration=0,
         ),
@@ -559,7 +562,7 @@ def test_trial_result_mean_memory_skips_none_per_group():
             timestamp=datetime.now(UTC),
             mode="tcp",
             bits_per_second=1e9,
-            memory_used_bytes=500_000_000,
+            node_memory_used_bytes=500_000_000,
             client_node="c2",
             iteration=0,
         ),
@@ -575,16 +578,16 @@ def test_trial_result_mean_memory_skips_none_per_group():
         config=BenchmarkConfig(),
         results=results,
     )
-    assert trial.mean_memory() == pytest.approx(500_000_000)
+    assert trial.mean_node_memory() == pytest.approx(500_000_000)
 
 
-def test_trial_result_mean_memory_all_none_returns_zero():
+def test_trial_result_mean_node_memory_all_none_returns_zero():
     results = [
         BenchmarkResult(
             timestamp=datetime.now(UTC),
             mode="tcp",
             bits_per_second=1e9,
-            memory_used_bytes=None,
+            node_memory_used_bytes=None,
             client_node="n",
             iteration=0,
         ),
@@ -595,7 +598,121 @@ def test_trial_result_mean_memory_all_none_returns_zero():
         config=BenchmarkConfig(),
         results=results,
     )
-    assert trial.mean_memory() == pytest.approx(0.0)
+    assert trial.mean_node_memory() == pytest.approx(0.0)
+
+
+def test_trial_result_mean_cni_memory_single_client():
+    results = [
+        BenchmarkResult(
+            timestamp=datetime.now(UTC),
+            mode="tcp",
+            bits_per_second=1e9,
+            cni_memory_used_bytes=10_000_000,
+            client_node="n",
+            iteration=0,
+        ),
+        BenchmarkResult(
+            timestamp=datetime.now(UTC),
+            mode="tcp",
+            bits_per_second=1e9,
+            cni_memory_used_bytes=30_000_000,
+            client_node="n",
+            iteration=1,
+        ),
+    ]
+    trial = TrialResult(
+        node_pair=NodePair(source="n", target="t", hardware_class="10g"),
+        sysctl_values={},
+        config=BenchmarkConfig(),
+        results=results,
+    )
+    assert trial.mean_cni_memory() == pytest.approx(20_000_000)
+
+
+def test_trial_result_mean_cni_memory_multi_client():
+    def _r(mem, client, itr):
+        return BenchmarkResult(
+            timestamp=datetime.now(UTC),
+            mode="tcp",
+            bits_per_second=1e9,
+            cni_memory_used_bytes=mem,
+            client_node=client,
+            iteration=itr,
+        )
+
+    results = [
+        _r(10_000_000, "c1", 0),
+        _r(30_000_000, "c2", 0),
+        _r(20_000_000, "c1", 1),
+        _r(40_000_000, "c2", 1),
+    ]
+    trial = TrialResult(
+        node_pair=NodePair(
+            source="c1",
+            target="t",
+            hardware_class="10g",
+            extra_sources=["c2"],
+        ),
+        sysctl_values={},
+        config=BenchmarkConfig(),
+        results=results,
+    )
+    # Iter 0 mean = 2e7, Iter 1 mean = 3e7 -> overall 2.5e7.
+    assert trial.mean_cni_memory() == pytest.approx(25_000_000)
+
+
+def test_trial_result_mean_cni_memory_skips_none_per_group():
+    """Records with None CNI memory are skipped within each iteration."""
+    results = [
+        BenchmarkResult(
+            timestamp=datetime.now(UTC),
+            mode="tcp",
+            bits_per_second=1e9,
+            cni_memory_used_bytes=None,
+            client_node="c1",
+            iteration=0,
+        ),
+        BenchmarkResult(
+            timestamp=datetime.now(UTC),
+            mode="tcp",
+            bits_per_second=1e9,
+            cni_memory_used_bytes=50_000_000,
+            client_node="c2",
+            iteration=0,
+        ),
+    ]
+    trial = TrialResult(
+        node_pair=NodePair(
+            source="c1",
+            target="t",
+            hardware_class="10g",
+            extra_sources=["c2"],
+        ),
+        sysctl_values={},
+        config=BenchmarkConfig(),
+        results=results,
+    )
+    assert trial.mean_cni_memory() == pytest.approx(50_000_000)
+
+
+def test_trial_result_mean_cni_memory_all_none_returns_zero():
+    results = [
+        BenchmarkResult(
+            timestamp=datetime.now(UTC),
+            mode="tcp",
+            bits_per_second=1e9,
+            cni_memory_used_bytes=None,
+            client_node="n",
+            iteration=0,
+        ),
+    ]
+    trial = TrialResult(
+        node_pair=NodePair(source="n", target="t", hardware_class="10g"),
+        sysctl_values={},
+        config=BenchmarkConfig(),
+        results=results,
+    )
+    assert trial.mean_cni_memory() == pytest.approx(0.0)
 
 
 def test_benchmark_result_new_fields_round_trip():
@@ -620,10 +737,10 @@ class TestTrialLogMetadata:
         section = ObjectivesSection(
             pareto=[
                 ParetoObjective(metric="throughput", direction="maximize"),
-                ParetoObjective(metric="memory", direction="minimize"),
+                ParetoObjective(metric="node_memory", direction="minimize"),
             ],
             constraints=["throughput >= 1e6"],
-            recommendation_weights={"memory": 0.5},
+            recommendation_weights={"node_memory": 0.5},
         )
         TrialLog.write_metadata(path, section)
         loaded = TrialLog.load_metadata(path)
@@ -644,7 +761,7 @@ class TestTrialLogMetadata:
         drifted = ObjectivesSection(
             recommendation_weights={
                 "cpu": 0.4,
-                "memory": 0.15,
+                "node_memory": 0.15,
                 "retransmit_rate": 0.3,
             },
         )

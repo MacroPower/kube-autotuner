@@ -24,7 +24,8 @@ REQUIRED_RECOMMENDATION_KEYS = {
     "sysctl_values",
     "mean_throughput",
     "mean_cpu",
-    "mean_memory",
+    "mean_node_memory",
+    "mean_cni_memory",
     "retransmit_rate",
     "score",
 }
@@ -104,9 +105,11 @@ def test_analyze_generates_reports_from_baseline_output(
     expected_labels = [
         "Objective space (scatter matrix)",
         "Pareto: mean_throughput vs mean_cpu",
-        "Pareto: mean_throughput vs mean_memory",
+        "Pareto: mean_throughput vs mean_node_memory",
+        "Pareto: mean_throughput vs mean_cni_memory",
         "Pareto: mean_throughput vs retransmit_rate",
-        "Pareto: mean_cpu vs mean_memory",
+        "Pareto: mean_cpu vs mean_node_memory",
+        "Pareto: mean_cpu vs mean_cni_memory",
         "Pareto: mean_cpu vs retransmit_rate",
     ]
     for label in expected_labels:

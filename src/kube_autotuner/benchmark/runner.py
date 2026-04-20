@@ -35,7 +35,7 @@ from kube_autotuner.benchmark.client_spec import build_client_yaml
 from kube_autotuner.benchmark.parser import parse_iperf_json, parse_k8s_memory
 from kube_autotuner.benchmark.patch import apply_patches
 from kube_autotuner.benchmark.server_spec import build_server_yaml
-from kube_autotuner.experiment import IperfSection
+from kube_autotuner.experiment import CniSection, IperfSection
 from kube_autotuner.k8s.client import K8sApiError, K8sClient
 
 if TYPE_CHECKING:
@@ -60,6 +60,7 @@ class BenchmarkRunner:
         client: K8sClient | None = None,
         iperf_args: IperfSection | None = None,
         patches: list[Patch] | None = None,
+        cni: CniSection | None = None,
     ) -> None:
         """Wire the runner to a node pair and benchmark config.
 
@@ -74,16 +75,16 @@ class BenchmarkRunner:
             patches: Optional kustomize patches applied to every rendered
                 manifest (server Deployment/Service and every client
                 Job) via :func:`kube_autotuner.benchmark.patch.apply_patches`.
+            cni: Selector for CNI pods to track on the target node. When
+                ``enabled`` is ``False``, CNI sampling is skipped.
         """
         self.node_pair = node_pair
         self.config = config
         self.client = client or K8sClient()
         self.iperf_args = iperf_args or IperfSection()
         self.patches = patches or []
+        self.cni = cni or CniSection()
         self._server_name = f"iperf3-server-{node_pair.target}"
-        self._server_label = (
-            f"app.kubernetes.io/instance=iperf3-server-{node_pair.target}"
-        )
         self._clients = list(node_pair.all_sources)
         self._ports = {c: _IPERF_BASE_PORT + i for i, c in enumerate(self._clients)}
 
@@ -173,48 +174,77 @@ class BenchmarkRunner:
                 msg = f"cleanup of client job {job_name} failed"
                 raise RuntimeError(msg) from cleanup_err
 
-    def _sample_server_memory_loop(
+    def _sum_cni_memory(self, target: str) -> int | None:
+        """Return summed CNI-pod memory on ``target``, or ``None`` when empty.
+
+        Args:
+            target: Node name whose CNI pods are totalled.
+
+        Returns:
+            Total memory in bytes across every container of every CNI
+            pod on ``target``, or ``None`` when no container produced a
+            reading.
+        """
+        pods = self.client.list_pods_by_selector_on_node(
+            self.cni.label_selector,
+            self.cni.namespace,
+            target,
+        )
+        total = 0
+        saw_any = False
+        for pod in pods:
+            for r in self.client.top_pod_containers(pod, self.cni.namespace):
+                m = r.get("memory")
+                if m:
+                    total += parse_k8s_memory(m)
+                    saw_any = True
+        return total if saw_any else None
+
+    def _sample_resources_loop(
         self,
         stop: threading.Event,
-        sink: queue.Queue[int],
+        sink: queue.Queue[dict[str, int]],
     ) -> None:
-        """Poll metrics-server for server-pod memory until ``stop`` is set.
+        """Poll metrics-server for node and CNI memory until ``stop`` is set.
 
-        Re-resolves the server pod name on every tick so a pod restart
-        or late readiness does not strand the sampler on a dead name.
-        Empty rows (no scrape yet) and empty pod names are silently
-        skipped; poisoning the peak with ``0`` would be wrong. The
-        loop body catches :class:`Exception` broadly and logs at
-        ``warning``: this is a daemon thread, and an uncaught exception
-        would terminate it silently and leave the operator with no
-        sampling and no signal. Parsing errors from
-        :func:`parse_k8s_memory` (``ValueError``) or malformed row
-        dicts (``KeyError``) are therefore explicitly tolerated.
+        On every tick the loop polls:
+
+        * Whole-node memory on ``self.node_pair.target`` via
+          :meth:`K8sClient.top_node`.
+        * When ``self.cni.enabled``, memory summed across the CNI pods
+          on the target node matching ``self.cni.label_selector`` in
+          ``self.cni.namespace``.
+
+        Empty rows (no scrape yet) are silently skipped; poisoning the
+        peak with ``0`` would be wrong. The loop body catches
+        :class:`Exception` broadly and logs at ``warning``: this is a
+        daemon thread, and an uncaught exception would terminate it
+        silently and leave the operator with no sampling.
 
         Args:
             stop: Event signalling shutdown. The loop blocks on
                 ``stop.wait(SAMPLE_INTERVAL_S)`` so shutdown is prompt.
-            sink: Thread-safe queue receiving one per-pod byte total
-                per successful poll.
+            sink: Thread-safe queue receiving one dict per successful
+                poll. Keys are a subset of ``{"node", "cni"}``.
         """
-        ns = self.node_pair.namespace
+        target = self.node_pair.target
         while not stop.is_set():
+            sample: dict[str, int] = {}
             try:
-                name = self.client.get_pod_name(self._server_label, ns)
-                if name:
-                    rows = self.client.top_pod_containers(name, ns)
-                    if rows:
-                        total = sum(
-                            parse_k8s_memory(r["memory"])
-                            for r in rows
-                            if r.get("memory")
-                        )
-                        sink.put(total)
+                node_mem = self.client.top_node(target).get("memory")
+                if node_mem:
+                    sample["node"] = parse_k8s_memory(node_mem)
+                if self.cni.enabled:
+                    cni_total = self._sum_cni_memory(target)
+                    if cni_total is not None:
+                        sample["cni"] = cni_total
             except Exception:
                 logger.warning(
-                    "Memory sampler poll failed; continuing",
+                    "Resource sampler poll failed; continuing",
                     exc_info=True,
                 )
+            if sample:
+                sink.put(sample)
             stop.wait(SAMPLE_INTERVAL_S)
 
     def run(self) -> list[BenchmarkResult]:
@@ -222,8 +252,9 @@ class BenchmarkRunner:
 
         Returns:
             Every :class:`BenchmarkResult` recorded across iterations
-            and modes, tagged with the peak server memory observed
-            during each iteration when sampling produced any data.
+            and modes, tagged with the peak node and CNI memory
+            observed during each iteration when sampling produced any
+            data.
         """
         results: list[BenchmarkResult] = []
         for mode in self.config.modes:
@@ -237,9 +268,9 @@ class BenchmarkRunner:
                     self.node_pair.target,
                 )
                 stop = threading.Event()
-                sink: queue.Queue[int] = queue.Queue()
+                sink: queue.Queue[dict[str, int]] = queue.Queue()
                 sampler = threading.Thread(
-                    target=self._sample_server_memory_loop,
+                    target=self._sample_resources_loop,
                     args=(stop, sink),
                     name=f"mem-sampler-{mode}-{i}",
                     daemon=True,
@@ -250,16 +281,22 @@ class BenchmarkRunner:
                 finally:
                     stop.set()
                     sampler.join(timeout=SAMPLE_INTERVAL_S * 2)
-                samples: list[int] = []
+                samples: list[dict[str, int]] = []
                 while True:
                     try:
                         samples.append(sink.get_nowait())
                     except queue.Empty:
                         break
-                if samples:
-                    peak = max(samples)
-                    for r in iter_results:
-                        r.memory_used_bytes = peak
+                peaks: dict[str, int] = {}
+                for sample in samples:
+                    for k, v in sample.items():
+                        cur = peaks.get(k)
+                        peaks[k] = v if cur is None else max(cur, v)
+                for r in iter_results:
+                    if "node" in peaks:
+                        r.node_memory_used_bytes = peaks["node"]
+                    if "cni" in peaks:
+                        r.cni_memory_used_bytes = peaks["cni"]
                 results.extend(iter_results)
         return results
 

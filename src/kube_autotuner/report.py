@@ -122,7 +122,8 @@ def _render_recommendations(recs: list[dict[str, Any]]) -> str:
                 "trial_id": r["trial_id"],
                 "throughput (Mbps)": round(r["mean_throughput"] / 1e6, 1),
                 "cpu": f"{r['mean_cpu']:.1f}%",
-                "memory (MiB)": f"{r['mean_memory'] / 1024 / 1024:.0f}",
+                "node memory (MiB)": f"{r['mean_node_memory'] / 1024 / 1024:.0f}",
+                "cni memory (MiB)": f"{r['mean_cni_memory'] / 1024 / 1024:.0f}",
                 "retx/MB": format_retransmit_rate(r["retransmit_rate"]),
                 "score": r["score"],
             }

@@ -655,6 +655,69 @@ class K8sClient:
             "memory": f"{mem_total_bytes // 1024}Ki",
         }
 
+    def top_node(self, name: str) -> dict[str, str]:
+        """Return summed CPU/memory usage for a single node.
+
+        Args:
+            name: Node name.
+
+        Returns:
+            ``{"cpu": "<n>m", "memory": "<n>Ki"}`` sourced from
+            ``metrics.k8s.io/v1beta1 nodes/<name>``, or ``{}`` when the
+            metrics-server has no data for the node (404).
+        """
+        try:
+            resp = self.custom_objects.get_cluster_custom_object(
+                "metrics.k8s.io",
+                "v1beta1",
+                "nodes",
+                name,
+            )
+        except ApiException as e:
+            if e.status == _HTTP_NOT_FOUND:
+                return {}
+            _raise(f"top node/{name}", e)
+        usage = resp.get("usage", {})
+        cpu = usage.get("cpu")
+        mem = usage.get("memory")
+        if cpu is None or mem is None:
+            return {}
+        return {"cpu": str(cpu), "memory": str(mem)}
+
+    def list_pods_by_selector_on_node(
+        self,
+        label_selector: str,
+        namespace: str,
+        node_name: str,
+    ) -> list[str]:
+        """Return pod names matching ``label_selector`` on ``node_name``.
+
+        Merges the label and field selectors server-side so the result
+        is scoped to pods scheduled on the target node.
+
+        Args:
+            label_selector: Label selector (``"k=v"``).
+            namespace: Target namespace.
+            node_name: Node name to filter on via
+                ``spec.nodeName==<node_name>``.
+
+        Returns:
+            The pod names, in list-API order. Empty list when nothing
+            matches.
+
+        Raises:
+            K8sApiError: The list call itself failed.
+        """
+        try:
+            listing = self.core_v1.list_namespaced_pod(
+                namespace,
+                label_selector=label_selector,
+                field_selector=f"spec.nodeName={node_name}",
+            )
+        except ApiException as e:
+            _raise(f"list pods -l {label_selector} on {node_name}", e)
+        return [p.metadata.name for p in listing.items]
+
     def top_pod_containers(self, name: str, namespace: str) -> list[dict[str, str]]:
         """Return per-container CPU/memory usage for a pod.
 
@@ -699,9 +762,7 @@ class K8sClient:
 
         Returns:
             The first pod name, or ``""`` when the selector matches
-            nothing. Never raises on empty lists — callers (notably
-            :meth:`BenchmarkRunner._sample_server_memory_loop`) rely
-            on that shape during startup and shutdown windows.
+            nothing. Never raises on empty lists.
 
         Raises:
             K8sApiError: The list call itself failed.
