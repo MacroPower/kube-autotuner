@@ -16,7 +16,7 @@ the wait loop uses
   its own Job in ``finally``), drain ``not_done`` so their own cleanup
   paths get a chance to run, and finally re-raise the primary failure.
 
-The cleanup block *no longer swallows* ``KubectlError``: if the label
+The cleanup block *no longer swallows* ``K8sApiError``: if the label
 sweep itself fails while a primary client failure is in flight, we log
 at ``warning`` and raise a wrapping :class:`RuntimeError` chained from
 the primary exception so neither failure is hidden from the operator.
@@ -34,7 +34,7 @@ from kube_autotuner.benchmark.parser import parse_iperf_json, parse_k8s_memory
 from kube_autotuner.benchmark.patch import apply_patches
 from kube_autotuner.benchmark.server_spec import build_server_yaml
 from kube_autotuner.experiment import IperfSection
-from kube_autotuner.k8s.client import Kubectl, KubectlError
+from kube_autotuner.k8s.client import K8sApiError, K8sClient
 
 if TYPE_CHECKING:
     from kube_autotuner.experiment import Patch
@@ -48,13 +48,13 @@ _CLIENT_WAIT_TIMEOUT_SECONDS = 180
 
 
 class BenchmarkRunner:
-    """Orchestrates iperf3 server/client lifecycle via kubectl."""
+    """Orchestrates iperf3 server/client lifecycle via the Kubernetes API."""
 
     def __init__(
         self,
         node_pair: NodePair,
         config: BenchmarkConfig,
-        kubectl: Kubectl | None = None,
+        client: K8sClient | None = None,
         iperf_args: IperfSection | None = None,
         patches: list[Patch] | None = None,
     ) -> None:
@@ -64,8 +64,8 @@ class BenchmarkRunner:
             node_pair: Source/target nodes and namespace for this run.
             config: :class:`BenchmarkConfig` (duration, iterations, modes,
                 parallel streams, TCP window).
-            kubectl: Injected :class:`Kubectl` client. Defaults to a
-                freshly constructed real client.
+            client: Injected :class:`K8sClient`. Defaults to a freshly
+                constructed real client.
             iperf_args: Optional per-role ``extra_args`` for the iperf3
                 client and server commands.
             patches: Optional kustomize patches applied to every rendered
@@ -74,7 +74,7 @@ class BenchmarkRunner:
         """
         self.node_pair = node_pair
         self.config = config
-        self.kubectl = kubectl or Kubectl()
+        self.client = client or K8sClient()
         self.iperf_args = iperf_args or IperfSection()
         self.patches = patches or []
         self._server_name = f"iperf3-server-{node_pair.target}"
@@ -93,8 +93,8 @@ class BenchmarkRunner:
             extra_args=self.iperf_args.server.extra_args,
         )
         server_yaml = apply_patches(server_yaml, self.patches)
-        self.kubectl.apply(server_yaml, self.node_pair.namespace)
-        self.kubectl.rollout_status(
+        self.client.apply(server_yaml, self.node_pair.namespace)
+        self.client.rollout_status(
             "deployment", self._server_name, self.node_pair.namespace
         )
         logger.info(
@@ -119,7 +119,7 @@ class BenchmarkRunner:
         Raises:
             RuntimeError: When the best-effort Job cleanup in
                 ``finally`` fails; the original cleanup
-                :class:`KubectlError` is attached as the cause.
+                :class:`K8sApiError` is attached as the cause.
         """
         job_name = f"iperf3-client-{client}-p{port}"
         ns = self.node_pair.namespace
@@ -138,15 +138,15 @@ class BenchmarkRunner:
         client_yaml = apply_patches(client_yaml, self.patches)
 
         try:
-            self.kubectl.apply(client_yaml, ns)
-            self.kubectl.wait(
+            self.client.apply(client_yaml, ns)
+            self.client.wait(
                 "job",
                 job_name,
                 "condition=complete",
                 ns,
                 timeout=_CLIENT_WAIT_TIMEOUT_SECONDS,
             )
-            output = self.kubectl.logs("job", job_name, ns)
+            output = self.client.logs("job", job_name, ns)
             raw = json.loads(output)
             return parse_iperf_json(
                 raw,
@@ -156,8 +156,8 @@ class BenchmarkRunner:
             )
         finally:
             try:
-                self.kubectl.delete("job", job_name, ns, ignore_not_found=True)
-            except KubectlError as cleanup_err:
+                self.client.delete("job", job_name, ns, ignore_not_found=True)
+            except K8sApiError as cleanup_err:
                 logger.warning(
                     "Best-effort delete of client job %s failed",
                     job_name,
@@ -175,20 +175,20 @@ class BenchmarkRunner:
 
         Returns:
             The summed memory in bytes across every server container,
-            or ``None`` when the server pod cannot be located or
-            ``kubectl top`` returns no rows. This path is informational
+            or ``None`` when the server pod cannot be located or the
+            metrics-server returns no rows. This path is informational
             and must not abort a benchmark iteration.
         """
         try:
-            pod_name = self.kubectl.get_pod_name(
+            pod_name = self.client.get_pod_name(
                 self._server_label,
                 self.node_pair.namespace,
             )
-            rows = self.kubectl.top_pod_containers(
+            rows = self.client.top_pod_containers(
                 pod_name,
                 self.node_pair.namespace,
             )
-        except KubectlError:
+        except K8sApiError:
             logger.warning("Failed to collect memory for server pod", exc_info=True)
             return None
         if not rows:
@@ -277,19 +277,19 @@ class BenchmarkRunner:
         chained traceback.
 
         Raises:
-            RuntimeError: The label-based cleanup ``kubectl delete`` call
-                returned non-zero. The original ``first_exc`` is attached
-                as the exception's cause.
+            RuntimeError: The label-based cleanup API call returned
+                non-zero. The original ``first_exc`` is attached as the
+                exception's cause.
         """
         for f in not_done:
             f.cancel()
         try:
-            self.kubectl.delete_by_label(
+            self.client.delete_by_label(
                 "job",
                 CLIENT_LABEL,
                 self.node_pair.namespace,
             )
-        except KubectlError as cleanup_err:
+        except K8sApiError as cleanup_err:
             logger.warning(
                 "Failed label-based cleanup of client jobs",
                 exc_info=True,
@@ -309,11 +309,11 @@ class BenchmarkRunner:
     def cleanup(self) -> None:
         """Remove iperf3 server/client resources by label."""
         ns = self.node_pair.namespace
-        self.kubectl.delete_by_label(
+        self.client.delete_by_label(
             "deployment", "app.kubernetes.io/name=iperf3-server", ns
         )
-        self.kubectl.delete_by_label(
+        self.client.delete_by_label(
             "service", "app.kubernetes.io/name=iperf3-server", ns
         )
-        self.kubectl.delete_by_label("job", CLIENT_LABEL, ns)
+        self.client.delete_by_label("job", CLIENT_LABEL, ns)
         logger.info("iperf3 resources cleaned up")

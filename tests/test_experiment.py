@@ -614,14 +614,14 @@ def test_check_kustomize_available_nonzero_rc(monkeypatch):
     assert "boom" in result.detail
 
 
-def test_check_nodes_exist_surfaces_kubectl_failure():
+def test_check_nodes_exist_surfaces_api_failure():
     exp = ExperimentConfig.model_validate({
         "mode": "baseline",
         "nodes": {"sources": ["a"], "target": "b"},
     })
-    kubectl = MagicMock()
-    kubectl.get_node_zone.side_effect = RuntimeError("NotFound")
-    result = exp._check_nodes_exist(kubectl)
+    client = MagicMock()
+    client.get_node_zone.side_effect = RuntimeError("NotFound")
+    result = exp._check_nodes_exist(client)
     assert not result.passed
     assert "not found or unreachable" in result.detail
 
@@ -631,10 +631,10 @@ def test_check_nodes_exist_happy_path():
         "mode": "baseline",
         "nodes": {"sources": ["a", "extra"], "target": "b"},
     })
-    kubectl = MagicMock()
-    kubectl.get_node_zone.return_value = "zone-a"
-    assert exp._check_nodes_exist(kubectl).passed
-    assert kubectl.get_node_zone.call_count == 3
+    client = MagicMock()
+    client.get_node_zone.return_value = "zone-a"
+    assert exp._check_nodes_exist(client).passed
+    assert client.get_node_zone.call_count == 3
 
 
 def test_output_path_creates_parent_dir(tmp_path: Path):
@@ -674,9 +674,9 @@ def test_preflight_orchestration_smoke():
         "mode": "baseline",
         "nodes": {"sources": ["a"], "target": "b"},
     })
-    kubectl = MagicMock()
-    kubectl.get_node_zone.return_value = ""
-    results = exp.preflight(kubectl)
+    client = MagicMock()
+    client.get_node_zone.return_value = ""
+    results = exp.preflight(client)
     names = [r.name for r in results]
     assert names == [
         "denylists",
@@ -699,9 +699,9 @@ def test_preflight_collects_multiple_failures(tmp_path: Path):
         "iperf": {"client": {"extraArgs": ["-c"]}},
         "output": str(out),
     })
-    kubectl = MagicMock()
-    kubectl.get_node_zone.side_effect = RuntimeError("NotFound")
-    results = exp.preflight(kubectl)
+    client = MagicMock()
+    client.get_node_zone.side_effect = RuntimeError("NotFound")
+    results = exp.preflight(client)
 
     assert not _find(results, "denylists").passed
     assert not _find(results, "nodes-exist").passed

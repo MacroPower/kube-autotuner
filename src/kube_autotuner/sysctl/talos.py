@@ -18,7 +18,7 @@ Every ``talosctl`` shell-out routes through
 :func:`kube_autotuner.subproc.run_tool`, the sanctioned subprocess
 entrypoint in the repo. The module reads no environment variables; the
 endpoint is either supplied explicitly or discovered via
-:meth:`kube_autotuner.k8s.client.Kubectl.get_node_internal_ip`. The
+:meth:`kube_autotuner.k8s.client.K8sClient.get_node_internal_ip`. The
 ``make_sysctl_setter_from_env`` helper in
 :mod:`kube_autotuner.sysctl.setter` is the single place env vars are
 consulted.
@@ -34,7 +34,7 @@ from typing import TYPE_CHECKING
 
 import yaml
 
-from kube_autotuner.k8s.client import Kubectl, KubectlError
+from kube_autotuner.k8s.client import K8sApiError, K8sClient
 from kube_autotuner.k8s.lease import NodeLease
 from kube_autotuner.subproc import run_tool
 from kube_autotuner.sysctl.backend import (
@@ -54,13 +54,13 @@ _APPLY_PROPAGATION_POLL_INTERVAL_SECONDS = 1.0
 class TalosSysctlBackend:
     """Applies and reads sysctls on a Talos node via ``talosctl``."""
 
-    kubectl: Kubectl
+    client: K8sClient
 
     def __init__(
         self,
         node: str,
         namespace: str = "default",
-        kubectl: Kubectl | None = None,
+        client: K8sClient | None = None,
         endpoint: str | None = None,
     ) -> None:
         """Configure the Talos backend.
@@ -70,15 +70,15 @@ class TalosSysctlBackend:
                 ``talosctl -n`` target when ``endpoint`` is not supplied
                 and the InternalIP lookup succeeds.
             namespace: Namespace hosting the coordination Lease.
-            kubectl: Injected :class:`Kubectl` client. Defaults to a
-                freshly constructed real client.
+            client: Injected :class:`K8sClient`. Defaults to a freshly
+                constructed real client.
             endpoint: Explicit ``talosctl`` endpoint address. When
-                ``None``, the endpoint is resolved lazily from
-                ``kubectl get node <node>`` on first access.
+                ``None``, the endpoint is resolved lazily from the node
+                object on first access.
         """
         self.node = node
         self.namespace = namespace
-        self.kubectl = kubectl or Kubectl()
+        self.client = client or K8sClient()
         self._endpoint_override = endpoint
         self._resolved_endpoint: str | None = None
 
@@ -90,10 +90,10 @@ class TalosSysctlBackend:
 
         1. Cached ``_resolved_endpoint`` (memoised after first resolution).
         2. ``endpoint=`` kwarg passed to :meth:`__init__`.
-        3. The node's ``InternalIP`` from ``kubectl get node``.
+        3. The node's ``InternalIP`` from the Kubernetes API.
 
         Raises:
-            RuntimeError: If ``kubectl`` fails, or the node has no
+            RuntimeError: If the API call fails, or the node has no
                 ``InternalIP``.
         """
         if self._resolved_endpoint:
@@ -102,11 +102,11 @@ class TalosSysctlBackend:
             self._resolved_endpoint = self._endpoint_override
             return self._resolved_endpoint
         try:
-            ip = self.kubectl.get_node_internal_ip(self.node)
-        except KubectlError as e:
+            ip = self.client.get_node_internal_ip(self.node)
+        except K8sApiError as e:
             msg = (
                 f"Could not resolve Talos endpoint for node {self.node!r}: "
-                f"{e.stderr.strip()}"
+                f"{e.message.strip()}"
             )
             raise RuntimeError(msg) from e
         if not ip:
@@ -275,4 +275,4 @@ class TalosSysctlBackend:
 
     def lock(self) -> NodeLease:
         """Return a :class:`NodeLease` guarding exclusive node access."""
-        return NodeLease(self.node, namespace=self.namespace, kubectl=self.kubectl)
+        return NodeLease(self.node, namespace=self.namespace, client=self.client)

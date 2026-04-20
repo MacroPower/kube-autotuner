@@ -12,7 +12,7 @@ import logging
 from typing import TYPE_CHECKING, Self
 from uuid import uuid4
 
-from kube_autotuner.k8s.client import Kubectl, KubectlError
+from kube_autotuner.k8s.client import K8sApiError, K8sClient
 from kube_autotuner.k8s.templates import render_template
 
 if TYPE_CHECKING:
@@ -74,20 +74,19 @@ class NodeLease:
 
     Acquisition strategy:
 
-    1. **Fast path.** ``kubectl create`` of a fresh ``Lease`` is an
-       atomic CAS on the object's name — the API server rejects a second
-       creator with ``AlreadyExists``. A successful create takes the
-       lock.
+    1. **Fast path.** Creating a fresh ``Lease`` is an atomic CAS on
+       the object's name — the API server rejects a second creator with
+       ``AlreadyExists``. A successful create takes the lock.
     2. **Takeover path.** ``AlreadyExists`` means a lease with the same
        name already lives in the namespace. :meth:`_try_takeover` fetches
        it and decides whether the current caller is entitled to replace
        it: either it is expired (``renewTime`` older than
        ``leaseDurationSeconds``) or the caller is already the recorded
        ``holderIdentity`` (re-entrant). In either case we issue a
-       ``kubectl replace`` that echoes back the observed
-       ``resourceVersion``; the API server rejects the replace with
-       ``Conflict`` if anyone else mutated the object in between,
-       giving us optimistic concurrency control without explicit locks.
+       ``replace`` that echoes back the observed ``resourceVersion``;
+       the API server rejects the replace with ``Conflict`` if anyone
+       else mutated the object in between, giving us optimistic
+       concurrency control without explicit locks.
     3. **Retry rationale.** Two races are expected during normal
        operation and are handled with a single retry:
 
@@ -102,9 +101,9 @@ class NodeLease:
          over with a fresh read or fails cleanly with
          :class:`LeaseHeldError` if the winner still holds it.
 
-    The lease is released with ``kubectl delete`` on context-manager
-    exit; delete failures are logged but not re-raised so they never
-    mask a caller-level exception.
+    The lease is deleted on context-manager exit; delete failures are
+    logged but not re-raised so they never mask a caller-level
+    exception.
     """
 
     LEASE_PREFIX = "kube-autotuner-lock"
@@ -114,7 +113,7 @@ class NodeLease:
         node: str,
         namespace: str = "default",
         holder: str | None = None,
-        kubectl: Kubectl | None = None,
+        client: K8sClient | None = None,
     ) -> None:
         """Configure the lease wrapper.
 
@@ -125,13 +124,13 @@ class NodeLease:
             holder: ``holderIdentity`` to claim. Defaults to a random
                 ``kube-autotuner-<hex8>`` identifier unique to this
                 process.
-            kubectl: Injected :class:`Kubectl` client (tests pass a
-                mock). Defaults to a freshly constructed real client.
+            client: Injected :class:`K8sClient` (tests pass a mock).
+                Defaults to a freshly constructed real client.
         """
         self.node = node
         self.namespace = namespace
         self.holder = holder or f"kube-autotuner-{uuid4().hex[:8]}"
-        self.kubectl = kubectl or Kubectl()
+        self.client = client or K8sClient()
         self.lease_name = f"{self.LEASE_PREFIX}-{node}"
         self._acquired = False
 
@@ -140,7 +139,7 @@ class NodeLease:
 
         Args:
             resource_version: When non-empty, embed this
-                ``resourceVersion`` so a subsequent ``kubectl replace``
+                ``resourceVersion`` so a subsequent ``replace`` call
                 participates in optimistic-concurrency control.
 
         Returns:
@@ -165,17 +164,16 @@ class NodeLease:
         """Acquire the node lease.
 
         Delegates to :meth:`_try_takeover` when the lease already exists;
-        see that method for the ``LeaseHeldError`` / ``KubectlError``
+        see that method for the ``LeaseHeldError`` / ``K8sApiError``
         conditions.
 
         Raises:
-            KubectlError: On any ``kubectl`` failure other than
-                ``AlreadyExists``.
+            K8sApiError: On any API failure other than ``AlreadyExists``.
         """
         try:
-            self.kubectl.create(self._render_lease(), self.namespace)
-        except KubectlError as e:
-            if "AlreadyExists" not in e.stderr:
+            self.client.create(self._render_lease(), self.namespace)
+        except K8sApiError as e:
+            if e.reason != "AlreadyExists":
                 raise
             self._try_takeover()
             return
@@ -194,15 +192,15 @@ class NodeLease:
         Raises:
             LeaseHeldError: A non-expired lease is held by another
                 process.
-            KubectlError: A ``kubectl`` call failed with an error other
-                than the ones we retry on.
+            K8sApiError: An API call failed with an error other than
+                the ones we retry on.
         """
-        existing = self.kubectl.get_json("lease", self.lease_name, self.namespace)
+        existing = self.client.get_json("lease", self.lease_name, self.namespace)
         if existing is None:
             try:
-                self.kubectl.create(self._render_lease(), self.namespace)
-            except KubectlError as e:
-                if "AlreadyExists" not in e.stderr or retries <= 0:
+                self.client.create(self._render_lease(), self.namespace)
+            except K8sApiError as e:
+                if e.reason != "AlreadyExists" or retries <= 0:
                     raise
                 self._try_takeover(retries - 1)
                 return
@@ -233,9 +231,9 @@ class NodeLease:
 
         yaml = self._render_lease(str(resource_version))
         try:
-            self.kubectl.replace(yaml, self.namespace)
-        except KubectlError as e:
-            if retries > 0 and "Conflict" in e.stderr:
+            self.client.replace(yaml, self.namespace)
+        except K8sApiError as e:
+            if retries > 0 and e.reason == "Conflict":
                 logger.debug("Conflict on replace, retrying takeover")
                 self._try_takeover(retries - 1)
                 return
@@ -252,7 +250,7 @@ class NodeLease:
         """Release the lease if it is currently held by this wrapper."""
         if not self._acquired:
             return
-        self.kubectl.delete("lease", self.lease_name, self.namespace)
+        self.client.delete("lease", self.lease_name, self.namespace)
         self._acquired = False
         logger.info("Released lease %s", self.lease_name)
 
@@ -274,7 +272,7 @@ class NodeLease:
         """Release the lease on exit; never mask the caller's exception."""
         try:
             self.release()
-        except KubectlError:
+        except K8sApiError:
             logger.warning(
                 "Failed to release lease %s",
                 self.lease_name,

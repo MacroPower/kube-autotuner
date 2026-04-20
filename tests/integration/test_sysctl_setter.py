@@ -19,7 +19,7 @@ import pytest
 from kube_autotuner.sysctl.setter import make_sysctl_setter_from_env
 
 if TYPE_CHECKING:
-    from kube_autotuner.k8s.client import Kubectl
+    from kube_autotuner.k8s.client import K8sClient
     from kube_autotuner.sysctl.backend import SysctlBackend
 
 pytestmark = [
@@ -31,22 +31,22 @@ SAFE_PARAMS = ["net.core.rmem_max", "net.core.wmem_max"]
 
 
 def _make_setter(
-    kubectl: Kubectl, node_names: dict[str, str], test_namespace: str
+    k8s_client: K8sClient, node_names: dict[str, str], test_namespace: str
 ) -> SysctlBackend:
     return make_sysctl_setter_from_env(
         node=node_names["target"],
         namespace=test_namespace,
-        kubectl=kubectl,
+        client=k8s_client,
     )
 
 
 def test_get_reads_sysctl_values(
-    kubectl: Kubectl,
+    k8s_client: K8sClient,
     node_names: dict[str, str],
     test_namespace: str,
     sysctls_available: None,  # noqa: ARG001 - activation fixture
 ) -> None:
-    setter = _make_setter(kubectl, node_names, test_namespace)
+    setter = _make_setter(k8s_client, node_names, test_namespace)
     values = setter.get(SAFE_PARAMS)
 
     for param in SAFE_PARAMS:
@@ -58,9 +58,9 @@ def test_get_reads_sysctl_values(
 
 @pytest.mark.requires_real_sysctl_write
 def test_apply_and_verify(
-    kubectl: Kubectl, node_names: dict[str, str], test_namespace: str
+    k8s_client: K8sClient, node_names: dict[str, str], test_namespace: str
 ) -> None:
-    setter = _make_setter(kubectl, node_names, test_namespace)
+    setter = _make_setter(k8s_client, node_names, test_namespace)
     original = setter.get(["net.core.rmem_max"])
 
     test_value = "16777216"
@@ -76,9 +76,9 @@ def test_apply_and_verify(
 
 @pytest.mark.requires_real_sysctl_write
 def test_snapshot_and_restore(
-    kubectl: Kubectl, node_names: dict[str, str], test_namespace: str
+    k8s_client: K8sClient, node_names: dict[str, str], test_namespace: str
 ) -> None:
-    setter = _make_setter(kubectl, node_names, test_namespace)
+    setter = _make_setter(k8s_client, node_names, test_namespace)
     original = setter.snapshot(["net.core.rmem_max"])
 
     setter.apply({"net.core.rmem_max": "8388608"})

@@ -110,7 +110,7 @@ class BenchmarkResult(BaseModel):
     jitter_ms: float | None = None
     memory_used_bytes: int | None = Field(
         default=None,
-        description="Deferred: requires cgroup/kubectl-top integration.",
+        description="Populated from metrics.k8s.io/v1beta1 PodMetrics.",
     )
     client_node: str = ""
     iteration: int = 0

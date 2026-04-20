@@ -9,38 +9,38 @@ import pytest
 from kube_autotuner.k8s.lease import LeaseHeldError, NodeLease
 
 if TYPE_CHECKING:
-    from kube_autotuner.k8s.client import Kubectl
+    from kube_autotuner.k8s.client import K8sClient
 
 pytestmark = pytest.mark.integration
 
 
-def test_acquire_and_release(kubectl: Kubectl, test_namespace: str) -> None:
-    lease = NodeLease("test-node", namespace=test_namespace, kubectl=kubectl)
+def test_acquire_and_release(k8s_client: K8sClient, test_namespace: str) -> None:
+    lease = NodeLease("test-node", namespace=test_namespace, client=k8s_client)
     lease.acquire()
 
-    obj = kubectl.get_json("lease", lease.lease_name, test_namespace)
+    obj = k8s_client.get_json("lease", lease.lease_name, test_namespace)
     assert obj is not None
     assert obj["spec"]["holderIdentity"] == lease.holder
 
     lease.release()
-    assert kubectl.get_json("lease", lease.lease_name, test_namespace) is None
+    assert k8s_client.get_json("lease", lease.lease_name, test_namespace) is None
 
 
-def test_context_manager(kubectl: Kubectl, test_namespace: str) -> None:
-    lease = NodeLease("test-node-cm", namespace=test_namespace, kubectl=kubectl)
+def test_context_manager(k8s_client: K8sClient, test_namespace: str) -> None:
+    lease = NodeLease("test-node-cm", namespace=test_namespace, client=k8s_client)
     with lease:
-        obj = kubectl.get_json("lease", lease.lease_name, test_namespace)
+        obj = k8s_client.get_json("lease", lease.lease_name, test_namespace)
         assert obj is not None
 
-    assert kubectl.get_json("lease", lease.lease_name, test_namespace) is None
+    assert k8s_client.get_json("lease", lease.lease_name, test_namespace) is None
 
 
-def test_same_holder_reacquire(kubectl: Kubectl, test_namespace: str) -> None:
+def test_same_holder_reacquire(k8s_client: K8sClient, test_namespace: str) -> None:
     lease = NodeLease(
         "test-node-reacq",
         namespace=test_namespace,
         holder="holder-a",
-        kubectl=kubectl,
+        client=k8s_client,
     )
     lease.acquire()
 
@@ -49,7 +49,7 @@ def test_same_holder_reacquire(kubectl: Kubectl, test_namespace: str) -> None:
         "test-node-reacq",
         namespace=test_namespace,
         holder="holder-a",
-        kubectl=kubectl,
+        client=k8s_client,
     )
     lease2.acquire()
 
@@ -57,12 +57,12 @@ def test_same_holder_reacquire(kubectl: Kubectl, test_namespace: str) -> None:
     lease2.release()
 
 
-def test_held_by_other_raises(kubectl: Kubectl, test_namespace: str) -> None:
+def test_held_by_other_raises(k8s_client: K8sClient, test_namespace: str) -> None:
     lease_a = NodeLease(
         "test-node-held",
         namespace=test_namespace,
         holder="holder-a",
-        kubectl=kubectl,
+        client=k8s_client,
     )
     lease_a.acquire()
 
@@ -70,7 +70,7 @@ def test_held_by_other_raises(kubectl: Kubectl, test_namespace: str) -> None:
         "test-node-held",
         namespace=test_namespace,
         holder="holder-b",
-        kubectl=kubectl,
+        client=k8s_client,
     )
     with pytest.raises(LeaseHeldError):
         lease_b.acquire()

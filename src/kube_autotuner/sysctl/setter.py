@@ -3,8 +3,8 @@
 :class:`SysctlSetter` is the default production backend: it schedules a
 privileged ``hostNetwork`` pod onto the target node, runs
 ``sysctl -w`` / ``sysctl -n`` inside the host network namespace, and
-tears the pod down. All shell-outs route through the
-:class:`kube_autotuner.k8s.client.Kubectl` wrapper.
+tears the pod down. All Kubernetes calls route through the
+:class:`kube_autotuner.k8s.client.K8sClient` wrapper.
 
 The factory layer (:func:`make_sysctl_setter` and
 :func:`make_sysctl_setter_from_env`) also lives here. The env-reading
@@ -22,7 +22,7 @@ import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 
-from kube_autotuner.k8s.client import Kubectl, KubectlError
+from kube_autotuner.k8s.client import K8sApiError, K8sClient
 from kube_autotuner.k8s.lease import NodeLease
 from kube_autotuner.k8s.templates import render_template
 from kube_autotuner.sysctl.backend import (
@@ -53,7 +53,7 @@ class PodExecutionError(RuntimeError):
 
     The exception message embeds the pod name, target node, and the last
     :data:`_LOG_TAIL_LINES` lines of the pod's logs so operators do not
-    need to run ``kubectl logs`` manually to triage a failure.
+    need to fetch logs manually to triage a failure.
 
     Attributes:
         pod_name: Name of the failed pod.
@@ -75,7 +75,7 @@ class PodExecutionError(RuntimeError):
             pod_name: Name of the failed pod.
             node: Target node.
             logs_tail: Tail of the pod's log output.
-            cause: Short description of the triggering ``kubectl`` error.
+            cause: Short description of the triggering API error.
         """
         self.pod_name = pod_name
         self.node = node
@@ -100,19 +100,19 @@ class SysctlSetter:
         self,
         node: str,
         namespace: str = "default",
-        kubectl: Kubectl | None = None,
+        client: K8sClient | None = None,
     ) -> None:
         """Configure the real sysctl backend.
 
         Args:
             node: Kubernetes node the sysctls are applied to.
             namespace: Namespace for the ephemeral setter pods.
-            kubectl: Injected :class:`Kubectl` client (tests pass a
-                mock). Defaults to a freshly constructed real client.
+            client: Injected :class:`K8sClient` (tests pass a mock).
+                Defaults to a freshly constructed real client.
         """
         self.node = node
         self.namespace = namespace
-        self.kubectl = kubectl or Kubectl()
+        self.client = client or K8sClient()
 
     def _render_pod(self, pod_name: str, commands: str) -> str:
         """Return the rendered setter-pod manifest.
@@ -123,7 +123,7 @@ class SysctlSetter:
             commands: Shell snippet run inside the privileged container.
 
         Returns:
-            The rendered YAML manifest ready for ``kubectl apply``.
+            The rendered YAML manifest ready for :meth:`K8sClient.apply`.
         """
         return render_template(
             "sysctl_setter.yaml",
@@ -137,11 +137,11 @@ class SysctlSetter:
     def _await_ready(self, pod_name: str) -> None:
         """Block until the setter pod reaches ``Succeeded``.
 
-        Propagates :class:`KubectlError` from the underlying
-        ``kubectl wait`` call unchanged; :meth:`_run_pod` wraps that
-        error with pod/log context.
+        Propagates :class:`K8sApiError` from the underlying wait call
+        unchanged; :meth:`_run_pod` wraps that error with pod/log
+        context.
         """
-        self.kubectl.wait(
+        self.client.wait(
             "pod",
             pod_name,
             "jsonpath={.status.phase}=Succeeded",
@@ -151,14 +151,14 @@ class SysctlSetter:
 
     def _collect_logs(self, pod_name: str) -> str:
         """Return the pod's full log output."""
-        return self.kubectl.logs("pod", pod_name, self.namespace)
+        return self.client.logs("pod", pod_name, self.namespace)
 
     def _tail_logs(self, pod_name: str) -> str:
         """Return the last :data:`_LOG_TAIL_LINES` lines, never raising."""
         try:
             logs = self._collect_logs(pod_name)
-        except KubectlError as e:
-            return f"<logs unavailable: {e.stderr.strip() or e}>"
+        except K8sApiError as e:
+            return f"<logs unavailable: {e.message.strip() or e}>"
         lines = logs.splitlines()[-_LOG_TAIL_LINES:]
         return "\n".join(lines)
 
@@ -170,8 +170,8 @@ class SysctlSetter:
             commands: Shell snippet run inside the privileged container.
 
         Returns:
-            The pod's ``stdout`` (captured via ``kubectl logs``) on
-            successful completion.
+            The pod's ``stdout`` (captured from the pod's log stream)
+            on successful completion.
 
         Raises:
             PodExecutionError: The pod failed to reach ``Succeeded``;
@@ -179,10 +179,10 @@ class SysctlSetter:
         """
         yaml_manifest = self._render_pod(pod_name, commands)
         try:
-            self.kubectl.apply(yaml_manifest, self.namespace)
+            self.client.apply(yaml_manifest, self.namespace)
             try:
                 self._await_ready(pod_name)
-            except KubectlError as e:
+            except K8sApiError as e:
                 tail = self._tail_logs(pod_name)
                 raise PodExecutionError(
                     pod_name,
@@ -192,8 +192,8 @@ class SysctlSetter:
                 ) from e
             return self._collect_logs(pod_name)
         finally:
-            with suppress(KubectlError):
-                self.kubectl.delete("pod", pod_name, self.namespace)
+            with suppress(K8sApiError):
+                self.client.delete("pod", pod_name, self.namespace)
 
     def apply(self, params: Mapping[str, str | int]) -> None:
         """Apply ``params`` on the target node.
@@ -254,7 +254,7 @@ class SysctlSetter:
 
     def lock(self) -> NodeLease:
         """Return a :class:`NodeLease` guarding exclusive node access."""
-        return NodeLease(self.node, namespace=self.namespace, kubectl=self.kubectl)
+        return NodeLease(self.node, namespace=self.namespace, client=self.client)
 
 
 def make_sysctl_setter(
@@ -262,7 +262,7 @@ def make_sysctl_setter(
     backend: BackendName,
     node: str,
     namespace: str = "default",
-    kubectl: Kubectl | None = None,
+    client: K8sClient | None = None,
     fake_state_path: Path | None = None,
     talos_endpoint: str | None = None,
 ) -> SysctlBackend:
@@ -280,7 +280,7 @@ def make_sysctl_setter(
             :class:`~kube_autotuner.sysctl.fake.FakeSysctlBackend`.
         node: Kubernetes node name.
         namespace: Namespace for coordination resources.
-        kubectl: Injected :class:`Kubectl` client. Ignored by the fake
+        client: Injected :class:`K8sClient`. Ignored by the fake
             backend.
         fake_state_path: JSON state file required when
             ``backend == "fake"``. Ignored by the real/Talos backends.
@@ -297,12 +297,12 @@ def make_sysctl_setter(
             missing.
     """
     if backend == "real":
-        return SysctlSetter(node, namespace=namespace, kubectl=kubectl)
+        return SysctlSetter(node, namespace=namespace, client=client)
     if backend == "talos":
         return TalosSysctlBackend(
             node,
             namespace=namespace,
-            kubectl=kubectl,
+            client=client,
             endpoint=talos_endpoint,
         )
     if backend == "fake":
@@ -321,7 +321,7 @@ def make_sysctl_setter_from_env(
     *,
     node: str,
     namespace: str = "default",
-    kubectl: Kubectl | None = None,
+    client: K8sClient | None = None,
     talos_endpoint: str | None = None,
     env: Mapping[str, str] | None = None,
 ) -> SysctlBackend:
@@ -337,7 +337,7 @@ def make_sysctl_setter_from_env(
     Args:
         node: Kubernetes node name.
         namespace: Namespace for coordination resources.
-        kubectl: Injected :class:`Kubectl` client.
+        client: Injected :class:`K8sClient`.
         talos_endpoint: Explicit ``talosctl -n`` target. Forwarded to
             :func:`make_sysctl_setter` for the Talos backend.
         env: Environment mapping to consult. Defaults to
@@ -376,7 +376,7 @@ def make_sysctl_setter_from_env(
         backend=cast("BackendName", backend_name),
         node=node,
         namespace=namespace,
-        kubectl=kubectl,
+        client=client,
         fake_state_path=fake_state_path,
         talos_endpoint=talos_endpoint,
     )

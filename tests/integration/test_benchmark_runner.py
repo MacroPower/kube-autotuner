@@ -5,13 +5,14 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from kubernetes.client.exceptions import ApiException
 import pytest
 
 from kube_autotuner.benchmark.runner import BenchmarkRunner
 from kube_autotuner.models import BenchmarkConfig, NodePair, TrialLog, TrialResult
 
 if TYPE_CHECKING:
-    from kube_autotuner.k8s.client import Kubectl
+    from kube_autotuner.k8s.client import K8sClient
 
 pytestmark = [
     pytest.mark.integration,
@@ -20,7 +21,7 @@ pytestmark = [
 
 
 def _make_runner(
-    kubectl: Kubectl, node_names: dict[str, str], namespace: str
+    k8s_client: K8sClient, node_names: dict[str, str], namespace: str
 ) -> BenchmarkRunner:
     node_pair = NodePair(
         source=node_names["source"],
@@ -32,42 +33,57 @@ def _make_runner(
     config = BenchmarkConfig(
         duration=5, omit=0, iterations=1, parallel=1, modes=["tcp"]
     )
-    return BenchmarkRunner(node_pair, config, kubectl=kubectl)
+    return BenchmarkRunner(node_pair, config, client=k8s_client)
+
+
+def _deployment_exists(k8s_client: K8sClient, name: str, namespace: str) -> bool:
+    try:
+        k8s_client.apps_v1.read_namespaced_deployment(name, namespace)
+    except ApiException as e:
+        if e.status == 404:
+            return False
+        raise
+    return True
+
+
+def _service_exists(k8s_client: K8sClient, name: str, namespace: str) -> bool:
+    try:
+        k8s_client.core_v1.read_namespaced_service(name, namespace)
+    except ApiException as e:
+        if e.status == 404:
+            return False
+        raise
+    return True
 
 
 def test_setup_server(
-    kubectl: Kubectl, node_names: dict[str, str], test_namespace: str
+    k8s_client: K8sClient, node_names: dict[str, str], test_namespace: str
 ) -> None:
-    runner = _make_runner(kubectl, node_names, test_namespace)
+    runner = _make_runner(k8s_client, node_names, test_namespace)
     try:
         runner.setup_server()
-
-        obj = kubectl.get_json("deployment", runner._server_name, test_namespace)
-        assert obj is not None
-        assert obj["kind"] == "Deployment"
-
-        svc = kubectl.get_json("service", runner._server_name, test_namespace)
-        assert svc is not None
+        assert _deployment_exists(k8s_client, runner._server_name, test_namespace)
+        assert _service_exists(k8s_client, runner._server_name, test_namespace)
     finally:
         runner.cleanup()
 
 
 def test_cleanup_removes_resources(
-    kubectl: Kubectl, node_names: dict[str, str], test_namespace: str
+    k8s_client: K8sClient, node_names: dict[str, str], test_namespace: str
 ) -> None:
-    runner = _make_runner(kubectl, node_names, test_namespace)
+    runner = _make_runner(k8s_client, node_names, test_namespace)
     runner.setup_server()
     runner.cleanup()
 
-    assert kubectl.get_json("deployment", runner._server_name, test_namespace) is None
-    assert kubectl.get_json("service", runner._server_name, test_namespace) is None
+    assert not _deployment_exists(k8s_client, runner._server_name, test_namespace)
+    assert not _service_exists(k8s_client, runner._server_name, test_namespace)
 
 
 def test_full_run_records_results(
-    kubectl: Kubectl, node_names: dict[str, str], test_namespace: str
+    k8s_client: K8sClient, node_names: dict[str, str], test_namespace: str
 ) -> None:
     """Run benchmark end-to-end and record results to JSONL, mirroring real usage."""
-    runner = _make_runner(kubectl, node_names, test_namespace)
+    runner = _make_runner(k8s_client, node_names, test_namespace)
     try:
         runner.setup_server()
         results = runner.run()

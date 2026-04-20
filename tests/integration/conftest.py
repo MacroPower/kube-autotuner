@@ -7,9 +7,10 @@ import subprocess
 from typing import TYPE_CHECKING, Any
 import uuid
 
+from kubernetes import client as _k8s, config as _k8s_config
 import pytest
 
-from kube_autotuner.k8s.client import Kubectl
+from kube_autotuner.k8s.client import K8sClient
 from kube_autotuner.sysctl.setter import make_sysctl_setter_from_env
 
 if TYPE_CHECKING:
@@ -93,52 +94,26 @@ def talos_cluster(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
         check=True,
     )
 
-    # Discover nodes.
-    env = {**os.environ, "KUBECONFIG": kubeconfig_path}
-    result = subprocess.run(
-        [
-            "kubectl",
-            "get",
-            "nodes",
-            "-o",
-            "jsonpath={.items[*].metadata.name}",
-        ],
-        capture_output=True,
-        text=True,
-        check=True,
-        env=env,
-    )
-    nodes = result.stdout.strip().split()
+    # Discover nodes via the typed API.
+    _k8s_config.load_kube_config(config_file=kubeconfig_path)
+    core = _k8s.CoreV1Api()
+    node_items = core.list_node().items
 
-    # Classify CP vs worker by label.
     cp_nodes: list[str] = []
     worker_nodes: list[str] = []
-    for node in nodes:
-        label_result = subprocess.run(
-            [
-                "kubectl",
-                "get",
-                "node",
-                node,
-                "-o",
-                "jsonpath={.metadata.labels.node-role\\.kubernetes\\.io/control-plane}",
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-            env=env,
-        )
-        if label_result.stdout.strip():
-            cp_nodes.append(node)
+    for node in node_items:
+        labels = node.metadata.labels or {}
+        if labels.get("node-role.kubernetes.io/control-plane") is not None:
+            cp_nodes.append(node.metadata.name)
         else:
-            worker_nodes.append(node)
+            worker_nodes.append(node.metadata.name)
 
     return {
         "name": CLUSTER_NAME,
         "kubeconfig": kubeconfig_path,
         "controlplane_nodes": cp_nodes,
         "worker_nodes": worker_nodes,
-        "all_nodes": nodes,
+        "all_nodes": [*cp_nodes, *worker_nodes],
     }
 
 
@@ -155,9 +130,9 @@ def kubeconfig_env(talos_cluster: dict[str, Any]) -> Any:
 
 
 @pytest.fixture(scope="session")
-def kubectl(kubeconfig_env: str) -> Kubectl:  # noqa: ARG001 - activates env
-    """Kubectl instance configured for the test cluster."""
-    return Kubectl()
+def k8s_client(kubeconfig_env: str) -> K8sClient:  # noqa: ARG001 - activates env
+    """K8sClient instance configured for the test cluster."""
+    return K8sClient()
 
 
 @pytest.fixture(scope="session")
@@ -176,13 +151,13 @@ def node_names(talos_cluster: dict[str, Any]) -> dict[str, str]:
 
 @pytest.fixture
 def sysctls_available(
-    kubectl: Kubectl, node_names: dict[str, str], test_namespace: str
+    k8s_client: K8sClient, node_names: dict[str, str], test_namespace: str
 ) -> None:
     """Fail the test if sysctl read fails, unless KUBE_AUTOTUNER_ALLOW_SYSCTL_SKIP=1."""
     setter = make_sysctl_setter_from_env(
         node=node_names["target"],
         namespace=test_namespace,
-        kubectl=kubectl,
+        client=k8s_client,
     )
     try:
         setter.get(["net.core.rmem_max"])
@@ -231,7 +206,7 @@ def fake_sysctl_env(monkeypatch: pytest.MonkeyPatch, fake_sysctl_state: Path) ->
 
 
 @pytest.fixture
-def test_namespace(kubectl: Kubectl) -> Any:
+def test_namespace(k8s_client: K8sClient) -> Any:
     """Create an ephemeral namespace for a single test, clean up after."""
     ns = f"kube-autotuner-test-{uuid.uuid4().hex[:8]}"
     ns_yaml = (
@@ -242,6 +217,6 @@ def test_namespace(kubectl: Kubectl) -> Any:
         "  labels:\n"
         "    pod-security.kubernetes.io/enforce: privileged\n"
     )
-    kubectl.create(ns_yaml, "default")
+    k8s_client.create(ns_yaml, "default")
     yield ns
-    kubectl.delete("namespace", ns, "default")
+    k8s_client.delete("namespace", ns, "default")

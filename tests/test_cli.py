@@ -96,11 +96,11 @@ def _fake_backend(tmp_path: Path) -> FakeSysctlBackend:
 def test_baseline_invokes_run_baseline(tmp_path: Path) -> None:
     out = tmp_path / "results.jsonl"
     with (
-        patch("kube_autotuner.cli.Kubectl") as kubectl_cls,
+        patch("kube_autotuner.cli.K8sClient") as client_cls,
         patch("kube_autotuner.cli._resolve_backend") as resolve,
         patch("kube_autotuner.cli.runs.run_baseline") as run_baseline,
     ):
-        kubectl_cls.return_value = MagicMock()
+        client_cls.return_value = MagicMock()
         resolve.return_value = _fake_backend(tmp_path)
 
         result = runner.invoke(
@@ -135,11 +135,11 @@ def test_baseline_invokes_run_baseline(tmp_path: Path) -> None:
 def test_trial_parses_params_and_invokes_run_trial(tmp_path: Path) -> None:
     out = tmp_path / "results.jsonl"
     with (
-        patch("kube_autotuner.cli.Kubectl") as kubectl_cls,
+        patch("kube_autotuner.cli.K8sClient") as client_cls,
         patch("kube_autotuner.cli._resolve_backend") as resolve,
         patch("kube_autotuner.cli.runs.run_trial") as run_trial,
     ):
-        kubectl_cls.return_value = MagicMock()
+        client_cls.return_value = MagicMock()
         resolve.return_value = _fake_backend(tmp_path)
 
         result = runner.invoke(
@@ -175,7 +175,7 @@ def test_trial_parses_params_and_invokes_run_trial(tmp_path: Path) -> None:
 
 def test_trial_rejects_malformed_param(tmp_path: Path) -> None:
     with (
-        patch("kube_autotuner.cli.Kubectl"),
+        patch("kube_autotuner.cli.K8sClient"),
         patch("kube_autotuner.cli._resolve_backend"),
         patch("kube_autotuner.cli.runs.run_trial") as run_trial,
     ):
@@ -201,11 +201,11 @@ def test_trial_rejects_malformed_param(tmp_path: Path) -> None:
 def test_optimize_invokes_run_optimize(tmp_path: Path) -> None:
     out = tmp_path / "opt.jsonl"
     with (
-        patch("kube_autotuner.cli.Kubectl") as kubectl_cls,
+        patch("kube_autotuner.cli.K8sClient") as client_cls,
         patch("kube_autotuner.cli._resolve_backend") as resolve,
         patch("kube_autotuner.cli.runs.run_optimize") as run_optimize,
     ):
-        kubectl_cls.return_value = MagicMock()
+        client_cls.return_value = MagicMock()
         resolve.return_value = _fake_backend(tmp_path)
 
         result = runner.invoke(
@@ -251,7 +251,7 @@ def test_run_loads_yaml_and_dispatches_to_run_baseline(tmp_path: Path) -> None:
         f"output: {out}\n",
     )
     with (
-        patch("kube_autotuner.cli.Kubectl") as kubectl_cls,
+        patch("kube_autotuner.cli.K8sClient") as client_cls,
         patch("kube_autotuner.cli._resolve_backend") as resolve,
         patch("kube_autotuner.cli.runs.run_baseline") as run_baseline,
         patch(
@@ -259,7 +259,7 @@ def test_run_loads_yaml_and_dispatches_to_run_baseline(tmp_path: Path) -> None:
             return_value=[],
         ),
     ):
-        kubectl_cls.return_value = MagicMock()
+        client_cls.return_value = MagicMock()
         resolve.return_value = _fake_backend(tmp_path)
 
         result = runner.invoke(app, ["run", "--config", str(config)])
@@ -284,7 +284,7 @@ def test_run_reports_preflight_failures(tmp_path: Path) -> None:
         detail="node 'a' missing",
     )
     with (
-        patch("kube_autotuner.cli.Kubectl"),
+        patch("kube_autotuner.cli.K8sClient"),
         patch(
             "kube_autotuner.cli.ExperimentConfig.preflight",
             return_value=[failing],

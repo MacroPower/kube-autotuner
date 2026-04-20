@@ -35,7 +35,7 @@ from kube_autotuner.subproc import run_tool
 from kube_autotuner.sysctl.params import PARAM_SPACE
 
 if TYPE_CHECKING:
-    from kube_autotuner.k8s.client import Kubectl
+    from kube_autotuner.k8s.client import K8sClient
 
 Mode = Literal["baseline", "trial", "optimize"]
 
@@ -341,7 +341,7 @@ class ExperimentConfig(BaseModel):
             return ParamSpace(params=self.optimize.param_space)
         return PARAM_SPACE
 
-    def preflight(self, kubectl: Kubectl) -> list[PreflightResult]:
+    def preflight(self, client: K8sClient) -> list[PreflightResult]:
         """Run every preflight check and return the results.
 
         Order: pure-data checks first, then local tool shell-outs, then
@@ -350,8 +350,8 @@ class ExperimentConfig(BaseModel):
         returned list.
 
         Args:
-            kubectl: :class:`Kubectl` client used for the node-exists
-                cluster probe.
+            client: :class:`K8sClient` used for the node-exists cluster
+                probe.
 
         Returns:
             One :class:`PreflightResult` per check, in execution order.
@@ -363,7 +363,7 @@ class ExperimentConfig(BaseModel):
             self._check_kustomize_available(),
             self._dry_render_patches(),
             self._check_output_path(),
-            self._check_nodes_exist(kubectl),
+            self._check_nodes_exist(client),
         ]
 
     def _check_denylists(self) -> PreflightResult:
@@ -438,8 +438,8 @@ class ExperimentConfig(BaseModel):
                 if isinstance(md, dict) and "namespace" in md:
                     detail = (
                         f"patch[{i}] sets metadata.namespace; namespace is "
-                        f"controlled by `nodes.namespace` and passed via "
-                        f"`kubectl apply -n`"
+                        f"controlled by `nodes.namespace` and passed on "
+                        f"every apply call"
                     )
                     return PreflightResult(name=name, passed=False, detail=detail)
             elif isinstance(p.patch, list):
@@ -490,25 +490,25 @@ class ExperimentConfig(BaseModel):
             return PreflightResult(name=name, passed=False, detail=detail)
         return PreflightResult(name=name, passed=True)
 
-    def _check_nodes_exist(self, kubectl: Kubectl) -> PreflightResult:
-        """Verify every referenced node is reachable by kubectl.
+    def _check_nodes_exist(self, client: K8sClient) -> PreflightResult:
+        """Verify every referenced node is reachable by the API server.
 
         Args:
-            kubectl: :class:`Kubectl` client used to probe each node via
-                ``get node --show-labels`` (topology-zone fetch).
+            client: :class:`K8sClient` used to probe each node via a
+                topology-zone fetch.
 
         Returns:
             A passing result when every node in ``nodes.target`` and
             ``nodes.sources`` responds, otherwise a failing result naming
-            the first unreachable node and the kubectl error that
-            surfaced it.
+            the first unreachable node and the API error that surfaced
+            it.
         """
         name = "nodes-exist"
         nodes = [self.nodes.target, *self.nodes.sources]
         for node in nodes:
             try:
-                kubectl.get_node_zone(node)
-            except Exception as e:  # noqa: BLE001 - surface any kubectl failure
+                client.get_node_zone(node)
+            except Exception as e:  # noqa: BLE001 - surface any client failure
                 detail = f"node {node!r} not found or unreachable: {e}"
                 return PreflightResult(name=name, passed=False, detail=detail)
         return PreflightResult(name=name, passed=True)

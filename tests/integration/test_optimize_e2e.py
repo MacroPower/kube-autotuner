@@ -14,7 +14,7 @@ from kube_autotuner.models import TrialResult
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from kube_autotuner.k8s.client import Kubectl
+    from kube_autotuner.k8s.client import K8sClient
 
 pytestmark = [
     pytest.mark.integration,
@@ -24,7 +24,7 @@ pytestmark = [
 
 def test_optimize_runs_trials_and_writes_jsonl(
     kubeconfig_env: str,  # noqa: ARG001 - activates KUBECONFIG env var
-    kubectl: Kubectl,
+    k8s_client: K8sClient,
     node_names: dict[str, str],
     test_namespace: str,
     fake_sysctl_env: Path,  # noqa: ARG001 - activates fake backend env vars
@@ -72,4 +72,4 @@ def test_optimize_runs_trials_and_writes_jsonl(
         assert trial.results[0].bits_per_second > 0
 
     lease_name = f"{NodeLease.LEASE_PREFIX}-{node_names['target']}"
-    assert kubectl.get_json("lease", lease_name, test_namespace) is None
+    assert k8s_client.get_json("lease", lease_name, test_namespace) is None

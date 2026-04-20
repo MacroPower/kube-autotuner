@@ -14,7 +14,7 @@ from kube_autotuner.cli import app
 from kube_autotuner.models import TrialResult
 
 if TYPE_CHECKING:
-    from kube_autotuner.k8s.client import Kubectl
+    from kube_autotuner.k8s.client import K8sClient
 
 pytestmark = [
     pytest.mark.integration,
@@ -24,7 +24,7 @@ pytestmark = [
 
 def test_trial_snapshots_applies_benchmarks_restores(
     kubeconfig_env: str,  # noqa: ARG001 - activates KUBECONFIG env var
-    kubectl: Kubectl,  # noqa: ARG001 - fixture kept for parity with other e2e tests
+    k8s_client: K8sClient,  # noqa: ARG001 - fixture kept for parity with other e2e tests
     node_names: dict[str, str],
     test_namespace: str,
     fake_sysctl_env: Path,  # noqa: ARG001 - activates fake backend env vars

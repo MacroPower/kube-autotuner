@@ -15,7 +15,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import yaml
 
-from kube_autotuner.k8s.client import Kubectl, KubectlError
+from kube_autotuner.k8s.client import K8sApiError, K8sClient
 from kube_autotuner.sysctl.talos import TalosSysctlBackend
 
 if TYPE_CHECKING:
@@ -34,7 +34,7 @@ def _make_backend(endpoint: str = "10.5.0.3") -> TalosSysctlBackend:
     return TalosSysctlBackend(
         node="node-1",
         namespace="default",
-        kubectl=MagicMock(spec=Kubectl),
+        client=MagicMock(spec=K8sClient),
         endpoint=endpoint,
     )
 
@@ -253,41 +253,44 @@ class TestValidation:
 
 class TestEndpointResolution:
     def test_explicit_endpoint_wins(self):
-        kubectl = MagicMock(spec=Kubectl)
+        client = MagicMock(spec=K8sClient)
         backend = TalosSysctlBackend(
-            node="n", kubectl=kubectl, endpoint="explicit.example"
+            node="n", client=client, endpoint="explicit.example"
         )
         assert backend.endpoint == "explicit.example"
-        kubectl.get_node_internal_ip.assert_not_called()
+        client.get_node_internal_ip.assert_not_called()
 
-    def test_kubectl_fallback_when_no_endpoint(self):
-        kubectl = MagicMock(spec=Kubectl)
-        kubectl.get_node_internal_ip.return_value = "10.0.0.5"
-        backend = TalosSysctlBackend(node="n1", kubectl=kubectl)
+    def test_client_fallback_when_no_endpoint(self):
+        client = MagicMock(spec=K8sClient)
+        client.get_node_internal_ip.return_value = "10.0.0.5"
+        backend = TalosSysctlBackend(node="n1", client=client)
         assert backend.endpoint == "10.0.0.5"
-        kubectl.get_node_internal_ip.assert_called_once_with("n1")
+        client.get_node_internal_ip.assert_called_once_with("n1")
 
     def test_endpoint_memoised(self):
-        kubectl = MagicMock(spec=Kubectl)
-        kubectl.get_node_internal_ip.return_value = "10.0.0.5"
-        backend = TalosSysctlBackend(node="n1", kubectl=kubectl)
+        client = MagicMock(spec=K8sClient)
+        client.get_node_internal_ip.return_value = "10.0.0.5"
+        backend = TalosSysctlBackend(node="n1", client=client)
         assert backend.endpoint == "10.0.0.5"
         assert backend.endpoint == "10.0.0.5"
-        kubectl.get_node_internal_ip.assert_called_once()
+        client.get_node_internal_ip.assert_called_once()
 
-    def test_kubectl_error_wrapped(self):
-        kubectl = MagicMock(spec=Kubectl)
-        kubectl.get_node_internal_ip.side_effect = KubectlError(
-            ["kubectl"], 1, "boom\n"
+    def test_client_error_wrapped(self):
+        client = MagicMock(spec=K8sClient)
+        client.get_node_internal_ip.side_effect = K8sApiError(
+            op="get node/n1",
+            status=500,
+            reason="InternalError",
+            message="boom",
         )
-        backend = TalosSysctlBackend(node="n1", kubectl=kubectl)
+        backend = TalosSysctlBackend(node="n1", client=client)
         with pytest.raises(RuntimeError, match="boom"):
             _ = backend.endpoint
 
     def test_empty_internal_ip_raises_with_hint(self):
-        kubectl = MagicMock(spec=Kubectl)
-        kubectl.get_node_internal_ip.return_value = ""
-        backend = TalosSysctlBackend(node="n1", kubectl=kubectl)
+        client = MagicMock(spec=K8sClient)
+        client.get_node_internal_ip.return_value = ""
+        backend = TalosSysctlBackend(node="n1", client=client)
         with pytest.raises(RuntimeError, match="endpoint="):
             _ = backend.endpoint
 

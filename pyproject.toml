@@ -10,6 +10,7 @@ authors = [
     { name = "Jacob Colvin", email = "jacobcolvin1@gmail.com" },
 ]
 dependencies = [
+    "kubernetes>=31.0.0",
     "pydantic>=2.12",
     "pyyaml>=6.0",
     "typer>=0.23",
@@ -96,6 +97,12 @@ dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
     "PLR0913",
     "PLR0915",
     "PLR0917",
+]
+# K8sClient methods route API errors through a NoReturn ``_raise`` helper,
+# which DOC502 cannot trace. Documenting the real raise paths on the public
+# surface is more useful than hiding them.
+"src/kube_autotuner/k8s/client.py" = [
+    "DOC502",
 ]
 
 [tool.ruff.lint.pydocstyle]
@@ -193,3 +200,27 @@ include = [
 
 [tool.ty.overrides.rules]
 unresolved-import = "ignore"
+
+# python-kubernetes exposes swagger-generated models whose attributes ty
+# cannot always resolve statically. Callers outside this module use only
+# the fully typed K8sClient / K8sApiError surface, so the override is
+# narrow.
+[[tool.ty.overrides]]
+include = ["src/kube_autotuner/k8s/client.py"]
+
+[tool.ty.overrides.rules]
+unresolved-attribute = "warn"
+possibly-missing-attribute = "warn"
+invalid-assignment = "warn"
+
+# K8sClient tests bypass ``__init__`` and inject MagicMock handles on the
+# typed attributes. ty's inferred types come from the real assignments in
+# ``__init__``, so assigning canned return values or accessing
+# ``assert_called_*`` trips on the typed surface even though the runtime
+# just sees ``mock.foo``.
+[[tool.ty.overrides]]
+include = ["tests/test_k8s_client.py"]
+
+[tool.ty.overrides.rules]
+invalid-assignment = "warn"
+unresolved-attribute = "warn"

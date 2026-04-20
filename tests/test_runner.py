@@ -27,20 +27,20 @@ def _fake_iperf_json(bps: float, remote_total: float = 12.3) -> str:
     })
 
 
-def _make_kubectl(logs_by_job: dict[str, str]) -> MagicMock:
-    kubectl = MagicMock()
-    kubectl.apply.return_value = None
-    kubectl.wait.return_value = None
-    kubectl.rollout_status.return_value = None
-    kubectl.delete.return_value = None
-    kubectl.delete_by_label.return_value = None
+def _make_client(logs_by_job: dict[str, str]) -> MagicMock:
+    client = MagicMock()
+    client.apply.return_value = None
+    client.wait.return_value = None
+    client.rollout_status.return_value = None
+    client.delete.return_value = None
+    client.delete_by_label.return_value = None
 
     def _logs(_kind, name, _ns):
         return logs_by_job[name]
 
-    kubectl.logs.side_effect = _logs
-    kubectl.top_pod_containers.return_value = []
-    return kubectl
+    client.logs.side_effect = _logs
+    client.top_pod_containers.return_value = []
+    return client
 
 
 def test_single_client_single_iteration():
@@ -48,9 +48,9 @@ def test_single_client_single_iteration():
     config = BenchmarkConfig(duration=1, iterations=1, modes=["tcp"])
 
     logs = {"iperf3-client-kmain07-p5201": _fake_iperf_json(9e9)}
-    kubectl = _make_kubectl(logs)
+    client = _make_client(logs)
 
-    runner = BenchmarkRunner(node_pair, config, kubectl=kubectl)
+    runner = BenchmarkRunner(node_pair, config, client=client)
     runner.setup_server()
     results = runner.run()
 
@@ -75,9 +75,9 @@ def test_multi_client_concurrent_launch():
         "iperf3-client-kmain07-p5201": _fake_iperf_json(4e9),
         "iperf3-client-kmain09-p5202": _fake_iperf_json(5e9),
     }
-    kubectl = _make_kubectl(logs)
+    client = _make_client(logs)
 
-    runner = BenchmarkRunner(node_pair, config, kubectl=kubectl)
+    runner = BenchmarkRunner(node_pair, config, client=client)
     runner.setup_server()
     results = runner.run()
 
@@ -92,7 +92,7 @@ def test_multi_client_concurrent_launch():
     ]
 
     # Both ports used (one client Job per port).
-    applied_yamls = [c.args[0] for c in kubectl.apply.call_args_list]
+    applied_yamls = [c.args[0] for c in client.apply.call_args_list]
     assert any("iperf3-client-kmain07-p5201" in y for y in applied_yamls)
     assert any("iperf3-client-kmain09-p5202" in y for y in applied_yamls)
 
@@ -111,7 +111,7 @@ def test_first_exception_triggers_label_cleanup():
     )
     config = BenchmarkConfig(duration=1, iterations=1, modes=["tcp"])
 
-    kubectl = _make_kubectl({})
+    client = _make_client({})
 
     def _logs(_kind, name, _ns):
         if name == "iperf3-client-kmain07-p5201":
@@ -119,15 +119,15 @@ def test_first_exception_triggers_label_cleanup():
             raise RuntimeError(msg)
         return _fake_iperf_json(1e9)
 
-    kubectl.logs.side_effect = _logs
+    client.logs.side_effect = _logs
 
-    runner = BenchmarkRunner(node_pair, config, kubectl=kubectl)
+    runner = BenchmarkRunner(node_pair, config, client=client)
     with pytest.raises(RuntimeError, match="client failed"):
         runner.run()
 
     # Label-based cleanup must have been invoked at least once for client label.
     label_delete_calls = [
-        c for c in kubectl.delete_by_label.call_args_list if CLIENT_LABEL in c.args
+        c for c in client.delete_by_label.call_args_list if CLIENT_LABEL in c.args
     ]
     assert label_delete_calls, "expected label-based client cleanup on failure"
 
@@ -135,13 +135,13 @@ def test_first_exception_triggers_label_cleanup():
 def test_cleanup_removes_client_jobs_by_label():
     node_pair = NodePair(source="kmain07", target="kmain08", hardware_class="10g")
     config = BenchmarkConfig(duration=1, iterations=1, modes=["tcp"])
-    kubectl = _make_kubectl({})
+    client = _make_client({})
 
-    runner = BenchmarkRunner(node_pair, config, kubectl=kubectl)
+    runner = BenchmarkRunner(node_pair, config, client=client)
     runner.cleanup()
 
     labels_deleted = [
-        (c.args[0], c.args[1]) for c in kubectl.delete_by_label.call_args_list
+        (c.args[0], c.args[1]) for c in client.delete_by_label.call_args_list
     ]
     assert ("job", CLIENT_LABEL) in labels_deleted
     assert ("deployment", "app.kubernetes.io/name=iperf3-server") in labels_deleted
@@ -151,7 +151,7 @@ def test_cleanup_removes_client_jobs_by_label():
 def test_extra_args_threaded_into_applied_yaml():
     node_pair = NodePair(source="kmain07", target="kmain08", hardware_class="10g")
     config = BenchmarkConfig(duration=1, iterations=1, modes=["tcp"])
-    kubectl = _make_kubectl({"iperf3-client-kmain07-p5201": _fake_iperf_json(1e9)})
+    client = _make_client({"iperf3-client-kmain07-p5201": _fake_iperf_json(1e9)})
     iperf_args = IperfSection(
         client=IperfArgs(extra_args=["-Z"]),
         server=IperfArgs(extra_args=["--forceflush"]),
@@ -159,13 +159,13 @@ def test_extra_args_threaded_into_applied_yaml():
     runner = BenchmarkRunner(
         node_pair,
         config,
-        kubectl=kubectl,
+        client=client,
         iperf_args=iperf_args,
     )
     runner.setup_server()
     runner.run()
 
-    applied = [c.args[0] for c in kubectl.apply.call_args_list]
+    applied = [c.args[0] for c in client.apply.call_args_list]
     assert any("--forceflush" in y for y in applied), "server extra_args missing"
     assert any("-Z" in y for y in applied), "client extra_args missing"
 
@@ -177,7 +177,7 @@ def test_extra_args_threaded_into_applied_yaml():
 def test_patches_applied_to_server_yaml():
     node_pair = NodePair(source="kmain07", target="kmain08", hardware_class="10g")
     config = BenchmarkConfig(duration=1, iterations=1, modes=["tcp"])
-    kubectl = _make_kubectl({"iperf3-client-kmain07-p5201": _fake_iperf_json(1e9)})
+    client = _make_client({"iperf3-client-kmain07-p5201": _fake_iperf_json(1e9)})
     patches = [
         Patch(
             target=PatchTarget(kind="Deployment"),
@@ -187,12 +187,12 @@ def test_patches_applied_to_server_yaml():
     runner = BenchmarkRunner(
         node_pair,
         config,
-        kubectl=kubectl,
+        client=client,
         patches=patches,
     )
     runner.setup_server()
 
-    server_yaml = kubectl.apply.call_args_list[0].args[0]
+    server_yaml = client.apply.call_args_list[0].args[0]
     docs = list(yaml.safe_load_all(server_yaml))
     dep = next(d for d in docs if d["kind"] == "Deployment")
     assert dep["spec"]["replicas"] == 3
@@ -211,14 +211,14 @@ def test_memory_tagging_applied_to_all_client_results():
         "iperf3-client-kmain07-p5201": _fake_iperf_json(4e9),
         "iperf3-client-kmain09-p5202": _fake_iperf_json(5e9),
     }
-    kubectl = _make_kubectl(logs)
-    kubectl.get_pod_name.return_value = "iperf3-server-xxx"
-    kubectl.top_pod_containers.return_value = [
+    client = _make_client(logs)
+    client.get_pod_name.return_value = "iperf3-server-xxx"
+    client.top_pod_containers.return_value = [
         {"container": "iperf3-server-5201", "cpu": "10m", "memory": "50Mi"},
         {"container": "iperf3-server-5202", "cpu": "20m", "memory": "30Mi"},
     ]
 
-    runner = BenchmarkRunner(node_pair, config, kubectl=kubectl)
+    runner = BenchmarkRunner(node_pair, config, client=client)
     results = runner.run()
 
     assert len(results) == 2

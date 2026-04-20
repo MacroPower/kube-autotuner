@@ -40,7 +40,7 @@ _DEFAULTS = _seed_defaults()
 class FakeSysctlBackend:
     """JSON-file-backed sysctl backend for tests that exercise CLI pipelines."""
 
-    kubectl: object | None = None
+    client: object | None = None
 
     def __init__(self, node: str, state_path: Path) -> None:
         """Initialise the fake backend.

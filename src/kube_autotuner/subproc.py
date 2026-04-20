@@ -1,10 +1,10 @@
 """Sanctioned subprocess entrypoint for the entire package.
 
-Every shell-out — ``kubectl``, ``talosctl``, ``kustomize`` — routes
-through :func:`run_tool`. Bare :func:`subprocess.run` calls are banned
-in production code so the package has a single choke point for
-hygiene: ``capture_output=True``, ``text=True``, pre-allocated error
-messages (TRY003 compliance), and explicit ``check`` semantics.
+Every shell-out — ``talosctl`` and ``kustomize`` — routes through
+:func:`run_tool`. Bare :func:`subprocess.run` calls are banned in
+production code so the package has a single choke point for hygiene:
+``capture_output=True``, ``text=True``, pre-allocated error messages
+(TRY003 compliance), and explicit ``check`` semantics.
 """
 
 from __future__ import annotations
@@ -40,8 +40,7 @@ def run_tool(
         check: When ``True``, raise :class:`subprocess.CalledProcessError`
             on a non-zero exit code. Defaults to ``False`` so callers
             can inspect ``returncode`` and raise a domain-specific error
-            (e.g. :class:`kube_autotuner.k8s.client.KubectlError`) with
-            richer context.
+            with richer context.
         input_: Optional string written to the child's ``stdin``.
 
     Returns:

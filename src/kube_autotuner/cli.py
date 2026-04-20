@@ -19,7 +19,7 @@ import typer
 
 from kube_autotuner import __version__, runs
 from kube_autotuner.experiment import ExperimentConfig, ExperimentConfigError
-from kube_autotuner.k8s.client import Kubectl
+from kube_autotuner.k8s.client import K8sClient
 from kube_autotuner.models import TrialLog
 from kube_autotuner.sysctl.setter import (
     make_sysctl_setter,
@@ -190,7 +190,7 @@ def _resolve_backend(
     node: str,
     namespace: str,
     backend: str | None = None,
-    kubectl: Kubectl | None = None,
+    client: K8sClient | None = None,
     fake_state_path: Path | None = None,
     talos_endpoint: str | None = None,
 ) -> SysctlBackend:
@@ -207,7 +207,7 @@ def _resolve_backend(
         namespace: Namespace for coordination resources.
         backend: Explicit backend selector (``"real"`` / ``"talos"`` /
             ``"fake"``); ``None`` means consult the environment.
-        kubectl: Injected :class:`Kubectl` client.
+        client: Injected :class:`K8sClient`.
         fake_state_path: JSON state file when ``backend="fake"``.
         talos_endpoint: Explicit ``talosctl -n`` target.
 
@@ -218,14 +218,14 @@ def _resolve_backend(
         return make_sysctl_setter_from_env(
             node=node,
             namespace=namespace,
-            kubectl=kubectl,
+            client=client,
             talos_endpoint=talos_endpoint,
         )
     return make_sysctl_setter(
         backend=cast("BackendName", backend),
         node=node,
         namespace=namespace,
-        kubectl=kubectl,
+        client=client,
         fake_state_path=fake_state_path,
         talos_endpoint=talos_endpoint,
     )
@@ -247,19 +247,19 @@ def _build_context(
 
     Returns:
         A :class:`RunContext` with a freshly constructed
-        :class:`Kubectl` and backend targeting ``exp.nodes.target``.
+        :class:`K8sClient` and backend targeting ``exp.nodes.target``.
     """
-    kubectl = Kubectl()
+    client = K8sClient()
     sysctl_backend = _resolve_backend(
         node=exp.nodes.target,
         namespace=exp.nodes.namespace,
         backend=backend,
-        kubectl=kubectl,
+        client=client,
         fake_state_path=fake_state_path,
     )
     return runs.RunContext(
         exp=exp,
-        kubectl=kubectl,
+        client=client,
         backend=sysctl_backend,
         output=Path(exp.output),
     )
@@ -527,8 +527,8 @@ def run(
     """
     exp = _load_experiment_yaml(config_path)
 
-    kubectl = Kubectl()
-    preflight = exp.preflight(kubectl)
+    client = K8sClient()
+    preflight = exp.preflight(client)
     failures = [r for r in preflight if not r.passed]
     if failures:
         for r in failures:
@@ -539,12 +539,12 @@ def run(
         node=exp.nodes.target,
         namespace=exp.nodes.namespace,
         backend=backend,
-        kubectl=kubectl,
+        client=client,
         fake_state_path=fake_state_path,
     )
     ctx = runs.RunContext(
         exp=exp,
-        kubectl=kubectl,
+        client=client,
         backend=sysctl_backend,
         output=Path(exp.output),
     )

@@ -5,7 +5,7 @@ Shells out to the ``kustomize`` binary for full-fidelity patch semantics
 ``labelSelector`` / ``annotationSelector`` targets). Every subprocess
 goes through :func:`kube_autotuner.subproc.run_tool` -- the repo's
 single sanctioned entrypoint -- so hygiene is uniform with the
-``kubectl`` and ``talosctl`` call sites.
+``talosctl`` call sites.
 """
 
 from __future__ import annotations

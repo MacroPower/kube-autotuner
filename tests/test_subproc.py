@@ -1,7 +1,7 @@
 """Unit tests for :func:`kube_autotuner.subproc.run_tool`.
 
 Uses ``python -c`` as the external binary so the tests stay portable
-and don't depend on ``kubectl``/``talosctl`` being installed.
+and don't depend on ``talosctl`` being installed.
 """
 
 from __future__ import annotations

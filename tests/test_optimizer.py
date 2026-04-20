@@ -336,13 +336,13 @@ class TestNodeLeaseCleanup:
             ),
         )
         lease_factory = MagicMock(side_effect=[first_lease, second_lease])
-        kubectl = MagicMock()
+        client = MagicMock()
         nodes = sorted({"kmain07", "kmain08"})
 
         def _acquire_all():
             with ExitStack() as stack:
                 for node in nodes:
-                    lease = lease_factory(node, namespace="default", kubectl=kubectl)
+                    lease = lease_factory(node, namespace="default", client=client)
                     stack.enter_context(lease)
 
         with pytest.raises(LeaseHeldError):

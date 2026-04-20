@@ -31,7 +31,7 @@ import statistics
 from typing import TYPE_CHECKING
 
 from kube_autotuner.benchmark.runner import BenchmarkRunner
-from kube_autotuner.k8s.client import Kubectl
+from kube_autotuner.k8s.client import K8sClient
 from kube_autotuner.k8s.lease import NodeLease
 from kube_autotuner.models import TrialLog, TrialResult
 from kube_autotuner.sysctl.setter import make_sysctl_setter_from_env
@@ -345,11 +345,11 @@ class OptimizationLoop:
             initialization_budget=n_sobol,
         )
 
-        self.kubectl: Kubectl = Kubectl()
+        self.k8s_client: K8sClient = K8sClient()
         self.target_setter: SysctlBackend = make_sysctl_setter_from_env(
             node=node_pair.target,
             namespace=node_pair.namespace,
-            kubectl=self.kubectl,
+            client=self.k8s_client,
         )
         self.client_setters: dict[str, SysctlBackend] = {}
         if apply_source:
@@ -357,11 +357,12 @@ class OptimizationLoop:
                 self.client_setters[client_node] = make_sysctl_setter_from_env(
                     node=client_node,
                     namespace=node_pair.namespace,
-                    kubectl=self.kubectl,
+                    client=self.k8s_client,
                 )
         self.runner: BenchmarkRunner = BenchmarkRunner(
             node_pair,
             config,
+            client=self.k8s_client,
             iperf_args=iperf_args,
             patches=patches,
         )
@@ -389,7 +390,7 @@ class OptimizationLoop:
                     NodeLease(
                         node,
                         namespace=self.node_pair.namespace,
-                        kubectl=self.kubectl,
+                        client=self.k8s_client,
                     ),
                 )
             yield

@@ -2,8 +2,8 @@
 
 The three functions in this module -- :func:`run_baseline`,
 :func:`run_trial`, and :func:`run_optimize` -- glue together the data
-models, the kubectl/lease primitives, the sysctl backends, the
-benchmark runner,
+models, the Kubernetes client / lease primitives, the sysctl backends,
+the benchmark runner,
 :class:`~kube_autotuner.experiment.ExperimentConfig`, and the Ax
 optimizer. They are the single source of truth for run behaviour; the
 Typer CLI delegates into them rather than reimplementing the
@@ -62,7 +62,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from kube_autotuner.experiment import ExperimentConfig
-    from kube_autotuner.k8s.client import Kubectl
+    from kube_autotuner.k8s.client import K8sClient
     from kube_autotuner.models import NodePair
     from kube_autotuner.sysctl.backend import SysctlBackend
 
@@ -84,8 +84,8 @@ class RunContext:
     Attributes:
         exp: Validated experiment configuration produced by
             :meth:`ExperimentConfig.from_yaml` or equivalent.
-        kubectl: Injected :class:`Kubectl` client shared with the
-            lease, benchmark, and (indirectly) backend layers.
+        client: Injected :class:`K8sClient` shared with the lease,
+            benchmark, and (indirectly) backend layers.
         backend: Sysctl backend targeting ``exp.nodes.target``. Used
             by :func:`run_baseline` and :func:`run_trial`.
             :func:`run_optimize` leaves this field unused because
@@ -99,17 +99,17 @@ class RunContext:
     """
 
     exp: ExperimentConfig
-    kubectl: Kubectl
+    client: K8sClient
     backend: SysctlBackend
     output: Path
 
 
-def _resolve_zones(node_pair: NodePair, kubectl: Kubectl) -> NodePair:
-    """Populate zone fields on ``node_pair`` via ``kubectl`` node labels.
+def _resolve_zones(node_pair: NodePair, client: K8sClient) -> NodePair:
+    """Populate zone fields on ``node_pair`` via Kubernetes node labels.
 
     Args:
         node_pair: Pair to enrich.
-        kubectl: Client used to query
+        client: Client used to query
             ``topology.kubernetes.io/zone`` on each node.
 
     Returns:
@@ -121,7 +121,7 @@ def _resolve_zones(node_pair: NodePair, kubectl: Kubectl) -> NodePair:
 
     def _zone(node: str) -> str:
         try:
-            return kubectl.get_node_zone(node)
+            return client.get_node_zone(node)
         except Exception:  # noqa: BLE001 - topology is best-effort
             logger.warning("Could not resolve zone for node %s", node)
             return ""
@@ -139,7 +139,7 @@ def _resolve_zones(node_pair: NodePair, kubectl: Kubectl) -> NodePair:
 def _acquire_all_leases(
     nodes: list[str],
     namespace: str,
-    kubectl: Kubectl,
+    client: K8sClient,
 ) -> Iterator[None]:
     """Acquire a :class:`NodeLease` on every node in sorted order.
 
@@ -151,7 +151,7 @@ def _acquire_all_leases(
         nodes: Node names to lock. Duplicates collapse.
         namespace: Namespace hosting the ``coordination.k8s.io/v1``
             Lease resources.
-        kubectl: Client forwarded to :class:`NodeLease`.
+        client: Client forwarded to :class:`NodeLease`.
 
     Yields:
         ``None`` once every lease is held. Leases release in reverse
@@ -160,7 +160,7 @@ def _acquire_all_leases(
     with contextlib.ExitStack() as stack:
         for node in sorted(set(nodes)):
             stack.enter_context(
-                NodeLease(node, namespace=namespace, kubectl=kubectl),
+                NodeLease(node, namespace=namespace, client=client),
             )
         yield
 
@@ -180,19 +180,19 @@ def run_baseline(ctx: RunContext) -> None:
             ``ctx.exp.nodes.target``.
     """
     exp = ctx.exp
-    node_pair = _resolve_zones(exp.to_node_pair(), ctx.kubectl)
+    node_pair = _resolve_zones(exp.to_node_pair(), ctx.client)
     config = exp.benchmark
     all_params = [*PARAM_SPACE.param_names(), "kernel.osrelease"]
 
     lease_nodes = [node_pair.target, *node_pair.all_sources]
-    with _acquire_all_leases(lease_nodes, node_pair.namespace, ctx.kubectl):
+    with _acquire_all_leases(lease_nodes, node_pair.namespace, ctx.client):
         snapshot = ctx.backend.snapshot(all_params)
         kernel_version = snapshot.pop("kernel.osrelease", "")
 
         runner = BenchmarkRunner(
             node_pair,
             config,
-            kubectl=ctx.kubectl,
+            client=ctx.client,
             iperf_args=exp.iperf,
             patches=exp.patches,
         )
@@ -242,11 +242,11 @@ def run_trial(ctx: RunContext) -> None:
         raise RuntimeError(msg)
 
     params: dict[str, str] = {k: str(v) for k, v in exp.trial.sysctls.items()}
-    node_pair = _resolve_zones(exp.to_node_pair(), ctx.kubectl)
+    node_pair = _resolve_zones(exp.to_node_pair(), ctx.client)
     config = exp.benchmark
 
     lease_nodes = [node_pair.target, *node_pair.all_sources]
-    with _acquire_all_leases(lease_nodes, node_pair.namespace, ctx.kubectl):
+    with _acquire_all_leases(lease_nodes, node_pair.namespace, ctx.client):
         snapshot_params = [*params.keys(), "kernel.osrelease"]
         original = ctx.backend.snapshot(snapshot_params)
         kernel_version = original.pop("kernel.osrelease", "")
@@ -266,7 +266,7 @@ def run_trial(ctx: RunContext) -> None:
         runner = BenchmarkRunner(
             node_pair,
             config,
-            kubectl=ctx.kubectl,
+            client=ctx.client,
             iperf_args=exp.iperf,
             patches=exp.patches,
         )
@@ -329,7 +329,7 @@ def run_optimize(ctx: RunContext) -> None:
         )
         raise RuntimeError(msg)
 
-    node_pair = _resolve_zones(exp.to_node_pair(), ctx.kubectl)
+    node_pair = _resolve_zones(exp.to_node_pair(), ctx.client)
     config = exp.benchmark
 
     loop = OptimizationLoop(

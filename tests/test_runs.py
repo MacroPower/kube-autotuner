@@ -3,10 +3,10 @@
 The real ``NodeLease`` and ``BenchmarkRunner`` are patched out; the
 sysctl backend is injected directly as a ``MagicMock`` through
 :class:`~kube_autotuner.runs.RunContext`. Zone resolution is left real
-and driven by stubbing ``kubectl.get_node_zone`` on the injected
-kubectl mock, so the tests exercise the real ``_resolve_zones``
-helper. Nothing imports Ax, so these tests pass without the
-``optimize`` dependency group.
+and driven by stubbing ``client.get_node_zone`` on the injected
+:class:`K8sClient` mock, so the tests exercise the real
+``_resolve_zones`` helper. Nothing imports Ax, so these tests pass
+without the ``optimize`` dependency group.
 """
 
 from __future__ import annotations
@@ -41,11 +41,11 @@ def _snapshot(names):
     return {n: ("6.1.0-talos" if n == "kernel.osrelease" else "212992") for n in names}
 
 
-def _kubectl_stub() -> MagicMock:
-    """Return a kubectl mock whose ``get_node_zone`` returns ``""``."""
-    kubectl = MagicMock()
-    kubectl.get_node_zone.return_value = ""
-    return kubectl
+def _client_stub() -> MagicMock:
+    """Return a K8sClient mock whose ``get_node_zone`` returns ``""``."""
+    client = MagicMock()
+    client.get_node_zone.return_value = ""
+    return client
 
 
 @patch("kube_autotuner.runs.NodeLease")
@@ -72,7 +72,7 @@ def test_run_baseline_threads_iperf_args_and_patches(
     })
     ctx = runs.RunContext(
         exp=exp,
-        kubectl=_kubectl_stub(),
+        client=_client_stub(),
         backend=backend,
         output=out,
     )
@@ -112,7 +112,7 @@ def test_run_trial_snapshots_only_applied_keys(
     })
     ctx = runs.RunContext(
         exp=exp,
-        kubectl=_kubectl_stub(),
+        client=_client_stub(),
         backend=backend,
         output=out,
     )
@@ -146,7 +146,7 @@ def test_run_baseline_snapshots_full_param_space(
     })
     ctx = runs.RunContext(
         exp=exp,
-        kubectl=_kubectl_stub(),
+        client=_client_stub(),
         backend=backend,
         output=out,
     )
