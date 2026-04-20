@@ -6,6 +6,7 @@ and inject ``MagicMock`` typed-API handles directly.
 
 from __future__ import annotations
 
+import json
 import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -364,6 +365,18 @@ def test_rollout_status_raises_on_timeout(monkeypatch):
 # ---- logs (job → pod dispatch) -----------------------------------------
 
 
+def _log_response(body: bytes) -> MagicMock:
+    """Return a stand-in ``urllib3.HTTPResponse`` for log reads.
+
+    Matches the object returned by ``read_namespaced_pod_log`` when
+    invoked with ``_preload_content=False``.
+    """
+    resp = MagicMock()
+    resp.read.return_value = body
+    resp.release_conn.return_value = None
+    return resp
+
+
 def test_logs_job_prefers_modern_label():
     c = _client_with_mocks()
     modern_pod = SimpleNamespace(metadata=SimpleNamespace(name="p-modern"))
@@ -374,9 +387,11 @@ def test_logs_job_prefers_modern_label():
         return SimpleNamespace(items=[])
 
     c.core_v1.list_namespaced_pod.side_effect = _list
-    c.core_v1.read_namespaced_pod_log.return_value = "hello"
+    c.core_v1.read_namespaced_pod_log.return_value = _log_response(b"hello")
     assert c.logs("job", "j", "ns") == "hello"
-    c.core_v1.read_namespaced_pod_log.assert_called_once_with("p-modern", "ns")
+    c.core_v1.read_namespaced_pod_log.assert_called_once_with(
+        "p-modern", "ns", _preload_content=False
+    )
 
 
 def test_logs_job_falls_back_to_legacy_label():
@@ -389,8 +404,21 @@ def test_logs_job_falls_back_to_legacy_label():
         return SimpleNamespace(items=[legacy_pod])
 
     c.core_v1.list_namespaced_pod.side_effect = _list
-    c.core_v1.read_namespaced_pod_log.return_value = "legacy"
+    c.core_v1.read_namespaced_pod_log.return_value = _log_response(b"legacy")
     assert c.logs("job", "j", "ns") == "legacy"
+
+
+def test_logs_returns_json_body_verbatim():
+    # Regression: the default ``_preload_content=True`` path coerces a
+    # JSON body into ``str(dict)`` (Python repr with single quotes).
+    c = _client_with_mocks()
+    pod = SimpleNamespace(metadata=SimpleNamespace(name="p-json"))
+    c.core_v1.list_namespaced_pod.return_value = SimpleNamespace(items=[pod])
+    c.core_v1.read_namespaced_pod_log.return_value = _log_response(b'{"k": 1}')
+
+    out = c.logs("job", "j", "ns")
+    assert out == '{"k": 1}'
+    assert json.loads(out) == {"k": 1}
 
 
 def test_logs_job_raises_not_found_when_no_pod():

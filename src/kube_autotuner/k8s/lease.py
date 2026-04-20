@@ -47,26 +47,28 @@ def _utc_now_rfc3339() -> str:
 
 
 def _parse_k8s_time(ts: str) -> datetime:
-    """Parse a Kubernetes RFC3339Micro (or second-resolution) timestamp.
+    """Parse a Kubernetes RFC3339 timestamp.
+
+    Accepts the canonical ``...Z`` form written by the API server
+    (``"2026-04-17T00:00:00.000000Z"``) and the ``+HH:MM`` offset form
+    emitted by ``ApiClient.sanitize_for_serialization`` when a
+    ``datetime`` round-trips through the typed client
+    (``"2026-04-17T00:00:00.000000+00:00"``).
 
     Args:
-        ts: Timestamp string produced by the Kubernetes API
-            (``"2026-04-17T00:00:00.000000Z"`` or
-            ``"2026-04-17T00:00:00Z"``).
+        ts: Timestamp string produced by the Kubernetes API.
 
     Returns:
-        A timezone-aware UTC :class:`datetime`.
+        A timezone-aware :class:`datetime`.
 
     Raises:
-        ValueError: If ``ts`` matches neither recognised format.
+        ValueError: If ``ts`` is not an RFC3339 timestamp.
     """
-    for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ"):
-        try:
-            return datetime.strptime(ts, fmt).replace(tzinfo=UTC)
-        except ValueError:
-            continue
-    msg = f"Cannot parse timestamp: {ts!r}"
-    raise ValueError(msg)
+    try:
+        return datetime.fromisoformat(ts)
+    except ValueError as e:
+        msg = f"Cannot parse timestamp: {ts!r}"
+        raise ValueError(msg) from e
 
 
 class NodeLease:

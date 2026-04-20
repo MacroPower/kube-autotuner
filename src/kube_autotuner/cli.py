@@ -74,7 +74,9 @@ def main(
 ) -> None:
     """kube-autotuner root command."""
     level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(level=level, format="%(levelname)s: %(message)s")
+    # ``force=True`` rebinds the handler to the current ``sys.stderr`` so
+    # repeated ``CliRunner.invoke`` calls each see the redirected stream.
+    logging.basicConfig(level=level, format="%(levelname)s: %(message)s", force=True)
 
 
 # --- helpers ------------------------------------------------------------

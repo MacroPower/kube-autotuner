@@ -539,7 +539,7 @@ class K8sClient:
         op = f"logs {resource_type}/{name}"
         if resource_type == "pod":
             try:
-                return self.core_v1.read_namespaced_pod_log(name, namespace)
+                return self._read_pod_log(name, namespace)
             except ApiException as e:
                 _raise(op, e)
         if resource_type == "job":
@@ -552,11 +552,43 @@ class K8sClient:
                     message=f"no pod found for job {name!r}",
                 )
             try:
-                return self.core_v1.read_namespaced_pod_log(pod_name, namespace)
+                return self._read_pod_log(pod_name, namespace)
             except ApiException as e:
                 _raise(op, e)
         msg = f"logs: unsupported resource_type {resource_type!r}"
         raise ValueError(msg)
+
+    def _read_pod_log(self, pod_name: str, namespace: str) -> str:
+        """Return the raw log body for ``pod_name``, bypassing OpenAPI decode.
+
+        ``read_namespaced_pod_log``'s default ``_preload_content=True``
+        runs ``ApiClient.deserialize``, which calls ``json.loads`` on
+        the body and then coerces the resulting object to the declared
+        ``str`` return type via ``str(...)`` — corrupting any log that
+        is itself valid JSON (e.g. ``iperf3 --json``) into a Python
+        dict repr. ``_preload_content=False`` returns the underlying
+        ``urllib3.HTTPResponse`` so we can decode the socket bytes
+        directly.
+
+        Args:
+            pod_name: Pod name.
+            namespace: Target namespace.
+
+        Returns:
+            The decoded UTF-8 log body.
+
+        Raises:
+            ApiException: Forwarded from the initial request or the
+                lazy body read. The caller owns translation to
+                :class:`K8sApiError`.
+        """
+        resp = self.core_v1.read_namespaced_pod_log(
+            pod_name, namespace, _preload_content=False
+        )
+        try:
+            return resp.read().decode("utf-8")
+        finally:
+            resp.release_conn()
 
     def _job_pod_name(self, job_name: str, namespace: str) -> str:
         """Return the name of the first pod backing ``job_name``.

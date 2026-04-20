@@ -58,9 +58,9 @@ def test_trial_snapshots_applies_benchmarks_restores(
         ],
     )
     assert result.exit_code == 0, f"CLI failed:\n{result.output}"
-    assert "Snapshotted" in result.output
-    assert "Applied 1 sysctl(s)" in result.output
-    assert "Restored original sysctls" in result.output
+    assert "Snapshotted" in result.stderr
+    assert "Applied 1 sysctl(s)" in result.stderr
+    assert "Restored original sysctls" in result.stderr
 
     lines = output_file.read_text().strip().splitlines()
     assert len(lines) == 1

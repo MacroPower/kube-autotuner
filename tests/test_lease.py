@@ -1,12 +1,25 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING
 from unittest.mock import MagicMock
 
 import pytest
 
 from kube_autotuner.k8s.client import K8sApiError
 from kube_autotuner.k8s.lease import LEASE_TTL_SECONDS, LeaseHeldError, NodeLease
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+# The API server writes ``renewTime`` as RFC3339Micro with a ``Z`` suffix;
+# ``ApiClient.sanitize_for_serialization`` re-emits it via native
+# ``datetime.isoformat`` with a ``+00:00`` offset when a Lease round-trips
+# through the typed client. The lease parser must handle both shapes.
+RENEW_TIME_FORMATS: dict[str, Callable[[datetime], str]] = {
+    "z_suffix": lambda dt: dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+    "plus_offset": lambda dt: dt.isoformat(),
+}
 
 
 def _api_error(reason: str, status: int = 409, message: str = "") -> K8sApiError:
@@ -28,6 +41,9 @@ def _existing_lease(
     renew_time: datetime | None = None,
     ttl: int = LEASE_TTL_SECONDS,
     resource_version: str = "12345",
+    renew_fmt: Callable[[datetime], str] = lambda dt: dt.strftime(
+        "%Y-%m-%dT%H:%M:%S.%fZ"
+    ),
 ) -> dict:
     if renew_time is None:
         renew_time = datetime.now(UTC)
@@ -39,7 +55,7 @@ def _existing_lease(
         "spec": {
             "holderIdentity": holder,
             "leaseDurationSeconds": ttl,
-            "renewTime": renew_time.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+            "renewTime": renew_fmt(renew_time),
         },
     }
 
@@ -53,11 +69,18 @@ class TestAcquire:
         client.create.assert_called_once()
         assert lease._acquired is True
 
-    def test_takeover_expired(self, client):
+    @pytest.mark.parametrize(
+        "renew_fmt",
+        list(RENEW_TIME_FORMATS.values()),
+        ids=list(RENEW_TIME_FORMATS),
+    )
+    def test_takeover_expired(self, client, renew_fmt):
         """When an expired lease exists, replace with resourceVersion."""
         client.create.side_effect = _api_error("AlreadyExists")
         expired_time = datetime.now(UTC) - timedelta(seconds=LEASE_TTL_SECONDS + 60)
-        client.get_json.return_value = _existing_lease(renew_time=expired_time)
+        client.get_json.return_value = _existing_lease(
+            renew_time=expired_time, renew_fmt=renew_fmt
+        )
 
         lease = NodeLease("kmain07", namespace="default", holder="me", client=client)
         lease.acquire()
@@ -65,10 +88,15 @@ class TestAcquire:
         client.replace.assert_called_once()
         assert lease._acquired is True
 
-    def test_reentrant_same_holder(self, client):
+    @pytest.mark.parametrize(
+        "renew_fmt",
+        list(RENEW_TIME_FORMATS.values()),
+        ids=list(RENEW_TIME_FORMATS),
+    )
+    def test_reentrant_same_holder(self, client, renew_fmt):
         """Same holder can re-acquire an active lease."""
         client.create.side_effect = _api_error("AlreadyExists")
-        client.get_json.return_value = _existing_lease(holder="me")
+        client.get_json.return_value = _existing_lease(holder="me", renew_fmt=renew_fmt)
 
         lease = NodeLease("kmain07", namespace="default", holder="me", client=client)
         lease.acquire()
