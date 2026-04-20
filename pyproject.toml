@@ -36,6 +36,9 @@ analysis = [
 requires = ["uv_build>=0.11,<0.12"]
 build-backend = "uv_build"
 
+[tool.uv]
+default-groups = "all"
+
 [tool.ruff]
 line-length = 88
 indent-width = 4
@@ -168,18 +171,19 @@ include = ["tests/**"]
 possibly-unresolved-reference = "warn"
 unused-ignore-comment = "warn"
 
-# Ax lives in the optional `optimize` group, so `ax.*` is unresolvable under
-# the base `dev` sync. The lazy-import pattern means resolution only matters
-# at runtime inside the helpers, not at type-check time.
+# Ax lives in the `optimize` group. It is pulled by default via
+# `tool.uv.default-groups = "all"`, but CI jobs and wheel consumers may skip
+# the group with `--no-group optimize`; the lazy-import pattern plus this
+# override keep type-checking green in that case.
 [[tool.ty.overrides]]
 include = ["src/kube_autotuner/optimizer.py"]
 
 [tool.ty.overrides.rules]
 unresolved-import = "ignore"
 
-# pandas / plotly / scikit-learn live in the optional `analysis` group, so
-# under the base `dev` sync their imports cannot be resolved. The analysis
-# modules follow the same lazy-import discipline as `optimizer.py`.
+# pandas / plotly / scikit-learn live in the `analysis` group. Same deal as
+# `optimizer.py`: installed by default, but opt-out with `--no-group analysis`
+# must still type-check thanks to the lazy-import discipline.
 [[tool.ty.overrides]]
 include = [
     "src/kube_autotuner/analysis.py",

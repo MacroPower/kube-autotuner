@@ -13,6 +13,13 @@
       devShells = forAllSystems (system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
+          # Shared libs that precompiled wheels (numpy, scipy, torch via
+          # ax-platform) dlopen at runtime but that Nix's Python does not
+          # expose on the default loader path.
+          wheelRuntimeLibs = pkgs.lib.makeLibraryPath [
+            pkgs.stdenv.cc.cc.lib
+            pkgs.zlib
+          ];
         in
         {
           default = pkgs.mkShell {
@@ -35,6 +42,7 @@
               export PATH="$VIRTUAL_ENV/bin:$PATH"
               export XDG_DATA_DIRS="$PWD/.venv/completions:''${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
               export FPATH="$PWD/.venv/completions/zsh/site-functions:''${FPATH:-}"
+              export LD_LIBRARY_PATH="${wheelRuntimeLibs}''${LD_LIBRARY_PATH:+:}''${LD_LIBRARY_PATH:-}"
 
               task --silent bootstrap
             '';

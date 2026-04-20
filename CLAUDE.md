@@ -88,21 +88,26 @@ tests. Integration tests are opt-in and require a live Talos/k8s cluster — see
 ## Dependency groups
 
 Dependencies are split into one runtime set and three PEP 735 dev groups.
-Never nest the optional groups inside `dev` — lefthook pre-push and
-`task bootstrap` must not pull ~500 MB of optional deps on every clone.
+`[tool.uv] default-groups = "all"` makes `uv sync` pull every group by
+default — the flake devshell, `task bootstrap`, and `uv run` all land with
+`optimize` and `analysis` installed. Fresh clones therefore download the
+full ~500 MB set; CI or constrained environments opt out with
+`uv sync --no-group optimize --no-group analysis`.
 
 | Group     | Contents                                  | Who installs it                           |
 |-----------|-------------------------------------------|-------------------------------------------|
 | runtime   | `typer`, `pydantic`, `pyyaml`             | everyone, via `uv sync`.                  |
-| `dev`     | `pytest`, `pytest-cov`, `pytest-timeout`  | mandatory for developers; `uv sync` pulls it by default. |
-| `optimize` | `ax-platform`                            | `uv sync --group optimize`; optional.     |
-| `analysis` | `pandas`, `plotly`, `scikit-learn`       | `uv sync --group analysis`; optional. |
+| `dev`     | `pytest`, `pytest-cov`, `pytest-timeout`  | installed by default via `default-groups = "all"`. |
+| `optimize` | `ax-platform`                            | installed by default; skip with `--no-group optimize`. |
+| `analysis` | `pandas`, `plotly`, `scikit-learn`       | installed by default; skip with `--no-group analysis`. |
 
-Everything in `optimize` and `analysis` must be **lazy-imported** — either
-inside a function body, or behind `if TYPE_CHECKING:` for annotation-only
-references. `task completions` eagerly imports the Typer `app`, so any
-module reachable from `cli.py` at import time must also import cleanly
-without those groups installed.
+Even though the groups install by default, everything in `optimize` and
+`analysis` must still be **lazy-imported** — either inside a function body,
+or behind `if TYPE_CHECKING:` for annotation-only references. The wheel
+ships without these groups, and CI jobs that opt out must still import
+cleanly. `task completions` eagerly imports the Typer `app`, so any module
+reachable from `cli.py` at import time must import without those groups
+installed.
 
 ## Repository layout
 
