@@ -19,6 +19,19 @@ dependencies = [
 [project.scripts]
 kube-autotuner = "kube_autotuner.cli:app"
 
+# PEP 621 extras for pip/PyPI consumers. Kept in sync with
+# [dependency-groups] below — both blocks must move together on version
+# bumps. PEP 621 drives `pip install kube-autotuner[optimize]`; PEP 735
+# drives `uv sync --group optimize` for the dev workflow.
+[project.optional-dependencies]
+optimize = ["ax-platform>=1.1"]
+analysis = [
+    "pandas>=3.0",
+    "plotly>=6.0",
+    "scikit-learn>=1.7",
+]
+all = ["kube-autotuner[optimize,analysis]"]
+
 [dependency-groups]
 dev = [
     "pytest>=9.0",

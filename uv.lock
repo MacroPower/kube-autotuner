@@ -659,6 +659,22 @@ dependencies = [
     { name = "typer" },
 ]
 
+[package.optional-dependencies]
+all = [
+    { name = "ax-platform" },
+    { name = "pandas" },
+    { name = "plotly" },
+    { name = "scikit-learn" },
+]
+analysis = [
+    { name = "pandas" },
+    { name = "plotly" },
+    { name = "scikit-learn" },
+]
+optimize = [
+    { name = "ax-platform" },
+]
+
 [package.dev-dependencies]
 analysis = [
     { name = "pandas" },
@@ -677,11 +693,17 @@ optimize = [
 
 [package.metadata]
 requires-dist = [
+    { name = "ax-platform", marker = "extra == 'optimize'", specifier = ">=1.1" },
+    { name = "kube-autotuner", extras = ["optimize", "analysis"], marker = "extra == 'all'" },
     { name = "kubernetes", specifier = ">=31.0.0" },
+    { name = "pandas", marker = "extra == 'analysis'", specifier = ">=3.0" },
+    { name = "plotly", marker = "extra == 'analysis'", specifier = ">=6.0" },
     { name = "pydantic", specifier = ">=2.12" },
     { name = "pyyaml", specifier = ">=6.0" },
+    { name = "scikit-learn", marker = "extra == 'analysis'", specifier = ">=1.7" },
     { name = "typer", specifier = ">=0.23" },
 ]
+provides-extras = ["optimize", "analysis", "all"]
 
 [package.metadata.requires-dev]
 analysis = [
