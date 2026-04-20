@@ -72,7 +72,10 @@ outside this catalog without updating both the Taskfile and this document.
 | `task lint:check`  | CI-mode: `ruff check .` then `ruff format --check .`.|
 | `task typecheck`   | `ty check`.                                          |
 | `task test`        | `uv run pytest` (honours `addopts`).                 |
-| `task test:integration` | `uv run pytest -m integration` (requires a live Talos/k8s cluster). |
+| `task test:integration` | Auto-managed Talos Docker cluster: create, run integration tests, destroy. |
+| `task test:integration:keep` | Same as `test:integration` but keep the cluster afterward for iteration. |
+| `task cluster-up`  | Create the Talos Docker test cluster.                |
+| `task cluster-down`| Destroy the Talos Docker test cluster.               |
 | `task run -- ...`  | `uv run kube-autotuner ...`.                         |
 | `task bootstrap`   | Sync venv + regenerate shell completions.            |
 | `task completions` | Regenerate bash/zsh/fish completions under `.venv/`. |
@@ -81,9 +84,11 @@ outside this catalog without updating both the Taskfile and this document.
 `task test:integration` stands apart from the default pre-push gate: the
 lefthook pre-push hook runs `task test` and `task typecheck`, which select
 `-m "not integration"` via `addopts` and therefore **never** run integration
-tests. Integration tests are opt-in and require a live Talos/k8s cluster — see
-`tests/integration/README.md` for the `talosctl cluster create docker
---name kube-autotuner-test` bring-up step.
+tests. Integration tests are opt-in and require rootful Docker plus
+`talosctl` on `PATH`; the `cluster-up` dep creates a
+`kube-autotuner-test` Talos Docker cluster and the `defer: cluster-down`
+tears it down on exit. See `tests/integration/README.md` for backend
+selection and bare-metal instructions.
 
 ## Dependency groups
 

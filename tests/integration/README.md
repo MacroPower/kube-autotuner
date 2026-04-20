@@ -8,24 +8,41 @@ skips them and the lefthook pre-push hook never invokes them.
 ## Running
 
 ```sh
-task test:integration
+task test:integration        # create cluster, run suite, destroy on exit
+task test:integration:keep   # same, but keep the cluster for iteration
 ```
 
-Bring a Talos Docker cluster up before invoking the task. The conftest
-expects the cluster to be named `kube-autotuner-test`:
+Both tasks set `KUBE_AUTOTUNER_SYSCTL_BACKEND=talos` by default so sysctl
+writes route through `talosctl patch mc` and the optimize/trial suites
+exercise the real tuning path. The `test:integration:keep` variant reuses
+a live cluster on repeat runs via the `docker inspect` short-circuit in
+`cluster-up`; destroy it with `task cluster-down` when finished.
+
+`task test:integration` assumes the default Docker-provisioner endpoint.
+Callers with a custom `KUBE_AUTOTUNER_TALOS_ENDPOINT` (e.g. bare-metal
+Talos) should invoke `uv run pytest tests/integration/ -m integration`
+directly against their existing cluster instead.
+
+### Bringing the cluster up yourself
+
+If you would rather manage the cluster lifecycle outside Task (to poke
+at it between runs, swap in a `--config-patch`, etc.) use:
 
 ```sh
 sudo -E talosctl cluster create docker \
   --name kube-autotuner-test \
-  --workers 1
+  --workers 1 \
+  --cpus-controlplanes 4 \
+  --cpus-workers 4 \
+  --memory-controlplanes 4096 \
+  --memory-workers 4096
 ```
 
-Tear down with `sudo -E talosctl cluster destroy docker --name kube-autotuner-test`
-when you're done.
+The 4 CPU / 4 GiB sizing matches what `cluster-up` uses and keeps
+iperf3 `--parallel=16` from dropping control sockets mid-run.
 
-Both tasks set `KUBE_AUTOTUNER_SYSCTL_BACKEND=talos` by default so sysctl
-writes route through `talosctl patch mc` and the optimize/trial suites
-exercise the real tuning path.
+Tear down with `sudo -E talosctl cluster destroy --name kube-autotuner-test`
+when you're done.
 
 ## Backend selection
 
@@ -105,7 +122,7 @@ same Talos API. If a more specific assertion is required in a local
 experiment, recreate the Talos Docker cluster with a sysctls patch:
 
 ```sh
-sudo -E talosctl cluster destroy docker --name kube-autotuner-test
+sudo -E talosctl cluster destroy --name kube-autotuner-test
 sudo -E talosctl cluster create docker --name kube-autotuner-test --workers 1 \
   --config-patch '[{"op":"add","path":"/machine/sysctls","value":{"net.core.rmem_max":"16777216","net.core.wmem_max":"16777216"}}]'
 ```

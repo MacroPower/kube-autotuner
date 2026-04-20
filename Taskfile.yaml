@@ -1,6 +1,14 @@
 # yaml-language-server: $schema=https://taskfile.dev/schema.json
 version: "3"
 
+vars:
+  CLUSTER_NAME: kube-autotuner-test
+  # Talos-in-Docker needs rootful Docker (containers write host sysctls
+  # and /dev/kmsg; rootless forbids it even under --privileged). Inline
+  # before every docker/talosctl call to override any DOCKER_HOST already
+  # exported in the shell.
+  DOCKER_HOST: unix:///run/docker.sock
+
 tasks:
   default:
     cmd: task -l
@@ -46,9 +54,68 @@ tasks:
       - uv run pytest
 
   test:integration:
-    desc: Run integration tests (requires a live Talos/k8s cluster)
+    desc: Create Talos Docker cluster, run integration tests, destroy on exit
+    deps: [cluster-up]
+    env:
+      KUBE_AUTOTUNER_SYSCTL_BACKEND: "talos"
+      KUBE_AUTOTUNER_ALLOW_SYSCTL_SKIP: "1"
     cmds:
-      - uv run pytest -m integration
+      - defer: {task: cluster-down}
+      # --timeout=1800 overrides the 120s ini default: Talos applies
+      # a sysctl via reboot (~30s each), so multi-step tests exceed
+      # the unit-suite budget. --no-cov silences the useless
+      # --cov-report=term-missing that addopts inherits.
+      - uv run pytest tests/integration/ -m integration --no-cov -v -s --timeout=1800 {{.CLI_ARGS}}
+
+  test:integration:keep:
+    desc: Same as test:integration but keep the cluster for iteration
+    deps: [cluster-up]
+    env:
+      KUBE_AUTOTUNER_SYSCTL_BACKEND: "talos"
+      KUBE_AUTOTUNER_ALLOW_SYSCTL_SKIP: "1"
+    cmds:
+      - uv run pytest tests/integration/ -m integration --no-cov -v -s --timeout=1800 {{.CLI_ARGS}}
+
+  cluster-up:
+    desc: Create the Talos Docker test cluster
+    status:
+      - DOCKER_HOST={{.DOCKER_HOST}} sudo -E docker inspect {{.CLUSTER_NAME}}-controlplane-1 &>/dev/null
+    preconditions:
+      - sh: command -v talosctl
+        msg: talosctl is required
+      - sh: DOCKER_HOST={{.DOCKER_HOST}} sudo -E docker info &>/dev/null
+        msg: Rootful Docker daemon must be reachable at {{.DOCKER_HOST}}
+    cmds:
+      - task: cluster-clean
+      # 4 CPU / 4 GiB so iperf3 --parallel=16 + kubelet + etcd coexist
+      # without dropping control sockets mid-run.
+      - DOCKER_HOST={{.DOCKER_HOST}} sudo -E talosctl cluster create docker
+          --name {{.CLUSTER_NAME}}
+          --workers 1
+          --cpus-controlplanes 4
+          --cpus-workers 4
+          --memory-controlplanes 4096
+          --memory-workers 4096
+      # talosctl cluster create runs under sudo -E so writes root-owned
+      # state into ~/.talos and ~/.kube; chown back for user tooling.
+      - sudo chown -R $(id -u):$(id -g) {{.HOME}}/.talos {{.HOME}}/.kube
+      # Refresh the sudo ticket so conftest.py's `sudo -n docker inspect`
+      # calls don't hit a stale timestamp mid-run.
+      - sudo -v
+
+  cluster-down:
+    desc: Destroy the Talos Docker test cluster
+    cmds:
+      - DOCKER_HOST={{.DOCKER_HOST}} sudo -E talosctl cluster destroy --name {{.CLUSTER_NAME}}
+    ignore_error: true
+
+  cluster-clean:
+    desc: Remove stale cluster state if containers are gone
+    internal: true
+    status:
+      - '! test -d {{.HOME}}/.talos/clusters/{{.CLUSTER_NAME}}'
+    cmds:
+      - rm -rf {{.HOME}}/.talos/clusters/{{.CLUSTER_NAME}}
 
   run:
     desc: Run the CLI (pass args with --)
