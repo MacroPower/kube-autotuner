@@ -1,15 +1,15 @@
 # Example experiment config exercising the YAML loader end-to-end.
 #
 # Shape: mode=optimize, multi-source node pair, user-supplied param space,
-# iperf3 client/server extra_args, both SMP and JSON6902 patches, custom
+# iperf3 client/server extraArgs, both SMP and JSON6902 patches, custom
 # output path. Consumed by tests/test_experiment.py.
 mode: optimize
 nodes:
   sources: [kmain07, kmain09]
   target: kmain08
-  hardware_class: 10g
+  hardwareClass: 10g
   namespace: default
-  ip_family_policy: RequireDualStack
+  ipFamilyPolicy: RequireDualStack
 benchmark:
   duration: 30
   iterations: 3
@@ -17,21 +17,21 @@ benchmark:
   parallel: 16
   modes: [tcp]
 optimize:
-  n_trials: 50
-  n_sobol: 15
-  apply_source: true
-  param_space:
+  nTrials: 50
+  nSobol: 15
+  applySource: true
+  paramSpace:
     - name: net.core.rmem_max
-      param_type: int
+      paramType: int
       values: [4194304, 67108864]
     - name: net.ipv4.tcp_congestion_control
-      param_type: choice
+      paramType: choice
       values: [cubic, bbr]
 iperf:
   client:
-    extra_args: ["--bidir", "-Z"]
+    extraArgs: ["--bidir", "-Z"]
   server:
-    extra_args: ["--forceflush"]
+    extraArgs: ["--forceflush"]
 patches:
   - target:
       kind: Job

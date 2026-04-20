@@ -27,6 +27,7 @@ from pydantic import (
     ValidationError,
     model_validator,
 )
+from pydantic.alias_generators import to_camel
 import yaml
 
 from kube_autotuner.models import BenchmarkConfig, NodePair, ParamSpace, SysctlParam
@@ -183,7 +184,11 @@ class Patch(BaseModel):
 class IperfArgs(BaseModel):
     """Extra command-line arguments for an iperf3 invocation."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(
+        extra="forbid",
+        alias_generator=to_camel,
+        populate_by_name=True,
+    )
 
     extra_args: list[str] = Field(default_factory=list)
 
@@ -200,7 +205,11 @@ class IperfSection(BaseModel):
 class NodesSection(BaseModel):
     """Source/target node topology for an experiment."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(
+        extra="forbid",
+        alias_generator=to_camel,
+        populate_by_name=True,
+    )
 
     sources: list[str] = Field(min_length=1)
     target: str
@@ -212,7 +221,11 @@ class NodesSection(BaseModel):
 class OptimizeSection(BaseModel):
     """Ax Bayesian-loop configuration for ``mode=optimize``."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(
+        extra="forbid",
+        alias_generator=to_camel,
+        populate_by_name=True,
+    )
 
     n_trials: int = Field(default=50, ge=1)
     n_sobol: int = Field(default=15, ge=1)

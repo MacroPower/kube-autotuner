@@ -15,7 +15,8 @@ import json
 from typing import TYPE_CHECKING, Any, Literal, cast
 from uuid import uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
+from pydantic.alias_generators import to_camel
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -24,6 +25,8 @@ if TYPE_CHECKING:
 
 class SysctlParam(BaseModel):
     """A single sysctl knob with its discrete search space."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
 
     name: str
     values: list[int | str]

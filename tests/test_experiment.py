@@ -68,22 +68,22 @@ mode: optimize
 nodes:
   sources: [kmain07, kmain09]
   target: kmain08
-  hardware_class: 10g
+  hardwareClass: 10g
 benchmark:
   duration: 30
   iterations: 3
   modes: [tcp]
 optimize:
-  n_trials: 50
-  n_sobol: 15
-  apply_source: true
-  param_space:
-    - {name: net.core.rmem_max, param_type: int, values: [4194304, 67108864]}
+  nTrials: 50
+  nSobol: 15
+  applySource: true
+  paramSpace:
+    - {name: net.core.rmem_max, paramType: int, values: [4194304, 67108864]}
 iperf:
   client:
-    extra_args: ["--bidir", "-Z"]
+    extraArgs: ["--bidir", "-Z"]
   server:
-    extra_args: ["--forceflush"]
+    extraArgs: ["--forceflush"]
 patches:
   - target: {kind: Job}
     patch:
@@ -163,7 +163,7 @@ nodes:
   target: b
 iperf:
   clint:
-    extra_args: []
+    extraArgs: []
 """,
     )
     with pytest.raises(ExperimentConfigError):
@@ -251,8 +251,8 @@ nodes:
   sources: [a]
   target: b
 optimize:
-  n_trials: 5
-  n_sobol: 10
+  nTrials: 5
+  nSobol: 10
 """,
     )
     with pytest.raises(ExperimentConfigError, match="n_sobol must be <="):
@@ -269,8 +269,8 @@ nodes:
   sources: [a]
   target: b
 optimize:
-  n_trials: 5
-  n_sobol: 5
+  nTrials: 5
+  nSobol: 5
 """,
     )
     exp = ExperimentConfig.from_yaml(path)
@@ -296,10 +296,10 @@ def test_effective_param_space_override():
         "mode": "optimize",
         "nodes": {"sources": ["a"], "target": "b"},
         "optimize": {
-            "n_trials": 2,
-            "n_sobol": 1,
-            "param_space": [
-                {"name": "net.core.rmem_max", "param_type": "int", "values": [1, 2]},
+            "nTrials": 2,
+            "nSobol": 1,
+            "paramSpace": [
+                {"name": "net.core.rmem_max", "paramType": "int", "values": [1, 2]},
             ],
         },
     })
@@ -381,7 +381,7 @@ nodes:
   target: b
 iperf:
   client:
-    extra_args: ["{flag}"]
+    extraArgs: ["{flag}"]
 """,
     )
     exp = ExperimentConfig.from_yaml(path)
@@ -402,7 +402,7 @@ nodes:
   target: b
 iperf:
   client:
-    extra_args: ["--windowsize-hint"]
+    extraArgs: ["--windowsize-hint"]
 """,
     )
     exp = ExperimentConfig.from_yaml(path)
@@ -419,7 +419,7 @@ nodes:
   target: b
 iperf:
   server:
-    extra_args: ["-s"]
+    extraArgs: ["-s"]
 """,
     )
     exp = ExperimentConfig.from_yaml(path)
@@ -696,7 +696,7 @@ def test_preflight_collects_multiple_failures(tmp_path: Path):
     exp = ExperimentConfig.model_validate({
         "mode": "baseline",
         "nodes": {"sources": ["a"], "target": "b"},
-        "iperf": {"client": {"extra_args": ["-c"]}},
+        "iperf": {"client": {"extraArgs": ["-c"]}},
         "output": str(out),
     })
     kubectl = MagicMock()
