@@ -24,6 +24,7 @@
               pkgs.go-task
               pkgs.lefthook
               pkgs.kubectl
+              pkgs.talosctl
             ];
 
             shellHook = ''

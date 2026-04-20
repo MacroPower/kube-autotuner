@@ -1,17 +1,30 @@
-"""Tests for ``kube_autotuner.sysctl.backend``, ``.fake``, and ``.params``."""
+"""Tests for ``kube_autotuner.sysctl`` backend, fake, params, and factory.
+
+Covers the ``SysctlBackend`` protocol validators, the in-memory
+``FakeSysctlBackend``, ``build_param_space``, and the cluster-free
+paths of ``make_sysctl_setter`` / ``make_sysctl_setter_from_env``.
+"""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import pytest
 
 from kube_autotuner.models import SysctlParam
 from kube_autotuner.sysctl.fake import FakeSysctlBackend
 from kube_autotuner.sysctl.params import PARAM_SPACE, build_param_space
+from kube_autotuner.sysctl.setter import (
+    SysctlSetter,
+    make_sysctl_setter,
+    make_sysctl_setter_from_env,
+)
+from kube_autotuner.sysctl.talos import TalosSysctlBackend
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    from kube_autotuner.sysctl.setter import BackendName
 
 
 def test_fake_apply_then_get_returns_set_values(tmp_path: Path):
@@ -98,3 +111,103 @@ def test_build_param_space_accepts_valid_override():
     good = [SysctlParam(name="x.y", values=[1, 2], param_type="int")]
     ps = build_param_space(good)
     assert ps.param_names() == ["x.y"]
+
+
+class TestMakeSysctlSetter:
+    def test_real_returns_real_setter(self):
+        assert isinstance(
+            make_sysctl_setter(backend="real", node="node1"), SysctlSetter
+        )
+
+    def test_talos_returns_talos_backend(self):
+        assert isinstance(
+            make_sysctl_setter(backend="talos", node="node1"),
+            TalosSysctlBackend,
+        )
+
+    def test_fake_returns_fake_backend(self, tmp_path: Path):
+        backend = make_sysctl_setter(
+            backend="fake",
+            node="node1",
+            fake_state_path=tmp_path / "s.json",
+        )
+        assert isinstance(backend, FakeSysctlBackend)
+
+    def test_fake_without_state_path_raises(self):
+        with pytest.raises(RuntimeError, match="fake_state_path"):
+            make_sysctl_setter(backend="fake", node="node1")
+
+    def test_unknown_backend_raises(self):
+        with pytest.raises(ValueError, match="Unknown sysctl backend"):
+            make_sysctl_setter(backend=cast("BackendName", "garbage"), node="node1")
+
+    def test_explicit_args_not_coupled_to_env(self, monkeypatch):
+        # The explicit-arg factory never consults the environment, so
+        # setting either env-var name must have no effect.
+        monkeypatch.setenv("AUTOTUNER_SYSCTL_BACKEND", "fake")
+        monkeypatch.setenv("KUBE_AUTOTUNER_SYSCTL_BACKEND", "fake")
+        assert isinstance(
+            make_sysctl_setter(backend="real", node="node1"), SysctlSetter
+        )
+
+
+class TestMakeSysctlSetterFromEnv:
+    def test_default_real_backend(self):
+        assert isinstance(
+            make_sysctl_setter_from_env(node="node1", env={}), SysctlSetter
+        )
+
+    def test_explicit_real(self):
+        backend = make_sysctl_setter_from_env(
+            node="node1",
+            env={"KUBE_AUTOTUNER_SYSCTL_BACKEND": "real"},
+        )
+        assert isinstance(backend, SysctlSetter)
+
+    def test_talos(self):
+        backend = make_sysctl_setter_from_env(
+            node="node1",
+            env={"KUBE_AUTOTUNER_SYSCTL_BACKEND": "talos"},
+        )
+        assert isinstance(backend, TalosSysctlBackend)
+
+    def test_fake_with_state_path(self, tmp_path: Path):
+        state = tmp_path / "s.json"
+        backend = make_sysctl_setter_from_env(
+            node="node1",
+            env={
+                "KUBE_AUTOTUNER_SYSCTL_BACKEND": "fake",
+                "KUBE_AUTOTUNER_SYSCTL_FAKE_STATE": str(state),
+            },
+        )
+        assert isinstance(backend, FakeSysctlBackend)
+        assert backend.state_path == state
+
+    def test_fake_without_state_path_raises(self):
+        with pytest.raises(RuntimeError, match="KUBE_AUTOTUNER_SYSCTL_FAKE_STATE"):
+            make_sysctl_setter_from_env(
+                node="node1",
+                env={"KUBE_AUTOTUNER_SYSCTL_BACKEND": "fake"},
+            )
+
+    def test_unknown_backend_raises(self):
+        with pytest.raises(ValueError, match="Unknown KUBE_AUTOTUNER_SYSCTL_BACKEND"):
+            make_sysctl_setter_from_env(
+                node="node1",
+                env={"KUBE_AUTOTUNER_SYSCTL_BACKEND": "garbage"},
+            )
+
+    def test_env_default_falls_back_to_os_environ(self, monkeypatch):
+        # When ``env=None`` the helper must read os.environ. Sanity-check
+        # that ignores other unrelated env vars.
+        monkeypatch.delenv("KUBE_AUTOTUNER_SYSCTL_BACKEND", raising=False)
+        monkeypatch.delenv("KUBE_AUTOTUNER_SYSCTL_FAKE_STATE", raising=False)
+        assert isinstance(make_sysctl_setter_from_env(node="node1"), SysctlSetter)
+
+    def test_legacy_env_vars_are_ignored(self, monkeypatch, tmp_path: Path):
+        # Only the ``KUBE_AUTOTUNER_*`` prefix is honoured; the bare
+        # ``AUTOTUNER_*`` prefix must not influence backend selection.
+        monkeypatch.delenv("KUBE_AUTOTUNER_SYSCTL_BACKEND", raising=False)
+        monkeypatch.setenv("AUTOTUNER_SYSCTL_BACKEND", "fake")
+        monkeypatch.setenv("AUTOTUNER_SYSCTL_FAKE_STATE", str(tmp_path / "x.json"))
+        assert isinstance(make_sysctl_setter_from_env(node="node1"), SysctlSetter)
