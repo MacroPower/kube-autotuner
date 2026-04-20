@@ -17,6 +17,7 @@ import pytest
 
 pytest.importorskip("ax")
 
+from kube_autotuner.experiment import ObjectivesSection, ParetoObjective
 from kube_autotuner.k8s.lease import LeaseHeldError
 from kube_autotuner.models import BenchmarkConfig, BenchmarkResult, NodePair
 from kube_autotuner.optimizer import (
@@ -25,6 +26,7 @@ from kube_autotuner.optimizer import (
     _compute_metrics,  # noqa: PLC2701
     _decode_param_name,  # noqa: PLC2701
     _encode_param_name,  # noqa: PLC2701
+    build_ax_objective,
     build_ax_params,
 )
 from kube_autotuner.sysctl.params import PARAM_SPACE
@@ -131,6 +133,7 @@ class TestOptimizationLoop:
             output=output,
             n_trials=3,
             n_sobol=3,
+            objectives=ObjectivesSection(),
         )
         trials = loop.run()
 
@@ -188,6 +191,7 @@ class TestOptimizationLoop:
             output=output,
             n_trials=3,
             n_sobol=3,
+            objectives=ObjectivesSection(),
         )
         trials = loop.run()
 
@@ -222,6 +226,7 @@ class TestOptimizationLoop:
             output=tmp_path / "results.jsonl",
             n_trials=1,
             n_sobol=1,
+            objectives=ObjectivesSection(),
         )
         with pytest.raises(SystemExit):
             loop.run()
@@ -264,6 +269,7 @@ class TestOptimizationLoop:
             n_trials=1,
             n_sobol=1,
             apply_source=True,
+            objectives=ObjectivesSection(),
         )
         trials = loop.run()
 
@@ -314,6 +320,7 @@ class TestOptimizationLoop:
             n_trials=1,
             n_sobol=1,
             apply_source=True,
+            objectives=ObjectivesSection(),
         )
         loop.run()
 
@@ -423,3 +430,28 @@ class TestIterationsOneSEMFallback:
         metrics = _compute_metrics(results)
         assert metrics["throughput"][0] == pytest.approx(1e10)
         assert metrics["throughput"][1] > 0.0
+
+
+class TestBuildAxObjective:
+    def test_default_section_matches_legacy_literal(self) -> None:
+        objective, constraints = build_ax_objective(ObjectivesSection())
+        assert objective == "throughput, -cpu, -retransmits, -memory"
+        assert constraints == [
+            "throughput >= 1e6",
+            "cpu <= 200",
+            "retransmits <= 1e6",
+            "memory <= 1e10",
+        ]
+
+    def test_reduced_two_metric_section(self) -> None:
+        section = ObjectivesSection(
+            pareto=[
+                ParetoObjective(metric="throughput", direction="maximize"),
+                ParetoObjective(metric="memory", direction="minimize"),
+            ],
+            constraints=["throughput >= 1e6"],
+            recommendation_weights={"memory": 0.5},
+        )
+        objective, constraints = build_ax_objective(section)
+        assert objective == "throughput, -memory"
+        assert constraints == ["throughput >= 1e6"]

@@ -9,8 +9,8 @@ performance on the nodes of a Kubernetes cluster. iperf3 between two
 nodes is the measurement. An Ax-platform multi-objective Bayesian
 optimizer proposes the next configuration, the tool applies it, and the
 benchmark runs again. The loop repeats until it converges on a
-Pareto-optimal set of trade-offs between throughput, retransmits, and
-CPU.
+Pareto-optimal set of trade-offs between throughput, retransmits, CPU,
+and memory.
 
 ## How it works
 
@@ -21,8 +21,11 @@ CPU.
    Jobs on each source node; the runner collects JSON results.
 4. In `optimize` mode the Ax loop proposes trials, applies sysctls,
    benchmarks, and appends one JSONL record per trial.
-5. `kube-autotuner analyze` turns the JSONL into Pareto plots, parameter
-   importance scores, and a ranked list of configurations.
+5. Every run writes the resolved `objectives` block alongside the JSONL
+   as `<output>.meta.json`, so `kube-autotuner analyze` picks up the
+   same frontier and recommendation weights without re-specifying them
+   and turns the JSONL into Pareto plots, parameter importance scores,
+   and a ranked list of configurations.
 
 ## Install
 
@@ -61,8 +64,33 @@ optimize:
     - name: net.ipv4.tcp_congestion_control
       paramType: choice
       values: [cubic, bbr]
+objectives:
+  pareto:
+    - { metric: throughput, direction: maximize }
+    - { metric: cpu, direction: minimize }
+    - { metric: retransmits, direction: minimize }
+    - { metric: memory, direction: minimize }
+  constraints:
+    - "throughput >= 1e6"
+    - "cpu <= 200"
+    - "retransmits <= 1e6"
+    - "memory <= 1e10"
+  recommendationWeights:
+    cpu: 0.15
+    retransmits: 0.3
+    memory: 0.15
 output: out/results.jsonl
 ```
+
+`objectives:` is optional. When omitted, the loop optimises `throughput`
+(max) against `cpu`, `retransmits`, and `memory` (min) with default
+constraints and recommendation weights
+`{cpu: 0.15, memory: 0.15, retransmits: 0.3}`. Supplying `constraints:`
+or `recommendationWeights:` replaces the corresponding default list
+wholesale rather than extending it. Weights are only valid on
+minimize-direction metrics and must reference a metric present in
+`pareto`. Available metric names: `throughput`, `cpu`, `memory`,
+`retransmits`.
 
 See [`tests/fixtures/experiment_example.yaml`](tests/fixtures/experiment_example.yaml)
 for the full schema.
@@ -102,4 +130,3 @@ against different cluster shapes:
 - **talos**: patches machineconfig via `talosctl patch mc --mode=no-reboot`
   and polls `/proc/sys` until the new values show up.
 - **fake**: JSON-file state, for tests and local iteration.
-

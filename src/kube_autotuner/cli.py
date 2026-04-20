@@ -27,6 +27,7 @@ from kube_autotuner.sysctl.setter import (
 )
 
 if TYPE_CHECKING:
+    from kube_autotuner.experiment import ObjectivesSection
     from kube_autotuner.sysctl.backend import SysctlBackend
     from kube_autotuner.sysctl.setter import BackendName
 
@@ -691,11 +692,14 @@ def analyze(
             class has no trials.
     """
     from kube_autotuner import analysis, plots, report  # noqa: PLC0415
+    from kube_autotuner.experiment import ObjectivesSection  # noqa: PLC0415
 
     trials = TrialLog.load(input_file)
     if not trials:
         typer.echo(f"No trials found in {input_file}", err=True)
         raise typer.Exit(code=1)
+
+    objectives = TrialLog.load_metadata(input_file) or ObjectivesSection()
 
     if hardware_class is not None:
         classes = [hardware_class]
@@ -716,6 +720,7 @@ def analyze(
             analysis=analysis,
             plots=plots,
             explicit_class=hardware_class is not None,
+            objectives=objectives,
         )
         if section is not None:
             sections.append(section)
@@ -735,6 +740,7 @@ def _analyze_one_class(
     analysis: Any,  # noqa: ANN401
     plots: Any,  # noqa: ANN401
     explicit_class: bool,
+    objectives: ObjectivesSection,
 ) -> dict[str, Any] | None:
     """Produce analysis output for a single hardware class.
 
@@ -755,6 +761,8 @@ def _analyze_one_class(
             ``--hardware-class``; in that case an empty result is a
             hard error (no other class will be tried), otherwise we
             log and skip.
+        objectives: Effective Pareto objectives and recommendation
+            weights for this run.
 
     Returns:
         A section dict describing the analysis, or ``None`` when the
@@ -796,7 +804,11 @@ def _analyze_one_class(
         )
         return None
 
-    front = analysis.pareto_front(df)
+    tuple_objectives = [
+        (analysis.METRIC_TO_DF_COLUMN[obj.metric], obj.direction)
+        for obj in objectives.pareto
+    ]
+    front = analysis.pareto_front(df, objectives=tuple_objectives)
     pareto_mask = df["trial_id"].isin(front["trial_id"])
     importance = analysis.parameter_importance(df)
     recs = analysis.recommend_configs(
@@ -804,6 +816,8 @@ def _analyze_one_class(
         hardware_class,
         n=top_n,
         topology=topology,
+        objectives=objectives.pareto,
+        weights=objectives.recommendation_weights,
     )
 
     hw_dir = output_dir / hardware_class

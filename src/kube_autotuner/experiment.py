@@ -241,6 +241,137 @@ class TrialSection(BaseModel):
     sysctls: dict[str, str | int] = Field(default_factory=dict)
 
 
+Metric = Literal["throughput", "cpu", "memory", "retransmits"]
+Direction = Literal["maximize", "minimize"]
+
+_CONSTRAINT_RE = re.compile(
+    r"^\s*(?P<metric>[a-z_]+)\s*(?P<op><=|>=|==)\s*(?P<value>[+-]?"
+    r"(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)\s*$",
+)
+
+_DEFAULT_CONSTRAINTS: list[str] = [
+    "throughput >= 1e6",
+    "cpu <= 200",
+    "retransmits <= 1e6",
+    "memory <= 1e10",
+]
+
+_DEFAULT_WEIGHTS: dict[str, float] = {
+    "cpu": 0.15,
+    "memory": 0.15,
+    "retransmits": 0.3,
+}
+
+
+class ParetoObjective(BaseModel):
+    """One metric/direction pair in the Pareto objective set."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        alias_generator=to_camel,
+        populate_by_name=True,
+    )
+
+    metric: Metric
+    direction: Direction
+
+
+def _default_pareto() -> list[ParetoObjective]:
+    """Return the default Pareto objective list.
+
+    Returns:
+        Four objectives: throughput (max), cpu (min), retransmits (min),
+        memory (min).
+    """
+    return [
+        ParetoObjective(metric="throughput", direction="maximize"),
+        ParetoObjective(metric="cpu", direction="minimize"),
+        ParetoObjective(metric="retransmits", direction="minimize"),
+        ParetoObjective(metric="memory", direction="minimize"),
+    ]
+
+
+class ObjectivesSection(BaseModel):
+    """Pareto objectives, outcome constraints, and recommendation weights.
+
+    Drives both the live Ax optimization loop and post-hoc analysis.
+    ``pareto`` selects which metrics form the Pareto frontier and
+    whether each is maximized or minimized. ``constraints`` are
+    forwarded verbatim to Ax as outcome constraints. ``recommendation_weights``
+    (YAML key ``recommendationWeights``) scales minimize-direction
+    metrics in the post-hoc scoring formula used by
+    :func:`kube_autotuner.analysis.recommend_configs`; weights on
+    maximize-direction metrics are rejected because the gain term is
+    always ``+1.0 * norm`` in the normalized score.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+        alias_generator=to_camel,
+        populate_by_name=True,
+    )
+
+    pareto: list[ParetoObjective] = Field(
+        default_factory=_default_pareto,
+        min_length=1,
+    )
+    constraints: list[str] = Field(default_factory=lambda: list(_DEFAULT_CONSTRAINTS))
+    recommendation_weights: dict[str, float] = Field(
+        default_factory=lambda: dict(_DEFAULT_WEIGHTS),
+    )
+
+    @model_validator(mode="after")
+    def _validate_objectives(self) -> ObjectivesSection:
+        """Cross-field validation for objectives, weights, and constraints.
+
+        Returns:
+            ``self`` when every invariant holds.
+
+        Raises:
+            ValueError: A weight targets an unknown metric, a
+                maximize-direction metric, or a negative value; or a
+                constraint does not parse as ``"<metric> <op> <float>"``
+                against the four known metrics.
+        """
+        directions: dict[str, str] = {obj.metric: obj.direction for obj in self.pareto}
+        for metric, weight in self.recommendation_weights.items():
+            if weight < 0:
+                msg = (
+                    f"recommendation_weights[{metric!r}]={weight} must be non-negative"
+                )
+                raise ValueError(msg)
+            direction = directions.get(metric)
+            if direction is None:
+                msg = (
+                    f"recommendation_weights key {metric!r} is not in pareto objectives"
+                )
+                raise ValueError(msg)
+            if direction != "minimize":
+                msg = (
+                    f"recommendation_weights[{metric!r}] targets a "
+                    "maximize-direction metric; weights are only valid "
+                    "on minimize-direction metrics"
+                )
+                raise ValueError(msg)
+        known = {"throughput", "cpu", "memory", "retransmits"}
+        for constraint in self.constraints:
+            match = _CONSTRAINT_RE.match(constraint)
+            if match is None:
+                msg = (
+                    f"constraint {constraint!r} does not match "
+                    "'<metric> <=|>=|== <float>'"
+                )
+                raise ValueError(msg)
+            metric = match.group("metric")
+            if metric not in known:
+                msg = (
+                    f"constraint {constraint!r} references unknown metric "
+                    f"{metric!r}; expected one of {sorted(known)}"
+                )
+                raise ValueError(msg)
+        return self
+
+
 class ExperimentConfig(BaseModel):
     """Top-level experiment configuration loaded from YAML."""
 
@@ -253,6 +384,7 @@ class ExperimentConfig(BaseModel):
     trial: TrialSection | None = None
     iperf: IperfSection = Field(default_factory=IperfSection)
     patches: list[Patch] = Field(default_factory=list)
+    objectives: ObjectivesSection = Field(default_factory=ObjectivesSection)
     output: str = "results.jsonl"
 
     @model_validator(mode="after")

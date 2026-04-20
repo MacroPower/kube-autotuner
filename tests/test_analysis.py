@@ -15,6 +15,7 @@ from typer.testing import CliRunner  # noqa: E402
 
 from kube_autotuner.analysis import (  # noqa: E402
     DEFAULT_OBJECTIVES,
+    METRIC_TO_DF_COLUMN,
     parameter_importance,
     pareto_front,
     recommend_configs,
@@ -22,6 +23,7 @@ from kube_autotuner.analysis import (  # noqa: E402
     trials_to_dataframe,
 )
 from kube_autotuner.cli import app  # noqa: E402
+from kube_autotuner.experiment import ObjectivesSection, ParetoObjective  # noqa: E402
 from kube_autotuner.models import (  # noqa: E402
     BenchmarkConfig,
     BenchmarkResult,
@@ -374,6 +376,97 @@ class TestRecommendConfigs:
         for r in recs:
             assert "mean_memory" in r
 
+    def test_default_scoring_snapshot(self) -> None:
+        """Pin default scores against the baseline formula.
+
+        With two non-dominated trials whose ``cpu`` and ``retransmits``
+        are constant, ``_norm`` clamps those columns to ``0.5``. For
+        the surviving ``throughput`` and ``memory`` axes, trial A
+        (higher throughput, higher memory) normalizes to ``(1.0, 1.0)``
+        and trial B (lower throughput, lower memory) to ``(0.0, 0.0)``.
+        The baseline formula is
+        ``tp - 0.15 * cpu - 0.15 * mem - 0.3 * retx``:
+
+        - score_A = 1.0 - 0.15 * 0.5 - 0.15 * 1.0 - 0.3 * 0.5 = 0.625
+        - score_B = 0.0 - 0.15 * 0.5 - 0.15 * 0.0 - 0.3 * 0.5 = -0.225
+        """
+
+        def _mk(
+            tp_gbps: float,
+            mem_mib: int,
+            tid: str,
+        ) -> TrialResult:
+            return TrialResult(
+                trial_id=tid,
+                node_pair=NodePair(source="a", target="b", hardware_class="10g"),
+                sysctl_values={"net.core.rmem_max": 212992},
+                config=BenchmarkConfig(duration=10, iterations=1),
+                results=[
+                    BenchmarkResult(
+                        timestamp=datetime.now(UTC),
+                        mode="tcp",
+                        bits_per_second=tp_gbps * 1e9,
+                        retransmits=5,
+                        cpu_utilization_percent=20.0,
+                        memory_used_bytes=mem_mib * 1024 * 1024,
+                    ),
+                ],
+            )
+
+        trials = [_mk(10.0, 100, "a"), _mk(5.0, 50, "b")]
+        recs = recommend_configs(trials, "10g", n=2)
+        assert [r["trial_id"] for r in recs] == ["a", "b"]
+        assert recs[0]["score"] == pytest.approx(0.625)
+        assert recs[1]["score"] == pytest.approx(-0.225)
+
+    def test_metric_to_df_column_covers_default_objectives(self) -> None:
+        expected = {
+            METRIC_TO_DF_COLUMN[m]
+            for m in ("throughput", "cpu", "memory", "retransmits")
+        }
+        default_cols = {col for col, _ in DEFAULT_OBJECTIVES}
+        assert default_cols == expected
+
+    def test_custom_weights_reorders_recommendations(
+        self,
+        mixed_trials: list[TrialResult],
+    ) -> None:
+        default_recs = recommend_configs(mixed_trials, "10g", n=5)
+        heavy_cpu_recs = recommend_configs(
+            mixed_trials,
+            "10g",
+            n=5,
+            weights={"cpu": 5.0, "memory": 0.15, "retransmits": 0.3},
+        )
+        assert default_recs != heavy_cpu_recs or all(
+            a["score"] != b["score"]
+            for a, b in zip(default_recs, heavy_cpu_recs, strict=False)
+        )
+
+    def test_reduced_pareto_drops_retransmits_from_scoring(
+        self,
+        mixed_trials: list[TrialResult],
+    ) -> None:
+        reduced = [
+            ParetoObjective(metric="throughput", direction="maximize"),
+            ParetoObjective(metric="memory", direction="minimize"),
+        ]
+        recs = recommend_configs(
+            mixed_trials,
+            "10g",
+            n=5,
+            objectives=reduced,
+            weights={"memory": 0.15},
+        )
+        assert recs
+        for r in recs:
+            assert set(r.keys()) >= {
+                "mean_throughput",
+                "mean_cpu",
+                "mean_memory",
+                "total_retransmits",
+            }
+
     def test_lower_memory_outranks_higher(self) -> None:
         """Trials identical except memory: the lower-memory one wins.
 
@@ -558,6 +651,69 @@ class TestCLIAnalyze:
         hw_dir = out_dir / "10g"
         recs = json.loads((hw_dir / "recommendations.json").read_text())
         assert len(recs) >= 1
+
+    def test_analyze_reads_sidecar_metadata(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """End-to-end: JSONL + sidecar → analyze → custom weights applied.
+
+        Two non-dominated trials differ only in memory. With the
+        default memory weight (0.15) the high-throughput trial wins;
+        with a heavy memory weight the low-memory trial wins.
+        """
+
+        def _mk(tp_gbps: float, mem_mib: int, tid: str) -> TrialResult:
+            return TrialResult(
+                trial_id=tid,
+                node_pair=NodePair(source="a", target="b", hardware_class="10g"),
+                sysctl_values={"net.core.rmem_max": 212992 + mem_mib},
+                config=BenchmarkConfig(duration=10, iterations=1),
+                results=[
+                    BenchmarkResult(
+                        timestamp=datetime.now(UTC),
+                        mode="tcp",
+                        bits_per_second=tp_gbps * 1e9,
+                        retransmits=5,
+                        cpu_utilization_percent=20.0,
+                        memory_used_bytes=mem_mib * 1024 * 1024,
+                    ),
+                ],
+            )
+
+        trials = [_mk(10.0, 500, "hi-tp"), _mk(5.0, 50, "lo-mem")]
+        jsonl = tmp_path / "trials.jsonl"
+        for t in trials:
+            TrialLog.append(jsonl, t)
+
+        section = ObjectivesSection(
+            pareto=[
+                ParetoObjective(metric="throughput", direction="maximize"),
+                ParetoObjective(metric="memory", direction="minimize"),
+            ],
+            constraints=[],
+            recommendation_weights={"memory": 5.0},
+        )
+        TrialLog.write_metadata(jsonl, section)
+
+        out_dir = tmp_path / "out"
+        runner = CliRunner()
+        result = runner.invoke(
+            app,
+            [
+                "analyze",
+                "-i",
+                str(jsonl),
+                "-o",
+                str(out_dir),
+                "--hardware-class",
+                "10g",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+
+        recs = json.loads((out_dir / "10g" / "recommendations.json").read_text())
+        assert recs[0]["trial_id"] == "lo-mem"
 
     def test_analyze_empty_file(self, tmp_path: Path) -> None:
         empty = tmp_path / "empty.jsonl"

@@ -12,6 +12,7 @@ from collections import defaultdict
 from datetime import UTC, datetime
 import hashlib
 import json
+import sys
 from typing import TYPE_CHECKING, Any, Literal, cast
 from uuid import uuid4
 
@@ -21,6 +22,8 @@ from pydantic.alias_generators import to_camel
 if TYPE_CHECKING:
     from collections.abc import Mapping
     from pathlib import Path
+
+    from kube_autotuner.experiment import ObjectivesSection
 
 
 class SysctlParam(BaseModel):
@@ -286,3 +289,61 @@ class TrialLog:
                 if stripped:
                     trials.append(TrialResult.model_validate_json(stripped))
         return trials
+
+    @staticmethod
+    def _metadata_path(path: Path) -> Path:
+        """Return the sibling metadata path for a JSONL log at ``path``."""
+        return path.parent / f"{path.name}.meta.json"
+
+    @staticmethod
+    def write_metadata(path: Path, objectives: ObjectivesSection) -> None:
+        """Persist ``objectives`` as a sidecar next to the JSONL log.
+
+        The sidecar lives at ``<path>.meta.json``. When a sidecar
+        already exists and its serialized form differs from the
+        incoming one, a stderr warning is emitted before overwriting.
+
+        Args:
+            path: JSONL log path; the sidecar is written beside it.
+            objectives: Effective :class:`ObjectivesSection` for the
+                run that is about to write ``path``.
+        """
+        from kube_autotuner.experiment import ObjectivesSection  # noqa: PLC0415
+
+        meta_path = TrialLog._metadata_path(path)
+        incoming = objectives.model_dump_json()
+        if meta_path.exists():
+            existing_raw = meta_path.read_text(encoding="utf-8")
+            try:
+                existing = ObjectivesSection.model_validate_json(existing_raw)
+            except Exception:  # noqa: BLE001
+                existing = None
+            if existing is None or existing.model_dump() != objectives.model_dump():
+                print(  # noqa: T201
+                    f"WARNING: overwriting {meta_path} with a different "
+                    "objectives block; previous runs appended to "
+                    f"{path} used a different objective configuration.",
+                    file=sys.stderr,
+                )
+        meta_path.write_text(incoming + "\n", encoding="utf-8")
+
+    @staticmethod
+    def load_metadata(path: Path) -> ObjectivesSection | None:
+        """Return the sidecar :class:`ObjectivesSection` for ``path``.
+
+        Args:
+            path: JSONL log path whose sibling ``<path>.meta.json`` is
+                consulted.
+
+        Returns:
+            The parsed :class:`ObjectivesSection`, or ``None`` when no
+            sidecar exists.
+        """
+        from kube_autotuner.experiment import ObjectivesSection  # noqa: PLC0415
+
+        meta_path = TrialLog._metadata_path(path)
+        if not meta_path.exists():
+            return None
+        return ObjectivesSection.model_validate_json(
+            meta_path.read_text(encoding="utf-8"),
+        )

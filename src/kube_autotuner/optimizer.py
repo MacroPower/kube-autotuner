@@ -43,7 +43,7 @@ if TYPE_CHECKING:
     from ax.api.client import Client
     from ax.api.configs import ChoiceParameterConfig
 
-    from kube_autotuner.experiment import IperfSection, Patch
+    from kube_autotuner.experiment import IperfSection, ObjectivesSection, Patch
     from kube_autotuner.models import (
         BenchmarkConfig,
         BenchmarkResult,
@@ -275,6 +275,32 @@ def _compute_metrics(
     }
 
 
+def build_ax_objective(
+    section: ObjectivesSection,
+) -> tuple[str, list[str]]:
+    """Render an :class:`ObjectivesSection` into Ax's configure args.
+
+    Ax's ``configure_optimization`` accepts the multi-objective string
+    form ``"metric, -metric, ..."`` where a leading minus flips a
+    maximize direction to minimize. This helper emits that string plus
+    the section's outcome constraints verbatim.
+
+    Args:
+        section: Validated :class:`ObjectivesSection`.
+
+    Returns:
+        A ``(objective_string, outcome_constraints)`` pair ready to
+        pass to :meth:`ax.api.client.Client.configure_optimization`.
+    """
+    terms: list[str] = []
+    for obj in section.pareto:
+        if obj.direction == "maximize":
+            terms.append(obj.metric)
+        else:
+            terms.append(f"-{obj.metric}")
+    return ", ".join(terms), list(section.constraints)
+
+
 class OptimizationLoop:
     """Drive Ax trial proposals through benchmark execution.
 
@@ -297,6 +323,7 @@ class OptimizationLoop:
         apply_source: bool = False,
         iperf_args: IperfSection | None = None,
         patches: list[Patch] | None = None,
+        objectives: ObjectivesSection,
     ) -> None:
         """Wire up the Ax client, benchmark runner, and sysctl setters.
 
@@ -315,6 +342,8 @@ class OptimizationLoop:
                 threaded into :class:`BenchmarkRunner`.
             patches: Optional kustomize patches applied to the
                 rendered benchmark manifests.
+            objectives: Pareto objectives and outcome constraints
+                handed to Ax via :func:`build_ax_objective`.
         """
         self.node_pair: NodePair = node_pair
         self.config: BenchmarkConfig = config
@@ -325,6 +354,7 @@ class OptimizationLoop:
         self.apply_source: bool = apply_source
         self.iperf_args: IperfSection | None = iperf_args
         self.patches: list[Patch] | None = patches
+        self.objectives: ObjectivesSection = objectives
 
         client_cls = _require_ax_client()
         self.client: Client = client_cls()
@@ -332,14 +362,10 @@ class OptimizationLoop:
             name=f"sysctl-tune-{node_pair.hardware_class}",
             parameters=build_ax_params(param_space),
         )
+        objective_str, outcome_constraints = build_ax_objective(objectives)
         self.client.configure_optimization(
-            objective="throughput, -cpu, -retransmits, -memory",
-            outcome_constraints=[
-                "throughput >= 1e6",
-                "cpu <= 200",
-                "retransmits <= 1e6",
-                "memory <= 1e10",
-            ],
+            objective=objective_str,
+            outcome_constraints=outcome_constraints,
         )
         self.client.configure_generation_strategy(
             initialization_budget=n_sobol,

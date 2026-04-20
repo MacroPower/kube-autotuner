@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     import pandas as pd
     from sklearn.preprocessing import LabelEncoder
 
+    from kube_autotuner.experiment import ParetoObjective
     from kube_autotuner.models import TrialResult
 
 _ANALYSIS_HINT = "install analysis group: uv sync --group analysis"
@@ -32,11 +33,18 @@ _ANALYSIS_HINT = "install analysis group: uv sync --group analysis"
 _PARAM_TYPE_LOOKUP: dict[str, str] = {p.name: p.param_type for p in PARAM_SPACE.params}
 _SYSCTL_COLUMNS: list[str] = PARAM_SPACE.param_names()
 
+METRIC_TO_DF_COLUMN: dict[str, str] = {
+    "throughput": "mean_throughput",
+    "cpu": "mean_cpu",
+    "memory": "mean_memory",
+    "retransmits": "total_retransmits",
+}
+
 DEFAULT_OBJECTIVES: list[tuple[str, str]] = [
-    ("mean_throughput", "maximize"),
-    ("mean_cpu", "minimize"),
-    ("mean_memory", "minimize"),
-    ("total_retransmits", "minimize"),
+    (METRIC_TO_DF_COLUMN["throughput"], "maximize"),
+    (METRIC_TO_DF_COLUMN["cpu"], "minimize"),
+    (METRIC_TO_DF_COLUMN["retransmits"], "minimize"),
+    (METRIC_TO_DF_COLUMN["memory"], "minimize"),
 ]
 
 _FRAME_BASE_COLUMNS: list[str] = [
@@ -52,9 +60,6 @@ _FRAME_BASE_COLUMNS: list[str] = [
 ]
 
 _MIN_SPEARMAN_SAMPLES = 3
-_RECOMMEND_CPU_WEIGHT = 0.15
-_RECOMMEND_MEM_WEIGHT = 0.15
-_RECOMMEND_RETX_WEIGHT = 0.3
 
 
 def _require_pandas() -> Any:  # noqa: ANN401
@@ -408,31 +413,45 @@ def recommend_configs(
     hardware_class: str,
     n: int = 3,
     topology: str | None = None,
+    *,
+    objectives: list[ParetoObjective] | None = None,
+    weights: dict[str, float] | None = None,
 ) -> list[dict[str, Any]]:
     """Return the top ``n`` recommended sysctl configurations for a class.
 
     The ranking picks from the Pareto frontier of the filtered trials
     and scores each candidate as
-    ``tp_norm - 0.15 * cpu_norm - 0.15 * mem_norm - 0.3 * retx_norm``
-    where each term is min-max normalized across the Pareto set. CPU
-    and memory split the cost weight evenly because higher CPU is
-    typically a symptom of better-tuned parameters enabling more
-    useful work rather than a cost in its own right.
+    ``sum(+norm(metric) for maximize metrics) -
+    sum(weights[metric] * norm(metric) for minimize metrics)``
+    where each term is min-max normalized across the Pareto set.
+    Maximize metrics always contribute ``+1.0 * norm`` and cannot be
+    re-weighted. The default weights are
+    ``{cpu: 0.15, memory: 0.15, retransmits: 0.3}``, reproducing the
+    formula ``tp_norm - 0.15 * cpu_norm - 0.15 * mem_norm -
+    0.3 * retx_norm``.
 
     Args:
         trials: Input trial records (any number of hardware classes).
         hardware_class: Hardware-class label to filter on.
         n: Maximum number of recommendations to return.
         topology: Optional topology filter.
+        objectives: Pareto objectives driving both frontier selection
+            and scoring. Defaults to the four built-in metrics.
+        weights: Per-metric negative coefficients for
+            minimize-direction metrics. Missing metrics default to
+            ``0.0`` (i.e. they do not influence the score).
 
     Lazy-imports ``pandas`` (via :func:`trials_to_dataframe`) and
     raises :exc:`RuntimeError` with the ``uv sync --group analysis``
     hint when the group is missing.
 
     Returns:
-        A list of recommendation dicts, each containing ``rank``,
-        ``trial_id``, ``sysctl_values``, the three metric values, and a
-        ``score``. Returns an empty list when no trials match.
+        A list of recommendation dicts. Each dict always contains
+        ``rank``, ``trial_id``, ``sysctl_values``, the four base
+        metric values (``mean_throughput``, ``mean_cpu``,
+        ``mean_memory``, ``total_retransmits``) regardless of the
+        configured Pareto set, and a ``score``. Returns an empty list
+        when no trials match.
     """
     pd = _require_pandas()
 
@@ -444,7 +463,18 @@ def recommend_configs(
     if df.empty:
         return []
 
-    front = pareto_front(df)
+    if objectives is None:
+        from kube_autotuner.experiment import ObjectivesSection  # noqa: PLC0415
+
+        objectives = ObjectivesSection().pareto
+
+    if weights is None:
+        weights = {"cpu": 0.15, "memory": 0.15, "retransmits": 0.3}
+
+    tuple_objectives: list[tuple[str, str]] = [
+        (METRIC_TO_DF_COLUMN[obj.metric], obj.direction) for obj in objectives
+    ]
+    front = pareto_front(df, objectives=tuple_objectives)
     if front.empty:
         return []
 
@@ -454,17 +484,16 @@ def recommend_configs(
             return pd.Series(0.5, index=series.index)
         return (series - lo) / (hi - lo)
 
-    tp_norm = _norm(front["mean_throughput"])
-    cpu_norm = _norm(front["mean_cpu"])
-    mem_norm = _norm(front["mean_memory"])
-    rt_norm = _norm(front["total_retransmits"])
     front = front.copy()
-    front["score"] = (
-        tp_norm
-        - _RECOMMEND_CPU_WEIGHT * cpu_norm
-        - _RECOMMEND_MEM_WEIGHT * mem_norm
-        - _RECOMMEND_RETX_WEIGHT * rt_norm
-    )
+    score = pd.Series(0.0, index=front.index)
+    for obj in objectives:
+        col = METRIC_TO_DF_COLUMN[obj.metric]
+        norm = _norm(front[col])
+        if obj.direction == "maximize":
+            score += norm
+        else:
+            score -= weights.get(obj.metric, 0.0) * norm
+    front["score"] = score
     front = front.sort_values("score", ascending=False).reset_index(drop=True)
 
     results: list[dict[str, Any]] = []

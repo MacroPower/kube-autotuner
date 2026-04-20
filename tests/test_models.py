@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from kube_autotuner.experiment import ObjectivesSection, ParetoObjective
 from kube_autotuner.models import (
     BenchmarkConfig,
     BenchmarkResult,
@@ -547,3 +548,53 @@ def test_benchmark_result_new_fields_round_trip():
     assert restored.cpu_server_percent == pytest.approx(42.0)
     assert restored.client_node == "c7"
     assert restored.iteration == 2
+
+
+class TestTrialLogMetadata:
+    def test_round_trip(self, tmp_path: Path) -> None:
+        path = tmp_path / "results.jsonl"
+        section = ObjectivesSection(
+            pareto=[
+                ParetoObjective(metric="throughput", direction="maximize"),
+                ParetoObjective(metric="memory", direction="minimize"),
+            ],
+            constraints=["throughput >= 1e6"],
+            recommendation_weights={"memory": 0.5},
+        )
+        TrialLog.write_metadata(path, section)
+        loaded = TrialLog.load_metadata(path)
+        assert loaded is not None
+        assert loaded.model_dump() == section.model_dump()
+
+    def test_missing_sidecar_returns_none(self, tmp_path: Path) -> None:
+        assert TrialLog.load_metadata(tmp_path / "absent.jsonl") is None
+
+    def test_drift_warning_on_overwrite(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        path = tmp_path / "results.jsonl"
+        TrialLog.write_metadata(path, ObjectivesSection())
+        capsys.readouterr()
+        drifted = ObjectivesSection(
+            recommendation_weights={"cpu": 0.4, "memory": 0.15, "retransmits": 0.3},
+        )
+        TrialLog.write_metadata(path, drifted)
+        captured = capsys.readouterr()
+        assert "overwriting" in captured.err
+        assert "different" in captured.err
+        assert TrialLog.load_metadata(path) == drifted
+
+    def test_same_section_overwrite_is_silent(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        path = tmp_path / "results.jsonl"
+        section = ObjectivesSection()
+        TrialLog.write_metadata(path, section)
+        capsys.readouterr()
+        TrialLog.write_metadata(path, section)
+        captured = capsys.readouterr()
+        assert captured.err == ""

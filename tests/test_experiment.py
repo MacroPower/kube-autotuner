@@ -17,6 +17,8 @@ from kube_autotuner.experiment import (
     SERVER_FLAG_DENYLIST,
     ExperimentConfig,
     ExperimentConfigError,
+    ObjectivesSection,
+    ParetoObjective,
 )
 from kube_autotuner.sysctl.params import PARAM_SPACE
 
@@ -776,3 +778,80 @@ def test_denylist_constants_split_correctly():
     assert "-s" in SERVER_FLAG_DENYLIST
     assert "-c" not in SERVER_FLAG_DENYLIST
     assert "--json" not in SERVER_FLAG_DENYLIST
+
+
+class TestObjectivesSection:
+    def test_defaults_round_trip(self) -> None:
+        section = ObjectivesSection()
+        dumped = section.model_dump_json()
+        reloaded = ObjectivesSection.model_validate_json(dumped)
+        assert reloaded.model_dump() == section.model_dump()
+
+    def test_default_pareto_shape(self) -> None:
+        section = ObjectivesSection()
+        assert [(p.metric, p.direction) for p in section.pareto] == [
+            ("throughput", "maximize"),
+            ("cpu", "minimize"),
+            ("retransmits", "minimize"),
+            ("memory", "minimize"),
+        ]
+
+    def test_weight_on_maximize_metric_rejected(self) -> None:
+        with pytest.raises(ValueError, match="maximize-direction"):
+            ObjectivesSection(
+                recommendation_weights={"throughput": 1.0},
+            )
+
+    def test_weight_on_unknown_metric_rejected(self) -> None:
+        with pytest.raises(ValueError, match="not in pareto objectives"):
+            ObjectivesSection(
+                recommendation_weights={"nosuch": 0.1, "cpu": 0.15, "memory": 0.15},
+            )
+
+    def test_negative_weight_rejected(self) -> None:
+        with pytest.raises(ValueError, match="non-negative"):
+            ObjectivesSection(
+                recommendation_weights={"cpu": -0.1, "memory": 0.15},
+            )
+
+    def test_malformed_constraint_rejected(self) -> None:
+        with pytest.raises(ValueError, match="does not match"):
+            ObjectivesSection(constraints=["cpu !! 200"])
+
+    def test_unknown_constraint_metric_rejected(self) -> None:
+        with pytest.raises(ValueError, match="unknown metric"):
+            ObjectivesSection(constraints=["jitter <= 50"])
+
+    def test_empty_pareto_rejected(self) -> None:
+        with pytest.raises(ValueError, match="at least 1"):
+            ObjectivesSection(pareto=[])
+
+    def test_yaml_alias_recommendation_weights(self) -> None:
+        section = ObjectivesSection.model_validate(
+            {"recommendationWeights": {"cpu": 0.2, "memory": 0.2, "retransmits": 0.4}},
+        )
+        assert section.recommendation_weights == {
+            "cpu": 0.2,
+            "memory": 0.2,
+            "retransmits": 0.4,
+        }
+
+    def test_pareto_with_custom_metrics(self) -> None:
+        section = ObjectivesSection(
+            pareto=[
+                ParetoObjective(metric="throughput", direction="maximize"),
+                ParetoObjective(metric="memory", direction="minimize"),
+            ],
+            constraints=[],
+            recommendation_weights={"memory": 0.5},
+        )
+        assert len(section.pareto) == 2
+        assert section.recommendation_weights == {"memory": 0.5}
+
+
+def test_experiment_config_default_objectives() -> None:
+    config = ExperimentConfig.model_validate({
+        "mode": "baseline",
+        "nodes": {"sources": ["kmain07"], "target": "kmain08"},
+    })
+    assert config.objectives == ObjectivesSection()

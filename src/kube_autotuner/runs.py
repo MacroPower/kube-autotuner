@@ -180,6 +180,7 @@ def run_baseline(ctx: RunContext) -> None:
             ``ctx.exp.nodes.target``.
     """
     exp = ctx.exp
+    TrialLog.write_metadata(ctx.output, exp.objectives)
     node_pair = _resolve_zones(exp.to_node_pair(), ctx.client)
     config = exp.benchmark
     all_params = [*PARAM_SPACE.param_names(), "kernel.osrelease"]
@@ -244,6 +245,7 @@ def run_trial(ctx: RunContext) -> None:
         )
         raise RuntimeError(msg)
 
+    TrialLog.write_metadata(ctx.output, exp.objectives)
     params: dict[str, str] = {k: str(v) for k, v in exp.trial.sysctls.items()}
     node_pair = _resolve_zones(exp.to_node_pair(), ctx.client)
     config = exp.benchmark
@@ -335,6 +337,7 @@ def run_optimize(ctx: RunContext) -> None:
         )
         raise RuntimeError(msg)
 
+    TrialLog.write_metadata(ctx.output, exp.objectives)
     node_pair = _resolve_zones(exp.to_node_pair(), ctx.client)
     config = exp.benchmark
 
@@ -348,6 +351,7 @@ def run_optimize(ctx: RunContext) -> None:
         apply_source=exp.optimize.apply_source,
         iperf_args=exp.iperf,
         patches=exp.patches,
+        objectives=exp.objectives,
     )
     trials = loop.run()
     logger.info("Completed %d trials. Results in %s", len(trials), ctx.output)
