@@ -17,9 +17,12 @@ both rely on this). Three rules enforce the discipline:
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any
 
 from kube_autotuner.sysctl.params import PARAM_SPACE, PARAM_TO_CATEGORY
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -37,13 +40,13 @@ METRIC_TO_DF_COLUMN: dict[str, str] = {
     "throughput": "mean_throughput",
     "cpu": "mean_cpu",
     "memory": "mean_memory",
-    "retransmits": "total_retransmits",
+    "retransmit_rate": "retransmit_rate",
 }
 
 DEFAULT_OBJECTIVES: list[tuple[str, str]] = [
     (METRIC_TO_DF_COLUMN["throughput"], "maximize"),
     (METRIC_TO_DF_COLUMN["cpu"], "minimize"),
-    (METRIC_TO_DF_COLUMN["retransmits"], "minimize"),
+    (METRIC_TO_DF_COLUMN["retransmit_rate"], "minimize"),
     (METRIC_TO_DF_COLUMN["memory"], "minimize"),
 ]
 
@@ -56,7 +59,7 @@ _FRAME_BASE_COLUMNS: list[str] = [
     "mean_throughput",
     "mean_cpu",
     "mean_memory",
-    "total_retransmits",
+    "retransmit_rate",
 ]
 
 _MIN_SPEARMAN_SAMPLES = 3
@@ -199,7 +202,7 @@ def trials_to_dataframe(
             "mean_throughput": t.mean_throughput(),
             "mean_cpu": t.mean_cpu(),
             "mean_memory": t.mean_memory(),
-            "total_retransmits": t.total_retransmits(),
+            "retransmit_rate": t.retransmit_rate(),
         }
         for key in _SYSCTL_COLUMNS:
             row[key] = t.sysctl_values.get(key)
@@ -256,6 +259,12 @@ def pareto_front(
 ) -> pd.DataFrame:
     """Return the non-dominated rows from ``df``.
 
+    Rows with a NaN value on any objective column are dropped before
+    the dominance scan — numpy comparisons against NaN are always
+    ``False``, so a NaN-bearing row is neither dominated nor
+    dominates, and would otherwise survive the frontier and poison
+    downstream normalization.
+
     Lazy-imports ``numpy`` and raises :exc:`RuntimeError` with the
     ``uv sync --group analysis`` hint when the group is missing.
 
@@ -277,7 +286,24 @@ def pareto_front(
         return df
 
     cols = [col for col, _ in objectives]
-    vals = df[cols].to_numpy(dtype=float)
+    finite_mask = df[cols].notna().all(axis=1)
+    dropped = int((~finite_mask).sum())
+    if dropped:
+        dropped_ids = df.loc[~finite_mask, "trial_id"].tolist()
+        preview = dropped_ids[:5]
+        ellipsis = ", ..." if len(dropped_ids) > len(preview) else ""
+        logger.warning(
+            "pareto_front: dropping %d trial(s) with NaN on %s: %s%s",
+            dropped,
+            cols,
+            preview,
+            ellipsis,
+        )
+    finite_df = df.loc[finite_mask]
+    if finite_df.empty:
+        return finite_df.reset_index(drop=True)
+
+    vals = finite_df[cols].to_numpy(dtype=float)
 
     signs = np.array([1.0 if d == "minimize" else -1.0 for _, d in objectives])
     minimized = vals * signs
@@ -296,7 +322,7 @@ def pareto_front(
                 is_dominated[i] = True
                 break
 
-    return df.loc[~is_dominated].reset_index(drop=True)
+    return finite_df.loc[~is_dominated].reset_index(drop=True)
 
 
 def parameter_importance(
@@ -426,9 +452,9 @@ def recommend_configs(
     where each term is min-max normalized across the Pareto set.
     Maximize metrics always contribute ``+1.0 * norm`` and cannot be
     re-weighted. The default weights are
-    ``{cpu: 0.15, memory: 0.15, retransmits: 0.3}``, reproducing the
-    formula ``tp_norm - 0.15 * cpu_norm - 0.15 * mem_norm -
-    0.3 * retx_norm``.
+    ``{cpu: 0.15, memory: 0.15, retransmit_rate: 0.3}``, reproducing
+    the formula ``tp_norm - 0.15 * cpu_norm - 0.15 * mem_norm -
+    0.3 * rate_norm``.
 
     Args:
         trials: Input trial records (any number of hardware classes).
@@ -449,11 +475,12 @@ def recommend_configs(
         A list of recommendation dicts. Each dict always contains
         ``rank``, ``trial_id``, ``sysctl_values``, the four base
         metric values (``mean_throughput``, ``mean_cpu``,
-        ``mean_memory``, ``total_retransmits``) regardless of the
+        ``mean_memory``, ``retransmit_rate``) regardless of the
         configured Pareto set, and a ``score``. Returns an empty list
         when no trials match.
     """
     pd = _require_pandas()
+    from kube_autotuner.experiment import ObjectivesSection  # noqa: PLC0415
 
     df, _ = trials_to_dataframe(
         trials,
@@ -463,13 +490,11 @@ def recommend_configs(
     if df.empty:
         return []
 
+    defaults = ObjectivesSection()
     if objectives is None:
-        from kube_autotuner.experiment import ObjectivesSection  # noqa: PLC0415
-
-        objectives = ObjectivesSection().pareto
-
+        objectives = defaults.pareto
     if weights is None:
-        weights = {"cpu": 0.15, "memory": 0.15, "retransmits": 0.3}
+        weights = defaults.recommendation_weights
 
     tuple_objectives: list[tuple[str, str]] = [
         (METRIC_TO_DF_COLUMN[obj.metric], obj.direction) for obj in objectives
@@ -479,10 +504,11 @@ def recommend_configs(
         return []
 
     def _norm(series: pd.Series) -> pd.Series:
-        lo, hi = series.min(), series.max()
-        if hi == lo:
+        lo = series.min(skipna=True)
+        hi = series.max(skipna=True)
+        if pd.isna(lo) or pd.isna(hi) or hi == lo:
             return pd.Series(0.5, index=series.index)
-        return (series - lo) / (hi - lo)
+        return ((series - lo) / (hi - lo)).fillna(0.5)
 
     front = front.copy()
     score = pd.Series(0.0, index=front.index)
@@ -499,6 +525,7 @@ def recommend_configs(
     results: list[dict[str, Any]] = []
     for rank, (_, row) in enumerate(front.head(n).iterrows(), start=1):
         trial = next(t for t in trials if t.trial_id == row["trial_id"])
+        rate_val = row["retransmit_rate"]
         results.append(
             {
                 "rank": rank,
@@ -507,7 +534,7 @@ def recommend_configs(
                 "mean_throughput": row["mean_throughput"],
                 "mean_cpu": row["mean_cpu"],
                 "mean_memory": row["mean_memory"],
-                "total_retransmits": int(row["total_retransmits"]),
+                "retransmit_rate": (None if pd.isna(rate_val) else float(rate_val)),
                 "score": round(row["score"], 4),
             },
         )

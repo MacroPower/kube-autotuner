@@ -108,6 +108,13 @@ class BenchmarkResult(BaseModel):
     mode: Literal["tcp", "udp"]
     bits_per_second: float
     retransmits: int | None = None
+    bytes_sent: int | None = Field(
+        default=None,
+        description=(
+            "Total bytes sent during the iperf3 run; populated from "
+            "end.sum_sent.bytes for TCP, None for UDP or legacy records."
+        ),
+    )
     cpu_utilization_percent: float = 0.0
     cpu_server_percent: float | None = None
     jitter_ms: float | None = None
@@ -138,6 +145,37 @@ def compute_sysctl_hash(sysctl_values: Mapping[str, str | int]) -> str:
     """
     canonical = json.dumps(sorted(sysctl_values.items()), separators=(",", ":"))
     return hashlib.sha256(canonical.encode()).hexdigest()[:16]
+
+
+def retransmit_rate_by_iteration(results: list[BenchmarkResult]) -> list[float]:
+    """Return one retransmit rate (retx per byte) per iteration.
+
+    Each iteration's rate is ``sum(retransmits) / sum(bytes_sent)``
+    over its records. Iterations where no record reported
+    ``retransmits``, or whose ``bytes_sent`` total is zero, are
+    omitted so a UDP-only or failed iteration does not fabricate a
+    perfect-rate zero.
+
+    Args:
+        results: Raw benchmark records for a single trial.
+
+    Returns:
+        The per-iteration rates, in iteration-index order.
+    """
+    per_iter_retx: dict[int, int] = defaultdict(int)
+    per_iter_bytes: dict[int, int] = defaultdict(int)
+    per_iter_saw_retx: dict[int, bool] = defaultdict(bool)
+    for r in results:
+        if r.retransmits is not None:
+            per_iter_retx[r.iteration] += r.retransmits
+            per_iter_saw_retx[r.iteration] = True
+        if r.bytes_sent is not None and r.bytes_sent > 0:
+            per_iter_bytes[r.iteration] += r.bytes_sent
+    return [
+        per_iter_retx[it] / bytes_
+        for it, bytes_ in per_iter_bytes.items()
+        if bytes_ > 0 and per_iter_saw_retx[it]
+    ]
 
 
 def _group_by_iteration(
@@ -214,9 +252,37 @@ class TrialResult(BaseModel):
             per_iter_means.append(sum(values) / len(values))
         return sum(per_iter_means) / len(per_iter_means)
 
-    def total_retransmits(self) -> int:
-        """Return the total retransmit count summed across all results."""
-        return sum(r.retransmits or 0 for r in self.results)
+    def total_bytes_sent(self) -> int:
+        """Return total bytes sent, summed across every record.
+
+        Returns:
+            Sum of :attr:`BenchmarkResult.bytes_sent` over
+            ``self.results``; zero when no record reports it.
+        """
+        return sum(r.bytes_sent or 0 for r in self.results)
+
+    def retransmit_rate(self) -> float | None:
+        """Return retransmits per byte as a per-trial rate.
+
+        Aggregates per-iteration ratio-of-sums then means across
+        iterations -- matching how :meth:`mean_throughput` folds
+        clients within an iteration and averages across iterations.
+        Iterations where no record reported ``bytes_sent`` (or the
+        per-iteration byte total was zero), or where every record
+        lacks a ``retransmits`` value (mixed TCP/UDP trials), are
+        dropped from the mean rather than treated as perfect-rate
+        zero.
+
+        Returns:
+            Retransmits per byte sent as a ``float`` (e.g. ``1e-6``
+            ≈ 1 retransmit per MB), or ``None`` when no iteration
+            contributed a usable ratio (UDP-only trials or runs
+            without ``bytes_sent``).
+        """
+        rate_vals = retransmit_rate_by_iteration(self.results)
+        if not rate_vals:
+            return None
+        return sum(rate_vals) / len(rate_vals)
 
     def mean_jitter_ms(self) -> float:
         """Return the mean jitter in milliseconds.

@@ -32,6 +32,7 @@ def _results() -> list[BenchmarkResult]:
             mode="tcp",
             bits_per_second=9_000_000_000,
             retransmits=5,
+            bytes_sent=33_750_000_000,
             cpu_utilization_percent=30.0,
         ),
     ]

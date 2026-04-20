@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from contextlib import ExitStack
 from datetime import UTC, datetime
+import math
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -28,6 +29,7 @@ from kube_autotuner.optimizer import (
     _encode_param_name,  # noqa: PLC2701
     build_ax_objective,
     build_ax_params,
+    filter_objectives_for_observability,
 )
 from kube_autotuner.sysctl.params import PARAM_SPACE
 
@@ -39,6 +41,7 @@ def _make_results(n: int = 3) -> list[BenchmarkResult]:
             mode="tcp",
             bits_per_second=9_000_000_000 + i * 100_000,
             retransmits=5 + i,
+            bytes_sent=1_000_000_000,
             cpu_utilization_percent=30.0 + i,
             memory_used_bytes=100_000_000,
             client_node="kmain07",
@@ -433,13 +436,13 @@ class TestIterationsOneSEMFallback:
 
 
 class TestBuildAxObjective:
-    def test_default_section_matches_legacy_literal(self) -> None:
+    def test_default_section(self) -> None:
         objective, constraints = build_ax_objective(ObjectivesSection())
-        assert objective == "throughput, -cpu, -retransmits, -memory"
+        assert objective == "throughput, -cpu, -retransmit_rate, -memory"
         assert constraints == [
             "throughput >= 1e6",
             "cpu <= 200",
-            "retransmits <= 1e6",
+            "retransmit_rate <= 1e-6",
             "memory <= 1e10",
         ]
 
@@ -455,3 +458,63 @@ class TestBuildAxObjective:
         objective, constraints = build_ax_objective(section)
         assert objective == "throughput, -memory"
         assert constraints == ["throughput >= 1e6"]
+
+
+class TestComputeMetricsRate:
+    def test_rate_nan_when_bytes_missing(self) -> None:
+        results = [
+            BenchmarkResult(
+                timestamp=datetime.now(UTC),
+                mode="udp",
+                bits_per_second=1e9,
+                retransmits=None,
+                bytes_sent=None,
+                cpu_utilization_percent=10.0,
+                iteration=0,
+            ),
+        ]
+        metrics = _compute_metrics(results)
+        assert math.isnan(metrics["retransmit_rate"][0])
+
+    def test_rate_zero_when_no_retransmits(self) -> None:
+        results = [
+            BenchmarkResult(
+                timestamp=datetime.now(UTC),
+                mode="tcp",
+                bits_per_second=1e9,
+                retransmits=0,
+                bytes_sent=1_000_000_000,
+                cpu_utilization_percent=10.0,
+                iteration=0,
+            ),
+        ]
+        metrics = _compute_metrics(results)
+        assert metrics["retransmit_rate"][0] == pytest.approx(0.0)
+        assert not math.isnan(metrics["retransmit_rate"][0])
+
+
+class TestFilterObjectivesForObservability:
+    def test_noop_when_unobservable_empty(self) -> None:
+        section = ObjectivesSection()
+        assert filter_objectives_for_observability(section, set()) is section
+
+    def test_drops_matching_pareto_weights_constraints(self) -> None:
+        section = ObjectivesSection()
+        filtered = filter_objectives_for_observability(
+            section,
+            {"retransmit_rate"},
+        )
+        assert all(obj.metric != "retransmit_rate" for obj in filtered.pareto)
+        assert "retransmit_rate" not in filtered.recommendation_weights
+        assert all("retransmit_rate" not in c for c in filtered.constraints)
+
+    def test_raises_when_pareto_becomes_empty(self) -> None:
+        section = ObjectivesSection(
+            pareto=[
+                ParetoObjective(metric="retransmit_rate", direction="minimize"),
+            ],
+            constraints=[],
+            recommendation_weights={"retransmit_rate": 0.3},
+        )
+        with pytest.raises(ValueError, match="unobservable"):
+            filter_objectives_for_observability(section, {"retransmit_rate"})

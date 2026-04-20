@@ -792,9 +792,13 @@ class TestObjectivesSection:
         assert [(p.metric, p.direction) for p in section.pareto] == [
             ("throughput", "maximize"),
             ("cpu", "minimize"),
-            ("retransmits", "minimize"),
+            ("retransmit_rate", "minimize"),
             ("memory", "minimize"),
         ]
+
+    def test_default_constraints_include_retransmit_rate(self) -> None:
+        section = ObjectivesSection()
+        assert "retransmit_rate <= 1e-6" in section.constraints
 
     def test_weight_on_maximize_metric_rejected(self) -> None:
         with pytest.raises(ValueError, match="maximize-direction"):
@@ -828,12 +832,18 @@ class TestObjectivesSection:
 
     def test_yaml_alias_recommendation_weights(self) -> None:
         section = ObjectivesSection.model_validate(
-            {"recommendationWeights": {"cpu": 0.2, "memory": 0.2, "retransmits": 0.4}},
+            {
+                "recommendationWeights": {
+                    "cpu": 0.2,
+                    "memory": 0.2,
+                    "retransmit_rate": 0.4,
+                },
+            },
         )
         assert section.recommendation_weights == {
             "cpu": 0.2,
             "memory": 0.2,
-            "retransmits": 0.4,
+            "retransmit_rate": 0.4,
         }
 
     def test_pareto_with_custom_metrics(self) -> None:

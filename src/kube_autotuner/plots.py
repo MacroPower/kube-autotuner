@@ -53,10 +53,10 @@ def plot_pareto_scatter_matrix(
 
     Returns:
         A :class:`plotly.graph_objects.Figure` rendering a 4-objective
-        scatter matrix (throughput, CPU, memory, retransmits).
+        scatter matrix (throughput, CPU, memory, retransmit_rate).
     """
     px, _ = _require_plotly()
-    cols = ["mean_throughput", "mean_cpu", "mean_memory", "total_retransmits"]
+    cols = ["mean_throughput", "mean_cpu", "mean_memory", "retransmit_rate"]
     plot_df = df[[*cols, "trial_id"]].copy()
     plot_df["pareto"] = pareto_mask.map({True: "pareto", False: "other"})
     fig = px.scatter_matrix(

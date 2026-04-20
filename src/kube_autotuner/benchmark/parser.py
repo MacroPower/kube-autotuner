@@ -74,12 +74,14 @@ def parse_iperf_json(
         sum_sent = end.get("sum_sent", {})
         bits_per_second = sum_sent.get("bits_per_second", 0.0)
         retransmits = sum_sent.get("retransmits")
+        bytes_sent = sum_sent.get("bytes")
         jitter_ms = None
     else:
         sum_data = end.get("sum", {})
         bits_per_second = sum_data.get("bits_per_second", 0.0)
         jitter_ms = sum_data.get("jitter_ms")
         retransmits = None
+        bytes_sent = None
 
     cpu = end.get("cpu_utilization_percent", {})
     cpu_pct = cpu.get("host_total", 0.0)
@@ -96,6 +98,7 @@ def parse_iperf_json(
         mode=mode,
         bits_per_second=bits_per_second,
         retransmits=retransmits,
+        bytes_sent=bytes_sent,
         cpu_utilization_percent=cpu_pct,
         cpu_server_percent=cpu_server,
         jitter_ms=jitter_ms,

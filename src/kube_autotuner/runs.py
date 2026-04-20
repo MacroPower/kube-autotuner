@@ -50,11 +50,13 @@ from __future__ import annotations
 import contextlib
 from dataclasses import dataclass
 import logging
+import math
 from typing import TYPE_CHECKING, cast
 
 from kube_autotuner.benchmark.runner import BenchmarkRunner
 from kube_autotuner.k8s.lease import NodeLease
 from kube_autotuner.models import TrialLog, TrialResult
+from kube_autotuner.report import format_retransmit_rate
 from kube_autotuner.sysctl.params import PARAM_SPACE
 
 if TYPE_CHECKING:
@@ -368,14 +370,18 @@ def run_optimize(ctx: RunContext) -> None:
     for _params, metrics, trial_idx, _arm in pareto:
         tp = metrics.get("throughput", 0)
         cpu = metrics.get("cpu", 0)
-        rt = metrics.get("retransmits", 0)
+        rate = metrics.get("retransmit_rate")
         tp_val = tp[0] if isinstance(tp, tuple) else tp
         cpu_val = cpu[0] if isinstance(cpu, tuple) else cpu
-        rt_val = rt[0] if isinstance(rt, tuple) else rt
+        if rate is None:
+            rate_val: float | None = None
+        else:
+            raw = rate[0] if isinstance(rate, tuple) else rate
+            rate_val = None if math.isnan(raw) else float(raw)
         logger.info(
-            "  [%d] throughput=%.1f Mbps cpu=%.1f%% retransmits=%.0f",
+            "  [%d] throughput=%.1f Mbps cpu=%.1f%% rate=%s retx/MB",
             trial_idx,
             float(tp_val) / 1e6,
             float(cpu_val),
-            float(rt_val),
+            format_retransmit_rate(rate_val),
         )

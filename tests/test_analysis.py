@@ -36,16 +36,21 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 
+_DEFAULT_BYTES_SENT = 1_000_000_000
+
+
 def _result(
     bps: float,
     retransmits: int = 0,
     cpu: float = 10.0,
+    bytes_sent: int | None = _DEFAULT_BYTES_SENT,
 ) -> BenchmarkResult:
     return BenchmarkResult(
         timestamp=datetime.now(UTC),
         mode="tcp",
         bits_per_second=bps,
         retransmits=retransmits,
+        bytes_sent=bytes_sent,
         cpu_utilization_percent=cpu,
     )
 
@@ -60,6 +65,7 @@ def _trial(  # noqa: PLR0913, PLR0917
     trial_id: str | None = None,
     source_zone: str = "",
     target_zone: str = "",
+    bytes_sent: int | None = _DEFAULT_BYTES_SENT,
 ) -> TrialResult:
     kw: dict[str, Any] = {}
     if trial_id:
@@ -77,7 +83,7 @@ def _trial(  # noqa: PLR0913, PLR0917
             "net.ipv4.tcp_congestion_control": congestion,
         },
         config=BenchmarkConfig(duration=10, iterations=1),
-        results=[_result(bps, retransmits, cpu)],
+        results=[_result(bps, retransmits, cpu, bytes_sent)],
         **kw,
     )
 
@@ -220,7 +226,7 @@ class TestParetoFront:
                 "mean_throughput": [100, 80, 60, 50],
                 "mean_cpu": [10, 5, 30, 20],
                 "mean_memory": [1e8, 2e8, 3e8, 5e8],
-                "total_retransmits": [1, 2, 0, 5],
+                "retransmit_rate": [1, 2, 0, 5],
             },
         )
         front = pareto_front(df)
@@ -235,7 +241,7 @@ class TestParetoFront:
                 "mean_throughput": [100, 50],
                 "mean_cpu": [50, 10],
                 "mean_memory": [1e8, 2e8],
-                "total_retransmits": [5, 5],
+                "retransmit_rate": [5, 5],
             },
         )
         front = pareto_front(df)
@@ -248,7 +254,7 @@ class TestParetoFront:
                 "mean_throughput": [100],
                 "mean_cpu": [10],
                 "mean_memory": [1e8],
-                "total_retransmits": [1],
+                "retransmit_rate": [1],
             },
         )
         assert len(pareto_front(df)) == 1
@@ -260,7 +266,7 @@ class TestParetoFront:
                 "mean_throughput": [100, 100],
                 "mean_cpu": [10, 10],
                 "mean_memory": [1e8, 5e7],
-                "total_retransmits": [1, 1],
+                "retransmit_rate": [1, 1],
             },
         )
         ids = set(pareto_front(df)["trial_id"])
@@ -273,7 +279,7 @@ class TestParetoFront:
                 "mean_throughput",
                 "mean_cpu",
                 "mean_memory",
-                "total_retransmits",
+                "retransmit_rate",
             ],
         )
         assert pareto_front(df).empty
@@ -282,6 +288,36 @@ class TestParetoFront:
         assert len(DEFAULT_OBJECTIVES) == 4
         names = [n for n, _ in DEFAULT_OBJECTIVES]
         assert "mean_memory" in names
+
+    def test_drops_nan_rows_with_warning(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        df = pd.DataFrame(
+            {
+                "trial_id": ["A", "B"],
+                "mean_throughput": [100, 50],
+                "mean_cpu": [10, 20],
+                "mean_memory": [1e8, 2e8],
+                "retransmit_rate": [1e-7, float("nan")],
+            },
+        )
+        with caplog.at_level("WARNING", logger="kube_autotuner.analysis"):
+            front = pareto_front(df)
+        assert list(front["trial_id"]) == ["A"]
+        assert any("NaN" in rec.message for rec in caplog.records)
+
+    def test_all_nan_returns_empty(self) -> None:
+        df = pd.DataFrame(
+            {
+                "trial_id": ["A", "B"],
+                "mean_throughput": [100, 50],
+                "mean_cpu": [10, 20],
+                "mean_memory": [1e8, 2e8],
+                "retransmit_rate": [float("nan"), float("nan")],
+            },
+        )
+        assert pareto_front(df).empty
 
 
 # --- parameter_importance -----------------------------------------------
@@ -379,13 +415,13 @@ class TestRecommendConfigs:
     def test_default_scoring_snapshot(self) -> None:
         """Pin default scores against the baseline formula.
 
-        With two non-dominated trials whose ``cpu`` and ``retransmits``
-        are constant, ``_norm`` clamps those columns to ``0.5``. For
-        the surviving ``throughput`` and ``memory`` axes, trial A
-        (higher throughput, higher memory) normalizes to ``(1.0, 1.0)``
-        and trial B (lower throughput, lower memory) to ``(0.0, 0.0)``.
-        The baseline formula is
-        ``tp - 0.15 * cpu - 0.15 * mem - 0.3 * retx``:
+        With two non-dominated trials whose ``cpu`` and
+        ``retransmit_rate`` are constant, ``_norm`` clamps those
+        columns to ``0.5``. For the surviving ``throughput`` and
+        ``memory`` axes, trial A (higher throughput, higher memory)
+        normalizes to ``(1.0, 1.0)`` and trial B (lower throughput,
+        lower memory) to ``(0.0, 0.0)``. The baseline formula is
+        ``tp - 0.15 * cpu - 0.15 * mem - 0.3 * rate``:
 
         - score_A = 1.0 - 0.15 * 0.5 - 0.15 * 1.0 - 0.3 * 0.5 = 0.625
         - score_B = 0.0 - 0.15 * 0.5 - 0.15 * 0.0 - 0.3 * 0.5 = -0.225
@@ -407,6 +443,7 @@ class TestRecommendConfigs:
                         mode="tcp",
                         bits_per_second=tp_gbps * 1e9,
                         retransmits=5,
+                        bytes_sent=1_000_000_000,
                         cpu_utilization_percent=20.0,
                         memory_used_bytes=mem_mib * 1024 * 1024,
                     ),
@@ -419,10 +456,55 @@ class TestRecommendConfigs:
         assert recs[0]["score"] == pytest.approx(0.625)
         assert recs[1]["score"] == pytest.approx(-0.225)
 
+    def test_rate_metric_reranks_over_absolute_count(self) -> None:
+        """Per-byte rate reorders candidates vs. absolute retransmit count.
+
+        Trial A: 10 Gbps, 1000 retransmits over 37.5 GB -> rate ~2.67e-8.
+        Trial B: 5 Gbps, 100 retransmits over 18.75 GB -> rate ~5.33e-9.
+
+        On absolute count A looks bad (1000 > 100), but per byte A is
+        5x cleaner than B. Under the default (rate) objectives A wins
+        on throughput AND ties/beats B on rate, so A is ranked first.
+        """
+
+        def _mk(
+            tp_gbps: float,
+            retx: int,
+            bytes_: int,
+            tid: str,
+        ) -> TrialResult:
+            return TrialResult(
+                trial_id=tid,
+                node_pair=NodePair(source="a", target="b", hardware_class="10g"),
+                sysctl_values={"net.core.rmem_max": 212992 + (1 if tid == "a" else 2)},
+                config=BenchmarkConfig(duration=10, iterations=1),
+                results=[
+                    BenchmarkResult(
+                        timestamp=datetime.now(UTC),
+                        mode="tcp",
+                        bits_per_second=tp_gbps * 1e9,
+                        retransmits=retx,
+                        bytes_sent=bytes_,
+                        cpu_utilization_percent=20.0,
+                        memory_used_bytes=100 * 1024 * 1024,
+                    ),
+                ],
+            )
+
+        trials = [
+            _mk(10.0, 1000, 37_500_000_000, "a"),
+            _mk(5.0, 100, 18_750_000_000, "b"),
+        ]
+        recs = recommend_configs(trials, "10g", n=2)
+        assert [r["trial_id"] for r in recs] == ["a", "b"]
+        assert recs[0]["retransmit_rate"] == pytest.approx(
+            1000 / 37_500_000_000,
+        )
+
     def test_metric_to_df_column_covers_default_objectives(self) -> None:
         expected = {
             METRIC_TO_DF_COLUMN[m]
-            for m in ("throughput", "cpu", "memory", "retransmits")
+            for m in ("throughput", "cpu", "memory", "retransmit_rate")
         }
         default_cols = {col for col, _ in DEFAULT_OBJECTIVES}
         assert default_cols == expected
@@ -436,14 +518,14 @@ class TestRecommendConfigs:
             mixed_trials,
             "10g",
             n=5,
-            weights={"cpu": 5.0, "memory": 0.15, "retransmits": 0.3},
+            weights={"cpu": 5.0, "memory": 0.15, "retransmit_rate": 0.3},
         )
         assert default_recs != heavy_cpu_recs or all(
             a["score"] != b["score"]
             for a, b in zip(default_recs, heavy_cpu_recs, strict=False)
         )
 
-    def test_reduced_pareto_drops_retransmits_from_scoring(
+    def test_reduced_pareto_drops_rate_from_scoring(
         self,
         mixed_trials: list[TrialResult],
     ) -> None:
@@ -464,7 +546,7 @@ class TestRecommendConfigs:
                 "mean_throughput",
                 "mean_cpu",
                 "mean_memory",
-                "total_retransmits",
+                "retransmit_rate",
             }
 
     def test_lower_memory_outranks_higher(self) -> None:
@@ -487,6 +569,7 @@ class TestRecommendConfigs:
                         mode="tcp",
                         bits_per_second=5e9,
                         retransmits=3,
+                        bytes_sent=1_000_000_000,
                         cpu_utilization_percent=25.0,
                         memory_used_bytes=mem,
                     ),
@@ -675,6 +758,7 @@ class TestCLIAnalyze:
                         mode="tcp",
                         bits_per_second=tp_gbps * 1e9,
                         retransmits=5,
+                        bytes_sent=1_000_000_000,
                         cpu_utilization_percent=20.0,
                         memory_used_bytes=mem_mib * 1024 * 1024,
                     ),

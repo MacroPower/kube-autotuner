@@ -14,6 +14,7 @@ SAMPLE_TCP_JSON = {
         "sum_sent": {
             "bits_per_second": 9_400_000_000.0,
             "retransmits": 12,
+            "bytes": 35_250_000_000,
         },
         "sum_received": {
             "bits_per_second": 9_380_000_000.0,
@@ -49,10 +50,20 @@ def test_parse_tcp():
     assert result.mode == "tcp"
     assert result.bits_per_second == pytest.approx(9_400_000_000.0)
     assert result.retransmits == 12
+    assert result.bytes_sent == 35_250_000_000
     assert result.cpu_utilization_percent == pytest.approx(35.2)
     assert result.cpu_server_percent == pytest.approx(22.1)
     assert result.jitter_ms is None
     assert result.timestamp.year == 2023
+
+
+def test_parse_tcp_bytes_missing():
+    raw = {
+        "start": {"timestamp": {"timesecs": 1700000000}},
+        "end": {"sum_sent": {"bits_per_second": 1e9, "retransmits": 0}},
+    }
+    result = parse_iperf_json(raw, "tcp")
+    assert result.bytes_sent is None
 
 
 def test_parse_cpu_server_percent_missing():
@@ -84,6 +95,7 @@ def test_parse_udp():
     assert result.bits_per_second == pytest.approx(1_000_000_000.0)
     assert result.jitter_ms == pytest.approx(0.025)
     assert result.retransmits is None
+    assert result.bytes_sent is None
     assert result.cpu_utilization_percent == pytest.approx(12.5)
 
 

@@ -4,7 +4,7 @@ This module wraps `ax-platform`'s multi-objective Bayesian optimizer
 around the :class:`~kube_autotuner.benchmark.runner.BenchmarkRunner`.
 Each trial proposes a sysctl parameterization, applies it to the target
 (and optionally every source) node, runs iperf3, and reports the
-resulting throughput / CPU / retransmits / memory back to Ax.
+resulting throughput / CPU / retransmit rate / memory back to Ax.
 
 ``ax-platform`` is a heavyweight optional dependency that lives in the
 ``optimize`` dependency group, not in ``dev``. Every Ax symbol is
@@ -33,7 +33,7 @@ from typing import TYPE_CHECKING
 from kube_autotuner.benchmark.runner import BenchmarkRunner
 from kube_autotuner.k8s.client import K8sClient
 from kube_autotuner.k8s.lease import NodeLease
-from kube_autotuner.models import TrialLog, TrialResult
+from kube_autotuner.models import TrialLog, TrialResult, retransmit_rate_by_iteration
 from kube_autotuner.sysctl.setter import make_sysctl_setter_from_env
 
 if TYPE_CHECKING:
@@ -229,13 +229,20 @@ def _compute_metrics(
     SEM (best-effort — the samples share server state and are
     correlated).
 
+    ``retransmit_rate`` is the per-iteration ratio
+    ``sum(retransmits) / sum(bytes_sent)`` averaged across iterations.
+    When no iteration produced both a ``retransmits`` reading and a
+    non-zero ``bytes_sent`` total (UDP-only trials, failed TCP runs),
+    the mean is ``NaN`` and callers are expected to drop the key
+    before handing results to Ax.
+
     Args:
         results: Raw benchmark records for a single trial.
 
     Returns:
         A dict keyed by ``"throughput"`` / ``"cpu"`` /
-        ``"retransmits"`` / ``"memory"`` with ``(mean, SEM)`` values
-        ready for :meth:`ax.api.client.Client.complete_trial`.
+        ``"retransmit_rate"`` / ``"memory"`` with ``(mean, SEM)``
+        values ready for :meth:`ax.api.client.Client.complete_trial`.
     """
     throughput_vals = _aggregate_by_iteration(
         results,
@@ -243,11 +250,7 @@ def _compute_metrics(
         sum,
     )
     cpu_vals = _aggregate_by_iteration(results, _cpu_value, statistics.mean)
-    retransmit_vals = _aggregate_by_iteration(
-        results,
-        lambda r: float(r.retransmits) if r.retransmits is not None else None,
-        sum,
-    )
+    rate_vals = retransmit_rate_by_iteration(results)
     memory_vals = _aggregate_by_iteration(
         results,
         lambda r: float(r.memory_used_bytes) if r.memory_used_bytes else None,
@@ -256,7 +259,10 @@ def _compute_metrics(
 
     throughput_mean, throughput_sem = _mean_sem(throughput_vals)
     cpu_mean, cpu_sem = _mean_sem(cpu_vals)
-    retransmit_mean, retransmit_sem = _mean_sem(retransmit_vals)
+    if rate_vals:
+        rate_mean, rate_sem = _mean_sem(rate_vals)
+    else:
+        rate_mean, rate_sem = float("nan"), 0.0
     memory_mean, memory_sem = _mean_sem(memory_vals)
 
     if len(throughput_vals) == 1 and len(results) > 1:
@@ -270,7 +276,7 @@ def _compute_metrics(
     return {
         "throughput": (throughput_mean, throughput_sem),
         "cpu": (cpu_mean, cpu_sem),
-        "retransmits": (retransmit_mean, retransmit_sem),
+        "retransmit_rate": (rate_mean, rate_sem),
         "memory": (memory_mean, memory_sem),
     }
 
@@ -299,6 +305,68 @@ def build_ax_objective(
         else:
             terms.append(f"-{obj.metric}")
     return ", ".join(terms), list(section.constraints)
+
+
+def _constraint_metric(constraint: str) -> str | None:
+    """Return the metric name referenced by an outcome constraint, or None.
+
+    Parses with :data:`kube_autotuner.experiment._CONSTRAINT_RE`. Non-matching
+    strings return ``None`` rather than raising; :class:`ObjectivesSection`
+    has already validated the list at construction time.
+    """
+    from kube_autotuner.experiment import _CONSTRAINT_RE  # noqa: PLC0415
+
+    match = _CONSTRAINT_RE.match(constraint)
+    return match.group("metric") if match else None
+
+
+def filter_objectives_for_observability(
+    section: ObjectivesSection,
+    unobservable: set[str],
+) -> ObjectivesSection:
+    """Drop ``unobservable`` metrics from every part of ``section``.
+
+    Removes matching entries from ``pareto``,
+    ``recommendation_weights``, and any outcome constraint that
+    references one of the unobservable metrics. Used when the
+    configured benchmark cannot produce a metric (e.g. UDP-only
+    runs cannot observe ``retransmit_rate``).
+
+    Args:
+        section: The objectives block loaded from user config.
+        unobservable: Metric names that will never have observations.
+
+    Returns:
+        A new :class:`ObjectivesSection` with the unobservable
+        metrics removed. The input is left unchanged.
+
+    Raises:
+        ValueError: Every Pareto objective referenced an unobservable
+            metric, leaving no objective to optimize against.
+    """
+    if not unobservable:
+        return section
+    filtered_pareto = [obj for obj in section.pareto if obj.metric not in unobservable]
+    if not filtered_pareto:
+        msg = (
+            f"every Pareto objective references an unobservable "
+            f"metric {sorted(unobservable)}; add at least one "
+            "observable objective to experiment.yaml"
+        )
+        raise ValueError(msg)
+    filtered_weights = {
+        k: v for k, v in section.recommendation_weights.items() if k not in unobservable
+    }
+    filtered_constraints = [
+        c for c in section.constraints if _constraint_metric(c) not in unobservable
+    ]
+    return section.model_copy(
+        update={
+            "pareto": filtered_pareto,
+            "recommendation_weights": filtered_weights,
+            "constraints": filtered_constraints,
+        },
+    )
 
 
 class OptimizationLoop:
@@ -354,7 +422,30 @@ class OptimizationLoop:
         self.apply_source: bool = apply_source
         self.iperf_args: IperfSection | None = iperf_args
         self.patches: list[Patch] | None = patches
+
+        unobservable: set[str] = set()
+        if "tcp" not in config.modes:
+            unobservable.add("retransmit_rate")
+        references_unobservable = unobservable and (
+            any(obj.metric in unobservable for obj in objectives.pareto)
+            or any(
+                _constraint_metric(c) in unobservable for c in objectives.constraints
+            )
+        )
+        if references_unobservable:
+            logger.warning(
+                "benchmark modes=%s cannot observe %s; stripping from "
+                "objectives / constraints",
+                list(config.modes),
+                sorted(unobservable),
+            )
+        objectives = filter_objectives_for_observability(objectives, unobservable)
         self.objectives: ObjectivesSection = objectives
+        self._ax_metric_names: set[str] = {obj.metric for obj in objectives.pareto} | {
+            metric
+            for metric in (_constraint_metric(c) for c in objectives.constraints)
+            if metric is not None
+        }
 
         client_cls = _require_ax_client()
         self.client: Client = client_cls()
@@ -511,6 +602,12 @@ class OptimizationLoop:
     ) -> None:
         """Report a successful trial's metrics back to Ax and log a summary.
 
+        The raw metrics dict is narrowed to the metrics the configured
+        objectives actually reference, and any entry with a NaN mean is
+        dropped -- Ax's ``complete_trial`` rejects NaN outcomes, but it
+        treats a missing key as "not reported this trial" and the MOO
+        surrogate handles the partial observation.
+
         Args:
             i: Zero-based iteration index.
             phase: ``"sobol"`` or ``"bayesian"``.
@@ -518,18 +615,35 @@ class OptimizationLoop:
             metrics: Per-metric ``(mean, SEM)`` mapping returned by
                 :meth:`_evaluate`.
         """
-        self.client.complete_trial(trial_index=trial_index, raw_data=metrics)
+        raw_data: dict[str, tuple[float, float]] = {}
+        for name in self._ax_metric_names:
+            pair = metrics.get(name)
+            if pair is None:
+                continue
+            mean, _sem = pair
+            if math.isnan(mean):
+                logger.debug(
+                    "trial %d: dropping %s from raw_data (mean is NaN)",
+                    trial_index,
+                    name,
+                )
+                continue
+            raw_data[name] = pair
+        self.client.complete_trial(trial_index=trial_index, raw_data=raw_data)
+
         tp = metrics["throughput"][0]
         cpu = metrics["cpu"][0]
-        rt = metrics["retransmits"][0]
+        rate = metrics["retransmit_rate"][0]
+        rate_str = "NaN" if math.isnan(rate) else f"{rate * 1e6:.2f}"
         logger.info(
-            "Trial %d/%d [%s] throughput=%.1f Mbps cpu=%.1f%% retransmits=%.0f",
+            "Trial %d/%d [%s] throughput=%.1f Mbps cpu=%.1f%% "
+            "retransmit_rate=%s retx/MB",
             i + 1,
             self.n_trials,
             phase,
             tp / 1e6,
             cpu,
-            rt,
+            rate_str,
         )
 
     def run(self) -> list[TrialResult]:

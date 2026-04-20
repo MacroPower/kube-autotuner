@@ -9,8 +9,8 @@ performance on the nodes of a Kubernetes cluster. iperf3 between two
 nodes is the measurement. An Ax-platform multi-objective Bayesian
 optimizer proposes the next configuration, the tool applies it, and the
 benchmark runs again. The loop repeats until it converges on a
-Pareto-optimal set of trade-offs between throughput, retransmits, CPU,
-and memory.
+Pareto-optimal set of trade-offs between throughput, TCP retransmit
+rate, CPU, and memory.
 
 ## How it works
 
@@ -123,16 +123,16 @@ objectives:
   pareto:
     - { metric: throughput, direction: maximize }
     - { metric: cpu, direction: minimize }
-    - { metric: retransmits, direction: minimize }
+    - { metric: retransmit_rate, direction: minimize }
     - { metric: memory, direction: minimize }
   constraints:
     - "throughput >= 1e6"
     - "cpu <= 200"
-    - "retransmits <= 1e6"
+    - "retransmit_rate <= 1e-6"   # retransmits per byte sent; 1e-6 ≈ 1 retx/MB
     - "memory <= 1e10"
   recommendationWeights:
     cpu: 0.15
-    retransmits: 0.3
+    retransmit_rate: 0.3
     memory: 0.15
 
 output: out/results.jsonl
@@ -142,7 +142,13 @@ Supplying `constraints:` or `recommendationWeights:` replaces the
 default list wholesale rather than extending it. Weights are only valid
 on minimize-direction metrics and must reference a metric present in
 `pareto`. Valid metric names: `throughput`, `cpu`, `memory`,
-`retransmits`.
+`retransmit_rate`. `retransmit_rate` is measured as retransmits per
+byte sent — it is scale-invariant across throughput levels, which is
+what keeps a high-throughput / high-loss configuration from winning
+on normalized absolute retransmit counts alone. UDP-only benchmarks
+cannot observe it; the optimizer strips `retransmit_rate` from the
+objective and any referencing constraints with a logged warning when
+`benchmark.modes` does not include `tcp`.
 
 See [`tests/fixtures/experiment_example.yaml`](tests/fixtures/experiment_example.yaml)
 for the canonical executable fixture.

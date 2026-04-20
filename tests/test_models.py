@@ -260,6 +260,7 @@ def test_trial_result_single_client_multiple_iterations():
             mode="tcp",
             bits_per_second=1e9,
             retransmits=5,
+            bytes_sent=1_000_000_000,
             cpu_utilization_percent=10.0,
             client_node="n1",
             iteration=0,
@@ -269,6 +270,7 @@ def test_trial_result_single_client_multiple_iterations():
             mode="tcp",
             bits_per_second=3e9,
             retransmits=2,
+            bytes_sent=1_000_000_000,
             cpu_utilization_percent=30.0,
             client_node="n1",
             iteration=1,
@@ -282,7 +284,9 @@ def test_trial_result_single_client_multiple_iterations():
     )
     assert trial.mean_throughput() == pytest.approx(2e9)
     assert trial.mean_cpu() == pytest.approx(20.0)
-    assert trial.total_retransmits() == 7
+    # rates: iter0=5/1e9, iter1=2/1e9; mean=3.5/1e9.
+    assert trial.retransmit_rate() == pytest.approx(3.5e-9)
+    assert trial.total_bytes_sent() == 2_000_000_000
 
 
 def test_trial_result_multi_client_per_iteration_grouping():
@@ -294,6 +298,7 @@ def test_trial_result_multi_client_per_iteration_grouping():
             mode="tcp",
             bits_per_second=bps,
             retransmits=1,
+            bytes_sent=1_000_000_000,
             cpu_utilization_percent=cpu,
             cpu_server_percent=cpu,
             client_node=client,
@@ -321,8 +326,67 @@ def test_trial_result_multi_client_per_iteration_grouping():
     assert trial.mean_throughput() == pytest.approx(9e9)
     # CPU uses cpu_server_percent when all present: iter0=15, iter1=20 -> mean 17.5.
     assert trial.mean_cpu() == pytest.approx(17.5)
-    # Retransmits: grouped sum is 4 (2 per iteration).
-    assert trial.total_retransmits() == 4
+    # Rate: each iteration has 2 retx over 2GB; per-iter rate = 1e-9.
+    assert trial.retransmit_rate() == pytest.approx(1e-9)
+    assert trial.total_bytes_sent() == 4_000_000_000
+
+
+def test_retransmit_rate_returns_none_when_no_bytes():
+    """UDP-only or bytes-less TCP trials have no observable rate."""
+    results = [
+        BenchmarkResult(
+            timestamp=datetime.now(UTC),
+            mode="udp",
+            bits_per_second=1e9,
+            retransmits=None,
+            bytes_sent=None,
+            client_node="n1",
+            iteration=0,
+        ),
+    ]
+    trial = TrialResult(
+        node_pair=NodePair(source="n1", target="n2", hardware_class="10g"),
+        sysctl_values={},
+        config=BenchmarkConfig(),
+        results=results,
+    )
+    assert trial.retransmit_rate() is None
+    assert trial.total_bytes_sent() == 0
+
+
+def test_retransmit_rate_drops_iterations_missing_retx_record():
+    """Iter with bytes but no retx record (mixed TCP/UDP) is dropped."""
+    results = [
+        # Iter 0: TCP record with both retx and bytes -> valid rate.
+        BenchmarkResult(
+            timestamp=datetime.now(UTC),
+            mode="tcp",
+            bits_per_second=1e9,
+            retransmits=10,
+            bytes_sent=1_000_000_000,
+            iteration=0,
+        ),
+        # Iter 1: UDP-only -> no retransmits, but some bytes_sent would
+        # still arrive if bytes were attached. Here we set bytes=None so
+        # the iter is dropped by the bytes>0 filter anyway. Construct a
+        # deliberately mixed case: record has bytes but no retransmits.
+        BenchmarkResult(
+            timestamp=datetime.now(UTC),
+            mode="udp",
+            bits_per_second=1e9,
+            retransmits=None,
+            bytes_sent=1_000_000_000,
+            iteration=1,
+        ),
+    ]
+    trial = TrialResult(
+        node_pair=NodePair(source="n1", target="n2", hardware_class="10g"),
+        sysctl_values={},
+        config=BenchmarkConfig(),
+        results=results,
+    )
+    # Only iter 0 contributes (bytes present AND retx recorded).
+    assert trial.retransmit_rate() == pytest.approx(1e-8)
 
 
 def test_trial_result_multi_client_falls_back_to_host_cpu():
@@ -578,7 +642,11 @@ class TestTrialLogMetadata:
         TrialLog.write_metadata(path, ObjectivesSection())
         capsys.readouterr()
         drifted = ObjectivesSection(
-            recommendation_weights={"cpu": 0.4, "memory": 0.15, "retransmits": 0.3},
+            recommendation_weights={
+                "cpu": 0.4,
+                "memory": 0.15,
+                "retransmit_rate": 0.3,
+            },
         )
         TrialLog.write_metadata(path, drifted)
         captured = capsys.readouterr()

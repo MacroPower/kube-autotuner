@@ -21,6 +21,7 @@ from kube_autotuner import __version__, runs
 from kube_autotuner.experiment import ExperimentConfig, ExperimentConfigError
 from kube_autotuner.k8s.client import K8sClient
 from kube_autotuner.models import TrialLog
+from kube_autotuner.report import format_retransmit_rate
 from kube_autotuner.sysctl.setter import (
     make_sysctl_setter,
     make_sysctl_setter_from_env,
@@ -849,7 +850,7 @@ def _analyze_one_class(
             f"Top recommendation: {r['mean_throughput'] / 1e6:.1f} Mbps, "
             f"{r['mean_cpu']:.1f}% CPU, "
             f"{r['mean_memory'] / 1024 / 1024:.0f} MiB, "
-            f"{r['total_retransmits']} retransmits",
+            f"{format_retransmit_rate(r['retransmit_rate'])} retx/MB",
         )
 
     return {
@@ -895,9 +896,9 @@ def _write_figures(
     for x, y in [
         ("mean_throughput", "mean_cpu"),
         ("mean_throughput", "mean_memory"),
-        ("mean_throughput", "total_retransmits"),
+        ("mean_throughput", "retransmit_rate"),
         ("mean_cpu", "mean_memory"),
-        ("mean_cpu", "total_retransmits"),
+        ("mean_cpu", "retransmit_rate"),
     ]:
         fig = plots.plot_pareto_2d(df, front, x, y)
         fig.write_html(str(hw_dir / f"pareto_{x}_vs_{y}.html"))

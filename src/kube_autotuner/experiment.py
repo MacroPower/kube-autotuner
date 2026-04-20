@@ -241,7 +241,7 @@ class TrialSection(BaseModel):
     sysctls: dict[str, str | int] = Field(default_factory=dict)
 
 
-Metric = Literal["throughput", "cpu", "memory", "retransmits"]
+Metric = Literal["throughput", "cpu", "memory", "retransmit_rate"]
 Direction = Literal["maximize", "minimize"]
 
 _CONSTRAINT_RE = re.compile(
@@ -252,14 +252,14 @@ _CONSTRAINT_RE = re.compile(
 _DEFAULT_CONSTRAINTS: list[str] = [
     "throughput >= 1e6",
     "cpu <= 200",
-    "retransmits <= 1e6",
+    "retransmit_rate <= 1e-6",
     "memory <= 1e10",
 ]
 
 _DEFAULT_WEIGHTS: dict[str, float] = {
     "cpu": 0.15,
     "memory": 0.15,
-    "retransmits": 0.3,
+    "retransmit_rate": 0.3,
 }
 
 
@@ -280,13 +280,13 @@ def _default_pareto() -> list[ParetoObjective]:
     """Return the default Pareto objective list.
 
     Returns:
-        Four objectives: throughput (max), cpu (min), retransmits (min),
-        memory (min).
+        Four objectives: throughput (max), cpu (min), retransmit_rate
+        (min), memory (min).
     """
     return [
         ParetoObjective(metric="throughput", direction="maximize"),
         ParetoObjective(metric="cpu", direction="minimize"),
-        ParetoObjective(metric="retransmits", direction="minimize"),
+        ParetoObjective(metric="retransmit_rate", direction="minimize"),
         ParetoObjective(metric="memory", direction="minimize"),
     ]
 
@@ -353,7 +353,7 @@ class ObjectivesSection(BaseModel):
                     "on minimize-direction metrics"
                 )
                 raise ValueError(msg)
-        known = {"throughput", "cpu", "memory", "retransmits"}
+        known = {"throughput", "cpu", "memory", "retransmit_rate"}
         for constraint in self.constraints:
             match = _CONSTRAINT_RE.match(constraint)
             if match is None:

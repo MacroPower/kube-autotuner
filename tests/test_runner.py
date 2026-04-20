@@ -22,7 +22,11 @@ def _fake_iperf_json(bps: float, remote_total: float = 12.3) -> str:
     return json.dumps({
         "start": {"timestamp": {"timesecs": 1700000000}},
         "end": {
-            "sum_sent": {"bits_per_second": bps, "retransmits": 0},
+            "sum_sent": {
+                "bits_per_second": bps,
+                "retransmits": 0,
+                "bytes": 1_000_000_000,
+            },
             "cpu_utilization_percent": {
                 "host_total": 5.0,
                 "remote_total": remote_total,

@@ -66,7 +66,7 @@ def _minimal_section(
                 "mean_throughput": 4.2e10,
                 "mean_cpu": 33.9,
                 "mean_memory": 67108864,
-                "total_retransmits": 1,
+                "retransmit_rate": 1e-8,
                 "score": 0.95,
             },
         ],

@@ -23,6 +23,23 @@ _ANALYSIS_HINT = "install analysis group: uv sync --group analysis"
 
 _TOP_IMPORTANCE_ROWS = 20
 
+
+def format_retransmit_rate(rate: float | None) -> str:
+    """Format a retx-per-byte rate for display as retransmits per MB.
+
+    Args:
+        rate: Retransmits per byte, or ``None`` when the trial had no
+            observable rate (UDP-only, empty TCP).
+
+    Returns:
+        ``"-"`` when ``rate`` is ``None``; otherwise ``rate * 1e6``
+        formatted with two decimals.
+    """
+    if rate is None:
+        return "-"
+    return f"{rate * 1e6:.2f}"
+
+
 _STYLE = """
 body { font-family: -apple-system, system-ui, Segoe UI, Roboto, sans-serif;
        margin: 0; color: #222; background: #fafafa; }
@@ -106,7 +123,7 @@ def _render_recommendations(recs: list[dict[str, Any]]) -> str:
                 "throughput (Mbps)": round(r["mean_throughput"] / 1e6, 1),
                 "cpu": f"{r['mean_cpu']:.1f}%",
                 "memory (MiB)": f"{r['mean_memory'] / 1024 / 1024:.0f}",
-                "retransmits": r["total_retransmits"],
+                "retx/MB": format_retransmit_rate(r["retransmit_rate"]),
                 "score": r["score"],
             }
             for r in recs
