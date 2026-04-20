@@ -45,6 +45,11 @@ tasks:
     cmds:
       - uv run pytest
 
+  test:integration:
+    desc: Run integration tests (requires a live Talos/k8s cluster)
+    cmds:
+      - uv run pytest -m integration
+
   run:
     desc: Run the CLI (pass args with --)
     cmds:

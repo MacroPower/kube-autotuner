@@ -29,6 +29,19 @@ task test
 task run -- tune my-node
 ```
 
+## Integration tests
+
+`task test:integration` runs the integration suite (`tests/integration/`,
+marked `@pytest.mark.integration`) against a live Talos/k8s cluster. The
+default `task test` and the lefthook pre-push hook **do not** run these
+tests — `pyproject.toml` sets `-m "not integration"` in `addopts` so
+cluster-free pushes stay fast.
+
+Bring a Talos Docker cluster up first; see `tests/integration/README.md`
+for the `talosctl cluster create docker --name kube-autotuner-test`
+invocation and the `KUBE_AUTOTUNER_SYSCTL_BACKEND` / `KUBE_AUTOTUNER_ALLOW_SYSCTL_SKIP`
+environment knobs.
+
 ## Dependency groups
 
 The project splits dependencies into one runtime set and three PEP 735

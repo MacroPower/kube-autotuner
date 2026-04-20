@@ -72,14 +72,18 @@ outside this catalog without updating both the Taskfile and this document.
 | `task lint:check`  | CI-mode: `ruff check .` then `ruff format --check .`.|
 | `task typecheck`   | `ty check`.                                          |
 | `task test`        | `uv run pytest` (honours `addopts`).                 |
+| `task test:integration` | `uv run pytest -m integration` (requires a live Talos/k8s cluster). |
 | `task run -- ...`  | `uv run kube-autotuner ...`.                         |
 | `task bootstrap`   | Sync venv + regenerate shell completions.            |
 | `task completions` | Regenerate bash/zsh/fish completions under `.venv/`. |
 | `task hooks:install` | `lefthook install`.                                |
 
-Integration tests are opt-in and live behind the `integration` marker; when
-the suite is present, invoke them with `uv run pytest -m integration` against
-a live Talos/k8s cluster.
+`task test:integration` stands apart from the default pre-push gate: the
+lefthook pre-push hook runs `task test` and `task typecheck`, which select
+`-m "not integration"` via `addopts` and therefore **never** run integration
+tests. Integration tests are opt-in and require a live Talos/k8s cluster — see
+`tests/integration/README.md` for the `talosctl cluster create docker
+--name kube-autotuner-test` bring-up step.
 
 ## Dependency groups
 

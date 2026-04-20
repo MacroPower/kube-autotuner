@@ -74,6 +74,16 @@ dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
     "ANN",
     "INP001",
 ]
+# Integration tests drive subprocess calls and interact with mutable global
+# state (env vars, kubeconfig). The subprocess S603/S607 and docstring
+# return/yield rules (DOC201/DOC402) are noise in this context; blanket-
+# ignoring them here keeps per-call ``# noqa`` off the hot paths.
+"tests/integration/**/*.py" = [
+    "S603",
+    "S607",
+    "DOC201",
+    "DOC402",
+]
 "**/__init__.py" = [
     "D104",
     "F401",

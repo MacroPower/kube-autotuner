@@ -1,0 +1,62 @@
+"""End-to-end integration test for the baseline CLI command."""
+
+from __future__ import annotations
+
+import json
+from typing import TYPE_CHECKING
+
+import pytest
+from typer.testing import CliRunner
+
+from kube_autotuner.cli import app
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.timeout(300),
+]
+
+
+def test_baseline_produces_results(
+    kubeconfig_env: str,  # noqa: ARG001 - activates KUBECONFIG env var
+    node_names: dict[str, str],
+    test_namespace: str,
+    fake_sysctl_env: Path,  # noqa: ARG001 - activates fake backend env vars
+    tmp_path: Path,
+) -> None:
+    output_file = tmp_path / "results.jsonl"
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        [
+            "baseline",
+            "--source",
+            node_names["source"],
+            "--target",
+            node_names["target"],
+            "--hardware-class",
+            "1g",
+            "--ip-family-policy",
+            "SingleStack",
+            "--namespace",
+            test_namespace,
+            "--duration",
+            "5",
+            "--iterations",
+            "1",
+            "--output",
+            str(output_file),
+        ],
+    )
+    assert result.exit_code == 0, f"CLI failed:\n{result.output}"
+
+    lines = output_file.read_text().strip().splitlines()
+    assert len(lines) == 1
+
+    trial = json.loads(lines[0])
+    assert trial["results"]
+    assert trial["results"][0]["bits_per_second"] > 0
+    assert trial["sysctl_values"]
