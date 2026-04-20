@@ -8,9 +8,57 @@ Benchmark-driven kernel parameter tuning for Kubernetes nodes.
 performance on the nodes of a Kubernetes cluster. iperf3 between two
 nodes is the measurement. An Ax-platform multi-objective Bayesian
 optimizer proposes the next configuration, the tool applies it, and the
-benchmark runs again. The loop repeats until it converges on a
-Pareto-optimal set of trade-offs between throughput, TCP retransmit
-rate, CPU, target-node memory, and CNI data-plane memory.
+benchmark runs again. The loop converges on a Pareto-optimal set of
+trade-offs between throughput, TCP retransmit rate, CPU, target-node
+memory, and CNI data-plane memory. The surface is high-dimensional,
+noisy, slow to evaluate, and conflicted across objectives, so
+brute-force grid search is out.
+
+## Why this is hard
+
+- **Expensive trials.** A single iteration is `duration=30s` of
+  measurement plus `omit=5s` of discarded warmup, repeated three times
+  per mode, and run for each mode in `benchmark.modes` (TCP and/or UDP),
+  before setup and teardown. A 50-trial run takes hours. Grid search
+  over the default space is infeasible by orders of magnitude.
+- **Noisy measurements.** iperf3 throughput has real run-to-run
+  variance. The optimizer collapses each metric into a `(mean, SEM)`
+  pair and accounts for the fact that samples are correlated when
+  multiple clients share one server. The surrogate is fitting a noisy
+  response, not a deterministic function; iteration counts exist partly
+  to buy it confidence.
+- **High-dimensional, discrete search.** The default space has 30
+  parameters (see the next section) and on the order of 10^12
+  combinations. It is discrete and categorical, so the optimizer treats
+  it as a mixed integer/categorical problem. Gradient-based acquisition
+  still runs under the hood, but on a relaxed surrogate, not on the
+  (non-differentiable) iperf3 objective itself.
+- **Parameters interact.** The buffer family mixes types in the default
+  space: `net.core.rmem_max` / `net.core.wmem_max` are `int` rungs that
+  cap the window, while `net.ipv4.tcp_rmem` / `net.ipv4.tcp_wmem` are
+  `choice` parameters carrying the three-tuple strings the kernel
+  actually reads, and one bounds the other.
+  `net.ipv4.tcp_congestion_control` (cubic/bbr) and
+  `net.core.default_qdisc` (pfifo_fast/fq/fq_codel) couple on the egress
+  path. A setting that helps in isolation can regress in combination.
+  That is the kind of structure a GP surrogate can pick up.
+- **Objectives conflict.** Throughput-maximising configurations often
+  raise CPU and retransmit rate. The tool returns a **Pareto front**
+  rather than a single winner. Default outcome constraints (a
+  throughput floor, a CPU ceiling, a retransmit-rate ceiling, and a
+  memory ceiling) are forwarded to Ax as hard constraints; the exact
+  values live in the `objectives` block shown under
+  [Quick start](#quick-start).
+- **Results are hardware- and topology-dependent.** The tool stratifies
+  results by `hardwareClass` (1g/10g) and topology (intra-AZ /
+  inter-AZ). Tunings found on one NIC class or AZ pair do not transfer,
+  so the tool re-runs against the live cluster rather than shipping a
+  static recommendation.
+
+Ax fits this shape: sample-efficient Bayesian optimization with native
+multi-objective support, Sobol warm-up (`optimize.nSobol`, default 15)
+to explore, then a GP surrogate that absorbs the remaining trials and
+trades off throughput, CPU, retransmit rate, and memory in one pass.
 
 ## How it works
 
@@ -26,6 +74,40 @@ rate, CPU, target-node memory, and CNI data-plane memory.
    same frontier and recommendation weights without re-specifying them
    and turns the JSONL into Pareto plots, parameter importance scores,
    and a ranked list of configurations.
+
+## Parameter space
+
+When `optimize.paramSpace` is omitted, the tool searches a canonical
+default: 30 sysctls across seven categories. Two parameter types are
+accepted: `int` (a numeric range) and `choice` (an explicit value list
+of strings or ints). The canonical default quantises every integer
+parameter to a handful of representative rungs rather than covering the
+full `[min, max]` integer range; that's a convention of the default,
+not a type-system invariant, so a user-supplied `paramSpace` is free to
+hand Ax a wide integer range instead. Under the rung convention the
+default space has on the order of 10^12 combinations; treating integer
+parameters as full ranges (as the YAML doc comment
+`values = [min, max]` implies for custom params) makes it larger still.
+Either way, exhaustive search is not an option.
+
+| Category           | Count | Examples                                                        |
+|--------------------|-------|-----------------------------------------------------------------|
+| TCP buffers        | 9     | `net.core.rmem_max`, `net.ipv4.tcp_rmem`, `net.ipv4.tcp_mem`    |
+| Congestion control | 8     | `net.ipv4.tcp_congestion_control`, `net.core.default_qdisc`     |
+| NAPI / softirq     | 4     | `net.core.netdev_budget`, `net.core.netdev_max_backlog`         |
+| Busy poll          | 2     | `net.core.busy_poll`, `net.core.busy_read`                      |
+| VM / memory        | 2     | `vm.min_free_kbytes`, `vm.swappiness`                           |
+| Connection backlog | 4     | `net.core.somaxconn`, `net.ipv4.tcp_max_syn_backlog`            |
+| UDP                | 1     | `net.ipv4.udp_rmem_min`                                         |
+
+Two shapes of customisation:
+
+- Override the whole default set by supplying `optimize.paramSpace` in
+  `experiment.yaml` (see the example under [Quick start](#quick-start)).
+  Both `int` (range) and `choice` (explicit list) types are accepted;
+  `int` params must have `min < max`.
+- Use `mode: trial` with a fixed `sysctls:` map to benchmark one
+  configuration without invoking the optimizer.
 
 ## Install
 
@@ -156,12 +238,12 @@ on minimize-direction metrics and must reference a metric present in
 the iperf target, sampled from `metrics.k8s.io/v1beta1 nodes/<name>`.
 `cni_memory` is memory summed across the CNI pods selected by the
 `cni:` section on the target node; it is what most sysctl tweaks
-actually move on the data-plane side. `retransmit_rate` is measured as retransmits per
-byte sent — it is scale-invariant across throughput levels, which is
-what keeps a high-throughput / high-loss configuration from winning
-on normalized absolute retransmit counts alone. UDP-only benchmarks
-cannot observe it; the optimizer strips `retransmit_rate` from the
-objective and any referencing constraints with a logged warning when
+actually move on the data-plane side. `retransmit_rate` is measured as
+retransmits per byte sent, which is scale-invariant across throughput
+levels and keeps a high-throughput / high-loss configuration from
+winning on absolute retransmit counts alone. UDP-only benchmarks cannot
+observe it; the optimizer strips `retransmit_rate` from the objective
+and any referencing constraints with a logged warning when
 `benchmark.modes` does not include `tcp`.
 
 See [`tests/fixtures/experiment_example.yaml`](tests/fixtures/experiment_example.yaml)

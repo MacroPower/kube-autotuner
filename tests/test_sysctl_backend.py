@@ -13,7 +13,11 @@ import pytest
 
 from kube_autotuner.models import SysctlParam
 from kube_autotuner.sysctl.fake import FakeSysctlBackend
-from kube_autotuner.sysctl.params import PARAM_SPACE, build_param_space
+from kube_autotuner.sysctl.params import (
+    PARAM_CATEGORIES,
+    PARAM_SPACE,
+    build_param_space,
+)
 from kube_autotuner.sysctl.setter import (
     SysctlSetter,
     make_sysctl_setter,
@@ -87,6 +91,24 @@ def test_build_param_space_canonical_validates():
     ps = build_param_space()
     assert ps.params, "canonical PARAM_SPACE must be non-empty"
     assert ps is not PARAM_SPACE  # builder returns a fresh instance each call
+
+
+# Drift guard: the README "Parameter space" section advertises a 30-sysctl
+# default broken down into seven categories. If these counts change,
+# update the README table in the same commit.
+def test_param_space_counts_match_readme():
+    assert len(PARAM_SPACE.params) == 30
+    expected_counts = {
+        "tcp_buffer": 9,
+        "congestion": 8,
+        "napi": 4,
+        "busy_poll": 2,
+        "memory": 2,
+        "connection": 4,
+        "udp": 1,
+    }
+    actual_counts = {cat: len(names) for cat, names in PARAM_CATEGORIES.items()}
+    assert actual_counts == expected_counts
 
 
 def test_build_param_space_rejects_empty_values():
