@@ -35,6 +35,7 @@ from kube_autotuner.benchmark.runner import BenchmarkRunner
 from kube_autotuner.k8s.client import K8sClient
 from kube_autotuner.k8s.lease import NodeLease
 from kube_autotuner.models import TrialLog, TrialResult, retransmit_rate_by_iteration
+from kube_autotuner.progress import NullObserver
 from kube_autotuner.sysctl.setter import make_sysctl_setter_from_env
 
 if TYPE_CHECKING:
@@ -56,6 +57,7 @@ if TYPE_CHECKING:
         NodePair,
         ParamSpace,
     )
+    from kube_autotuner.progress import ProgressObserver
     from kube_autotuner.sysctl.backend import SysctlBackend
 
 logger = logging.getLogger(__name__)
@@ -408,6 +410,7 @@ class OptimizationLoop:
         patches: list[Patch] | None = None,
         objectives: ObjectivesSection,
         cni: CniSection | None = None,
+        observer: ProgressObserver | None = None,
     ) -> None:
         """Wire up the Ax client, benchmark runner, and sysctl setters.
 
@@ -430,6 +433,11 @@ class OptimizationLoop:
                 handed to Ax via :func:`build_ax_objective`.
             cni: Selector for CNI pods tracked by the benchmark
                 runner's resource sampler on the target node.
+            observer: Optional progress callback. Defaults to
+                :class:`~kube_autotuner.progress.NullObserver`. The
+                same instance is forwarded to the internal
+                :class:`~kube_autotuner.benchmark.runner.BenchmarkRunner`
+                so iteration-level hooks share the live display.
         """
         self.node_pair: NodePair = node_pair
         self.config: BenchmarkConfig = config
@@ -441,6 +449,7 @@ class OptimizationLoop:
         self.iperf_args: IperfSection | None = iperf_args
         self.patches: list[Patch] | None = patches
         self.cni: CniSection | None = cni
+        self.observer: ProgressObserver = observer or NullObserver()
 
         unobservable: set[str] = set()
         if "tcp" not in config.modes:
@@ -502,6 +511,7 @@ class OptimizationLoop:
             iperf_args=iperf_args,
             patches=patches,
             cni=cni,
+            observer=self.observer,
         )
         self._completed: list[TrialResult] = []
 
@@ -665,6 +675,7 @@ class OptimizationLoop:
             cpu,
             rate_str,
         )
+        self.observer.on_trial_complete(i, phase, metrics)
 
     def run(self) -> list[TrialResult]:
         """Execute the full optimization loop.
@@ -685,12 +696,18 @@ class OptimizationLoop:
             i = 0
             while not self._should_stop(i):
                 trial_index, parameterization, phase = self._suggest(i)
+                self.observer.on_trial_start(
+                    i,
+                    self.n_trials,
+                    phase,
+                    parameterization,
+                )
                 try:
                     metrics = self._evaluate(parameterization)
                     self._record(i, phase, trial_index, metrics)
                 except KeyboardInterrupt:
                     raise
-                except Exception:
+                except Exception as e:
                     logger.warning(
                         "Trial %d/%d failed, continuing",
                         i + 1,
@@ -698,6 +715,7 @@ class OptimizationLoop:
                         exc_info=True,
                     )
                     self.client.mark_trial_failed(trial_index=trial_index)
+                    self.observer.on_trial_failed(i, e)
                 i += 1
         except KeyboardInterrupt:
             logger.info("Interrupted after %d trials", len(self._completed))

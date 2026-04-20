@@ -10,17 +10,28 @@ caller of
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
 
+from rich.console import Console
+from rich.logging import RichHandler
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    TextColumn,
+    TimeElapsedColumn,
+)
 import typer
 
 from kube_autotuner import __version__, runs
 from kube_autotuner.experiment import ExperimentConfig, ExperimentConfigError
 from kube_autotuner.k8s.client import K8sClient
 from kube_autotuner.models import TrialLog
+from kube_autotuner.progress import make_observer
 from kube_autotuner.report import format_retransmit_rate
 from kube_autotuner.sysctl.setter import (
     make_sysctl_setter,
@@ -29,10 +40,44 @@ from kube_autotuner.sysctl.setter import (
 
 if TYPE_CHECKING:
     from kube_autotuner.experiment import ObjectivesSection
+    from kube_autotuner.progress import ProgressObserver
     from kube_autotuner.sysctl.backend import SysctlBackend
     from kube_autotuner.sysctl.setter import BackendName
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class AppState:
+    """Shared CLI state threaded through every long-running command.
+
+    Attributes:
+        console: The single :class:`rich.console.Console` used by
+            both the root logger's :class:`RichHandler` and any
+            :class:`~kube_autotuner.progress.RichProgressObserver`.
+            Sharing one instance is what lets log records render
+            above live progress regions instead of tearing through
+            them.
+        progress_enabled: ``True`` when the console is a TTY and the
+            user did not pass ``--no-progress``.
+    """
+
+    console: Console
+    progress_enabled: bool
+
+    def make_observer(self) -> ProgressObserver:
+        """Build a progress observer honoring the current CLI flags.
+
+        Returns:
+            A :class:`~kube_autotuner.progress.RichProgressObserver`
+            when :attr:`progress_enabled` is ``True``; otherwise a
+            :class:`~kube_autotuner.progress.NullObserver`.
+        """
+        return make_observer(
+            enabled=self.progress_enabled,
+            console=self.console,
+        )
+
 
 app = typer.Typer(
     name="kube-autotuner",
@@ -60,11 +105,19 @@ def _version_callback(value: bool) -> None:
 
 @app.callback()
 def main(
+    ctx: typer.Context,
     verbose: Annotated[
         bool,
         typer.Option("-v", "--verbose", help="Enable debug logging."),
     ] = False,
-    version: Annotated[  # noqa: ARG001 - consumed by the eager callback
+    no_progress: Annotated[
+        bool,
+        typer.Option(
+            "--no-progress",
+            help="Disable the live progress display (logs only).",
+        ),
+    ] = False,
+    _version: Annotated[
         bool,
         typer.Option(
             "--version",
@@ -76,9 +129,37 @@ def main(
 ) -> None:
     """kube-autotuner root command."""
     level = logging.DEBUG if verbose else logging.INFO
-    # ``force=True`` rebinds the handler to the current ``sys.stderr`` so
-    # repeated ``CliRunner.invoke`` calls each see the redirected stream.
-    logging.basicConfig(level=level, format="%(levelname)s: %(message)s", force=True)
+    # One stderr console shared across RichHandler and any progress
+    # observer. ``Console`` auto-detects TTY; under ``CliRunner`` the
+    # redirected stderr buffer reports ``is_terminal = False`` and
+    # progress cleanly degrades to plain logging.
+    console = Console(stderr=True)
+    progress_enabled = console.is_terminal and not no_progress
+    ctx.obj = AppState(console=console, progress_enabled=progress_enabled)
+    if progress_enabled:
+        handler: logging.Handler = RichHandler(
+            console=console,
+            show_path=False,
+            markup=False,
+            log_time_format="%H:%M:%S",
+            rich_tracebacks=True,
+        )
+        logging.basicConfig(
+            level=level,
+            format="%(message)s",
+            datefmt="[%X]",
+            handlers=[handler],
+            force=True,
+        )
+    else:
+        # ``force=True`` rebinds the handler to the current ``sys.stderr``
+        # so repeated ``CliRunner.invoke`` calls each see the redirected
+        # stream.
+        logging.basicConfig(
+            level=level,
+            format="%(levelname)s: %(message)s",
+            force=True,
+        )
 
 
 # --- helpers ------------------------------------------------------------
@@ -240,6 +321,7 @@ def _build_context(
     *,
     backend: str | None,
     fake_state_path: Path | None,
+    observer: ProgressObserver,
 ) -> runs.RunContext:
     """Build a :class:`~kube_autotuner.runs.RunContext` for a run mode.
 
@@ -248,6 +330,8 @@ def _build_context(
         backend: Explicit backend override, or ``None`` for env-driven
             resolution.
         fake_state_path: JSON state file when ``backend="fake"``.
+        observer: Progress observer for the run. Passed verbatim into
+            the returned :class:`RunContext`.
 
     Returns:
         A :class:`RunContext` with a freshly constructed
@@ -266,7 +350,13 @@ def _build_context(
         client=client,
         backend=sysctl_backend,
         output=Path(exp.output),
+        observer=observer,
     )
+
+
+def _app_state(ctx: typer.Context) -> AppState:
+    """Return the shared :class:`AppState` attached by the root callback."""
+    return cast("AppState", ctx.obj)
 
 
 # --- subcommands ---------------------------------------------------------
@@ -274,6 +364,7 @@ def _build_context(
 
 @app.command()
 def baseline(
+    ctx: typer.Context,
     sources: Annotated[
         list[str],
         typer.Option(
@@ -335,12 +426,20 @@ def baseline(
         iterations=iterations,
         udp=udp,
     )
-    ctx = _build_context(exp, backend=backend, fake_state_path=fake_state_path)
-    runs.run_baseline(ctx)
+    observer = _app_state(ctx).make_observer()
+    run_ctx = _build_context(
+        exp,
+        backend=backend,
+        fake_state_path=fake_state_path,
+        observer=observer,
+    )
+    with observer:
+        runs.run_baseline(run_ctx)
 
 
 @app.command()
 def trial(
+    ctx: typer.Context,
     sources: Annotated[
         list[str],
         typer.Option("--source", help="Source node hostname (repeatable)."),
@@ -409,12 +508,20 @@ def trial(
         udp=udp,
         sysctls=params,
     )
-    ctx = _build_context(exp, backend=backend, fake_state_path=fake_state_path)
-    runs.run_trial(ctx)
+    observer = _app_state(ctx).make_observer()
+    run_ctx = _build_context(
+        exp,
+        backend=backend,
+        fake_state_path=fake_state_path,
+        observer=observer,
+    )
+    with observer:
+        runs.run_trial(run_ctx)
 
 
 @app.command()
 def optimize(
+    ctx: typer.Context,
     sources: Annotated[
         list[str],
         typer.Option("--source", help="Source node hostname (repeatable)."),
@@ -493,12 +600,20 @@ def optimize(
             "apply_source": apply_source,
         },
     )
-    ctx = _build_context(exp, backend=backend, fake_state_path=fake_state_path)
-    runs.run_optimize(ctx)
+    observer = _app_state(ctx).make_observer()
+    run_ctx = _build_context(
+        exp,
+        backend=backend,
+        fake_state_path=fake_state_path,
+        observer=observer,
+    )
+    with observer:
+        runs.run_optimize(run_ctx)
 
 
 @app.command()
 def run(
+    ctx: typer.Context,
     config_path: Annotated[
         Path,
         typer.Option(
@@ -546,18 +661,21 @@ def run(
         client=client,
         fake_state_path=fake_state_path,
     )
-    ctx = runs.RunContext(
+    observer = _app_state(ctx).make_observer()
+    run_ctx = runs.RunContext(
         exp=exp,
         client=client,
         backend=sysctl_backend,
         output=Path(exp.output),
+        observer=observer,
     )
-    if exp.mode == "baseline":
-        runs.run_baseline(ctx)
-    elif exp.mode == "trial":
-        runs.run_trial(ctx)
-    else:
-        runs.run_optimize(ctx)
+    with observer:
+        if exp.mode == "baseline":
+            runs.run_baseline(run_ctx)
+        elif exp.mode == "trial":
+            runs.run_trial(run_ctx)
+        else:
+            runs.run_optimize(run_ctx)
 
 
 @sysctl_app.command("set")
@@ -649,6 +767,7 @@ def sysctl_get(
 
 @app.command()
 def analyze(
+    ctx: typer.Context,
     input_file: Annotated[
         Path,
         typer.Option(
@@ -711,20 +830,35 @@ def analyze(
         raise typer.Exit(code=1)
 
     sections: list[dict[str, Any]] = []
-    for hw in classes:
-        section = _analyze_one_class(
-            trials,
-            hardware_class=hw,
-            topology=topology,
-            top_n=top_n,
-            output_dir=output_dir,
-            analysis=analysis,
-            plots=plots,
-            explicit_class=hardware_class is not None,
-            objectives=objectives,
-        )
-        if section is not None:
-            sections.append(section)
+    state = _app_state(ctx)
+    progress = Progress(
+        TextColumn("[bold]{task.description}[/bold]"),
+        BarColumn(bar_width=None),
+        MofNCompleteColumn(),
+        TextColumn("[dim]elapsed[/dim]"),
+        TimeElapsedColumn(),
+        console=state.console,
+        disable=not state.progress_enabled,
+        transient=True,
+    )
+    with progress:
+        task_id = progress.add_task("Analyzing hardware classes", total=len(classes))
+        for hw in classes:
+            progress.update(task_id, description=f"Analyzing {hw}")
+            section = _analyze_one_class(
+                trials,
+                hardware_class=hw,
+                topology=topology,
+                top_n=top_n,
+                output_dir=output_dir,
+                analysis=analysis,
+                plots=plots,
+                explicit_class=hardware_class is not None,
+                objectives=objectives,
+            )
+            if section is not None:
+                sections.append(section)
+            progress.advance(task_id)
 
     if sections:
         index_path = report.write_index_html(output_dir, sections)

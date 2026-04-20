@@ -48,7 +48,7 @@ place to call
 from __future__ import annotations
 
 import contextlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import logging
 import math
 from typing import TYPE_CHECKING, cast
@@ -56,6 +56,7 @@ from typing import TYPE_CHECKING, cast
 from kube_autotuner.benchmark.runner import BenchmarkRunner
 from kube_autotuner.k8s.lease import NodeLease
 from kube_autotuner.models import TrialLog, TrialResult
+from kube_autotuner.progress import NullObserver
 from kube_autotuner.report import format_retransmit_rate
 from kube_autotuner.sysctl.params import PARAM_SPACE
 
@@ -66,6 +67,7 @@ if TYPE_CHECKING:
     from kube_autotuner.experiment import ExperimentConfig
     from kube_autotuner.k8s.client import K8sClient
     from kube_autotuner.models import NodePair
+    from kube_autotuner.progress import ProgressObserver
     from kube_autotuner.sysctl.backend import SysctlBackend
 
 logger = logging.getLogger(__name__)
@@ -98,12 +100,18 @@ class RunContext:
             Usually ``Path(exp.output)``; decoupled from ``exp`` so
             callers can redirect the sink without rewriting the
             config.
+        observer: Progress callback threaded into
+            :class:`BenchmarkRunner` / :class:`OptimizationLoop`.
+            Defaults to :class:`NullObserver` so library consumers
+            and tests get zero output side-effects; the CLI overrides
+            it with a :class:`RichProgressObserver` under a TTY.
     """
 
     exp: ExperimentConfig
     client: K8sClient
     backend: SysctlBackend
     output: Path
+    observer: ProgressObserver = field(default_factory=NullObserver)
 
 
 def _resolve_zones(node_pair: NodePair, client: K8sClient) -> NodePair:
@@ -199,6 +207,7 @@ def run_baseline(ctx: RunContext) -> None:
             iperf_args=exp.iperf,
             patches=exp.patches,
             cni=exp.cni,
+            observer=ctx.observer,
         )
         try:
             runner.setup_server()
@@ -281,6 +290,7 @@ def run_trial(ctx: RunContext) -> None:
             iperf_args=exp.iperf,
             patches=exp.patches,
             cni=exp.cni,
+            observer=ctx.observer,
         )
         try:
             runner.setup_server()
@@ -363,6 +373,7 @@ def run_optimize(ctx: RunContext) -> None:
         patches=exp.patches,
         objectives=exp.objectives,
         cni=exp.cni,
+        observer=ctx.observer,
     )
     trials = loop.run()
     logger.info("Completed %d trials. Results in %s", len(trials), ctx.output)

@@ -37,10 +37,12 @@ from kube_autotuner.benchmark.patch import apply_patches
 from kube_autotuner.benchmark.server_spec import build_server_yaml
 from kube_autotuner.experiment import CniSection, IperfSection
 from kube_autotuner.k8s.client import K8sApiError, K8sClient
+from kube_autotuner.progress import NullObserver
 
 if TYPE_CHECKING:
     from kube_autotuner.experiment import Patch
     from kube_autotuner.models import BenchmarkConfig, BenchmarkResult, NodePair
+    from kube_autotuner.progress import ProgressObserver
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +63,8 @@ class BenchmarkRunner:
         iperf_args: IperfSection | None = None,
         patches: list[Patch] | None = None,
         cni: CniSection | None = None,
+        *,
+        observer: ProgressObserver | None = None,
     ) -> None:
         """Wire the runner to a node pair and benchmark config.
 
@@ -77,6 +81,9 @@ class BenchmarkRunner:
                 Job) via :func:`kube_autotuner.benchmark.patch.apply_patches`.
             cni: Selector for CNI pods to track on the target node. When
                 ``enabled`` is ``False``, CNI sampling is skipped.
+            observer: Optional progress callback. Defaults to
+                :class:`~kube_autotuner.progress.NullObserver` so
+                library consumers and tests see no output side-effects.
         """
         self.node_pair = node_pair
         self.config = config
@@ -84,6 +91,7 @@ class BenchmarkRunner:
         self.iperf_args = iperf_args or IperfSection()
         self.patches = patches or []
         self.cni = cni or CniSection()
+        self.observer: ProgressObserver = observer or NullObserver()
         self._server_name = f"iperf3-server-{node_pair.target}"
         self._clients = list(node_pair.all_sources)
         self._ports = {c: _IPERF_BASE_PORT + i for i, c in enumerate(self._clients)}
@@ -258,6 +266,7 @@ class BenchmarkRunner:
         """
         results: list[BenchmarkResult] = []
         for mode in self.config.modes:
+            self.observer.on_mode_start(mode, self.config.iterations)
             for i in range(self.config.iterations):
                 logger.info(
                     "Running %s iteration %d/%d: %s -> %s",
@@ -267,6 +276,7 @@ class BenchmarkRunner:
                     self._clients,
                     self.node_pair.target,
                 )
+                self.observer.on_iteration_start(mode, i)
                 stop = threading.Event()
                 sink: queue.Queue[dict[str, int]] = queue.Queue()
                 sampler = threading.Thread(
@@ -281,6 +291,7 @@ class BenchmarkRunner:
                 finally:
                     stop.set()
                     sampler.join(timeout=SAMPLE_INTERVAL_S * 2)
+                    self.observer.on_iteration_end(mode, i)
                 samples: list[dict[str, int]] = []
                 while True:
                     try:

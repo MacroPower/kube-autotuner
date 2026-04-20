@@ -11,6 +11,7 @@ from typer.testing import CliRunner
 from kube_autotuner import __version__
 from kube_autotuner.cli import app
 from kube_autotuner.experiment import PreflightResult
+from kube_autotuner.progress import NullObserver, RichProgressObserver
 from kube_autotuner.sysctl.fake import FakeSysctlBackend
 
 if TYPE_CHECKING:
@@ -28,6 +29,7 @@ def test_root_help() -> None:
     assert result.stdout.strip()
     for sub in ("baseline", "trial", "optimize", "run", "sysctl"):
         assert sub in result.stdout
+    assert "--no-progress" in result.stdout
 
 
 def test_version_flag() -> None:
@@ -91,6 +93,85 @@ def test_sysctl_set_help() -> None:
 
 def _fake_backend(tmp_path: Path) -> FakeSysctlBackend:
     return FakeSysctlBackend("node-a", tmp_path / "sysctl_state.json")
+
+
+def test_no_progress_yields_null_observer(tmp_path: Path) -> None:
+    out = tmp_path / "results.jsonl"
+    with (
+        patch("kube_autotuner.cli.K8sClient") as client_cls,
+        patch("kube_autotuner.cli._resolve_backend") as resolve,
+        patch("kube_autotuner.cli.runs.run_baseline") as run_baseline,
+    ):
+        client_cls.return_value = MagicMock()
+        resolve.return_value = _fake_backend(tmp_path)
+
+        result = runner.invoke(
+            app,
+            [
+                "--no-progress",
+                "baseline",
+                "--source",
+                "a",
+                "--target",
+                "b",
+                "--duration",
+                "1",
+                "--iterations",
+                "1",
+                "--output",
+                str(out),
+                "--backend",
+                "fake",
+                "--fake-state-path",
+                str(tmp_path / "sysctl_state.json"),
+            ],
+        )
+    assert result.exit_code == 0, result.output
+    ctx = run_baseline.call_args.args[0]
+    assert isinstance(ctx.observer, NullObserver)
+    # CliRunner captures a non-TTY buffer, so no rich escape codes leak in.
+    assert "\x1b[" not in result.output
+
+
+def test_progress_enabled_under_forced_terminal(tmp_path: Path) -> None:
+    out = tmp_path / "results.jsonl"
+    # Force the shared Console to report is_terminal=True so the CLI
+    # selects the rich observer branch under ``CliRunner``.
+    with (
+        patch("kube_autotuner.cli.K8sClient") as client_cls,
+        patch("kube_autotuner.cli._resolve_backend") as resolve,
+        patch("kube_autotuner.cli.runs.run_baseline") as run_baseline,
+        patch("kube_autotuner.cli.Console") as console_cls,
+    ):
+        client_cls.return_value = MagicMock()
+        resolve.return_value = _fake_backend(tmp_path)
+        forced = MagicMock()
+        forced.is_terminal = True
+        console_cls.return_value = forced
+
+        result = runner.invoke(
+            app,
+            [
+                "baseline",
+                "--source",
+                "a",
+                "--target",
+                "b",
+                "--duration",
+                "1",
+                "--iterations",
+                "1",
+                "--output",
+                str(out),
+                "--backend",
+                "fake",
+                "--fake-state-path",
+                str(tmp_path / "sysctl_state.json"),
+            ],
+        )
+    assert result.exit_code == 0, result.output
+    ctx = run_baseline.call_args.args[0]
+    assert isinstance(ctx.observer, RichProgressObserver)
 
 
 def test_baseline_invokes_run_baseline(tmp_path: Path) -> None:
