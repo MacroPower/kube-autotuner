@@ -26,6 +26,11 @@ dev = [
     "types-PyYAML>=6.0",
 ]
 optimize = ["ax-platform>=1.0"]
+analysis = [
+    "pandas>=2.0",
+    "plotly>=5.0",
+    "scikit-learn>=1.3",
+]
 
 [build-system]
 requires = ["uv_build>=0.11,<0.12"]
@@ -158,6 +163,19 @@ unused-ignore-comment = "warn"
 # at runtime inside the helpers, not at type-check time.
 [[tool.ty.overrides]]
 include = ["src/kube_autotuner/optimizer.py"]
+
+[tool.ty.overrides.rules]
+unresolved-import = "ignore"
+
+# pandas / plotly / scikit-learn live in the optional `analysis` group, so
+# under the base `dev` sync their imports cannot be resolved. The analysis
+# modules follow the same lazy-import discipline as `optimizer.py`.
+[[tool.ty.overrides]]
+include = [
+    "src/kube_autotuner/analysis.py",
+    "src/kube_autotuner/report.py",
+    "src/kube_autotuner/plots.py",
+]
 
 [tool.ty.overrides.rules]
 unresolved-import = "ignore"

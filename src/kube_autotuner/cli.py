@@ -20,6 +20,7 @@ import typer
 from kube_autotuner import __version__, runs
 from kube_autotuner.experiment import ExperimentConfig, ExperimentConfigError
 from kube_autotuner.k8s.client import Kubectl
+from kube_autotuner.models import TrialLog
 from kube_autotuner.sysctl.setter import (
     make_sysctl_setter,
     make_sysctl_setter_from_env,
@@ -637,3 +638,255 @@ def sysctl_get(
     )
     values = setter.get(list(param))
     typer.echo(json.dumps(values, indent=2))
+
+
+# --- analyze subcommand --------------------------------------------------
+
+
+@app.command()
+def analyze(
+    input_file: Annotated[
+        Path,
+        typer.Option(
+            "-i",
+            "--input",
+            exists=True,
+            dir_okay=False,
+            help="Path to the JSONL trial data file.",
+        ),
+    ],
+    output_dir: Annotated[
+        Path,
+        typer.Option(
+            "-o",
+            "--output-dir",
+            help="Directory for HTML plots and JSON report.",
+        ),
+    ] = Path("analysis_output"),
+    hardware_class: Annotated[
+        Literal["1g", "10g"] | None,
+        typer.Option(
+            "--hardware-class",
+            help="Filter to a single hardware class (default: analyze all).",
+        ),
+    ] = None,
+    top_n: Annotated[
+        int,
+        typer.Option("--top-n", help="Number of recommended configs."),
+    ] = 3,
+    topology: Annotated[
+        Literal["intra-az", "inter-az"] | None,
+        typer.Option(
+            "--topology",
+            help="Filter to a topology (default: analyze all).",
+        ),
+    ] = None,
+) -> None:
+    """Analyze trial data: Pareto frontier, parameter importance, recommendations.
+
+    Raises:
+        typer.Exit: Input JSONL is empty or the requested hardware
+            class has no trials.
+    """
+    from kube_autotuner import analysis, plots, report  # noqa: PLC0415
+
+    trials = TrialLog.load(input_file)
+    if not trials:
+        typer.echo(f"No trials found in {input_file}", err=True)
+        raise typer.Exit(code=1)
+
+    if hardware_class is not None:
+        classes = [hardware_class]
+    else:
+        classes = sorted({t.node_pair.hardware_class for t in trials})
+    if not classes:
+        typer.echo("No hardware classes found in data", err=True)
+        raise typer.Exit(code=1)
+
+    sections: list[dict[str, Any]] = []
+    for hw in classes:
+        section = _analyze_one_class(
+            trials,
+            hardware_class=hw,
+            topology=topology,
+            top_n=top_n,
+            output_dir=output_dir,
+            analysis=analysis,
+            plots=plots,
+            explicit_class=hardware_class is not None,
+        )
+        if section is not None:
+            sections.append(section)
+
+    if sections:
+        index_path = report.write_index_html(output_dir, sections)
+        typer.echo(f"\nCombined report: {index_path}")
+
+
+def _analyze_one_class(
+    trials: list[Any],
+    *,
+    hardware_class: str,
+    topology: str | None,
+    top_n: int,
+    output_dir: Path,
+    analysis: Any,  # noqa: ANN401
+    plots: Any,  # noqa: ANN401
+    explicit_class: bool,
+) -> dict[str, Any] | None:
+    """Produce analysis output for a single hardware class.
+
+    Writes per-figure HTML, ``recommendations.json``, and
+    ``importance.json`` under ``output_dir / hardware_class / ...`` and
+    returns a section dict suitable for
+    :func:`kube_autotuner.report.write_index_html`.
+
+    Args:
+        trials: The full trial list (unfiltered).
+        hardware_class: The hardware-class label to analyse.
+        topology: Optional topology filter.
+        top_n: Number of recommendations to emit.
+        output_dir: Root output directory.
+        analysis: The lazy-imported ``kube_autotuner.analysis`` module.
+        plots: The lazy-imported ``kube_autotuner.plots`` module.
+        explicit_class: ``True`` when the user supplied
+            ``--hardware-class``; in that case an empty result is a
+            hard error (no other class will be tried), otherwise we
+            log and skip.
+
+    Returns:
+        A section dict describing the analysis, or ``None`` when the
+        class produced no trials and the caller supplied no explicit
+        filter.
+
+    Raises:
+        typer.Exit: The user supplied an explicit
+            ``--hardware-class`` filter but no trials matched.
+    """
+    hw_trials = [t for t in trials if t.node_pair.hardware_class == hardware_class]
+    if topology is not None:
+        hw_trials = [t for t in hw_trials if t.topology == topology]
+
+    cardinalities = {len(t.node_pair.all_sources) for t in hw_trials}
+    if len(cardinalities) > 1:
+        typer.echo(
+            f"WARNING: hardware class '{hardware_class}' mixes trials with different "
+            f"client counts {sorted(cardinalities)}; throughput is not "
+            f"directly comparable across cardinalities.",
+            err=True,
+        )
+
+    df, _ = analysis.trials_to_dataframe(
+        trials,
+        hardware_class=hardware_class,
+        topology=topology,
+    )
+    if df.empty:
+        if explicit_class:
+            typer.echo(
+                f"No trials for hardware class '{hardware_class}'",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        typer.echo(
+            f"No trials for hardware class '{hardware_class}', skipping",
+            err=True,
+        )
+        return None
+
+    front = analysis.pareto_front(df)
+    pareto_mask = df["trial_id"].isin(front["trial_id"])
+    importance = analysis.parameter_importance(df)
+    recs = analysis.recommend_configs(
+        trials,
+        hardware_class,
+        n=top_n,
+        topology=topology,
+    )
+
+    hw_dir = output_dir / hardware_class
+    hw_dir.mkdir(parents=True, exist_ok=True)
+
+    figures = _write_figures(
+        df=df,
+        front=front,
+        pareto_mask=pareto_mask,
+        importance=importance,
+        hw_dir=hw_dir,
+        plots=plots,
+    )
+
+    (hw_dir / "recommendations.json").write_text(
+        json.dumps(recs, indent=2) + "\n",
+    )
+    (hw_dir / "importance.json").write_text(
+        importance.to_json(orient="records", indent=2) + "\n",
+    )
+
+    typer.echo(
+        f"\n=== {hardware_class} ({len(df)} trials, {len(front)} Pareto-optimal) ===",
+    )
+    typer.echo(f"Output: {hw_dir}")
+    if recs:
+        r = recs[0]
+        typer.echo(
+            f"Top recommendation: {r['mean_throughput'] / 1e6:.1f} Mbps, "
+            f"{r['mean_cpu']:.1f}% CPU, {r['total_retransmits']} retransmits",
+        )
+
+    return {
+        "hardware_class": hardware_class,
+        "trial_count": len(df),
+        "pareto_count": len(front),
+        "topology": topology,
+        "recommendations": recs,
+        "importance": importance,
+        "figures": figures,
+    }
+
+
+def _write_figures(
+    *,
+    df: Any,  # noqa: ANN401
+    front: Any,  # noqa: ANN401
+    pareto_mask: Any,  # noqa: ANN401
+    importance: Any,  # noqa: ANN401
+    hw_dir: Path,
+    plots: Any,  # noqa: ANN401
+) -> list[tuple[str, Any]]:
+    """Render every per-hardware-class figure and write it to disk.
+
+    Args:
+        df: The per-class DataFrame.
+        front: The Pareto frontier DataFrame.
+        pareto_mask: Boolean mask marking Pareto-optimal rows of
+            ``df``.
+        importance: The parameter-importance DataFrame.
+        hw_dir: Per-hardware-class output directory.
+        plots: The lazy-imported ``kube_autotuner.plots`` module.
+
+    Returns:
+        A list of ``(label, figure)`` tuples ready to hand to
+        :func:`kube_autotuner.report.write_index_html`.
+    """
+    scatter_fig = plots.plot_pareto_scatter_matrix(df, pareto_mask)
+    scatter_fig.write_html(str(hw_dir / "pareto_scatter_matrix.html"))
+    figures: list[tuple[str, Any]] = [
+        ("Objective space (scatter matrix)", scatter_fig),
+    ]
+    for x, y in [
+        ("mean_throughput", "mean_cpu"),
+        ("mean_throughput", "total_retransmits"),
+        ("mean_cpu", "total_retransmits"),
+    ]:
+        fig = plots.plot_pareto_2d(df, front, x, y)
+        fig.write_html(str(hw_dir / f"pareto_{x}_vs_{y}.html"))
+        figures.append((f"Pareto: {x} vs {y}", fig))
+    if not importance.empty:
+        imp_fig = plots.plot_importance(importance)
+        imp_fig.write_html(str(hw_dir / "importance_throughput.html"))
+        figures.append(("Parameter importance", imp_fig))
+        heat_fig = plots.plot_param_heatmap(df, front, importance)
+        heat_fig.write_html(str(hw_dir / "param_heatmap.html"))
+        figures.append(("Pareto config heatmap", heat_fig))
+    return figures
