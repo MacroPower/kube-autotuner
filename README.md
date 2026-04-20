@@ -42,28 +42,83 @@ Python ≥ 3.14 is required. For a managed uv + Nix dev environment, see
 
 ## Quick start
 
-A minimal `experiment.yaml` for a TCP optimization run:
+A full `experiment.yaml` covering every field the loader accepts. Every
+section except `mode` and `nodes` is optional; the defaults shown below
+are what you get when you omit them.
 
 ```yaml
+# mode selects the command branch: baseline | trial | optimize.
+# `optimize:` is required when mode=optimize; `trial:` when mode=trial.
 mode: optimize
+
 nodes:
-  sources: [nodeA]
+  sources: [nodeA]               # >=1 source node; first entry is primary
   target: nodeB
-  hardwareClass: 10g
+  hardwareClass: 10g             # 1g | 10g
+  namespace: default
+  ipFamilyPolicy: RequireDualStack
+
 benchmark:
-  duration: 30
+  duration: 30                   # seconds of measurement per iteration
+  omit: 5                        # warmup seconds discarded from stats
   iterations: 3
-  modes: [tcp]
+  parallel: 16                   # iperf3 -P streams per client
+  window: null                   # iperf3 -w hint; e.g. "256K" to pin it
+  modes: [tcp]                   # any of: tcp, udp
+
+# Required when mode: optimize. Ax Bayesian loop knobs plus the search
+# space. Omit paramSpace to use the built-in canonical sysctl set.
 optimize:
-  nTrials: 10
-  nSobol: 3
+  nTrials: 50
+  nSobol: 15                     # quasi-random exploration trials; <= nTrials
+  applySource: false             # also write best sysctls on source nodes
   paramSpace:
     - name: net.core.rmem_max
-      paramType: int
+      paramType: int             # integer range: values = [min, max]
       values: [4194304, 67108864]
     - name: net.ipv4.tcp_congestion_control
-      paramType: choice
+      paramType: choice          # discrete set; values are strings or ints
       values: [cubic, bbr]
+
+# Required when mode: trial. Apply a fixed sysctl set for one benchmark.
+# trial:
+#   sysctls:
+#     net.core.rmem_max: 67108864
+#     net.ipv4.tcp_congestion_control: bbr
+
+# Extra iperf3 flags per role. Flags the tool itself owns (-t, -P, -w,
+# -u, -J, --bind, etc.) are rejected at preflight.
+iperf:
+  client:
+    extraArgs: ["--bidir", "-Z"]
+  server:
+    extraArgs: ["--forceflush"]
+
+# Kustomize patches layered onto the generated client/server manifests.
+# `patch:` accepts a Strategic Merge Patch body (dict), a JSON6902 op
+# list, or a pre-rendered patch string. Do not set target.namespace or
+# metadata.namespace -- namespace is controlled by nodes.namespace.
+patches:
+  - target:
+      kind: Job
+      name: iperf3-client        # also: group, version, labelSelector, annotationSelector
+    patch:
+      spec:
+        template:
+          spec:
+            containers:
+              - name: iperf3-client
+                resources:
+                  limits:
+                    memory: "2Gi"
+  - target:
+      kind: Deployment
+    strict: false                # default true; false lets the patch no-op
+    patch:
+      - op: add
+        path: /spec/template/spec/hostNetwork
+        value: true
+
 objectives:
   pareto:
     - { metric: throughput, direction: maximize }
@@ -79,21 +134,18 @@ objectives:
     cpu: 0.15
     retransmits: 0.3
     memory: 0.15
+
 output: out/results.jsonl
 ```
 
-`objectives:` is optional. When omitted, the loop optimises `throughput`
-(max) against `cpu`, `retransmits`, and `memory` (min) with default
-constraints and recommendation weights
-`{cpu: 0.15, memory: 0.15, retransmits: 0.3}`. Supplying `constraints:`
-or `recommendationWeights:` replaces the corresponding default list
-wholesale rather than extending it. Weights are only valid on
-minimize-direction metrics and must reference a metric present in
-`pareto`. Available metric names: `throughput`, `cpu`, `memory`,
+Supplying `constraints:` or `recommendationWeights:` replaces the
+default list wholesale rather than extending it. Weights are only valid
+on minimize-direction metrics and must reference a metric present in
+`pareto`. Valid metric names: `throughput`, `cpu`, `memory`,
 `retransmits`.
 
 See [`tests/fixtures/experiment_example.yaml`](tests/fixtures/experiment_example.yaml)
-for the full schema.
+for the canonical executable fixture.
 
 Run it:
 
