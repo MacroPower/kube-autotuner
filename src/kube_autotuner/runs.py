@@ -213,6 +213,9 @@ def run_baseline(ctx: RunContext) -> None:
     logger.info("Wrote %d results to %s", len(results), ctx.output)
     logger.info("Mean throughput: %.1f Mbps", trial.mean_throughput() / 1e6)
     logger.info("Mean CPU: %.1f%%", trial.mean_cpu())
+    mem = trial.mean_memory()
+    if mem > 0:
+        logger.info("Mean memory: %.1f MiB", mem / 1024 / 1024)
 
 
 def run_trial(ctx: RunContext) -> None:
@@ -292,6 +295,9 @@ def run_trial(ctx: RunContext) -> None:
         trial_result.mean_throughput() / 1e6,
     )
     logger.info("Mean CPU: %.1f%%", trial_result.mean_cpu())
+    mem = trial_result.mean_memory()
+    if mem > 0:
+        logger.info("Mean memory: %.1f MiB", mem / 1024 / 1024)
 
 
 def run_optimize(ctx: RunContext) -> None:

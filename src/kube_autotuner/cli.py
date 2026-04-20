@@ -833,7 +833,9 @@ def _analyze_one_class(
         r = recs[0]
         typer.echo(
             f"Top recommendation: {r['mean_throughput'] / 1e6:.1f} Mbps, "
-            f"{r['mean_cpu']:.1f}% CPU, {r['total_retransmits']} retransmits",
+            f"{r['mean_cpu']:.1f}% CPU, "
+            f"{r['mean_memory'] / 1024 / 1024:.0f} MiB, "
+            f"{r['total_retransmits']} retransmits",
         )
 
     return {
@@ -878,7 +880,9 @@ def _write_figures(
     ]
     for x, y in [
         ("mean_throughput", "mean_cpu"),
+        ("mean_throughput", "mean_memory"),
         ("mean_throughput", "total_retransmits"),
+        ("mean_cpu", "mean_memory"),
         ("mean_cpu", "total_retransmits"),
     ]:
         fig = plots.plot_pareto_2d(df, front, x, y)

@@ -65,6 +65,7 @@ def _minimal_section(
                 },
                 "mean_throughput": 4.2e10,
                 "mean_cpu": 33.9,
+                "mean_memory": 67108864,
                 "total_retransmits": 1,
                 "score": 0.95,
             },
@@ -87,6 +88,7 @@ def test_write_index_html_renders_all_sections(
     html_text = path.read_text()
 
     assert "<title>kube-autotuner analysis report</title>" in html_text
+    assert "memory (MiB)" in html_text
     for hw in hw_classes:
         assert f"href='#hw-{hw}'" in html_text
         assert f"id='hw-{hw}'" in html_text

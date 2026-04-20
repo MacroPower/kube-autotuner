@@ -105,6 +105,7 @@ def _render_recommendations(recs: list[dict[str, Any]]) -> str:
                 "trial_id": r["trial_id"],
                 "throughput (Mbps)": round(r["mean_throughput"] / 1e6, 1),
                 "cpu": f"{r['mean_cpu']:.1f}%",
+                "memory (MiB)": f"{r['mean_memory'] / 1024 / 1024:.0f}",
                 "retransmits": r["total_retransmits"],
                 "score": r["score"],
             }

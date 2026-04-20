@@ -217,6 +217,7 @@ class TestParetoFront:
                 "trial_id": ["A", "B", "C", "D"],
                 "mean_throughput": [100, 80, 60, 50],
                 "mean_cpu": [10, 5, 30, 20],
+                "mean_memory": [1e8, 2e8, 3e8, 5e8],
                 "total_retransmits": [1, 2, 0, 5],
             },
         )
@@ -231,6 +232,7 @@ class TestParetoFront:
                 "trial_id": ["A", "B"],
                 "mean_throughput": [100, 50],
                 "mean_cpu": [50, 10],
+                "mean_memory": [1e8, 2e8],
                 "total_retransmits": [5, 5],
             },
         )
@@ -243,10 +245,24 @@ class TestParetoFront:
                 "trial_id": ["A"],
                 "mean_throughput": [100],
                 "mean_cpu": [10],
+                "mean_memory": [1e8],
                 "total_retransmits": [1],
             },
         )
         assert len(pareto_front(df)) == 1
+
+    def test_memory_makes_trial_nondominated(self) -> None:
+        df = pd.DataFrame(
+            {
+                "trial_id": ["A", "B"],
+                "mean_throughput": [100, 100],
+                "mean_cpu": [10, 10],
+                "mean_memory": [1e8, 5e7],
+                "total_retransmits": [1, 1],
+            },
+        )
+        ids = set(pareto_front(df)["trial_id"])
+        assert "B" in ids
 
     def test_empty(self) -> None:
         df = pd.DataFrame(
@@ -254,13 +270,16 @@ class TestParetoFront:
                 "trial_id",
                 "mean_throughput",
                 "mean_cpu",
+                "mean_memory",
                 "total_retransmits",
             ],
         )
         assert pareto_front(df).empty
 
     def test_default_objectives_shape(self) -> None:
-        assert len(DEFAULT_OBJECTIVES) == 3
+        assert len(DEFAULT_OBJECTIVES) == 4
+        names = [n for n, _ in DEFAULT_OBJECTIVES]
+        assert "mean_memory" in names
 
 
 # --- parameter_importance -----------------------------------------------
@@ -346,6 +365,48 @@ class TestRecommendConfigs:
             if t.trial_id in rec_ids:
                 assert t.topology == "intra-az"
 
+    def test_output_includes_mean_memory(
+        self,
+        mixed_trials: list[TrialResult],
+    ) -> None:
+        recs = recommend_configs(mixed_trials, "10g", n=5)
+        assert recs, "expected at least one recommendation"
+        for r in recs:
+            assert "mean_memory" in r
+
+    def test_lower_memory_outranks_higher(self) -> None:
+        """Trials identical except memory: the lower-memory one wins.
+
+        Memory is a Pareto minimize-objective, so the higher-memory
+        twin is strictly dominated and drops out of the frontier before
+        scoring runs, leaving only the lower-memory trial.
+        """
+
+        def _trial_with_mem(mem: int, tid: str) -> TrialResult:
+            return TrialResult(
+                trial_id=tid,
+                node_pair=NodePair(source="a", target="b", hardware_class="10g"),
+                sysctl_values={"net.core.rmem_max": 212992 + mem},
+                config=BenchmarkConfig(duration=10, iterations=1),
+                results=[
+                    BenchmarkResult(
+                        timestamp=datetime.now(UTC),
+                        mode="tcp",
+                        bits_per_second=5e9,
+                        retransmits=3,
+                        cpu_utilization_percent=25.0,
+                        memory_used_bytes=mem,
+                    ),
+                ],
+            )
+
+        trials = [
+            _trial_with_mem(100_000_000, "hi-mem"),
+            _trial_with_mem(50_000_000, "lo-mem"),
+        ]
+        recs = recommend_configs(trials, "10g", n=2)
+        assert [r["trial_id"] for r in recs] == ["lo-mem"]
+
 
 # --- plots ---------------------------------------------------------------
 
@@ -372,6 +433,12 @@ class TestPlots:
         df, _ = trials_to_dataframe(mixed_trials, hardware_class="10g")
         front = pareto_front(df)
         fig = plot_pareto_2d(df, front, "mean_throughput", "mean_cpu")
+        assert fig is not None
+
+    def test_2d_memory_axis(self, mixed_trials: list[TrialResult]) -> None:
+        df, _ = trials_to_dataframe(mixed_trials, hardware_class="10g")
+        front = pareto_front(df)
+        fig = plot_pareto_2d(df, front, "mean_throughput", "mean_memory")
         assert fig is not None
 
     def test_importance(self, mixed_trials: list[TrialResult]) -> None:

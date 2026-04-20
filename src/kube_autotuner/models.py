@@ -230,6 +230,27 @@ class TrialResult(BaseModel):
             return 0.0
         return sum(per_iter_means) / len(per_iter_means)
 
+    def mean_memory(self) -> float:
+        """Return the mean pod memory usage in bytes.
+
+        Takes the per-iteration mean across records that reported memory,
+        then averages across iterations.
+
+        Returns:
+            The averaged memory in bytes, or ``0.0`` when no results
+            report memory.
+        """
+        per_iter_means: list[float] = []
+        for group in _group_by_iteration(self.results).values():
+            vals = [
+                r.memory_used_bytes for r in group if r.memory_used_bytes is not None
+            ]
+            if vals:
+                per_iter_means.append(sum(vals) / len(vals))
+        if not per_iter_means:
+            return 0.0
+        return sum(per_iter_means) / len(per_iter_means)
+
 
 class TrialLog:
     """Append-only JSON-lines persistence for :class:`TrialResult` records."""

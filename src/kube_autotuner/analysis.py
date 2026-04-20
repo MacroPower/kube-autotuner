@@ -35,6 +35,7 @@ _SYSCTL_COLUMNS: list[str] = PARAM_SPACE.param_names()
 DEFAULT_OBJECTIVES: list[tuple[str, str]] = [
     ("mean_throughput", "maximize"),
     ("mean_cpu", "minimize"),
+    ("mean_memory", "minimize"),
     ("total_retransmits", "minimize"),
 ]
 
@@ -46,11 +47,13 @@ _FRAME_BASE_COLUMNS: list[str] = [
     "target_zone",
     "mean_throughput",
     "mean_cpu",
+    "mean_memory",
     "total_retransmits",
 ]
 
 _MIN_SPEARMAN_SAMPLES = 3
-_RECOMMEND_CPU_WEIGHT = 0.3
+_RECOMMEND_CPU_WEIGHT = 0.15
+_RECOMMEND_MEM_WEIGHT = 0.15
 _RECOMMEND_RETX_WEIGHT = 0.3
 
 
@@ -190,6 +193,7 @@ def trials_to_dataframe(
             "target_zone": t.node_pair.target_zone,
             "mean_throughput": t.mean_throughput(),
             "mean_cpu": t.mean_cpu(),
+            "mean_memory": t.mean_memory(),
             "total_retransmits": t.total_retransmits(),
         }
         for key in _SYSCTL_COLUMNS:
@@ -409,8 +413,11 @@ def recommend_configs(
 
     The ranking picks from the Pareto frontier of the filtered trials
     and scores each candidate as
-    ``tp_norm - 0.3 * cpu_norm - 0.3 * retx_norm`` where each term is
-    min-max normalized across the Pareto set.
+    ``tp_norm - 0.15 * cpu_norm - 0.15 * mem_norm - 0.3 * retx_norm``
+    where each term is min-max normalized across the Pareto set. CPU
+    and memory split the cost weight evenly because higher CPU is
+    typically a symptom of better-tuned parameters enabling more
+    useful work rather than a cost in its own right.
 
     Args:
         trials: Input trial records (any number of hardware classes).
@@ -449,10 +456,14 @@ def recommend_configs(
 
     tp_norm = _norm(front["mean_throughput"])
     cpu_norm = _norm(front["mean_cpu"])
+    mem_norm = _norm(front["mean_memory"])
     rt_norm = _norm(front["total_retransmits"])
     front = front.copy()
     front["score"] = (
-        tp_norm - _RECOMMEND_CPU_WEIGHT * cpu_norm - _RECOMMEND_RETX_WEIGHT * rt_norm
+        tp_norm
+        - _RECOMMEND_CPU_WEIGHT * cpu_norm
+        - _RECOMMEND_MEM_WEIGHT * mem_norm
+        - _RECOMMEND_RETX_WEIGHT * rt_norm
     )
     front = front.sort_values("score", ascending=False).reset_index(drop=True)
 
@@ -466,6 +477,7 @@ def recommend_configs(
                 "sysctl_values": trial.sysctl_values,
                 "mean_throughput": row["mean_throughput"],
                 "mean_cpu": row["mean_cpu"],
+                "mean_memory": row["mean_memory"],
                 "total_retransmits": int(row["total_retransmits"]),
                 "score": round(row["score"], 4),
             },
