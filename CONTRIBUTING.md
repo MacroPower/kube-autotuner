@@ -29,6 +29,24 @@ task test
 task run -- tune my-node
 ```
 
+## Dependency groups
+
+The project splits dependencies into one runtime set and three PEP 735
+dev groups:
+
+- `dev` (mandatory): `pytest`, `pytest-cov`, `pytest-timeout`,
+  `types-PyYAML`. Installed by `uv sync` / `task bootstrap`.
+- `optimize` (optional): `ax-platform` for the Bayesian optimizer.
+  Install with `uv sync --group optimize` when you need to run
+  `kube-autotuner optimize` or `tests/test_optimizer.py` against the
+  real Ax engine — tests gated on Ax skip cleanly without it.
+- `analysis` (optional): `pandas`, `plotly`, `scikit-learn` for the
+  post-run reporting tools. Install with `uv sync --group analysis`.
+
+The optional groups are deliberately *not* nested inside `dev` so
+`task bootstrap` and the lefthook pre-push gate stay cheap. Run
+`uv sync --all-groups` when you want every group at once.
+
 ## Shell completions
 
 `task bootstrap` writes bash, zsh, and fish completion scripts into
