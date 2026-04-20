@@ -56,8 +56,14 @@ dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = [
     "S101",
+    "S404",
     "D1",
+    "DOC501",
+    "EM101",
+    "EM102",
+    "PLC1901",
     "PLR2004",
+    "PLR6301",
     "SLF001",
     "ANN",
     "INP001",

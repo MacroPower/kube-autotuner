@@ -23,6 +23,7 @@
               pkgs.ty
               pkgs.go-task
               pkgs.lefthook
+              pkgs.kubectl
             ];
 
             shellHook = ''
