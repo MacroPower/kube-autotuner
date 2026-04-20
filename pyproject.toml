@@ -75,6 +75,9 @@ dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
 ]
 "**/cli.py" = [
     "FBT",
+    "PLR0913",
+    "PLR0915",
+    "PLR0917",
 ]
 
 [tool.ruff.lint.pydocstyle]
