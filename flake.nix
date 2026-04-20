@@ -25,6 +25,7 @@
               pkgs.lefthook
               pkgs.kubectl
               pkgs.talosctl
+              pkgs.kustomize
             ];
 
             shellHook = ''
