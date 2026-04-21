@@ -346,16 +346,52 @@ class TestParetoFront:
         assert list(front["trial_id"]) == ["A"]
         assert any("NaN" in rec.message for rec in caplog.records)
 
-    def test_all_nan_returns_empty(self) -> None:
+    def test_all_nan_column_dropped_from_objectives(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A metric whose column is entirely NaN is silently excluded.
+
+        The canonical case is a trial log produced with
+        ``cni.enabled=false``: every ``mean_cni_memory`` cell is NaN.
+        Rather than dropping every trial (the previous behavior, which
+        emptied the frontier) or poisoning dominance with ``0.0``, the
+        objective is removed and the frontier is computed from the
+        remaining axes.
+        """
         df = pd.DataFrame(
             {
                 "trial_id": ["A", "B"],
                 "mean_throughput": [100, 50],
-                "mean_cpu": [10, 20],
+                "mean_cpu": [50, 10],
                 "mean_node_memory": [1e8, 2e8],
-                "mean_cni_memory": [1e7, 2e7],
-                "retransmit_rate": [float("nan"), float("nan")],
+                "mean_cni_memory": [float("nan"), float("nan")],
+                "retransmit_rate": [1e-7, 2e-7],
                 **_pad_latency_cols(2),
+            },
+        )
+        with caplog.at_level("INFO", logger="kube_autotuner.analysis"):
+            front = pareto_front(df)
+        assert set(front["trial_id"]) == {"A", "B"}
+        assert any(
+            "mean_cni_memory" in rec.message and "excluded" in rec.message
+            for rec in caplog.records
+        )
+
+    def test_all_objectives_dropped_returns_empty(self) -> None:
+        """If every objective column is NaN, the frontier is empty."""
+        df = pd.DataFrame(
+            {
+                "trial_id": ["A", "B"],
+                "mean_throughput": [float("nan"), float("nan")],
+                "mean_cpu": [float("nan"), float("nan")],
+                "mean_node_memory": [float("nan"), float("nan")],
+                "mean_cni_memory": [float("nan"), float("nan")],
+                "retransmit_rate": [float("nan"), float("nan")],
+                "mean_rps": [float("nan"), float("nan")],
+                "mean_latency_p50_ms": [float("nan"), float("nan")],
+                "mean_latency_p90_ms": [float("nan"), float("nan")],
+                "mean_latency_p99_ms": [float("nan"), float("nan")],
             },
         )
         assert pareto_front(df).empty
@@ -458,12 +494,17 @@ class TestRecommendConfigs:
         """Pin default scores against the baseline formula.
 
         With two non-dominated trials whose ``cpu``, ``retransmit_rate``,
-        ``cni_memory``, ``rps`` and every latency percentile are
-        constant, ``_norm`` clamps those columns to ``0.5``. For the
-        surviving ``throughput`` and ``node_memory`` axes, trial A
-        (higher throughput, higher memory) normalizes to ``(1.0, 1.0)``
-        and trial B (lower throughput, lower memory) to ``(0.0, 0.0)``.
-        The default formula with the added ``rps`` maximize objective
+        ``rps``, and every latency percentile are constant, ``_norm``
+        clamps those columns to ``0.5``. ``cni_memory`` is all-NaN
+        (never set on these trials) so
+        :func:`_objectives_with_data` excludes it -- but the exclusion
+        is score-neutral here because the default weights do not
+        include ``cni_memory`` and ``_norm`` of a constant would have
+        multiplied through by zero anyway. For the surviving
+        ``throughput`` and ``node_memory`` axes, trial A (higher
+        throughput, higher memory) normalizes to ``(1.0, 1.0)`` and
+        trial B (lower throughput, lower memory) to ``(0.0, 0.0)``.
+        The default formula with the ``rps`` maximize objective
         (unweighted ``+0.5`` for both) is:
 
         - score_A = 1.0 + 0.5 - 0.15 * 0.5 - 0.15 * 1.0 - 0.3 * 0.5 = 1.125
@@ -636,6 +677,43 @@ class TestRecommendConfigs:
         ]
         recs = recommend_configs(trials, "10g", n=2)
         assert [r["trial_id"] for r in recs] == ["lo-mem"]
+
+    def test_cni_disabled_returns_none_value_for_that_key(self) -> None:
+        """CNI-disabled trials keep the key present with a ``None`` value.
+
+        Every trial sets ``node_memory`` but leaves ``cni_memory`` unset,
+        mirroring a run with ``cni.enabled=false``. The recommendation
+        dict still has ``"mean_cni_memory"`` (contract preserved for
+        downstream consumers) but the value is ``None`` rather than a
+        misleading ``0.0``.
+        """
+
+        def _cni_disabled_trial(bps: float, tid: str) -> TrialResult:
+            return TrialResult(
+                trial_id=tid,
+                node_pair=NodePair(source="a", target="b", hardware_class="10g"),
+                sysctl_values={"net.core.rmem_max": 212992 + int(bps)},
+                config=BenchmarkConfig(duration=10, iterations=1),
+                results=[
+                    BenchmarkResult(
+                        timestamp=datetime.now(UTC),
+                        mode="tcp",
+                        bits_per_second=bps,
+                        retransmits=5,
+                        bytes_sent=1_000_000_000,
+                        cpu_utilization_percent=20.0,
+                        node_memory_used_bytes=100 * 1024 * 1024,
+                    ),
+                ],
+            )
+
+        trials = [_cni_disabled_trial(10e9, "a"), _cni_disabled_trial(5e9, "b")]
+        recs = recommend_configs(trials, "10g", n=2)
+        assert recs
+        for r in recs:
+            assert "mean_cni_memory" in r
+            assert r["mean_cni_memory"] is None
+            assert r["mean_node_memory"] is not None
 
 
 # --- plots ---------------------------------------------------------------

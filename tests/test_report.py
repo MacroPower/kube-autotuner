@@ -119,6 +119,17 @@ def test_write_index_html_handles_empty_importance(tmp_path: Path) -> None:
         assert f"Chart {i}" in html_text
 
 
+def test_write_index_html_omits_cni_column_when_all_none(tmp_path: Path) -> None:
+    section = _minimal_section("10g", n_figures=1)
+    for rec in section["recommendations"]:
+        rec["mean_cni_memory"] = None
+    path = report.write_index_html(tmp_path, [section])
+    html_text = path.read_text()
+
+    assert "cni memory (MiB)" not in html_text
+    assert "node memory (MiB)" in html_text
+
+
 def test_write_index_html_uses_cdn_not_inlined_plotly(tmp_path: Path) -> None:
     sections = [
         _minimal_section("10g", n_figures=2),

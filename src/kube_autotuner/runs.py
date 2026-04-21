@@ -234,10 +234,10 @@ def run_baseline(ctx: RunContext) -> None:
     logger.info("Mean throughput: %.1f Mbps", trial.mean_throughput() / 1e6)
     logger.info("Mean CPU: %.1f%%", trial.mean_cpu())
     nmem = trial.mean_node_memory()
-    if nmem > 0:
+    if nmem is not None:
         logger.info("Mean node memory: %.1f MiB", nmem / 1024 / 1024)
     cmem = trial.mean_cni_memory()
-    if cmem > 0:
+    if cmem is not None:
         logger.info("Mean CNI memory: %.1f MiB", cmem / 1024 / 1024)
     rps = trial.mean_rps()
     if rps > 0:
@@ -335,10 +335,10 @@ def run_trial(ctx: RunContext) -> None:  # noqa: PLR0914, PLR0915
     )
     logger.info("Mean CPU: %.1f%%", trial_result.mean_cpu())
     nmem = trial_result.mean_node_memory()
-    if nmem > 0:
+    if nmem is not None:
         logger.info("Mean node memory: %.1f MiB", nmem / 1024 / 1024)
     cmem = trial_result.mean_cni_memory()
-    if cmem > 0:
+    if cmem is not None:
         logger.info("Mean CNI memory: %.1f MiB", cmem / 1024 / 1024)
     rps = trial_result.mean_rps()
     if rps > 0:

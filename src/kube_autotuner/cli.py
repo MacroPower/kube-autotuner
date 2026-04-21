@@ -980,13 +980,18 @@ def _analyze_one_class(
     typer.echo(f"Output: {hw_dir}")
     if recs:
         r = recs[0]
-        typer.echo(
-            f"Top recommendation: {r['mean_throughput'] / 1e6:.1f} Mbps, "
-            f"{r['mean_cpu']:.1f}% CPU, "
-            f"node {r['mean_node_memory'] / 1024 / 1024:.0f} MiB, "
-            f"cni {r['mean_cni_memory'] / 1024 / 1024:.0f} MiB, "
-            f"{format_retransmit_rate(r['retransmit_rate'])} retx/MB",
-        )
+        parts: list[str] = [
+            f"{r['mean_throughput'] / 1e6:.1f} Mbps",
+            f"{r['mean_cpu']:.1f}% CPU",
+        ]
+        nmem = r["mean_node_memory"]
+        if nmem is not None:
+            parts.append(f"node {nmem / 1024 / 1024:.0f} MiB")
+        cmem = r["mean_cni_memory"]
+        if cmem is not None:
+            parts.append(f"cni {cmem / 1024 / 1024:.0f} MiB")
+        parts.append(f"{format_retransmit_rate(r['retransmit_rate'])} retx/MB")
+        typer.echo(f"Top recommendation: {', '.join(parts)}")
 
     return {
         "hardware_class": hardware_class,
@@ -1028,7 +1033,11 @@ def _write_figures(
     figures: list[tuple[str, Any]] = [
         ("Objective space (scatter matrix)", scatter_fig),
     ]
-    for x, y in [
+
+    def _has_data(col: str) -> bool:
+        return col in df.columns and bool(df[col].notna().any())
+
+    pair_candidates = [
         ("mean_throughput", "mean_cpu"),
         ("mean_throughput", "mean_node_memory"),
         ("mean_throughput", "mean_cni_memory"),
@@ -1036,7 +1045,10 @@ def _write_figures(
         ("mean_cpu", "mean_node_memory"),
         ("mean_cpu", "mean_cni_memory"),
         ("mean_cpu", "retransmit_rate"),
-    ]:
+    ]
+    for x, y in pair_candidates:
+        if not (_has_data(x) and _has_data(y)):
+            continue
         fig = plots.plot_pareto_2d(df, front, x, y)
         fig.write_html(str(hw_dir / f"pareto_{x}_vs_{y}.html"))
         figures.append((f"Pareto: {x} vs {y}", fig))

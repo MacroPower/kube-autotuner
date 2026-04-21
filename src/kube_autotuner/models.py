@@ -364,15 +364,16 @@ class TrialResult(BaseModel):
             return 0.0
         return sum(per_iter_means) / len(per_iter_means)
 
-    def mean_node_memory(self) -> float:
+    def mean_node_memory(self) -> float | None:
         """Return the mean target-node memory usage in bytes.
 
         Takes the per-iteration mean across records that reported
         node memory, then averages across iterations.
 
         Returns:
-            The averaged node memory in bytes, or ``0.0`` when no
-            results report node memory.
+            The averaged node memory in bytes, or ``None`` when no
+            results report node memory. ``None`` signals "not
+            measured" and is distinct from a real reading of ``0.0``.
         """
         per_iter_means: list[float] = []
         for group in _group_by_iteration(self.results).values():
@@ -384,18 +385,20 @@ class TrialResult(BaseModel):
             if vals:
                 per_iter_means.append(sum(vals) / len(vals))
         if not per_iter_means:
-            return 0.0
+            return None
         return sum(per_iter_means) / len(per_iter_means)
 
-    def mean_cni_memory(self) -> float:
+    def mean_cni_memory(self) -> float | None:
         """Return the mean CNI memory usage in bytes on the target node.
 
         Takes the per-iteration mean across records that reported CNI
         memory, then averages across iterations.
 
         Returns:
-            The averaged CNI memory in bytes, or ``0.0`` when no
-            results report CNI memory.
+            The averaged CNI memory in bytes, or ``None`` when no
+            results report CNI memory (e.g. ``cni.enabled=false`` or
+            the selector matched no pods). ``None`` signals "not
+            measured" and is distinct from a real reading of ``0.0``.
         """
         per_iter_means: list[float] = []
         for group in _group_by_iteration(self.results).values():
@@ -407,7 +410,7 @@ class TrialResult(BaseModel):
             if vals:
                 per_iter_means.append(sum(vals) / len(vals))
         if not per_iter_means:
-            return 0.0
+            return None
         return sum(per_iter_means) / len(per_iter_means)
 
     def mean_rps(self) -> float:

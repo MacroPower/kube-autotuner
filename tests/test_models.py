@@ -583,7 +583,7 @@ def test_trial_result_mean_node_memory_skips_none_per_group():
     assert trial.mean_node_memory() == pytest.approx(500_000_000)
 
 
-def test_trial_result_mean_node_memory_all_none_returns_zero():
+def test_trial_result_mean_node_memory_all_none_returns_none():
     results = [
         BenchmarkResult(
             timestamp=datetime.now(UTC),
@@ -600,7 +600,7 @@ def test_trial_result_mean_node_memory_all_none_returns_zero():
         config=BenchmarkConfig(),
         results=results,
     )
-    assert trial.mean_node_memory() == pytest.approx(0.0)
+    assert trial.mean_node_memory() is None
 
 
 def test_trial_result_mean_cni_memory_single_client():
@@ -697,7 +697,7 @@ def test_trial_result_mean_cni_memory_skips_none_per_group():
     assert trial.mean_cni_memory() == pytest.approx(50_000_000)
 
 
-def test_trial_result_mean_cni_memory_all_none_returns_zero():
+def test_trial_result_mean_cni_memory_all_none_returns_none():
     results = [
         BenchmarkResult(
             timestamp=datetime.now(UTC),
@@ -714,7 +714,7 @@ def test_trial_result_mean_cni_memory_all_none_returns_zero():
         config=BenchmarkConfig(),
         results=results,
     )
-    assert trial.mean_cni_memory() == pytest.approx(0.0)
+    assert trial.mean_cni_memory() is None
 
 
 def test_benchmark_result_new_fields_round_trip():

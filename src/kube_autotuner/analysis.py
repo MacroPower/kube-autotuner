@@ -232,6 +232,8 @@ def trials_to_dataframe(
         return pd.DataFrame(columns=_FRAME_BASE_COLUMNS + _SYSCTL_COLUMNS), {}
 
     df = pd.DataFrame(rows)
+    for col in METRIC_TO_DF_COLUMN.values():
+        df[col] = pd.to_numeric(df[col], errors="coerce")
     encoders = _encode_sysctl_columns(df, pd, label_encoder_cls)
     return df, encoders
 
@@ -273,17 +275,58 @@ def _encode_sysctl_columns(
     return encoders
 
 
+def _objectives_with_data(
+    df: pd.DataFrame,
+    objectives: list[tuple[str, str]],
+    *,
+    log: bool = True,
+) -> list[tuple[str, str]]:
+    """Drop objectives whose column is missing or all-NaN in ``df``.
+
+    A metric is excluded when its column is absent from ``df`` entirely
+    or when every value in that column is NaN. Both cases mean "not
+    measured for this experiment" -- the canonical example is
+    ``cni_memory`` when ``cni.enabled=false``.
+
+    Args:
+        df: Frame produced by :func:`trials_to_dataframe`.
+        objectives: List of ``(column, "maximize"|"minimize")`` tuples.
+        log: When ``True`` (default), emit one INFO line per dropped
+            objective so operators can see why a column disappeared
+            from reports and plots. Callers that re-filter an
+            already-filtered list pass ``log=False`` to avoid
+            duplicate output.
+
+    Returns:
+        The subset of ``objectives`` whose column has at least one
+        non-null value in ``df``, preserving input order.
+    """
+    kept: list[tuple[str, str]] = []
+    for col, direction in objectives:
+        if col in df.columns and df[col].notna().any():
+            kept.append((col, direction))
+        elif log:
+            logger.info(
+                "objective %r excluded: no trial reported this metric",
+                col,
+            )
+    return kept
+
+
 def pareto_front(
     df: pd.DataFrame,
     objectives: list[tuple[str, str]] | None = None,
 ) -> pd.DataFrame:
     """Return the non-dominated rows from ``df``.
 
-    Rows with a NaN value on any objective column are dropped before
-    the dominance scan — numpy comparisons against NaN are always
-    ``False``, so a NaN-bearing row is neither dominated nor
-    dominates, and would otherwise survive the frontier and poison
-    downstream normalization.
+    Objectives whose column is absent from ``df`` or entirely NaN are
+    dropped first (see :func:`_objectives_with_data`) so a
+    disabled-metric column does not reduce the frontier to the empty
+    set. Rows with a NaN value on any surviving objective column are
+    then dropped before the dominance scan — numpy comparisons against
+    NaN are always ``False``, so a NaN-bearing row is neither
+    dominated nor dominates, and would otherwise survive the frontier
+    and poison downstream normalization.
 
     Lazy-imports ``numpy`` and raises :exc:`RuntimeError` with the
     ``uv sync --group analysis`` hint when the group is missing.
@@ -304,6 +347,10 @@ def pareto_front(
 
     if df.empty:
         return df
+
+    objectives = _objectives_with_data(df, objectives)
+    if not objectives:
+        return df.iloc[0:0].reset_index(drop=True)
 
     cols = [col for col, _ in objectives]
     finite_mask = df[cols].notna().all(axis=1)
@@ -492,15 +539,16 @@ def recommend_configs(
     hint when the group is missing.
 
     Returns:
-        A list of recommendation dicts. Each dict always contains
-        ``rank``, ``trial_id``, ``sysctl_values``, the nine base
-        metric values (``mean_throughput``, ``mean_cpu``,
+        A list of recommendation dicts. Each dict always contains the
+        same keys (``rank``, ``trial_id``, ``sysctl_values``, the nine
+        base metric names -- ``mean_throughput``, ``mean_cpu``,
         ``mean_node_memory``, ``mean_cni_memory``,
         ``retransmit_rate``, ``mean_rps``,
         ``mean_latency_p50_ms``, ``mean_latency_p90_ms``,
-        ``mean_latency_p99_ms``) regardless of the configured Pareto
-        set, and a ``score``. Returns an empty list when no trials
-        match.
+        ``mean_latency_p99_ms`` -- and a ``score``). A metric value
+        is ``None`` when the trial produced no reading for it (e.g.
+        ``mean_cni_memory`` when CNI was disabled). Returns an empty
+        list when no trials match.
     """
     pd = _require_pandas()
     from kube_autotuner.experiment import ObjectivesSection  # noqa: PLC0415
@@ -522,6 +570,10 @@ def recommend_configs(
     tuple_objectives: list[tuple[str, str]] = [
         (METRIC_TO_DF_COLUMN[obj.metric], obj.direction) for obj in objectives
     ]
+    # Suppress the log here so the CLI's direct pareto_front call is
+    # the single source of truth for "excluded" INFO lines. We still
+    # need the filtered list locally for kept_cols below.
+    tuple_objectives = _objectives_with_data(df, tuple_objectives, log=False)
     front = pareto_front(df, objectives=tuple_objectives)
     if front.empty:
         return []
@@ -533,10 +585,13 @@ def recommend_configs(
             return pd.Series(0.5, index=series.index)
         return ((series - lo) / (hi - lo)).fillna(0.5)
 
+    kept_cols = {col for col, _ in tuple_objectives}
     front = front.copy()
     score = pd.Series(0.0, index=front.index)
     for obj in objectives:
         col = METRIC_TO_DF_COLUMN[obj.metric]
+        if col not in kept_cols:
+            continue
         norm = _norm(front[col])
         if obj.direction == "maximize":
             score += norm
@@ -545,24 +600,27 @@ def recommend_configs(
     front["score"] = score
     front = front.sort_values("score", ascending=False).reset_index(drop=True)
 
+    def _maybe(row: pd.Series, col: str) -> float | None:
+        v = row[col]
+        return None if pd.isna(v) else float(v)
+
     results: list[dict[str, Any]] = []
     for rank, (_, row) in enumerate(front.head(n).iterrows(), start=1):
         trial = next(t for t in trials if t.trial_id == row["trial_id"])
-        rate_val = row["retransmit_rate"]
         results.append(
             {
                 "rank": rank,
                 "trial_id": row["trial_id"],
                 "sysctl_values": trial.sysctl_values,
-                "mean_throughput": row["mean_throughput"],
-                "mean_cpu": row["mean_cpu"],
-                "mean_node_memory": row["mean_node_memory"],
-                "mean_cni_memory": row["mean_cni_memory"],
-                "retransmit_rate": (None if pd.isna(rate_val) else float(rate_val)),
-                "mean_rps": row["mean_rps"],
-                "mean_latency_p50_ms": row["mean_latency_p50_ms"],
-                "mean_latency_p90_ms": row["mean_latency_p90_ms"],
-                "mean_latency_p99_ms": row["mean_latency_p99_ms"],
+                "mean_throughput": _maybe(row, "mean_throughput"),
+                "mean_cpu": _maybe(row, "mean_cpu"),
+                "mean_node_memory": _maybe(row, "mean_node_memory"),
+                "mean_cni_memory": _maybe(row, "mean_cni_memory"),
+                "retransmit_rate": _maybe(row, "retransmit_rate"),
+                "mean_rps": _maybe(row, "mean_rps"),
+                "mean_latency_p50_ms": _maybe(row, "mean_latency_p50_ms"),
+                "mean_latency_p90_ms": _maybe(row, "mean_latency_p90_ms"),
+                "mean_latency_p99_ms": _maybe(row, "mean_latency_p99_ms"),
                 "score": round(row["score"], 4),
             },
         )

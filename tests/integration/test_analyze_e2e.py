@@ -106,11 +106,17 @@ def test_analyze_generates_reports_from_baseline_output(
         "Objective space (scatter matrix)",
         "Pareto: mean_throughput vs mean_cpu",
         "Pareto: mean_throughput vs mean_node_memory",
-        "Pareto: mean_throughput vs mean_cni_memory",
         "Pareto: mean_throughput vs retransmit_rate",
         "Pareto: mean_cpu vs mean_node_memory",
-        "Pareto: mean_cpu vs mean_cni_memory",
         "Pareto: mean_cpu vs retransmit_rate",
     ]
     for label in expected_labels:
         assert label in index_text, f"missing figure label in index.html: {label}"
+    for cni_label in (
+        "Pareto: mean_throughput vs mean_cni_memory",
+        "Pareto: mean_cpu vs mean_cni_memory",
+    ):
+        assert cni_label not in index_text, (
+            f"CNI label {cni_label!r} should be absent when cni.enabled=false "
+            "(baseline runs with a fake backend and no CNI pods)"
+        )

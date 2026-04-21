@@ -115,21 +115,24 @@ def _render_recommendations(recs: list[dict[str, Any]]) -> str:
 
     pd = _require_pandas()
 
-    display = pd.DataFrame(
-        [
-            {
-                "rank": r["rank"],
-                "trial_id": r["trial_id"],
-                "throughput (Mbps)": round(r["mean_throughput"] / 1e6, 1),
-                "cpu": f"{r['mean_cpu']:.1f}%",
-                "node memory (MiB)": f"{r['mean_node_memory'] / 1024 / 1024:.0f}",
-                "cni memory (MiB)": f"{r['mean_cni_memory'] / 1024 / 1024:.0f}",
-                "retx/MB": format_retransmit_rate(r["retransmit_rate"]),
-                "score": r["score"],
-            }
-            for r in recs
-        ],
-    )
+    def _row(r: dict[str, Any]) -> dict[str, Any]:
+        row: dict[str, Any] = {
+            "rank": r["rank"],
+            "trial_id": r["trial_id"],
+            "throughput (Mbps)": round(r["mean_throughput"] / 1e6, 1),
+            "cpu": f"{r['mean_cpu']:.1f}%",
+        }
+        nmem = r["mean_node_memory"]
+        if nmem is not None:
+            row["node memory (MiB)"] = f"{nmem / 1024 / 1024:.0f}"
+        cmem = r["mean_cni_memory"]
+        if cmem is not None:
+            row["cni memory (MiB)"] = f"{cmem / 1024 / 1024:.0f}"
+        row["retx/MB"] = format_retransmit_rate(r["retransmit_rate"])
+        row["score"] = r["score"]
+        return row
+
+    display = pd.DataFrame([_row(r) for r in recs]).dropna(axis=1, how="all")
     parts = [display.to_html(index=False, classes="report-table", border=0)]
     for r in recs:
         sysctl_json = json.dumps(r["sysctl_values"], indent=2)
