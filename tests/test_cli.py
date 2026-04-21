@@ -405,6 +405,79 @@ def test_sysctl_set_apply_roundtrip(tmp_path: Path) -> None:
     assert persisted == {"net.core.rmem_max": "16777216"}
 
 
+def test_optimize_forwards_fresh_flag(tmp_path: Path) -> None:
+    out = tmp_path / "opt.jsonl"
+    with (
+        patch("kube_autotuner.cli.K8sClient") as client_cls,
+        patch("kube_autotuner.cli._resolve_backend") as resolve,
+        patch("kube_autotuner.cli.runs.run_optimize") as run_optimize,
+    ):
+        client_cls.return_value = MagicMock()
+        resolve.return_value = _fake_backend(tmp_path)
+
+        result = runner.invoke(
+            app,
+            [
+                "optimize",
+                "--source",
+                "a",
+                "--target",
+                "b",
+                "--duration",
+                "1",
+                "--iterations",
+                "1",
+                "--output",
+                str(out),
+                "--n-trials",
+                "4",
+                "--n-sobol",
+                "2",
+                "--fresh",
+            ],
+        )
+    assert result.exit_code == 0, result.output
+    run_optimize.assert_called_once()
+    assert run_optimize.call_args.kwargs == {"fresh": True}
+
+
+def test_run_command_forwards_fresh_flag_to_optimize(tmp_path: Path) -> None:
+    config = tmp_path / "exp.yaml"
+    out = tmp_path / "opt.jsonl"
+    config.write_text(
+        f"mode: optimize\n"
+        f"nodes:\n"
+        f"  sources: [a]\n"
+        f"  target: b\n"
+        f"benchmark:\n"
+        f"  duration: 1\n"
+        f"  iterations: 1\n"
+        f"optimize:\n"
+        f"  n_trials: 2\n"
+        f"  n_sobol: 2\n"
+        f"output: {out}\n",
+    )
+    with (
+        patch("kube_autotuner.cli.K8sClient") as client_cls,
+        patch("kube_autotuner.cli._resolve_backend") as resolve,
+        patch("kube_autotuner.cli.runs.run_optimize") as run_optimize,
+        patch(
+            "kube_autotuner.cli.ExperimentConfig.preflight",
+            return_value=[],
+        ),
+    ):
+        client_cls.return_value = MagicMock()
+        resolve.return_value = _fake_backend(tmp_path)
+
+        result = runner.invoke(
+            app,
+            ["run", "--config", str(config), "--fresh"],
+        )
+    assert result.exit_code == 0, result.output
+    run_optimize.assert_called_once()
+    assert run_optimize.call_args.kwargs == {"fresh": True}
+
+
 def test_sysctl_get_reads_persisted_state(tmp_path: Path) -> None:
     state = tmp_path / "state.json"
     state.write_text(json.dumps({"net.core.rmem_max": "67108864"}))

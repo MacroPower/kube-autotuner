@@ -978,6 +978,16 @@ def _validate_rendered_docs(docs: list[Any]) -> str | None:
     return None
 
 
+# Resolve the forward reference inside
+# :class:`kube_autotuner.models.ResumeMetadata` now that
+# :class:`ObjectivesSection` exists. ``models`` declares the field under
+# ``TYPE_CHECKING`` to avoid a circular import; importing this module
+# is the single sanctioned trigger for the rebuild.
+from kube_autotuner.models import _ensure_resume_metadata_built  # noqa: E402
+
+_ensure_resume_metadata_built()
+
+
 def _yaml_docs_equal(a: list[Any], b: list[Any]) -> bool:
     """Return whether two lists of YAML docs are equal as multisets.
 

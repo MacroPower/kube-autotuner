@@ -12,18 +12,25 @@ from collections import defaultdict
 from datetime import UTC, datetime
 import hashlib
 import json
-import sys
+import logging
 from typing import TYPE_CHECKING, Any, Literal, cast
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from pydantic.alias_generators import to_camel
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
     from pathlib import Path
 
-    from kube_autotuner.experiment import ObjectivesSection
+    # Imported for the :class:`ResumeMetadata` forward reference only.
+    # The actual import cannot live at module level because
+    # :mod:`kube_autotuner.experiment` already imports from this module.
+    # :func:`_ensure_resume_metadata_built` resolves the forward ref
+    # lazily and is triggered from ``experiment``'s module initialiser.
+    from kube_autotuner.experiment import ObjectivesSection  # noqa: TC004
+
+logger = logging.getLogger(__name__)
 
 
 class SysctlParam(BaseModel):
@@ -487,6 +494,45 @@ class TrialResult(BaseModel):
         return sum(per_iter_means) / len(per_iter_means)
 
 
+class ResumeMetadata(BaseModel):
+    """Sidecar describing the experiment that produced a JSONL log.
+
+    Written next to the JSONL file at ``<path>.meta.json`` on every run
+    and consulted by :func:`kube_autotuner.runs.run_optimize` to decide
+    whether the prior trials are compatible with the incoming
+    experiment. ``objectives``, ``param_space``, ``benchmark`` are the
+    compatibility keys; ``n_sobol`` is only populated by ``optimize``
+    mode (baseline / trial leave it ``None``).
+    """
+
+    objectives: ObjectivesSection
+    param_space: ParamSpace
+    benchmark: BenchmarkConfig
+    n_sobol: int | None = None
+
+
+_resume_metadata_built = False
+
+
+def _ensure_resume_metadata_built() -> None:
+    """Resolve :class:`ResumeMetadata`'s ``ObjectivesSection`` forward ref.
+
+    The annotation lives under ``TYPE_CHECKING`` to avoid an import
+    cycle with :mod:`kube_autotuner.experiment`. Callers invoke this
+    helper before the first validate/dump so Pydantic can bind the
+    real class into the model's type namespace.
+    """
+    global _resume_metadata_built  # noqa: PLW0603
+    if _resume_metadata_built:
+        return
+    from kube_autotuner.experiment import ObjectivesSection  # noqa: PLC0415
+
+    ResumeMetadata.model_rebuild(
+        _types_namespace={"ObjectivesSection": ObjectivesSection},
+    )
+    _resume_metadata_built = True
+
+
 class TrialLog:
     """Append-only JSON-lines persistence for :class:`TrialResult` records."""
 
@@ -505,21 +551,47 @@ class TrialLog:
     def load(path: Path) -> list[TrialResult]:
         """Load every trial record from the JSONL file at ``path``.
 
+        A single partially-written trailing line (from a Ctrl-C during
+        ``append``) is tolerated: the last line is parsed leniently and
+        a warning is logged if it fails. Any mid-file failure still
+        raises, because that signals real corruption rather than an
+        interrupted write.
+
         Args:
             path: Source JSONL file. If it does not exist, an empty list is
                 returned.
 
         Returns:
             The decoded trials, in file order.
+
+        Raises:
+            json.JSONDecodeError: Mid-file JSON decoding failure
+                (real corruption, not an interrupted write).
+            pydantic.ValidationError: Mid-file record fails schema
+                validation.
         """
         if not path.exists():
             return []
-        trials: list[TrialResult] = []
         with path.open(encoding="utf-8") as f:
-            for raw in f:
-                stripped = raw.strip()
-                if stripped:
-                    trials.append(TrialResult.model_validate_json(stripped))
+            raw_lines = f.readlines()
+        lines = [line for line in raw_lines if line.strip()]
+        if not lines:
+            return []
+        trials: list[TrialResult] = []
+        last_idx = len(lines) - 1
+        for idx, raw in enumerate(lines):
+            stripped = raw.strip()
+            try:
+                trials.append(TrialResult.model_validate_json(stripped))
+            except ValidationError, json.JSONDecodeError:
+                if idx == last_idx:
+                    logger.warning(
+                        "dropping truncated final line in %s (likely from "
+                        "an interrupted write)",
+                        path,
+                    )
+                    break
+                raise
         return trials
 
     @staticmethod
@@ -528,54 +600,40 @@ class TrialLog:
         return path.parent / f"{path.name}.meta.json"
 
     @staticmethod
-    def write_metadata(path: Path, objectives: ObjectivesSection) -> None:
-        """Persist ``objectives`` as a sidecar next to the JSONL log.
+    def write_resume_metadata(path: Path, meta: ResumeMetadata) -> None:
+        """Persist ``meta`` as a sidecar next to the JSONL log.
 
-        The sidecar lives at ``<path>.meta.json``. When a sidecar
-        already exists and its serialized form differs from the
-        incoming one, a stderr warning is emitted before overwriting.
+        The sidecar lives at ``<path>.meta.json``. Writes are
+        idempotent for identical content; drift detection now happens
+        at resume time in
+        :func:`kube_autotuner.runs._check_compatibility`, not here.
 
         Args:
             path: JSONL log path; the sidecar is written beside it.
-            objectives: Effective :class:`ObjectivesSection` for the
-                run that is about to write ``path``.
+            meta: :class:`ResumeMetadata` describing the run that is
+                about to write ``path``.
         """
-        from kube_autotuner.experiment import ObjectivesSection  # noqa: PLC0415
-
+        _ensure_resume_metadata_built()
         meta_path = TrialLog._metadata_path(path)
-        incoming = objectives.model_dump_json()
-        if meta_path.exists():
-            existing_raw = meta_path.read_text(encoding="utf-8")
-            try:
-                existing = ObjectivesSection.model_validate_json(existing_raw)
-            except Exception:  # noqa: BLE001
-                existing = None
-            if existing is None or existing.model_dump() != objectives.model_dump():
-                print(  # noqa: T201
-                    f"WARNING: overwriting {meta_path} with a different "
-                    "objectives block; previous runs appended to "
-                    f"{path} used a different objective configuration.",
-                    file=sys.stderr,
-                )
-        meta_path.write_text(incoming + "\n", encoding="utf-8")
+        meta_path.write_text(meta.model_dump_json() + "\n", encoding="utf-8")
 
     @staticmethod
-    def load_metadata(path: Path) -> ObjectivesSection | None:
-        """Return the sidecar :class:`ObjectivesSection` for ``path``.
+    def load_resume_metadata(path: Path) -> ResumeMetadata | None:
+        """Return the sidecar :class:`ResumeMetadata` for ``path``.
 
         Args:
             path: JSONL log path whose sibling ``<path>.meta.json`` is
                 consulted.
 
         Returns:
-            The parsed :class:`ObjectivesSection`, or ``None`` when no
-            sidecar exists.
+            The parsed :class:`ResumeMetadata`, or ``None`` when no
+            sidecar exists. A malformed sidecar raises
+            :class:`pydantic.ValidationError`.
         """
-        from kube_autotuner.experiment import ObjectivesSection  # noqa: PLC0415
-
+        _ensure_resume_metadata_built()
         meta_path = TrialLog._metadata_path(path)
         if not meta_path.exists():
             return None
-        return ObjectivesSection.model_validate_json(
+        return ResumeMetadata.model_validate_json(
             meta_path.read_text(encoding="utf-8"),
         )

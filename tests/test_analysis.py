@@ -28,6 +28,8 @@ from kube_autotuner.models import (  # noqa: E402
     BenchmarkConfig,
     BenchmarkResult,
     NodePair,
+    ParamSpace,
+    ResumeMetadata,
     TrialLog,
     TrialResult,
 )
@@ -919,7 +921,14 @@ class TestCLIAnalyze:
             constraints=[],
             recommendation_weights={"node_memory": 5.0},
         )
-        TrialLog.write_metadata(jsonl, section)
+        TrialLog.write_resume_metadata(
+            jsonl,
+            ResumeMetadata(
+                objectives=section,
+                param_space=ParamSpace(params=[]),
+                benchmark=BenchmarkConfig(duration=10, iterations=1),
+            ),
+        )
 
         out_dir = tmp_path / "out"
         runner = CliRunner()

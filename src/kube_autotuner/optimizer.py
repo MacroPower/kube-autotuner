@@ -488,6 +488,7 @@ class OptimizationLoop:
         objectives: ObjectivesSection,
         cni: CniSection | None = None,
         observer: ProgressObserver | None = None,
+        prior_trials: list[TrialResult] | None = None,
     ) -> None:
         """Wire up the Ax client, benchmark runner, and sysctl setters.
 
@@ -519,6 +520,13 @@ class OptimizationLoop:
                 same instance is forwarded to the internal
                 :class:`~kube_autotuner.benchmark.runner.BenchmarkRunner`
                 so iteration-level hooks share the live display.
+            prior_trials: Prior successful :class:`TrialResult`
+                records to seed Ax with before the live loop begins.
+                Each is replayed through ``attach_trial`` +
+                ``complete_trial`` so the surrogate sees the full
+                history. ``n_trials`` remains the total budget across
+                sessions; the live loop runs
+                ``max(0, n_trials - len(prior_trials))`` more attempts.
         """
         self.node_pair: NodePair = node_pair
         self.config: BenchmarkConfig = config
@@ -597,6 +605,44 @@ class OptimizationLoop:
             observer=self.observer,
         )
         self._completed: list[TrialResult] = []
+        self.prior_count: int = len(prior_trials or [])
+        self._seed_prior_trials(prior_trials or [])
+
+    def _seed_prior_trials(self, prior: list[TrialResult]) -> None:
+        """Replay ``prior`` into the Ax client via attach + complete.
+
+        Each seeded trial lands in Ax's history with the same metric
+        aggregation the live loop would produce (:func:`_compute_metrics`),
+        and the NaN filter mirrors :meth:`_record` so
+        ``complete_trial`` cannot abort mid-seeding. Seeded trials are
+        also appended to ``self._completed`` so the pareto log sees the
+        combined history.
+
+        Parameter names are encoded with :func:`_encode_param_name` and
+        values are string-coerced to match the Ax schema built by
+        :func:`build_ax_params`; otherwise Ax's categorical dictionary
+        keys would not line up with the live suggestions.
+
+        Args:
+            prior: Prior trial records in file order.
+        """
+        for tr in prior:
+            params = {
+                _encode_param_name(k): str(v) for k, v in tr.sysctl_values.items()
+            }
+            trial_index = self.client.attach_trial(parameters=params)
+            metrics = _compute_metrics(tr)
+            raw_data: dict[str, tuple[float, float]] = {}
+            for name in self._ax_metric_names:
+                pair = metrics.get(name)
+                if pair is None or math.isnan(pair[0]):
+                    continue
+                raw_data[name] = pair
+            self.client.complete_trial(
+                trial_index=trial_index,
+                raw_data=raw_data,
+            )
+            self._completed.append(tr)
 
     def _snapshot_params(self) -> list[str]:
         """Return the sysctl keys to snapshot before each trial."""
@@ -679,21 +725,32 @@ class OptimizationLoop:
     def _should_stop(self, completed_iterations: int) -> bool:
         """Return ``True`` when the main loop should terminate.
 
+        ``completed_iterations`` is the live-session attempt counter
+        (success plus failure). :attr:`prior_count` folds in seeded
+        trials from a prior session so the combined budget
+        ``prior_count + completed_iterations >= n_trials`` is honoured
+        across resumes.
+
         Args:
-            completed_iterations: Number of trial attempts (successful
-                plus failed) already performed.
+            completed_iterations: Number of live-session trial
+                attempts (successful plus failed) already performed.
 
         Returns:
-            ``True`` once ``completed_iterations`` reaches
+            ``True`` once the combined attempt count reaches
             :attr:`n_trials`.
         """
-        return completed_iterations >= self.n_trials
+        return self.prior_count + completed_iterations >= self.n_trials
 
     def _suggest(self, i: int) -> tuple[int, dict[str, str], str]:
         """Ask Ax for the next trial's parameterization.
 
+        The phase label reflects the *global* position across prior
+        and live sessions (``prior_count + i``), so resumed runs pick
+        up their phase continuously rather than restarting the
+        ``"sobol"`` label counter at zero.
+
         Args:
-            i: Zero-based iteration index.
+            i: Zero-based live-loop iteration index.
 
         Returns:
             A ``(trial_index, parameterization, phase)`` tuple where
@@ -702,7 +759,7 @@ class OptimizationLoop:
             to ``str`` to match the declared ``parameter_type="str"``
             schema and the downstream sysctl writer's signature.
         """
-        phase = "sobol" if i < self.n_sobol else "bayesian"
+        phase = "sobol" if self.prior_count + i < self.n_sobol else "bayesian"
         trials = self.client.get_next_trials(max_trials=1)
         trial_index, parameterization = next(iter(trials.items()))
         return trial_index, {k: str(v) for k, v in parameterization.items()}, phase
@@ -756,7 +813,7 @@ class OptimizationLoop:
         logger.info(
             "Trial %d/%d [%s] throughput=%.1f Mbps cpu=%.1f%% "
             "retransmit_rate=%s retx/MB rps=%s p99=%s ms",
-            i + 1,
+            self.prior_count + i + 1,
             self.n_trials,
             phase,
             tp / 1e6,
@@ -765,7 +822,7 @@ class OptimizationLoop:
             rps_str,
             p99_str,
         )
-        self.observer.on_trial_complete(i, phase, metrics)
+        self.observer.on_trial_complete(self.prior_count + i, phase, metrics)
 
     def run(self) -> list[TrialResult]:
         """Execute the full optimization loop.
@@ -787,7 +844,7 @@ class OptimizationLoop:
             while not self._should_stop(i):
                 trial_index, parameterization, phase = self._suggest(i)
                 self.observer.on_trial_start(
-                    i,
+                    self.prior_count + i,
                     self.n_trials,
                     phase,
                     parameterization,
@@ -800,15 +857,20 @@ class OptimizationLoop:
                 except Exception as e:
                     logger.warning(
                         "Trial %d/%d failed, continuing",
-                        i + 1,
+                        self.prior_count + i + 1,
                         self.n_trials,
                         exc_info=True,
                     )
                     self.client.mark_trial_failed(trial_index=trial_index)
-                    self.observer.on_trial_failed(i, e)
+                    self.observer.on_trial_failed(self.prior_count + i, e)
                 i += 1
         except KeyboardInterrupt:
-            logger.info("Interrupted after %d trials", len(self._completed))
+            live = len(self._completed) - self.prior_count
+            logger.info(
+                "Interrupted after %d live trials (%d total)",
+                live,
+                len(self._completed),
+            )
         finally:
             self.cleanup()
         return self._completed

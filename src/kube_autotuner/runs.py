@@ -49,13 +49,16 @@ from __future__ import annotations
 
 import contextlib
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 import logging
 import math
 from typing import TYPE_CHECKING, cast
 
+import typer
+
 from kube_autotuner.benchmark.runner import BenchmarkRunner
 from kube_autotuner.k8s.lease import NodeLease
-from kube_autotuner.models import TrialLog, TrialResult
+from kube_autotuner.models import ResumeMetadata, TrialLog, TrialResult
 from kube_autotuner.progress import NullObserver
 from kube_autotuner.report import format_retransmit_rate
 from kube_autotuner.sysctl.params import PARAM_SPACE
@@ -175,6 +178,161 @@ def _acquire_all_leases(
         yield
 
 
+@dataclass(frozen=True)
+class _ResumeState:
+    """Result of a resume-preparation pass.
+
+    Attributes:
+        prior_trials: Successful :class:`TrialResult` records loaded
+            from the prior session; empty when no resume occurred.
+        remaining_trials: Live-loop attempt budget: ``max(0,
+            n_trials - len(prior_trials))``. Counts successful
+            priors only; a prior run that had failures leaves the
+            remaining budget wider than a strict
+            ``n_trials - attempts_so_far`` would -- accepted as the
+            simplest interpretation. See the module docstring.
+    """
+
+    prior_trials: list[TrialResult]
+    remaining_trials: int
+
+
+def _move_prior_artifacts(output: Path) -> None:
+    """Rename the prior JSONL and sidecar aside with a UTC timestamp.
+
+    Given ``output = <dir>/results.jsonl``, renames to
+    ``<dir>/results.jsonl.<T>.bak`` and the sidecar to
+    ``<dir>/results.jsonl.meta.json.<T>.bak`` where ``T`` is a UTC
+    ISO-like timestamp (``YYYYMMDDTHHMMSSZ``). Non-existent files are
+    skipped silently.
+
+    Args:
+        output: JSONL log path whose prior artefacts should be
+            archived.
+    """
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    meta = TrialLog._metadata_path(output)  # noqa: SLF001 sibling path helper
+    for path in (output, meta):
+        if not path.exists():
+            continue
+        backup = path.with_name(f"{path.name}.{stamp}.bak")
+        path.rename(backup)
+        logger.info("moved prior results to %s", backup)
+
+
+def _check_compatibility(
+    meta: ResumeMetadata | None,
+    exp: ExperimentConfig,
+) -> None:
+    """Validate that ``meta`` matches ``exp`` on the compatibility keys.
+
+    Compatibility keys: ``objectives``, ``param_space``,
+    ``benchmark``, and (when the sidecar carries one) ``n_sobol``.
+    Node identity, patches, iperf/fortio args, and ``apply_source``
+    can change silently between runs.
+
+    A ``None`` sidecar alongside a non-empty JSONL signals a prior
+    run that wrote no metadata (or a manually crafted JSONL); the
+    user must pass ``--fresh`` or supply a sidecar before resume.
+
+    Args:
+        meta: The loaded sidecar, or ``None`` when absent.
+        exp: The incoming experiment configuration.
+
+    Raises:
+        typer.BadParameter: The sidecar is missing or any
+            compatibility key diverges.
+    """
+    if meta is None:
+        msg = (
+            "prior JSONL has no sidecar to validate against; pass "
+            "--fresh to move it aside or supply a sidecar before "
+            "resuming."
+        )
+        raise typer.BadParameter(msg)
+
+    changed: list[str] = []
+    if meta.objectives.model_dump() != exp.objectives.model_dump():
+        changed.append("objectives")
+    if meta.param_space.model_dump() != exp.effective_param_space().model_dump():
+        changed.append("param_space")
+    if meta.benchmark.model_dump() != exp.benchmark.model_dump():
+        changed.append("benchmark")
+    if exp.optimize is not None and meta.n_sobol is not None:
+        if meta.n_sobol != exp.optimize.n_sobol:
+            changed.append("n_sobol")
+    elif exp.optimize is not None and meta.n_sobol is None:
+        logger.warning("sidecar has no n_sobol; not verified")
+
+    if changed:
+        msg = (
+            "prior results in --output are incompatible with the current "
+            f"experiment; changed fields: {sorted(changed)}. Realign the "
+            "config or pass --fresh to archive the prior results."
+        )
+        raise typer.BadParameter(msg)
+
+
+def _prepare_resume(
+    output: Path,
+    exp: ExperimentConfig,
+    *,
+    fresh: bool,
+) -> _ResumeState:
+    """Decide whether to resume and return the state the loop needs.
+
+    Budget counts successful priors only; a prior run that had
+    failures will have a remaining budget equal to ``n_trials -
+    successful_priors``, which over-estimates the remaining attempts
+    compared to a strict ``n_trials - attempts_so_far`` budget. This
+    is the simplest interpretation -- users can always stop early.
+
+    Args:
+        output: JSONL destination path for the run.
+        exp: Validated experiment. Must have ``exp.optimize`` set.
+        fresh: When ``True``, archive any prior artefacts and return
+            a fresh state unconditionally.
+
+    Returns:
+        A :class:`_ResumeState` describing the prior trials to replay
+        and the remaining live-loop budget.
+
+    Raises:
+        RuntimeError: ``exp.optimize`` is ``None`` -- a caller
+            invariant has been violated.
+        typer.BadParameter: The prior JSONL exists but has no
+            sidecar, or the sidecar's compatibility keys diverge from
+            ``exp``. Raised indirectly via
+            :func:`_check_compatibility`.
+    """  # noqa: DOC502 - typer.BadParameter raised via _check_compatibility
+    if exp.optimize is None:
+        msg = "_prepare_resume requires exp.optimize to be populated"
+        raise RuntimeError(msg)
+
+    if fresh:
+        _move_prior_artifacts(output)
+        return _ResumeState(prior_trials=[], remaining_trials=exp.optimize.n_trials)
+
+    if not output.exists():
+        return _ResumeState(prior_trials=[], remaining_trials=exp.optimize.n_trials)
+
+    prior = TrialLog.load(output)
+    if not prior:
+        return _ResumeState(prior_trials=[], remaining_trials=exp.optimize.n_trials)
+
+    meta = TrialLog.load_resume_metadata(output)
+    _check_compatibility(meta, exp)
+
+    remaining = max(0, exp.optimize.n_trials - len(prior))
+    logger.info(
+        "Resuming: %d prior trials; running %d more (budget=%d)",
+        len(prior),
+        remaining,
+        exp.optimize.n_trials,
+    )
+    return _ResumeState(prior_trials=prior, remaining_trials=remaining)
+
+
 def run_baseline(ctx: RunContext) -> None:
     """Record a baseline :class:`TrialResult` without touching the node.
 
@@ -190,7 +348,14 @@ def run_baseline(ctx: RunContext) -> None:
             ``ctx.exp.nodes.target``.
     """
     exp = ctx.exp
-    TrialLog.write_metadata(ctx.output, exp.objectives)
+    TrialLog.write_resume_metadata(
+        ctx.output,
+        ResumeMetadata(
+            objectives=exp.objectives,
+            param_space=exp.effective_param_space(),
+            benchmark=exp.benchmark,
+        ),
+    )
     node_pair = _resolve_zones(exp.to_node_pair(), ctx.client)
     config = exp.benchmark
     all_params = [*PARAM_SPACE.param_names(), "kernel.osrelease"]
@@ -273,7 +438,14 @@ def run_trial(ctx: RunContext) -> None:  # noqa: PLR0914, PLR0915
         )
         raise RuntimeError(msg)
 
-    TrialLog.write_metadata(ctx.output, exp.objectives)
+    TrialLog.write_resume_metadata(
+        ctx.output,
+        ResumeMetadata(
+            objectives=exp.objectives,
+            param_space=exp.effective_param_space(),
+            benchmark=exp.benchmark,
+        ),
+    )
     params: dict[str, str] = {k: str(v) for k, v in exp.trial.sysctls.items()}
     node_pair = _resolve_zones(exp.to_node_pair(), ctx.client)
     config = exp.benchmark
@@ -348,7 +520,11 @@ def run_trial(ctx: RunContext) -> None:  # noqa: PLR0914, PLR0915
         logger.info("Mean p99 latency (fixed_qps): %.2f ms", p99)
 
 
-def run_optimize(ctx: RunContext) -> None:  # noqa: PLR0914
+def run_optimize(  # noqa: PLR0914, PLR0915
+    ctx: RunContext,
+    *,
+    fresh: bool = False,
+) -> None:
     """Drive the Ax Bayesian optimization loop.
 
     Per-trial lease acquisition lives inside
@@ -359,17 +535,39 @@ def run_optimize(ctx: RunContext) -> None:  # noqa: PLR0914
     source node when ``apply_source=True``) because a single fan-out
     setter does not fit a single target-only backend.
 
+    Resume is automatic: when ``ctx.output`` already exists and its
+    sidecar is compatible with ``ctx.exp``, the prior
+    :class:`~kube_autotuner.models.TrialResult` records are replayed
+    into Ax via ``attach_trial`` + ``complete_trial`` and the live
+    loop only runs the remaining
+    ``max(0, n_trials - len(prior))`` attempts. Budget invariant:
+    when the budget is already met the loop is short-circuited
+    entirely, which is safe because
+    :meth:`OptimizationLoop.__init__` constructs only light objects
+    (no server pods, leases, or similar per-run resources) -- this
+    invariant must hold for future refactors of ``__init__``.
+
+    Concurrency: two operators pointing at the same ``ctx.output``
+    already race on :meth:`TrialLog.append`; resume widens the window
+    but per-trial leases still serialise execution against the nodes.
+
     Args:
         ctx: Orchestration context. ``ctx.exp.optimize`` must be
             populated (guaranteed by
             :class:`~kube_autotuner.experiment.ExperimentConfig`'s
             mode validator).
+        fresh: When ``True``, move any pre-existing ``ctx.output`` and
+            sidecar aside (timestamped ``.bak`` rename) before
+            starting, so the run begins from zero.
 
     Raises:
         RuntimeError: ``ctx.exp.optimize`` is ``None``, or
             ``ax-platform`` is not installed (the ``optimize`` dep
             group provides it).
-    """
+        typer.BadParameter: The prior JSONL exists but its sidecar is
+            missing or incompatible with the current experiment.
+            Raised indirectly via :func:`_prepare_resume`.
+    """  # noqa: DOC502 - typer.BadParameter raised via _prepare_resume
     try:
         from kube_autotuner.optimizer import OptimizationLoop  # noqa: PLC0415
     except ImportError as e:
@@ -383,7 +581,18 @@ def run_optimize(ctx: RunContext) -> None:  # noqa: PLR0914
         )
         raise RuntimeError(msg)
 
-    TrialLog.write_metadata(ctx.output, exp.objectives)
+    resume = _prepare_resume(ctx.output, exp, fresh=fresh)
+    if not resume.prior_trials:
+        TrialLog.write_resume_metadata(
+            ctx.output,
+            ResumeMetadata(
+                objectives=exp.objectives,
+                param_space=exp.effective_param_space(),
+                benchmark=exp.benchmark,
+                n_sobol=exp.optimize.n_sobol,
+            ),
+        )
+    ctx.observer.seed_history(resume.prior_trials, exp.optimize.n_sobol)
     node_pair = _resolve_zones(exp.to_node_pair(), ctx.client)
     config = exp.benchmark
 
@@ -401,9 +610,25 @@ def run_optimize(ctx: RunContext) -> None:  # noqa: PLR0914
         objectives=exp.objectives,
         cni=exp.cni,
         observer=ctx.observer,
+        prior_trials=resume.prior_trials,
     )
-    trials = loop.run()
-    logger.info("Completed %d trials. Results in %s", len(trials), ctx.output)
+    if resume.remaining_trials == 0:
+        logger.info(
+            "Budget already met (%d >= %d); skipping loop",
+            len(resume.prior_trials),
+            exp.optimize.n_trials,
+        )
+        trials = list(resume.prior_trials)
+    else:
+        trials = loop.run()
+    new_count = len(trials) - loop.prior_count
+    logger.info(
+        "Completed %d trials (%d prior + %d new). Results in %s",
+        len(trials),
+        loop.prior_count,
+        new_count,
+        ctx.output,
+    )
     if not trials:
         return
 

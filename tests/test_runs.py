@@ -16,9 +16,22 @@ import json
 from typing import TYPE_CHECKING
 from unittest.mock import MagicMock, patch
 
+import pytest
+import typer
+
 from kube_autotuner import runs
 from kube_autotuner.experiment import ExperimentConfig
-from kube_autotuner.models import BenchmarkResult, IterationResults
+from kube_autotuner.models import (
+    BenchmarkConfig,
+    BenchmarkResult,
+    IterationResults,
+    NodePair,
+    ParamSpace,
+    ResumeMetadata,
+    SysctlParam,
+    TrialLog,
+    TrialResult,
+)
 from kube_autotuner.sysctl.params import PARAM_SPACE
 
 if TYPE_CHECKING:
@@ -161,3 +174,284 @@ def test_run_baseline_snapshots_full_param_space(
         assert name in requested
     assert "kernel.osrelease" in requested
     assert mock_lease_cls.call_count == 2
+
+
+# --- resume + fresh semantics -------------------------------------------
+
+
+def _prior_trial(sysctl_value: int = 1048576) -> TrialResult:
+    return TrialResult(
+        node_pair=NodePair(source="a", target="b", hardware_class="10g"),
+        sysctl_values={"net.core.rmem_max": sysctl_value},
+        config=BenchmarkConfig(duration=1, iterations=1),
+        results=[
+            BenchmarkResult(
+                timestamp=datetime.now(UTC),
+                mode="tcp",
+                bits_per_second=9e9,
+                retransmits=5,
+                bytes_sent=1_000_000_000,
+                cpu_utilization_percent=20.0,
+            ),
+        ],
+    )
+
+
+def _optimize_exp(out: Path, n_trials: int = 5) -> ExperimentConfig:
+    return ExperimentConfig.model_validate({
+        "mode": "optimize",
+        "nodes": {"sources": ["a"], "target": "b"},
+        "benchmark": {"duration": 1, "iterations": 1},
+        "optimize": {"n_trials": n_trials, "n_sobol": 2},
+        "output": str(out),
+    })
+
+
+def _seed_prior_results(
+    output: Path,
+    exp: ExperimentConfig,
+    trials: list[TrialResult],
+    *,
+    n_sobol: int | None = None,
+) -> None:
+    assert exp.optimize is not None
+    for t in trials:
+        TrialLog.append(output, t)
+    TrialLog.write_resume_metadata(
+        output,
+        ResumeMetadata(
+            objectives=exp.objectives,
+            param_space=exp.effective_param_space(),
+            benchmark=exp.benchmark,
+            n_sobol=n_sobol if n_sobol is not None else exp.optimize.n_sobol,
+        ),
+    )
+
+
+@patch("kube_autotuner.optimizer.OptimizationLoop")
+def test_run_optimize_loads_prior_trials_when_jsonl_present(
+    mock_loop_cls,
+    tmp_path: Path,
+):
+    out = tmp_path / "opt.jsonl"
+    exp = _optimize_exp(out, n_trials=5)
+    priors = [_prior_trial(), _prior_trial(2097152)]
+    _seed_prior_results(out, exp, priors)
+
+    loop = MagicMock()
+    loop.run.return_value = [*priors, _prior_trial(4194304)]
+    loop.prior_count = 2
+    loop.pareto_front.return_value = []
+    mock_loop_cls.return_value = loop
+
+    ctx = runs.RunContext(
+        exp=exp,
+        client=_client_stub(),
+        backend=MagicMock(),
+        output=out,
+    )
+    runs.run_optimize(ctx)
+
+    kwargs = mock_loop_cls.call_args.kwargs
+    assert len(kwargs["prior_trials"]) == 2
+    assert kwargs["n_trials"] == 5
+
+
+@patch("kube_autotuner.optimizer.OptimizationLoop")
+def test_run_optimize_fresh_moves_prior_files(
+    mock_loop_cls,
+    tmp_path: Path,
+):
+    out = tmp_path / "opt.jsonl"
+    exp = _optimize_exp(out, n_trials=5)
+    priors = [_prior_trial()]
+    _seed_prior_results(out, exp, priors)
+
+    loop = MagicMock()
+    loop.run.return_value = []
+    loop.prior_count = 0
+    loop.pareto_front.return_value = []
+    mock_loop_cls.return_value = loop
+
+    ctx = runs.RunContext(
+        exp=exp,
+        client=_client_stub(),
+        backend=MagicMock(),
+        output=out,
+    )
+    runs.run_optimize(ctx, fresh=True)
+
+    kwargs = mock_loop_cls.call_args.kwargs
+    assert kwargs["prior_trials"] == []
+
+    # Archived files present with the exact naming scheme.
+    jsonl_backups = [
+        p for p in tmp_path.glob("opt.jsonl.*.bak") if ".meta.json" not in p.name
+    ]
+    assert len(jsonl_backups) == 1
+    meta_backups = list(tmp_path.glob("opt.jsonl.meta.json.*.bak"))
+    assert len(meta_backups) == 1
+    # Current output does not carry any prior trials.
+    assert not out.exists() or out.stat().st_size == 0
+
+
+def test_run_optimize_incompatible_param_space_raises(tmp_path: Path):
+    out = tmp_path / "opt.jsonl"
+    exp = _optimize_exp(out, n_trials=5)
+    assert exp.optimize is not None
+    priors = [_prior_trial()]
+    # Write a sidecar with a different param_space.
+    for t in priors:
+        TrialLog.append(out, t)
+    TrialLog.write_resume_metadata(
+        out,
+        ResumeMetadata(
+            objectives=exp.objectives,
+            param_space=ParamSpace(
+                params=[
+                    SysctlParam(
+                        name="other.sysctl",
+                        values=[1, 2],
+                        param_type="int",
+                    ),
+                ],
+            ),
+            benchmark=exp.benchmark,
+            n_sobol=exp.optimize.n_sobol,
+        ),
+    )
+
+    ctx = runs.RunContext(
+        exp=exp,
+        client=_client_stub(),
+        backend=MagicMock(),
+        output=out,
+    )
+    with pytest.raises(typer.BadParameter, match="param_space"):
+        runs.run_optimize(ctx)
+
+
+def test_run_optimize_incompatible_n_sobol_raises(tmp_path: Path):
+    out = tmp_path / "opt.jsonl"
+    exp = _optimize_exp(out, n_trials=5)
+    assert exp.optimize is not None
+    priors = [_prior_trial()]
+    _seed_prior_results(out, exp, priors, n_sobol=exp.optimize.n_sobol + 1)
+
+    ctx = runs.RunContext(
+        exp=exp,
+        client=_client_stub(),
+        backend=MagicMock(),
+        output=out,
+    )
+    with pytest.raises(typer.BadParameter, match="n_sobol"):
+        runs.run_optimize(ctx)
+
+
+@patch("kube_autotuner.optimizer.OptimizationLoop")
+def test_run_optimize_short_circuits_when_budget_met(
+    mock_loop_cls,
+    tmp_path: Path,
+    caplog,
+):
+    out = tmp_path / "opt.jsonl"
+    exp = _optimize_exp(out, n_trials=2)
+    priors = [_prior_trial(), _prior_trial(2097152)]
+    _seed_prior_results(out, exp, priors)
+
+    loop = MagicMock()
+    loop.prior_count = 2
+    loop.pareto_front.return_value = []
+    mock_loop_cls.return_value = loop
+
+    caplog.set_level("INFO")
+    ctx = runs.RunContext(
+        exp=exp,
+        client=_client_stub(),
+        backend=MagicMock(),
+        output=out,
+    )
+    runs.run_optimize(ctx)
+
+    loop.run.assert_not_called()
+    assert any("Budget already met" in rec.message for rec in caplog.records)
+
+
+def test_run_optimize_missing_sidecar_raises(tmp_path: Path):
+    out = tmp_path / "opt.jsonl"
+    exp = _optimize_exp(out, n_trials=5)
+    # Write JSONL but not sidecar.
+    for t in [_prior_trial()]:
+        TrialLog.append(out, t)
+    ctx = runs.RunContext(
+        exp=exp,
+        client=_client_stub(),
+        backend=MagicMock(),
+        output=out,
+    )
+    with pytest.raises(typer.BadParameter, match="sidecar"):
+        runs.run_optimize(ctx)
+
+
+def test_run_baseline_writes_resume_meta_without_n_sobol(tmp_path: Path):
+    out = tmp_path / "r.jsonl"
+    exp = ExperimentConfig.model_validate({
+        "mode": "baseline",
+        "nodes": {"sources": ["a"], "target": "b"},
+        "benchmark": {"duration": 1, "iterations": 1},
+        "output": str(out),
+    })
+
+    with (
+        patch("kube_autotuner.runs.NodeLease"),
+        patch("kube_autotuner.runs.BenchmarkRunner") as mock_runner_cls,
+    ):
+        backend = MagicMock()
+        backend.snapshot.side_effect = _snapshot
+        mock_runner_cls.return_value.run.return_value = _results()
+
+        ctx = runs.RunContext(
+            exp=exp,
+            client=_client_stub(),
+            backend=backend,
+            output=out,
+        )
+        runs.run_baseline(ctx)
+
+    loaded = TrialLog.load_resume_metadata(out)
+    assert loaded is not None
+    assert loaded.n_sobol is None
+
+
+def test_run_trial_writes_resume_meta_without_n_sobol(tmp_path: Path):
+    out = tmp_path / "r.jsonl"
+    exp = ExperimentConfig.model_validate({
+        "mode": "trial",
+        "nodes": {"sources": ["a"], "target": "b"},
+        "benchmark": {"duration": 1, "iterations": 1},
+        "trial": {"sysctls": {"net.core.rmem_max": "16777216"}},
+        "output": str(out),
+    })
+
+    with (
+        patch("kube_autotuner.runs.NodeLease"),
+        patch("kube_autotuner.runs.BenchmarkRunner") as mock_runner_cls,
+    ):
+        backend = MagicMock()
+        backend.snapshot.return_value = {
+            "net.core.rmem_max": "67108864",
+            "kernel.osrelease": "6.1.0",
+        }
+        mock_runner_cls.return_value.run.return_value = _results()
+
+        ctx = runs.RunContext(
+            exp=exp,
+            client=_client_stub(),
+            backend=backend,
+            output=out,
+        )
+        runs.run_trial(ctx)
+
+    loaded = TrialLog.load_resume_metadata(out)
+    assert loaded is not None
+    assert loaded.n_sobol is None

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+import json
 from typing import TYPE_CHECKING
 
 from pydantic import ValidationError
@@ -15,6 +16,9 @@ from kube_autotuner.models import (
     IterationResults,
     LatencyResult,
     NodePair,
+    ParamSpace,
+    ResumeMetadata,
+    SysctlParam,
     TrialLog,
     TrialResult,
     compute_sysctl_hash,
@@ -955,55 +959,132 @@ def test_trial_result_round_trip_preserves_latency_results(tmp_path: Path) -> No
     assert loaded[0].latency_results[0].workload == "fixed_qps"
 
 
-class TestTrialLogMetadata:
-    def test_round_trip(self, tmp_path: Path) -> None:
-        path = tmp_path / "results.jsonl"
-        section = ObjectivesSection(
-            pareto=[
-                ParetoObjective(metric="throughput", direction="maximize"),
-                ParetoObjective(metric="node_memory", direction="minimize"),
-            ],
-            constraints=["throughput >= 1e6"],
-            recommendation_weights={"node_memory": 0.5},
+class TestResumeMetadata:
+    def _meta(self, *, n_sobol: int | None = 15) -> ResumeMetadata:
+        return ResumeMetadata(
+            objectives=ObjectivesSection(
+                pareto=[
+                    ParetoObjective(metric="throughput", direction="maximize"),
+                    ParetoObjective(metric="node_memory", direction="minimize"),
+                ],
+                constraints=["throughput >= 1e6"],
+                recommendation_weights={"node_memory": 0.5},
+            ),
+            param_space=ParamSpace(
+                params=[
+                    SysctlParam(
+                        name="net.core.rmem_max",
+                        values=[1048576, 16777216],
+                        param_type="int",
+                    ),
+                ],
+            ),
+            benchmark=BenchmarkConfig(duration=10, iterations=2),
+            n_sobol=n_sobol,
         )
-        TrialLog.write_metadata(path, section)
-        loaded = TrialLog.load_metadata(path)
+
+    def test_resume_metadata_roundtrip(self, tmp_path: Path) -> None:
+        path = tmp_path / "results.jsonl"
+        meta = self._meta()
+        TrialLog.write_resume_metadata(path, meta)
+        loaded = TrialLog.load_resume_metadata(path)
         assert loaded is not None
-        assert loaded.model_dump() == section.model_dump()
+        assert loaded.model_dump() == meta.model_dump()
+
+    def test_resume_metadata_requires_param_space_and_benchmark(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        # Write a partial sidecar missing benchmark; load must raise.
+        path = tmp_path / "results.jsonl"
+        meta_path = path.parent / f"{path.name}.meta.json"
+        meta_path.write_text(
+            '{"objectives": {"pareto": [{"metric": "throughput", '
+            '"direction": "maximize"}], "constraints": [], '
+            '"recommendationWeights": {}}, '
+            '"param_space": {"params": []}}\n',
+        )
+        with pytest.raises(ValidationError):
+            TrialLog.load_resume_metadata(path)
+
+    def test_load_resume_metadata_rejects_old_objectives_only_file(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        # Write an objectives-only sidecar — the old format.
+        path = tmp_path / "results.jsonl"
+        meta_path = path.parent / f"{path.name}.meta.json"
+        meta_path.write_text(
+            '{"pareto": [{"metric": "throughput", '
+            '"direction": "maximize"}], "constraints": [], '
+            '"recommendationWeights": {}}\n',
+        )
+        with pytest.raises(ValidationError):
+            TrialLog.load_resume_metadata(path)
 
     def test_missing_sidecar_returns_none(self, tmp_path: Path) -> None:
-        assert TrialLog.load_metadata(tmp_path / "absent.jsonl") is None
+        assert TrialLog.load_resume_metadata(tmp_path / "absent.jsonl") is None
 
-    def test_drift_warning_on_overwrite(
-        self,
-        tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
+    def test_resume_metadata_n_sobol_optional(self, tmp_path: Path) -> None:
         path = tmp_path / "results.jsonl"
-        TrialLog.write_metadata(path, ObjectivesSection())
-        capsys.readouterr()
-        drifted = ObjectivesSection(
-            recommendation_weights={
-                "cpu": 0.4,
-                "node_memory": 0.15,
-                "retransmit_rate": 0.3,
-            },
+        meta = self._meta(n_sobol=None)
+        TrialLog.write_resume_metadata(path, meta)
+        loaded = TrialLog.load_resume_metadata(path)
+        assert loaded is not None
+        assert loaded.n_sobol is None
+
+
+class TestTrialLogLoadTruncatedTail:
+    def _make_trial(self, iter_idx: int) -> TrialResult:
+        return TrialResult(
+            node_pair=NodePair(source="n1", target="n2", hardware_class="10g"),
+            sysctl_values={"net.core.rmem_max": 1048576 + iter_idx},
+            config=BenchmarkConfig(),
+            results=[
+                BenchmarkResult(
+                    timestamp=datetime.now(UTC),
+                    mode="tcp",
+                    bits_per_second=1e9 + iter_idx,
+                ),
+            ],
         )
-        TrialLog.write_metadata(path, drifted)
-        captured = capsys.readouterr()
-        assert "overwriting" in captured.err
-        assert "different" in captured.err
-        assert TrialLog.load_metadata(path) == drifted
 
-    def test_same_section_overwrite_is_silent(
+    def test_malformed_trailing_line_is_dropped(
         self,
         tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         path = tmp_path / "results.jsonl"
-        section = ObjectivesSection()
-        TrialLog.write_metadata(path, section)
-        capsys.readouterr()
-        TrialLog.write_metadata(path, section)
-        captured = capsys.readouterr()
-        assert captured.err == ""
+        TrialLog.append(path, self._make_trial(0))
+        TrialLog.append(path, self._make_trial(1))
+        with path.open("a", encoding="utf-8") as f:
+            f.write("{not valid json\n")
+        caplog.set_level("WARNING")
+        loaded = TrialLog.load(path)
+        assert len(loaded) == 2
+        assert any("truncated" in rec.message for rec in caplog.records)
+
+    def test_partial_trailing_line_without_newline_is_dropped(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        path = tmp_path / "results.jsonl"
+        TrialLog.append(path, self._make_trial(0))
+        TrialLog.append(path, self._make_trial(1))
+        # Simulate a Ctrl-C mid-write: a partial JSON line without
+        # the trailing newline.
+        with path.open("a", encoding="utf-8") as f:
+            f.write('{"trial_id": "abc123", "node_pair"')
+        caplog.set_level("WARNING")
+        loaded = TrialLog.load(path)
+        assert len(loaded) == 2
+        assert any("truncated" in rec.message for rec in caplog.records)
+
+    def test_mid_file_corruption_still_raises(self, tmp_path: Path) -> None:
+        path = tmp_path / "results.jsonl"
+        with path.open("w", encoding="utf-8") as f:
+            f.write("{not valid json\n")
+            f.write(self._make_trial(0).model_dump_json() + "\n")
+        with pytest.raises((ValidationError, json.JSONDecodeError)):
+            TrialLog.load(path)

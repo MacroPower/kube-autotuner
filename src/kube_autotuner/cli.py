@@ -604,6 +604,13 @@ def optimize(
             help="JSON state file for the fake backend.",
         ),
     ] = None,
+    fresh: Annotated[
+        bool,
+        typer.Option(
+            "--fresh",
+            help="Ignore prior results; move them aside before starting.",
+        ),
+    ] = False,
 ) -> None:
     """Run the Bayesian optimization loop (requires the optimize group)."""
     exp = _apply_overrides(
@@ -631,7 +638,7 @@ def optimize(
         observer=observer,
     )
     with observer:
-        runs.run_optimize(run_ctx)
+        runs.run_optimize(run_ctx, fresh=fresh)
 
 
 @app.command()
@@ -661,6 +668,16 @@ def run(
             help="JSON state file for the fake backend.",
         ),
     ] = None,
+    fresh: Annotated[
+        bool,
+        typer.Option(
+            "--fresh",
+            help=(
+                "Ignore prior results; move them aside before starting "
+                "(optimize mode only)."
+            ),
+        ),
+    ] = False,
 ) -> None:
     """Run an experiment defined by a YAML config file.
 
@@ -694,11 +711,15 @@ def run(
     )
     with observer:
         if exp.mode == "baseline":
+            if fresh:
+                logger.info("--fresh has no effect in mode=%s", exp.mode)
             runs.run_baseline(run_ctx)
         elif exp.mode == "trial":
+            if fresh:
+                logger.info("--fresh has no effect in mode=%s", exp.mode)
             runs.run_trial(run_ctx)
         else:
-            runs.run_optimize(run_ctx)
+            runs.run_optimize(run_ctx, fresh=fresh)
 
 
 @sysctl_app.command("set")
@@ -842,7 +863,8 @@ def analyze(
         typer.echo(f"No trials found in {input_file}", err=True)
         raise typer.Exit(code=1)
 
-    objectives = TrialLog.load_metadata(input_file) or ObjectivesSection()
+    meta = TrialLog.load_resume_metadata(input_file)
+    objectives = meta.objectives if meta is not None else ObjectivesSection()
 
     if hardware_class is not None:
         classes = [hardware_class]

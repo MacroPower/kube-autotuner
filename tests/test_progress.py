@@ -135,6 +135,98 @@ def test_rich_observer_handles_missing_metrics() -> None:
     assert math.isnan(observer._top[0].retx_per_mb)
 
 
+def _prior_trial(bps: float, *, mem: int | None = 500_000_000) -> Any:
+    from datetime import UTC, datetime  # noqa: PLC0415
+
+    from kube_autotuner.models import (  # noqa: PLC0415
+        BenchmarkConfig,
+        BenchmarkResult,
+        NodePair,
+        TrialResult,
+    )
+
+    return TrialResult(
+        node_pair=NodePair(source="a", target="b", hardware_class="10g"),
+        sysctl_values={"net.core.rmem_max": int(bps)},
+        config=BenchmarkConfig(),
+        results=[
+            BenchmarkResult(
+                timestamp=datetime.now(UTC),
+                mode="tcp",
+                bits_per_second=bps,
+                retransmits=5,
+                bytes_sent=1_000_000_000,
+                cpu_utilization_percent=10.0,
+                node_memory_used_bytes=mem,
+                iteration=0,
+            ),
+        ],
+    )
+
+
+def test_null_seed_history_is_noop() -> None:
+    obs = NullObserver()
+    obs.seed_history([_prior_trial(1e9)], n_sobol=2)
+    # No attrs to assert on; the fact that no exception was raised is the test.
+
+
+def test_rich_seed_history_populates_top_and_phase() -> None:
+    pytest.importorskip("ax")
+    console = _capture_console()
+    observer = RichProgressObserver(console)
+    priors = [
+        _prior_trial(5e9),
+        _prior_trial(9e9),
+        _prior_trial(7e9),
+    ]
+    observer.seed_history(priors, n_sobol=2)
+    # Top is sorted by throughput descending and capped.
+    tps = [r.throughput_mbps for r in observer._top]
+    assert tps == sorted(tps, reverse=True)
+    assert len(observer._top) == 3
+    # Phase label reflects number of priors vs n_sobol (3 priors, n_sobol=2
+    # → "bayesian").
+    assert observer._phase == "bayesian"
+    # Trial-timing counters are untouched by seed_history.
+    assert observer._trial_count == 0
+    assert observer._trial_total_seconds == pytest.approx(0.0)
+
+
+def test_rich_seed_history_infers_sobol_phase_when_under_budget() -> None:
+    pytest.importorskip("ax")
+    console = _capture_console()
+    observer = RichProgressObserver(console)
+    observer.seed_history([_prior_trial(1e9)], n_sobol=5)
+    assert observer._phase == "sobol"
+
+
+def test_seed_history_importable_without_ax(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The lazy import inside seed_history fires only at call time.
+
+    ``RichProgressObserver`` itself must be constructible and ``_top``
+    assertable without ``ax-platform`` being importable at module
+    load time. This pins the rule that ``progress`` stays optimize-
+    free for ``task completions``.
+    """
+    import sys  # noqa: PLC0415
+
+    # Block every `ax` import path so module-level code that tried to
+    # pull it in would fail loudly.
+    blocked = [
+        name for name in list(sys.modules) if name == "ax" or name.startswith("ax.")
+    ]
+    for name in blocked:
+        monkeypatch.setitem(sys.modules, name, None)  # block re-imports
+
+    console = _capture_console()
+    observer = RichProgressObserver(console)
+    # Constructing + using the non-seed methods must still work.
+    observer.on_trial_complete(0, "sobol", {"throughput": (1e9, 0.0)})
+    assert observer._top
+
+
 def test_rich_observer_tracks_top_n() -> None:
     console = _capture_console()
     observer = RichProgressObserver(console)

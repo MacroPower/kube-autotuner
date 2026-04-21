@@ -617,6 +617,273 @@ class TestComputeMetricsLatency:
             assert math.isnan(metrics[key][0])
 
 
+class TestSeedPriorTrials:
+    @pytest.fixture
+    def node_pair(self) -> NodePair:
+        return NodePair(
+            source="a",
+            target="b",
+            hardware_class="10g",
+            namespace="default",
+        )
+
+    @pytest.fixture
+    def config(self) -> BenchmarkConfig:
+        return BenchmarkConfig(duration=10, iterations=3, modes=["tcp"])
+
+    def _prior(
+        self,
+        bps: float = 9e9,
+        *,
+        rate_nan: bool = False,
+    ) -> TrialResult:
+        return TrialResult(
+            node_pair=NodePair(source="a", target="b", hardware_class="10g"),
+            sysctl_values={"net.core.rmem_max": 1048576},
+            config=BenchmarkConfig(),
+            results=[
+                BenchmarkResult(
+                    timestamp=datetime.now(UTC),
+                    mode="tcp",
+                    bits_per_second=bps,
+                    retransmits=None if rate_nan else 5,
+                    bytes_sent=None if rate_nan else 1_000_000_000,
+                    cpu_utilization_percent=10.0,
+                    iteration=0,
+                ),
+            ],
+        )
+
+    @patch("kube_autotuner.optimizer.BenchmarkRunner")
+    @patch("kube_autotuner.optimizer.make_sysctl_setter_from_env")
+    @patch("kube_autotuner.optimizer._require_ax_client")
+    def test_seed_prior_trials_attaches_and_completes(
+        self,
+        mock_require_client,
+        mock_setter_cls,  # noqa: ARG002
+        mock_runner_cls,  # noqa: ARG002
+        node_pair,
+        config,
+        tmp_path,
+    ):
+        fake_client = MagicMock()
+        fake_client.attach_trial.side_effect = [11, 12, 13]
+        mock_require_client.return_value = lambda: fake_client
+        priors = [self._prior(9e9), self._prior(8e9), self._prior(7e9)]
+
+        from kube_autotuner.optimizer import OptimizationLoop  # noqa: PLC0415
+
+        loop = OptimizationLoop(
+            node_pair=node_pair,
+            config=config,
+            param_space=PARAM_SPACE,
+            output=tmp_path / "r.jsonl",
+            n_trials=5,
+            n_sobol=5,
+            objectives=ObjectivesSection(),
+            prior_trials=priors,
+        )
+        assert loop.prior_count == 3
+        assert len(loop._completed) == 3
+
+        attach_calls = fake_client.attach_trial.call_args_list
+        assert len(attach_calls) == 3
+        # Each call uses encoded names (no dots) and string values.
+        for call in attach_calls:
+            params = call.kwargs["parameters"]
+            assert all("." not in k for k in params)
+            assert all(isinstance(v, str) for v in params.values())
+
+        complete_calls = fake_client.complete_trial.call_args_list
+        assert len(complete_calls) == 3
+        for call in complete_calls:
+            raw = call.kwargs["raw_data"]
+            assert "throughput" in raw
+
+    @patch("kube_autotuner.optimizer.BenchmarkRunner")
+    @patch("kube_autotuner.optimizer.make_sysctl_setter_from_env")
+    @patch("kube_autotuner.optimizer._require_ax_client")
+    def test_seed_drops_nan_metrics(
+        self,
+        mock_require_client,
+        mock_setter_cls,  # noqa: ARG002
+        mock_runner_cls,  # noqa: ARG002
+        node_pair,
+        config,
+        tmp_path,
+    ):
+        fake_client = MagicMock()
+        fake_client.attach_trial.return_value = 42
+        mock_require_client.return_value = lambda: fake_client
+        # UDP-only trial produces NaN retransmit_rate.
+        nan_prior = self._prior(rate_nan=True)
+
+        from kube_autotuner.optimizer import OptimizationLoop  # noqa: PLC0415
+
+        OptimizationLoop(
+            node_pair=node_pair,
+            config=config,
+            param_space=PARAM_SPACE,
+            output=tmp_path / "r.jsonl",
+            n_trials=5,
+            n_sobol=5,
+            objectives=ObjectivesSection(),
+            prior_trials=[nan_prior],
+        )
+        assert fake_client.complete_trial.call_count == 1
+        raw = fake_client.complete_trial.call_args.kwargs["raw_data"]
+        assert "retransmit_rate" not in raw
+        assert "throughput" in raw
+
+    @patch("kube_autotuner.optimizer.BenchmarkRunner")
+    @patch("kube_autotuner.optimizer.make_sysctl_setter_from_env")
+    @patch("kube_autotuner.optimizer._require_ax_client")
+    def test_should_stop_budget_counts_priors(
+        self,
+        mock_require_client,
+        mock_setter_cls,  # noqa: ARG002
+        mock_runner_cls,  # noqa: ARG002
+        node_pair,
+        config,
+        tmp_path,
+    ):
+        fake_client = MagicMock()
+        fake_client.attach_trial.side_effect = [1, 2, 3]
+        mock_require_client.return_value = lambda: fake_client
+        priors = [self._prior(), self._prior(), self._prior()]
+
+        from kube_autotuner.optimizer import OptimizationLoop  # noqa: PLC0415
+
+        loop = OptimizationLoop(
+            node_pair=node_pair,
+            config=config,
+            param_space=PARAM_SPACE,
+            output=tmp_path / "r.jsonl",
+            n_trials=5,
+            n_sobol=5,
+            objectives=ObjectivesSection(),
+            prior_trials=priors,
+        )
+        assert loop._should_stop(0) is False
+        assert loop._should_stop(1) is False
+        assert loop._should_stop(2) is True
+
+    @patch("kube_autotuner.optimizer.NodeLease")
+    @patch("kube_autotuner.optimizer.BenchmarkRunner")
+    @patch("kube_autotuner.optimizer.make_sysctl_setter_from_env")
+    @patch("kube_autotuner.optimizer._require_ax_client")
+    def test_run_keyboardinterrupt_log_reports_split_counts(  # noqa: PLR0913, PLR0917
+        self,
+        mock_require_client,
+        mock_setter_cls,
+        mock_runner_cls,
+        mock_lease_cls,  # noqa: ARG002
+        node_pair,
+        config,
+        tmp_path,
+        caplog,
+    ):
+        fake_client = MagicMock()
+        fake_client.attach_trial.side_effect = [1, 2]
+        fake_client.get_next_trials.return_value = {
+            99: {"net__core__rmem_max": "1048576"},
+        }
+        mock_require_client.return_value = lambda: fake_client
+
+        mock_setter = MagicMock()
+        mock_setter.snapshot.side_effect = _mock_snapshot
+        mock_setter_cls.return_value = mock_setter
+
+        call_state = {"count": 0}
+
+        def _run_side_effect():
+            call_state["count"] += 1
+            if call_state["count"] == 2:
+                raise KeyboardInterrupt
+            return IterationResults(
+                bench=_make_results(),
+                latency=_make_latency_results(),
+            )
+
+        mock_runner = MagicMock()
+        mock_runner.run.side_effect = _run_side_effect
+        mock_runner_cls.return_value = mock_runner
+
+        priors = [self._prior(), self._prior()]
+
+        from kube_autotuner.optimizer import OptimizationLoop  # noqa: PLC0415
+
+        loop = OptimizationLoop(
+            node_pair=node_pair,
+            config=config,
+            param_space=PARAM_SPACE,
+            output=tmp_path / "r.jsonl",
+            n_trials=10,
+            n_sobol=5,
+            objectives=ObjectivesSection(),
+            prior_trials=priors,
+        )
+        caplog.set_level("INFO")
+        loop.run()
+        messages = [rec.message for rec in caplog.records]
+        assert any("Interrupted after 1 live trials" in m for m in messages)
+        assert any("(3 total)" in m for m in messages)
+
+    @patch("kube_autotuner.optimizer.NodeLease")
+    @patch("kube_autotuner.optimizer.BenchmarkRunner")
+    @patch("kube_autotuner.optimizer.make_sysctl_setter_from_env")
+    @patch("kube_autotuner.optimizer._require_ax_client")
+    def test_record_log_numerator_counts_priors(  # noqa: PLR0913, PLR0917
+        self,
+        mock_require_client,
+        mock_setter_cls,
+        mock_runner_cls,
+        mock_lease_cls,  # noqa: ARG002
+        node_pair,
+        config,
+        tmp_path,
+        caplog,
+    ):
+        fake_client = MagicMock()
+        fake_client.attach_trial.side_effect = [1, 2]
+        fake_client.get_next_trials.return_value = {
+            55: {"net__core__rmem_max": "1048576"},
+        }
+        mock_require_client.return_value = lambda: fake_client
+
+        mock_setter = MagicMock()
+        mock_setter.snapshot.side_effect = _mock_snapshot
+        mock_setter_cls.return_value = mock_setter
+
+        mock_runner = MagicMock()
+        mock_runner.run.return_value = IterationResults(
+            bench=_make_results(),
+            latency=_make_latency_results(),
+        )
+        mock_runner_cls.return_value = mock_runner
+
+        priors = [self._prior(), self._prior()]
+
+        from kube_autotuner.optimizer import OptimizationLoop  # noqa: PLC0415
+
+        loop = OptimizationLoop(
+            node_pair=node_pair,
+            config=config,
+            param_space=PARAM_SPACE,
+            output=tmp_path / "r.jsonl",
+            n_trials=3,
+            n_sobol=3,
+            objectives=ObjectivesSection(),
+            prior_trials=priors,
+        )
+        caplog.set_level("INFO")
+        loop.run()
+        # Expect log numerator = prior_count + i + 1 = 2 + 0 + 1 = 3, total = 3.
+        assert any("Trial 3/3" in rec.message for rec in caplog.records), [
+            rec.message for rec in caplog.records
+        ]
+
+
 class TestFilterObjectivesForObservability:
     def test_noop_when_unobservable_empty(self) -> None:
         section = ObjectivesSection()

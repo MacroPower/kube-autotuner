@@ -64,6 +64,7 @@ if TYPE_CHECKING:
     from rich.progress import Task, TaskID
 
     from kube_autotuner.experiment import ObjectivesSection
+    from kube_autotuner.models import TrialResult
 
 
 _TOP_N = 5
@@ -99,6 +100,24 @@ class ProgressObserver(Protocol):
         tb: TracebackType | None,
     ) -> None:
         """Tear down the live display, flushing any pending output."""
+        ...
+
+    def seed_history(self, prior: list[TrialResult], n_sobol: int) -> None:
+        """Pre-populate the observer with prior trial results.
+
+        Called once before the optimize loop begins when resuming from
+        a previous session's JSONL. The default implementation is a
+        no-op; :class:`RichProgressObserver` overrides it to rebuild
+        the "best so far" table so the live display does not start
+        blank after a resume.
+
+        Args:
+            prior: Successful :class:`TrialResult` records from the
+                prior session, in file order.
+            n_sobol: The Sobol initialization budget for the
+                experiment; used to infer each seeded trial's phase
+                label from its index.
+        """
         ...
 
     def on_trial_start(
@@ -234,6 +253,9 @@ class NullObserver:
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
+        """No-op."""
+
+    def seed_history(self, prior: list[TrialResult], n_sobol: int) -> None:
         """No-op."""
 
     def on_trial_start(
@@ -804,6 +826,39 @@ class RichProgressObserver:
         self._all_rows.append(row)
         self._rerank()
         self._refresh()
+
+    def seed_history(self, prior: list[TrialResult], n_sobol: int) -> None:
+        """Pre-populate the "best so far" table from prior trials.
+
+        Called once at loop-start when resuming from a prior session.
+        The phase of each seeded row is inferred from its index versus
+        ``n_sobol`` -- this is sound because the compat check rejects
+        resumes whose ``n_sobol`` differs from the sidecar's.
+        ``_trial_count`` / ``_trial_total_seconds`` are deliberately
+        left at zero so the ETA re-learns from live wall-clock; the
+        first ``on_trial_start`` advances the Rich bar to
+        ``completed=index`` to reflect the seeded position.
+
+        Args:
+            prior: Prior successful :class:`TrialResult` records in
+                file order.
+            n_sobol: The current experiment's Sobol budget; used to
+                infer the phase label per seeded row.
+        """
+        # Lazy import: ``_compute_metrics`` lives in ``optimizer`` which
+        # is reachable only when the ``optimize`` dep group is
+        # installed. Keeping this import inside the method preserves
+        # the module-level constraint that ``progress`` stays
+        # optimize-free for ``task completions``.
+        from kube_autotuner.optimizer import _compute_metrics  # noqa: PLC0415
+
+        for idx, tr in enumerate(prior):
+            phase = "sobol" if idx < n_sobol else "bayesian"
+            metrics = _compute_metrics(tr)
+            self._all_rows.append(_build_trial_row(idx, phase, metrics))
+        self._rerank()
+        if prior:
+            self._phase = "sobol" if len(prior) < n_sobol else "bayesian"
 
     def _rerank(self) -> None:
         """Refresh ``self._top`` from ``self._all_rows``.
