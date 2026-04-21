@@ -286,13 +286,51 @@ optimize:
 # --- projections ---------------------------------------------------------
 
 
-def test_effective_param_space_default():
-    """When unset, falls back to the canonical PARAM_SPACE."""
+def test_effective_param_space_default_tcp_only_strips_udp():
+    """TCP-only default runs strip UDP-category params from the canonical space."""
+    from kube_autotuner.sysctl.params import PARAM_CATEGORIES  # noqa: PLC0415
+
     exp = ExperimentConfig.model_validate({
         "mode": "baseline",
         "nodes": {"sources": ["a"], "target": "b"},
     })
+    ps = exp.effective_param_space()
+    udp_names = set(PARAM_CATEGORIES["udp"])
+    names = set(ps.param_names())
+    assert not (names & udp_names), "UDP params must be absent under modes=[tcp]"
+    assert len(ps.params) == len(PARAM_SPACE.params) - len(udp_names)
+
+
+def test_effective_param_space_default_tcp_and_udp_keeps_udp():
+    """Including udp in modes returns the canonical PARAM_SPACE intact."""
+    exp = ExperimentConfig.model_validate({
+        "mode": "baseline",
+        "nodes": {"sources": ["a"], "target": "b"},
+        "benchmark": {"modes": ["tcp", "udp"]},
+    })
     assert exp.effective_param_space() is PARAM_SPACE
+
+
+def test_effective_param_space_user_override_bypasses_mode_gate():
+    """A user-supplied param_space is returned verbatim, even on a tcp-only run."""
+    exp = ExperimentConfig.model_validate({
+        "mode": "optimize",
+        "nodes": {"sources": ["a"], "target": "b"},
+        "benchmark": {"modes": ["tcp"]},
+        "optimize": {
+            "nTrials": 2,
+            "nSobol": 1,
+            "paramSpace": [
+                {
+                    "name": "net.ipv4.udp_mem",
+                    "paramType": "choice",
+                    "values": ["a b c"],
+                },
+            ],
+        },
+    })
+    ps = exp.effective_param_space()
+    assert ps.param_names() == ["net.ipv4.udp_mem"]
 
 
 def test_effective_param_space_override():

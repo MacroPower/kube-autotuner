@@ -3,6 +3,12 @@
 The canonical search space is assembled and validated by
 :func:`build_param_space`. A module-level :data:`PARAM_SPACE` alias is
 kept for consumers that prefer a ready-made constant.
+
+Each :class:`SysctlParam` below carries a short comment summarising how
+changing that knob is expected to move the configured objectives
+(throughput, cpu, retransmit_rate, node_memory, cni_memory, rps,
+latency_p50/p90/p99). These are expectations used to read results, not
+guarantees; the optimizer discovers the actual response surface.
 """
 
 from __future__ import annotations
@@ -12,26 +18,27 @@ from kube_autotuner.models import ParamSpace, SysctlParam
 # Full search space, organised by category.
 
 _TCP_BUFFER_PARAMS: list[SysctlParam] = [
+    # System-wide SO_RCVBUF ceiling. Low rungs cap the TCP receive
+    # window on fat pipes and throttle throughput on long-BDP paths;
+    # high rungs trade node_memory for headroom under many flows.
     SysctlParam(
         name="net.core.rmem_max",
         values=[212992, 4194304, 16777216, 67108864],
         param_type="int",
     ),
+    # System-wide SO_SNDBUF ceiling. Mirror of rmem_max on the send
+    # path: low rungs cap the send window and throughput, high rungs
+    # raise memory pressure.
     SysctlParam(
         name="net.core.wmem_max",
         values=[212992, 4194304, 16777216, 67108864],
         param_type="int",
     ),
-    SysctlParam(
-        name="net.core.rmem_default",
-        values=[212992, 1048576, 16777216],
-        param_type="int",
-    ),
-    SysctlParam(
-        name="net.core.wmem_default",
-        values=[212992, 1048576, 16777216],
-        param_type="int",
-    ),
+    # Autotuning triple (min default max) for TCP receive buffers.
+    # Governs the peak receive window. Under-sized max caps iperf3
+    # throughput on high-BDP links and can raise retransmit_rate when
+    # the window collapses; over-sized max raises node_memory under
+    # many concurrent flows.
     SysctlParam(
         name="net.ipv4.tcp_rmem",
         values=[
@@ -41,6 +48,8 @@ _TCP_BUFFER_PARAMS: list[SysctlParam] = [
         ],
         param_type="choice",
     ),
+    # Autotuning triple for TCP send buffers. Same trade-off as
+    # tcp_rmem on the send path: throughput vs. memory footprint.
     SysctlParam(
         name="net.ipv4.tcp_wmem",
         values=[
@@ -50,61 +59,70 @@ _TCP_BUFFER_PARAMS: list[SysctlParam] = [
         ],
         param_type="choice",
     ),
+    # Global TCP memory pressure thresholds in pages (min pressure max).
+    # Too small and the kernel prunes/throttles under load (throughput
+    # drops, retransmit_rate rises); too large and node_memory climbs.
+    # Represented as the canonical three-integer string form.
     SysctlParam(
         name="net.ipv4.tcp_mem",
-        # Kernel default is auto-sized; represented here as the common
-        # three-integer form since sysctl -w requires three integers.
         values=["393216 524288 786432", "786432 1048576 1572864"],
         param_type="choice",
-    ),
-    SysctlParam(
-        name="net.ipv4.udp_mem",
-        values=["393216 524288 786432", "786432 1048576 1572864"],
-        param_type="choice",
-    ),
-    SysctlParam(
-        name="net.core.optmem_max",
-        values=[131072, 524288, 16777216],
-        param_type="int",
     ),
 ]
 
 _CONGESTION_PARAMS: list[SysctlParam] = [
+    # cubic vs. bbr. BBR drives higher throughput on shallow-buffered
+    # paths and generally cuts retransmit_rate, but can move p99
+    # latency in either direction depending on the fabric. One of the
+    # largest single levers in the whole space.
     SysctlParam(
         name="net.ipv4.tcp_congestion_control",
         values=["cubic", "bbr"],
         param_type="choice",
     ),
+    # Egress queueing discipline. fq enables BBR pacing (so it
+    # couples with tcp_congestion_control); fq_codel actively fights
+    # bufferbloat, which shows up as lower fortio p99 under load.
+    # pfifo_fast is the legacy FIFO baseline.
     SysctlParam(
         name="net.core.default_qdisc",
         values=["pfifo_fast", "fq", "fq_codel"],
         param_type="choice",
     ),
-    SysctlParam(
-        name="net.ipv4.tcp_fastopen",
-        values=[0, 3],
-        param_type="choice",
-    ),
-    SysctlParam(
-        name="net.ipv4.tcp_slow_start_after_idle",
-        values=[0, 1],
-        param_type="choice",
-    ),
+    # When 0 (default), the kernel caches per-peer RTT/ssthresh in
+    # tcp_metrics; repeated trials against the same src/dst peer
+    # inherit warm state, which biases early-trial results and can
+    # mask the real effect of other knobs. Setting 1 forces cold
+    # starts (trial independence) at the cost of slower ramp-up.
     SysctlParam(
         name="net.ipv4.tcp_no_metrics_save",
         values=[0, 1],
         param_type="choice",
     ),
+    # Path-MTU probing. Only helps when the path has a PMTUD blackhole
+    # (rare intra-cluster). When it matters, it cuts retransmit_rate
+    # and latency spikes caused by fragmentation-induced loss.
     SysctlParam(
         name="net.ipv4.tcp_mtu_probing",
         values=[0, 1],
         param_type="choice",
     ),
+    # Explicit Congestion Notification. 0 disabled; 1 accept-and-
+    # request (both directions, so iperf3 / fortio clients will
+    # negotiate ECN on outbound connections). Rung 2 (responder-only)
+    # is omitted because the clients initiate every flow in this
+    # harness, making it equivalent to 0. On fabrics that honour ECN
+    # marks, 1 substitutes marks for drops and lowers retransmit_rate
+    # without hurting throughput; on fabrics that don't, it's a no-op.
     SysctlParam(
         name="net.ipv4.tcp_ecn",
-        values=[0, 1, 2],
+        values=[0, 1],
         param_type="choice",
     ),
+    # Per-socket cap on bytes queued in the qdisc/TX ring. Low values
+    # cut bufferbloat and improve p99 latency; high values give the
+    # send path more runway for throughput at the cost of tail
+    # latency. Direct lever on the throughput vs. p99 trade-off.
     SysctlParam(
         name="net.ipv4.tcp_limit_output_bytes",
         values=[262144, 4194304],
@@ -113,21 +131,27 @@ _CONGESTION_PARAMS: list[SysctlParam] = [
 ]
 
 _NAPI_PARAMS: list[SysctlParam] = [
+    # Per-CPU input queue length before drops under RX bursts. Low
+    # rungs cause packet drops on bursty workloads (visible as
+    # retransmit_rate spikes); very high rungs add queuing latency
+    # once the system is already overloaded.
     SysctlParam(
         name="net.core.netdev_max_backlog",
         values=[1000, 5000, 30000, 250000],
         param_type="int",
     ),
+    # Max packets per NAPI poll cycle. Higher = better throughput on
+    # bulk traffic (iperf3), potentially at the cost of softirq
+    # fairness and higher cpu under the bulk sub-stage.
     SysctlParam(
         name="net.core.netdev_budget",
         values=[300, 600, 1000, 2000],
         param_type="int",
     ),
-    SysctlParam(
-        name="net.core.dev_weight",
-        values=[64, 128, 256, 600],
-        param_type="int",
-    ),
+    # Packets GRO coalesces before flushing up the stack. Larger
+    # batches cut per-packet overhead (cpu, throughput) on bulk
+    # flows; small batches reduce in-stack latency for small
+    # request/response traffic.
     SysctlParam(
         name="net.core.gro_normal_batch",
         values=[8, 16, 32],
@@ -135,59 +159,142 @@ _NAPI_PARAMS: list[SysctlParam] = [
     ),
 ]
 
-_BUSY_POLL_PARAMS: list[SysctlParam] = [
-    SysctlParam(
-        name="net.core.busy_poll",
-        values=[0, 50, 100],
-        param_type="int",
-    ),
-    SysctlParam(
-        name="net.core.busy_read",
-        values=[0, 50, 100],
-        param_type="int",
-    ),
-]
-
 _MEMORY_PARAMS: list[SysctlParam] = [
+    # Floor on free pages the kernel keeps reserved. Too low and
+    # allocations stall under pressure (packet drops, p99 spikes,
+    # retransmit_rate); too high wastes headroom and inflates
+    # node_memory.
     SysctlParam(
         name="vm.min_free_kbytes",
         values=[65536, 131072, 262144],
         param_type="int",
     ),
-    SysctlParam(
-        name="vm.swappiness",
-        values=[1, 10, 60],
-        param_type="int",
-    ),
 ]
 
 _CONNECTION_PARAMS: list[SysctlParam] = [
+    # listen() accept queue cap. Under-sized values drop SYNs during
+    # fortio saturation, showing up as rps regressions and
+    # connection-establishment latency spikes.
     SysctlParam(
         name="net.core.somaxconn",
-        values=[128, 4096],
+        values=[128, 4096, 16384, 65535],
         param_type="int",
     ),
+    # Per-listener SYN queue. Complements somaxconn earlier in the
+    # handshake; under-sized values cause SYN drops under heavy
+    # new-connection load.
     SysctlParam(
         name="net.ipv4.tcp_max_syn_backlog",
         values=[1024, 4096, 65536],
         param_type="int",
     ),
+    # Allows outbound reuse of TIME_WAIT sockets. Mitigates ephemeral
+    # port exhaustion under fortio connection churn; couples with
+    # ip_local_port_range and tcp_fin_timeout.
     SysctlParam(
         name="net.ipv4.tcp_tw_reuse",
         values=[0, 1],
         param_type="choice",
     ),
+    # FIN-WAIT-2 timeout. Shorter values reclaim sockets faster under
+    # high connection-establishment churn (fortio saturation), at the
+    # cost of occasional late-packet rejection.
     SysctlParam(
         name="net.ipv4.tcp_fin_timeout",
         values=[15, 60],
         param_type="int",
     ),
+    # Ceiling on concurrent TIME_WAIT entries. Overflow triggers the
+    # `TCP: time wait bucket table overflow` dmesg warning and forced
+    # eviction of the oldest TW entry. fortio fixed_qps p99 (the only
+    # sub-stage feeding latency percentiles) can move if saturation
+    # churn pushes the table into eviction and the residual pressure
+    # carries into the following fixed_qps stage. At fortio.connections=4
+    # and the current default shape the lowest rung is not reachable;
+    # this dimension only bites if connection churn is scaled up.
+    SysctlParam(
+        name="net.ipv4.tcp_max_tw_buckets",
+        values=[65536, 262144, 1048576],
+        param_type="int",
+    ),
+    # Cap on unsent bytes in the TCP send queue. The kernel default
+    # is UINT_MAX (4294967295), i.e. effectively unlimited; the
+    # sysctl handler is proc_douintvec over an unsigned int, so
+    # negative writes are rejected at apply time. Smaller positive
+    # rungs cut head-of-line blocking and bufferbloat inside the
+    # host stack, lowering fortio fixed_qps p99 without usually
+    # hurting iperf3 throughput.
+    SysctlParam(
+        name="net.ipv4.tcp_notsent_lowat",
+        values=[131072, 262144, 4294967295],
+        param_type="int",
+    ),
+    # Ephemeral port pool size. With benchmark.parallel iperf3
+    # streams plus fortio saturation from the same source pod,
+    # narrow ranges exhaust ports and cap rps. Expressed as a
+    # "low high" integer tuple since sysctl -w reads two integers.
+    SysctlParam(
+        name="net.ipv4.ip_local_port_range",
+        values=["32768 60999", "15000 65535", "1024 65535"],
+        param_type="choice",
+    ),
 ]
 
 _UDP_PARAMS: list[SysctlParam] = [
+    # Per-socket receive-buffer floor for UDP. Too small and bursts
+    # overflow the socket queue, producing datagram loss (UDP
+    # retransmit/jitter metrics).
     SysctlParam(
         name="net.ipv4.udp_rmem_min",
         values=[4096, 65536],
+        param_type="int",
+    ),
+    # Global UDP memory pressure thresholds (pages). Too small and
+    # the kernel prunes under load; too large and node_memory climbs.
+    # Only active when benchmark.modes includes udp.
+    SysctlParam(
+        name="net.ipv4.udp_mem",
+        values=["393216 524288 786432", "786432 1048576 1572864"],
+        param_type="choice",
+    ),
+]
+
+_CONNTRACK_PARAMS: list[SysctlParam] = [
+    # Conntrack table capacity. On nodes using iptables/ipvs
+    # kube-proxy or a netfilter-based CNI, every new flow through a
+    # Service IP or SNAT consumes an entry. Overflow caps rps on the
+    # saturation sub-stage; residual conntrack pressure carried into
+    # the following fixed_qps sub-stage can also move p99. Rungs are
+    # kept narrow because SysctlParam has no way to couple a paired
+    # buckets write, so we rely on the node's boot-time buckets value
+    # (typically ~max/4) and avoid max values that would blow the
+    # chain-depth ratio past ~8x. At the default fortio shape this
+    # dimension mostly matters for production guidance rather than
+    # moving trial metrics.
+    SysctlParam(
+        name="net.netfilter.nf_conntrack_max",
+        values=[131072, 262144, 1048576],
+        param_type="int",
+    ),
+    # How long ESTABLISHED entries persist when idle (default 432000s
+    # / 5 days). Shorter values reduce conntrack table pressure
+    # (helps nf_conntrack_max headroom) at the cost of reaping
+    # idle-but-alive flows sooner.
+    SysctlParam(
+        name="net.netfilter.nf_conntrack_tcp_timeout_established",
+        values=[600, 3600, 86400, 432000],
+        param_type="int",
+    ),
+    # TIME_WAIT tail inside conntrack. Shorter values free table slots
+    # faster under fortio connection churn; when the saturation
+    # sub-stage leaves lingering conntrack pressure, the effect
+    # surfaces on the following fixed_qps sub-stage's p99 (latency is
+    # never sampled during saturation). Too short risks conntrack
+    # losing track of strays from the same 5-tuple on lossy paths,
+    # though intra-cluster loss makes that caveat mostly theoretical.
+    SysctlParam(
+        name="net.netfilter.nf_conntrack_tcp_timeout_time_wait",
+        values=[30, 60, 120, 300],
         param_type="int",
     ),
 ]
@@ -242,10 +349,10 @@ def build_param_space(params: list[SysctlParam] | None = None) -> ParamSpace:
             _TCP_BUFFER_PARAMS
             + _CONGESTION_PARAMS
             + _NAPI_PARAMS
-            + _BUSY_POLL_PARAMS
             + _MEMORY_PARAMS
             + _CONNECTION_PARAMS
             + _UDP_PARAMS
+            + _CONNTRACK_PARAMS
         )
     )
     _validate_params(effective)
@@ -258,10 +365,10 @@ PARAM_CATEGORIES: dict[str, list[str]] = {
     "tcp_buffer": [p.name for p in _TCP_BUFFER_PARAMS],
     "congestion": [p.name for p in _CONGESTION_PARAMS],
     "napi": [p.name for p in _NAPI_PARAMS],
-    "busy_poll": [p.name for p in _BUSY_POLL_PARAMS],
     "memory": [p.name for p in _MEMORY_PARAMS],
     "connection": [p.name for p in _CONNECTION_PARAMS],
     "udp": [p.name for p in _UDP_PARAMS],
+    "conntrack": [p.name for p in _CONNTRACK_PARAMS],
 }
 
 PARAM_TO_CATEGORY: dict[str, str] = {

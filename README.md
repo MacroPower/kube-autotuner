@@ -30,12 +30,13 @@ under saturation, and p50/p90/p99 latency under a fixed offered load.
   multiple clients share one server. The surrogate is fitting a noisy
   response, not a deterministic function; iteration counts exist partly
   to buy it confidence.
-- **High-dimensional, discrete search.** The default space has 30
-  parameters (see the next section) and on the order of 10^12
-  combinations. It is discrete and categorical, so the optimizer treats
-  it as a mixed integer/categorical problem. Gradient-based acquisition
-  still runs under the hood, but on a relaxed surrogate, not on the
-  (non-differentiable) iperf3 objective itself.
+- **High-dimensional, discrete search.** The default space has 27
+  parameters (see the next section) with well over 10^10 combinations
+  under the rung convention. It is discrete and categorical, so the
+  optimizer treats it as a mixed integer/categorical problem.
+  Gradient-based acquisition still runs under the hood, but on a
+  relaxed surrogate, not on the (non-differentiable) iperf3 objective
+  itself.
 - **Parameters interact.** The buffer family mixes types in the default
   space: `net.core.rmem_max` / `net.core.wmem_max` are `int` rungs that
   cap the window, while `net.ipv4.tcp_rmem` / `net.ipv4.tcp_wmem` are
@@ -92,27 +93,34 @@ percentiles in one pass.
 ## Parameter space
 
 When `optimize.paramSpace` is omitted, the tool searches a canonical
-default: 30 sysctls across seven categories. Two parameter types are
+default: 27 sysctls across seven categories. Two parameter types are
 accepted: `int` (a numeric range) and `choice` (an explicit value list
 of strings or ints). The canonical default quantises every integer
 parameter to a handful of representative rungs rather than covering the
 full `[min, max]` integer range; that's a convention of the default,
 not a type-system invariant, so a user-supplied `paramSpace` is free to
 hand Ax a wide integer range instead. Under the rung convention the
-default space has on the order of 10^12 combinations; treating integer
+default space has well over 10^10 combinations; treating integer
 parameters as full ranges (as the YAML doc comment
 `values = [min, max]` implies for custom params) makes it larger still.
 Either way, exhaustive search is not an option.
 
-| Category           | Count | Examples                                                        |
-|--------------------|-------|-----------------------------------------------------------------|
-| TCP buffers        | 9     | `net.core.rmem_max`, `net.ipv4.tcp_rmem`, `net.ipv4.tcp_mem`    |
-| Congestion control | 8     | `net.ipv4.tcp_congestion_control`, `net.core.default_qdisc`     |
-| NAPI / softirq     | 4     | `net.core.netdev_budget`, `net.core.netdev_max_backlog`         |
-| Busy poll          | 2     | `net.core.busy_poll`, `net.core.busy_read`                      |
-| VM / memory        | 2     | `vm.min_free_kbytes`, `vm.swappiness`                           |
-| Connection backlog | 4     | `net.core.somaxconn`, `net.ipv4.tcp_max_syn_backlog`            |
-| UDP                | 1     | `net.ipv4.udp_rmem_min`                                         |
+| Category           | Count | Examples                                                                               |
+|--------------------|-------|----------------------------------------------------------------------------------------|
+| TCP buffers        | 5     | `net.core.rmem_max`, `net.ipv4.tcp_rmem`, `net.ipv4.tcp_mem`                           |
+| Congestion control | 6     | `net.ipv4.tcp_congestion_control`, `net.core.default_qdisc`                            |
+| NAPI / softirq     | 3     | `net.core.netdev_budget`, `net.core.netdev_max_backlog`                                |
+| VM / memory        | 1     | `vm.min_free_kbytes`                                                                   |
+| Connection         | 7     | `net.core.somaxconn`, `net.ipv4.tcp_max_tw_buckets`, `net.ipv4.ip_local_port_range`    |
+| UDP                | 2     | `net.ipv4.udp_rmem_min`, `net.ipv4.udp_mem`                                            |
+| Conntrack          | 3     | `net.netfilter.nf_conntrack_max`, `net.netfilter.nf_conntrack_tcp_timeout_established` |
+
+UDP-category params are only searched when `benchmark.modes` includes
+`udp`; on a TCP-only run (the default) they are stripped from the
+canonical default. A user-supplied `optimize.paramSpace` bypasses the
+mode gate. Conntrack tuning assumes the `nf_conntrack` kernel module is
+loaded on the target node; on nodes without `/proc/sys/net/netfilter`
+these writes will fail at apply time.
 
 Two shapes of customisation:
 

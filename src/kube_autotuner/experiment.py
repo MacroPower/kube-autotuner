@@ -32,7 +32,7 @@ import yaml
 
 from kube_autotuner.models import BenchmarkConfig, NodePair, ParamSpace, SysctlParam
 from kube_autotuner.subproc import run_tool
-from kube_autotuner.sysctl.params import PARAM_SPACE
+from kube_autotuner.sysctl.params import PARAM_CATEGORIES, PARAM_SPACE
 
 if TYPE_CHECKING:
     from kube_autotuner.k8s.client import K8sClient
@@ -570,13 +570,20 @@ class ExperimentConfig(BaseModel):
         """Return the active search space for the experiment.
 
         Returns:
-            ``optimize.param_space`` when the config supplies one,
-            otherwise the canonical :data:`PARAM_SPACE` assembled by
-            :func:`kube_autotuner.sysctl.params.build_param_space`.
+            ``optimize.param_space`` when the config supplies one. For
+            the canonical default, UDP-category params are stripped when
+            ``benchmark.modes`` does not include ``"udp"``, since the
+            clients never generate UDP traffic and those dimensions are
+            noise. A user-supplied override bypasses the mode gate.
         """
         if self.optimize and self.optimize.param_space:
             return ParamSpace(params=self.optimize.param_space)
-        return PARAM_SPACE
+        if "udp" in self.benchmark.modes:
+            return PARAM_SPACE
+        udp_names = set(PARAM_CATEGORIES.get("udp", []))
+        return ParamSpace(
+            params=[p for p in PARAM_SPACE.params if p.name not in udp_names],
+        )
 
     def preflight(self, client: K8sClient) -> list[PreflightResult]:
         """Run every preflight check and return the results.

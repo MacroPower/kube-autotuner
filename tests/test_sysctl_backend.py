@@ -11,7 +11,9 @@ from typing import TYPE_CHECKING, cast
 
 import pytest
 
+from kube_autotuner.experiment import SYSCTL_NAME_RE
 from kube_autotuner.models import SysctlParam
+from kube_autotuner.sysctl.backend import _validate_sysctl_key  # noqa: PLC2701
 from kube_autotuner.sysctl.fake import FakeSysctlBackend
 from kube_autotuner.sysctl.params import (
     PARAM_CATEGORIES,
@@ -93,22 +95,40 @@ def test_build_param_space_canonical_validates():
     assert ps is not PARAM_SPACE  # builder returns a fresh instance each call
 
 
-# Drift guard: the README "Parameter space" section advertises a 30-sysctl
+# Drift guard: the README "Parameter space" section advertises a 27-sysctl
 # default broken down into seven categories. If these counts change,
 # update the README table in the same commit.
 def test_param_space_counts_match_readme():
-    assert len(PARAM_SPACE.params) == 30
+    assert len(PARAM_SPACE.params) == 27
     expected_counts = {
-        "tcp_buffer": 9,
-        "congestion": 8,
-        "napi": 4,
-        "busy_poll": 2,
-        "memory": 2,
-        "connection": 4,
-        "udp": 1,
+        "tcp_buffer": 5,
+        "congestion": 6,
+        "napi": 3,
+        "memory": 1,
+        "connection": 7,
+        "udp": 2,
+        "conntrack": 3,
     }
     actual_counts = {cat: len(names) for cat, names in PARAM_CATEGORIES.items()}
     assert actual_counts == expected_counts
+
+
+def test_param_categories_includes_conntrack_excludes_busy_poll():
+    # Dropped in the sysctl parameter-space review: busy_poll / busy_read
+    # require application SO_BUSY_POLL opt-in that neither iperf3 nor
+    # fortio provide, and the conntrack family is the single biggest gap
+    # for a Kubernetes-focused tuner.
+    assert "conntrack" in PARAM_CATEGORIES
+    assert "busy_poll" not in PARAM_CATEGORIES
+
+
+def test_conntrack_keys_pass_both_sysctl_regexes():
+    # net.netfilter.* must survive both the experiment-level shape check
+    # and the backend-level allowlist. Tightening either regex would
+    # silently block conntrack tuning.
+    key = "net.netfilter.nf_conntrack_max"
+    assert SYSCTL_NAME_RE.match(key) is not None
+    _validate_sysctl_key(key)  # does not raise
 
 
 def test_build_param_space_rejects_empty_values():
