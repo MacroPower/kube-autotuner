@@ -4,15 +4,21 @@ from __future__ import annotations
 
 import io
 import math
-from typing import TYPE_CHECKING, cast
+import os
+import pty
+from typing import TYPE_CHECKING, Any, cast
 
+import pytest
 from rich.console import Console
 
+from kube_autotuner import progress as progress_module
 from kube_autotuner.progress import (
     NullObserver,
     RichProgressObserver,
     make_observer,
 )
+
+_TtyEchoSuppressor = progress_module._TtyEchoSuppressor
 
 if TYPE_CHECKING:
     from kube_autotuner.progress import ProgressObserver
@@ -119,3 +125,191 @@ def test_make_observer_disabled_returns_null() -> None:
     console = _capture_console()
     obs = make_observer(enabled=False, console=console)
     assert isinstance(obs, NullObserver)
+
+
+# --- _TtyEchoSuppressor coverage -------------------------------------------
+
+
+class _RecordingTty:
+    """Stand-in for the ``tty`` module that records setcbreak calls."""
+
+    def __init__(self, sentinel: list[Any]) -> None:
+        self.calls: list[tuple[Any, ...]] = []
+        self._sentinel = sentinel
+
+    def setcbreak(self, *args: Any, **kwargs: Any) -> list[Any]:
+        self.calls.append((args, kwargs))
+        return self._sentinel
+
+
+class _RecordingTermios:
+    """Stand-in for the ``termios`` module that records tcsetattr calls."""
+
+    TCSAFLUSH = 2
+    ECHO = 0o10
+    ICANON = 0o2
+    ISIG = 0o1
+
+    class error(Exception):  # noqa: N801, N818 mirrors termios.error
+        """Mimic ``termios.error``."""
+
+    def __init__(self) -> None:
+        self.set_calls: list[tuple[Any, ...]] = []
+
+    def tcsetattr(self, *args: Any, **kwargs: Any) -> None:
+        self.set_calls.append((args, kwargs))
+
+
+def test_tty_echo_suppressor_noop_when_stdin_not_tty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_tty = _RecordingTty(sentinel=[])
+    fake_termios = _RecordingTermios()
+    monkeypatch.setattr(progress_module, "tty", fake_tty)
+    monkeypatch.setattr(progress_module, "termios", fake_termios)
+    monkeypatch.setattr(progress_module.os, "isatty", lambda _fd: False)
+
+    class _FakeStdin:
+        def fileno(self) -> int:
+            return 99
+
+    monkeypatch.setattr(progress_module.sys, "stdin", _FakeStdin())
+
+    with _TtyEchoSuppressor():
+        pass
+
+    assert fake_tty.calls == []
+    assert fake_termios.set_calls == []
+
+
+def test_tty_echo_suppressor_happy_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sentinel: list[Any] = ["SAVED"]
+    fake_tty = _RecordingTty(sentinel=sentinel)
+    fake_termios = _RecordingTermios()
+    monkeypatch.setattr(progress_module, "tty", fake_tty)
+    monkeypatch.setattr(progress_module, "termios", fake_termios)
+    monkeypatch.setattr(progress_module.os, "isatty", lambda _fd: True)
+
+    class _FakeStdin:
+        def fileno(self) -> int:
+            return 7
+
+    monkeypatch.setattr(progress_module.sys, "stdin", _FakeStdin())
+
+    with _TtyEchoSuppressor():
+        assert fake_tty.calls == [((7, fake_termios.TCSAFLUSH), {})]
+        assert fake_termios.set_calls == []
+
+    assert fake_termios.set_calls == [((7, fake_termios.TCSAFLUSH, sentinel), {})]
+
+
+def test_tty_echo_suppressor_preserves_isig_on_real_pty() -> None:
+    pytest.importorskip("termios")
+    import sys  # noqa: PLC0415 per-test stdin swap
+    import termios  # noqa: PLC0415 required to read back the pty state
+
+    master, slave = pty.openpty()
+    try:
+        saved = termios.tcgetattr(slave)
+        saved_lflag = saved[3]
+
+        class _SlaveStdin:
+            def fileno(self) -> int:
+                return slave
+
+        original_stdin = sys.stdin
+        sys.stdin = cast("Any", _SlaveStdin())
+        try:
+            with _TtyEchoSuppressor():
+                inside = termios.tcgetattr(slave)
+                inside_lflag = inside[3]
+                assert inside_lflag & termios.ECHO == 0
+                assert inside_lflag & termios.ICANON == 0
+                assert inside_lflag & termios.ISIG == saved_lflag & termios.ISIG
+            after = termios.tcgetattr(slave)
+            assert after[3] == saved_lflag
+        finally:
+            sys.stdin = original_stdin
+    finally:
+        os.close(master)
+        os.close(slave)
+
+
+def test_rich_observer_restores_echo_on_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sentinel: list[Any] = ["SAVED"]
+    fake_tty = _RecordingTty(sentinel=sentinel)
+    fake_termios = _RecordingTermios()
+    monkeypatch.setattr(progress_module, "tty", fake_tty)
+    monkeypatch.setattr(progress_module, "termios", fake_termios)
+    monkeypatch.setattr(progress_module.os, "isatty", lambda _fd: True)
+
+    class _FakeStdin:
+        def fileno(self) -> int:
+            return 11
+
+    monkeypatch.setattr(progress_module.sys, "stdin", _FakeStdin())
+
+    console = _capture_console()
+    observer = RichProgressObserver(console)
+    with pytest.raises(RuntimeError, match="boom"), observer:
+        raise RuntimeError("boom")
+
+    assert fake_termios.set_calls == [((11, fake_termios.TCSAFLUSH, sentinel), {})]
+
+
+def test_rich_observer_unwinds_echo_when_live_enter_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sentinel: list[Any] = ["SAVED"]
+    fake_tty = _RecordingTty(sentinel=sentinel)
+    fake_termios = _RecordingTermios()
+    monkeypatch.setattr(progress_module, "tty", fake_tty)
+    monkeypatch.setattr(progress_module, "termios", fake_termios)
+    monkeypatch.setattr(progress_module.os, "isatty", lambda _fd: True)
+
+    class _FakeStdin:
+        def fileno(self) -> int:
+            return 13
+
+    monkeypatch.setattr(progress_module.sys, "stdin", _FakeStdin())
+
+    def _boom(_self: Any) -> None:
+        msg = "live boom"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(progress_module.Live, "__enter__", _boom)
+
+    console = _capture_console()
+    observer = RichProgressObserver(console)
+    with pytest.raises(RuntimeError, match="live boom"), observer:
+        pass
+
+    assert observer._live is None
+    assert observer._echo is None
+    assert fake_termios.set_calls == [((13, fake_termios.TCSAFLUSH, sentinel), {})]
+
+
+def test_tty_echo_suppressor_noop_when_termios_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(progress_module, "termios", None)
+    monkeypatch.setattr(progress_module, "tty", None)
+
+    sentinel_called = False
+
+    class _FakeStdin:
+        def fileno(self) -> int:
+            nonlocal sentinel_called
+            sentinel_called = True
+            return 0
+
+    monkeypatch.setattr(progress_module.sys, "stdin", _FakeStdin())
+
+    with _TtyEchoSuppressor():
+        pass
+
+    assert sentinel_called is False

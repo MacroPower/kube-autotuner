@@ -23,7 +23,10 @@ standard library, and pure-typing helpers.
 
 from __future__ import annotations
 
+import contextlib
 import math
+import os
+import sys
 from typing import TYPE_CHECKING, Protocol, Self
 
 from rich.console import Group
@@ -38,9 +41,17 @@ from rich.progress import (
 )
 from rich.table import Table
 
+try:
+    import termios
+    import tty
+except ImportError:  # Windows
+    termios = None  # ty: ignore[invalid-assignment]
+    tty = None  # ty: ignore[invalid-assignment]
+
 if TYPE_CHECKING:
     from collections.abc import Mapping
     from types import TracebackType
+    from typing import Any
 
     from rich.console import Console
     from rich.progress import TaskID
@@ -228,6 +239,67 @@ class _TrialRow:
         self.retx_per_mb = retx_per_mb
 
 
+class _TtyEchoSuppressor:
+    """Disable stdin ECHO/ICANON for the lifetime of a ``with`` block.
+
+    Reuses :func:`tty.setcbreak`, which clears ``ECHO | ICANON`` while
+    preserving ``ISIG`` (so Ctrl-C still raises SIGINT) and returns the
+    previously saved termios mode for restoration. Without this, the
+    tty driver echoes arrow-key escape sequences directly under a
+    ``rich.live.Live`` region, desyncing Rich's cursor tracking and
+    stranding a duplicate render in the scrollback on every keypress.
+
+    No-ops silently on Windows (``termios``/``tty`` import failed),
+    when stdin is detached or closed, when stdin is not a tty (piped
+    input, CliRunner capture), or when the termios calls fail.
+    """
+
+    def __init__(self) -> None:
+        """Start disarmed; ``__enter__`` attempts the suppression."""
+        self._fd: int | None = None
+        self._saved: list[Any] | None = None
+
+    def __enter__(self) -> Self:
+        """Switch stdin to cbreak mode if possible; record prior state.
+
+        Returns:
+            The suppressor instance so callers can use
+            ``with _TtyEchoSuppressor() as s:``.
+        """
+        if termios is None or tty is None:
+            return self
+        try:
+            fd = sys.stdin.fileno()
+        except AttributeError, ValueError, OSError:
+            return self
+        if not os.isatty(fd):
+            return self
+        try:
+            # setcbreak returns the prior termios attrs in 3.12+.
+            # TCSAFLUSH (positional) discards already-buffered
+            # keystrokes so escape bytes typed moments before we
+            # entered don't echo after the mode switch.
+            saved = tty.setcbreak(fd, termios.TCSAFLUSH)
+        except OSError, termios.error:
+            return self
+        self._fd = fd
+        self._saved = saved
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        """Restore the original termios attributes if we changed them."""
+        del exc_type, exc, tb
+        if self._fd is None or self._saved is None or termios is None:
+            return
+        with contextlib.suppress(OSError, termios.error):
+            termios.tcsetattr(self._fd, termios.TCSAFLUSH, self._saved)
+
+
 class RichProgressObserver:
     """Live ``rich`` display with a trials bar, iteration bar, and results table.
 
@@ -254,6 +326,7 @@ class RichProgressObserver:
         self._phase: str = "sobol"
         self._current_mode: str = ""
         self._live: Live | None = None
+        self._echo: _TtyEchoSuppressor | None = None
 
     @staticmethod
     def _make_progress() -> Progress:
@@ -320,16 +393,32 @@ class RichProgressObserver:
     def __enter__(self) -> Self:
         """Start the ``rich.live.Live`` display on the bound console.
 
+        Stdin ECHO/ICANON is cleared first via :class:`_TtyEchoSuppressor`
+        so keystrokes (notably arrow-key escape sequences) do not echo
+        under the live region and desync Rich's cursor tracking.
+
         Returns:
             The observer instance so callers can use ``with obs as o:``.
         """
-        self._live = Live(
-            self._render(),
-            console=self._console,
-            refresh_per_second=8,
-            transient=False,
-        )
-        self._live.__enter__()
+        echo = _TtyEchoSuppressor()
+        echo.__enter__()
+        try:
+            live = Live(
+                self._render(),
+                console=self._console,
+                refresh_per_second=8,
+                transient=False,
+            )
+            live.__enter__()
+        except BaseException:
+            # BaseException (not Exception) so KeyboardInterrupt /
+            # SystemExit during Live construction still unwinds echo
+            # suppression — leaving the terminal in noecho mode would
+            # strand the user.
+            echo.__exit__(None, None, None)
+            raise
+        self._echo = echo
+        self._live = live
         return self
 
     def __exit__(
@@ -338,10 +427,15 @@ class RichProgressObserver:
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
-        """Stop the live display; swallow no exceptions."""
-        if self._live is not None:
-            self._live.__exit__(exc_type, exc, tb)
-            self._live = None
+        """Stop the live display and restore stdin echo; swallow no exceptions."""
+        try:
+            if self._live is not None:
+                self._live.__exit__(exc_type, exc, tb)
+                self._live = None
+        finally:
+            if self._echo is not None:
+                self._echo.__exit__(exc_type, exc, tb)
+                self._echo = None
 
     def on_trial_start(
         self,
