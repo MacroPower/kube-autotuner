@@ -343,13 +343,15 @@ class _TrialRow:
     __slots__ = (
         "cpu",
         "index",
+        "node_memory_mib",
         "p99_ms",
         "phase",
         "retx_per_mb",
+        "rps",
         "throughput_mbps",
     )
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 keyword-only summary bundle for one trial row
         self,
         *,
         index: int,
@@ -357,6 +359,8 @@ class _TrialRow:
         throughput_mbps: float,
         cpu: float,
         retx_per_mb: float,
+        rps: float,
+        node_memory_mib: float,
         p99_ms: float,
     ) -> None:
         """Store one trial's summary for display.
@@ -368,6 +372,11 @@ class _TrialRow:
             cpu: Mean target-node CPU utilization, 0-100.
             retx_per_mb: Retransmits per megabyte; ``NaN`` when the
                 mode cannot observe it (e.g. pure UDP).
+            rps: Mean requests-per-second from the fortio saturation
+                sub-stage; ``NaN`` when the mode cannot observe it
+                (e.g. pure iperf3 TCP/UDP).
+            node_memory_mib: Mean target-node memory usage in MiB;
+                ``NaN`` when the trial produced no memory samples.
             p99_ms: Fixed-QPS p99 latency in milliseconds; ``NaN``
                 when the trial produced no fortio records.
         """
@@ -376,6 +385,8 @@ class _TrialRow:
         self.throughput_mbps = throughput_mbps
         self.cpu = cpu
         self.retx_per_mb = retx_per_mb
+        self.rps = rps
+        self.node_memory_mib = node_memory_mib
         self.p99_ms = p99_ms
 
 
@@ -570,9 +581,17 @@ class RichProgressObserver:
         table.add_column("Throughput", justify="right")
         table.add_column("CPU", justify="right")
         table.add_column("retx/MB", justify="right")
+        table.add_column("RPS", justify="right")
+        table.add_column("node mem", justify="right")
         table.add_column("p99 ms", justify="right")
         for row in self._top:
             retx = "n/a" if math.isnan(row.retx_per_mb) else f"{row.retx_per_mb:.2f}"
+            rps = "n/a" if math.isnan(row.rps) else f"{row.rps:,.1f}"
+            nmem = (
+                "n/a"
+                if math.isnan(row.node_memory_mib)
+                else f"{row.node_memory_mib:,.0f} MiB"
+            )
             p99 = "n/a" if math.isnan(row.p99_ms) else f"{row.p99_ms:.1f}"
             table.add_row(
                 str(row.index + 1),
@@ -580,6 +599,8 @@ class RichProgressObserver:
                 f"{row.throughput_mbps:,.1f} Mbps",
                 f"{row.cpu:.1f}%",
                 retx,
+                rps,
+                nmem,
                 p99,
             )
         return Group(self._trials, self._iters, table)
@@ -677,11 +698,18 @@ class RichProgressObserver:
         tp_pair = metrics.get("throughput")
         cpu_pair = metrics.get("cpu")
         rate_pair = metrics.get("retransmit_rate")
+        rps_pair = metrics.get("rps")
+        nmem_pair = metrics.get("node_memory")
         p99_pair = metrics.get("latency_p99")
         tp = (tp_pair[0] if tp_pair is not None else 0.0) / 1e6
         cpu = cpu_pair[0] if cpu_pair is not None else 0.0
         rate = rate_pair[0] if rate_pair is not None else math.nan
         retx_per_mb = math.nan if math.isnan(rate) else rate * 1e6
+        rps = rps_pair[0] if rps_pair is not None else math.nan
+        nmem_bytes = nmem_pair[0] if nmem_pair is not None else math.nan
+        node_memory_mib = (
+            math.nan if math.isnan(nmem_bytes) else nmem_bytes / (1024 * 1024)
+        )
         p99 = p99_pair[0] if p99_pair is not None else math.nan
         row = _TrialRow(
             index=index,
@@ -689,6 +717,8 @@ class RichProgressObserver:
             throughput_mbps=tp,
             cpu=cpu,
             retx_per_mb=retx_per_mb,
+            rps=rps,
+            node_memory_mib=node_memory_mib,
             p99_ms=p99,
         )
         self._top.append(row)
