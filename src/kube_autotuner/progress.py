@@ -345,6 +345,12 @@ class RichProgressObserver:
             TextColumn("[dim]eta[/dim]"),
             TimeRemainingColumn(),
             expand=True,
+            # Rich's default 30s speed window is shorter than a single
+            # trial or iperf iteration, so samples age out before the
+            # next completion lands and ETA collapses to "-:--:--".
+            # Disable pruning so Task.speed averages across all samples
+            # since task start.
+            speed_estimate_period=float("inf"),
         )
 
     def _render(self) -> Group:

@@ -115,6 +115,68 @@ def test_rich_observer_tracks_top_n() -> None:
     assert top_mbps == [9, 8, 7, 5, 3]
 
 
+def test_rich_observer_trial_eta_survives_long_gaps_between_completions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Trials spaced farther apart than Rich's default 30s window still yield an ETA.
+
+    Rich's default ``speed_estimate_period`` of 30s prunes samples older
+    than that on every ``update()``. With trials taking minutes, only
+    one sample survives the window and ``Task.speed`` is ``None``. The
+    observer overrides that by setting ``speed_estimate_period`` on the
+    trials ``Progress``.
+    """
+    console = _capture_console()
+    observer = RichProgressObserver(console)
+    clock = {"t": 1000.0}
+
+    def _fake() -> float:
+        return clock["t"]
+
+    monkeypatch.setattr(observer._trials, "get_time", _fake)
+    monkeypatch.setattr(observer._iters, "get_time", _fake)
+    with observer:
+        observer.on_trial_start(0, 5, "sobol", {})
+        clock["t"] += 120.0
+        observer.on_trial_complete(0, "sobol", {"throughput": (1e9, 0.0)})
+        clock["t"] += 120.0  # >> 30s default speed window
+        observer.on_trial_complete(1, "sobol", {"throughput": (1e9, 0.0)})
+        trial_task = observer._trials.tasks[0]
+        assert trial_task.speed is not None
+        assert trial_task.time_remaining is not None
+        assert trial_task.time_remaining > 0
+
+
+def test_rich_observer_iteration_eta_populates_and_resets_on_mode_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Iteration-bar ETA populates after two completions and resets per mode."""
+    console = _capture_console()
+    observer = RichProgressObserver(console)
+    clock = {"t": 1000.0}
+
+    def _fake() -> float:
+        return clock["t"]
+
+    monkeypatch.setattr(observer._trials, "get_time", _fake)
+    monkeypatch.setattr(observer._iters, "get_time", _fake)
+    with observer:
+        observer.on_mode_start("tcp", 3)
+        clock["t"] += 60.0
+        observer.on_iteration_end("tcp", 0)
+        clock["t"] += 60.0  # >> 30s default speed window
+        observer.on_iteration_end("tcp", 1)
+        iter_task = observer._iters.tasks[0]
+        assert iter_task.speed is not None
+        assert iter_task.time_remaining is not None
+        assert iter_task.time_remaining > 0
+        clock["t"] += 60.0
+        observer.on_mode_start("udp", 3)
+        # reset() clears the sample deque; speed drops back to None
+        # until the next completion within the new mode lands.
+        assert observer._iters.tasks[0].speed is None
+
+
 def test_make_observer_enabled_returns_rich_implementation() -> None:
     console = _capture_console()
     obs = make_observer(enabled=True, console=console)
