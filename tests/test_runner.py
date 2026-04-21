@@ -12,7 +12,11 @@ import pytest
 import yaml
 
 from kube_autotuner.benchmark import runner as runner_module
-from kube_autotuner.benchmark.runner import CLIENT_LABEL, BenchmarkRunner
+from kube_autotuner.benchmark.runner import (
+    CLIENT_LABEL,
+    FORTIO_CLIENT_LABEL,
+    BenchmarkRunner,
+)
 from kube_autotuner.experiment import (
     CniSection,
     IperfArgs,
@@ -41,6 +45,23 @@ def _fake_iperf_json(bps: float, remote_total: float = 12.3) -> str:
     })
 
 
+def _fake_fortio_json(
+    rps: float = 1000.0,
+    p99_seconds: float = 0.01,
+) -> str:
+    return json.dumps({
+        "ActualQPS": rps,
+        "DurationHistogram": {
+            "Count": 10000,
+            "Percentiles": [
+                {"Percentile": 50.0, "Value": p99_seconds / 4},
+                {"Percentile": 90.0, "Value": p99_seconds / 2},
+                {"Percentile": 99.0, "Value": p99_seconds},
+            ],
+        },
+    })
+
+
 def _make_client(logs_by_job: dict[str, str]) -> MagicMock:
     client = MagicMock()
     client.apply.return_value = None
@@ -50,7 +71,11 @@ def _make_client(logs_by_job: dict[str, str]) -> MagicMock:
     client.delete_by_label.return_value = None
 
     def _logs(_kind, name, _ns):
-        return logs_by_job[name]
+        if name in logs_by_job:
+            return logs_by_job[name]
+        if name.startswith("fortio-client-"):
+            return _fake_fortio_json()
+        raise KeyError(name)
 
     client.logs.side_effect = _logs
     client.top_pod_containers.return_value = []
@@ -72,14 +97,18 @@ def test_single_client_single_iteration():
 
     runner = BenchmarkRunner(node_pair, config, client=client)
     runner.setup_server()
-    results = runner.run()
+    iteration_results = runner.run()
 
-    assert len(results) == 1
-    r = results[0]
+    assert len(iteration_results.bench) == 1
+    r = iteration_results.bench[0]
     assert r.bits_per_second == pytest.approx(9e9)
     assert r.client_node == "kmain07"
     assert r.iteration == 0
     assert r.cpu_server_percent == pytest.approx(12.3)
+    # Fortio sub-stages fire twice per iteration (saturation + fixed_qps).
+    assert len(iteration_results.latency) == 2
+    workloads = sorted(lr.workload for lr in iteration_results.latency)
+    assert workloads == ["fixed_qps", "saturation"]
 
 
 def test_multi_client_concurrent_launch():
@@ -99,17 +128,20 @@ def test_multi_client_concurrent_launch():
 
     runner = BenchmarkRunner(node_pair, config, client=client)
     runner.setup_server()
-    results = runner.run()
+    iteration_results = runner.run()
 
     # 2 clients * 2 iterations.
-    assert len(results) == 4
-    iterations = sorted({(r.client_node, r.iteration) for r in results})
+    bench = iteration_results.bench
+    assert len(bench) == 4
+    iterations = sorted({(r.client_node, r.iteration) for r in bench})
     assert iterations == [
         ("kmain07", 0),
         ("kmain07", 1),
         ("kmain09", 0),
         ("kmain09", 1),
     ]
+    # Latency: 2 clients * 2 iterations * 2 workloads = 8 records.
+    assert len(iteration_results.latency) == 8
 
     # Both ports used (one client Job per port).
     applied_yamls = [c.args[0] for c in client.apply.call_args_list]
@@ -164,8 +196,11 @@ def test_cleanup_removes_client_jobs_by_label():
         (c.args[0], c.args[1]) for c in client.delete_by_label.call_args_list
     ]
     assert ("job", CLIENT_LABEL) in labels_deleted
+    assert ("job", FORTIO_CLIENT_LABEL) in labels_deleted
     assert ("deployment", "app.kubernetes.io/name=iperf3-server") in labels_deleted
     assert ("service", "app.kubernetes.io/name=iperf3-server") in labels_deleted
+    assert ("deployment", "app.kubernetes.io/name=fortio-server") in labels_deleted
+    assert ("service", "app.kubernetes.io/name=fortio-server") in labels_deleted
 
 
 def test_extra_args_threaded_into_applied_yaml():
@@ -222,7 +257,9 @@ def _slow_logs(delay_seconds: float, logs_by_job: dict[str, str]):
     """Build a ``client.logs`` side_effect that waits before returning.
 
     Gives the background memory sampler time to poll at least once
-    during the otherwise-instant mocked iteration.
+    during the otherwise-instant mocked iteration. Unknown fortio
+    client job names fall back to a canned fortio JSON response so
+    sub-stages after the iperf3 stage can complete.
 
     Returns:
         A callable matching the ``client.logs`` signature.
@@ -230,7 +267,11 @@ def _slow_logs(delay_seconds: float, logs_by_job: dict[str, str]):
 
     def _impl(_kind, name, _ns):
         time.sleep(delay_seconds)
-        return logs_by_job[name]
+        if name in logs_by_job:
+            return logs_by_job[name]
+        if name.startswith("fortio-client-"):
+            return _fake_fortio_json()
+        raise KeyError(name)
 
     return _impl
 
@@ -255,12 +296,16 @@ def test_node_memory_tagging_applied_to_all_client_results(monkeypatch):
     client.top_node.return_value = {"cpu": "500m", "memory": "8000000Ki"}
 
     runner = BenchmarkRunner(node_pair, config, client=client, cni=_cni_disabled())
-    results = runner.run()
+    iteration_results = runner.run()
 
-    assert len(results) == 2
-    for r in results:
+    assert len(iteration_results.bench) == 2
+    for r in iteration_results.bench:
         assert r.node_memory_used_bytes == 8_000_000 * 1024
         assert r.cni_memory_used_bytes is None
+    # Latency records also see the iteration peak.
+    for lr in iteration_results.latency:
+        assert lr.node_memory_used_bytes == 8_000_000 * 1024
+        assert lr.cni_memory_used_bytes is None
 
 
 def test_node_memory_peak_not_last(monkeypatch):
@@ -286,10 +331,10 @@ def test_node_memory_peak_not_last(monkeypatch):
     client.top_node.side_effect = _top_node
 
     runner = BenchmarkRunner(node_pair, config, client=client, cni=_cni_disabled())
-    results = runner.run()
+    iteration_results = runner.run()
 
-    assert len(results) == 1
-    assert results[0].node_memory_used_bytes == 200 * 1024 * 1024
+    assert len(iteration_results.bench) == 1
+    assert iteration_results.bench[0].node_memory_used_bytes == 200 * 1024 * 1024
 
 
 def test_node_memory_none_when_metrics_empty(monkeypatch):
@@ -304,11 +349,11 @@ def test_node_memory_none_when_metrics_empty(monkeypatch):
     client.top_node.return_value = {}
 
     runner = BenchmarkRunner(node_pair, config, client=client, cni=_cni_disabled())
-    results = runner.run()
+    iteration_results = runner.run()
 
-    assert len(results) == 1
-    assert results[0].node_memory_used_bytes is None
-    assert results[0].cni_memory_used_bytes is None
+    assert len(iteration_results.bench) == 1
+    assert iteration_results.bench[0].node_memory_used_bytes is None
+    assert iteration_results.bench[0].cni_memory_used_bytes is None
 
 
 def test_memory_sampler_survives_api_error(monkeypatch):
@@ -337,10 +382,10 @@ def test_memory_sampler_survives_api_error(monkeypatch):
     client.top_node.side_effect = _top_node
 
     runner = BenchmarkRunner(node_pair, config, client=client, cni=_cni_disabled())
-    results = runner.run()
+    iteration_results = runner.run()
 
-    assert len(results) == 1
-    assert results[0].node_memory_used_bytes == 75 * 1024 * 1024
+    assert len(iteration_results.bench) == 1
+    assert iteration_results.bench[0].node_memory_used_bytes == 75 * 1024 * 1024
     assert calls["n"] >= 2, "sampler thread did not survive initial API error"
 
 
@@ -382,11 +427,11 @@ def test_cni_memory_populated_when_enabled(monkeypatch):
         label_selector="k8s-app=cilium",
     )
     runner = BenchmarkRunner(node_pair, config, client=client, cni=cni)
-    results = runner.run()
+    iteration_results = runner.run()
 
-    assert len(results) == 1
-    assert results[0].node_memory_used_bytes == 4_194_304 * 1024
-    assert results[0].cni_memory_used_bytes == 64 * 1024 * 1024
+    assert len(iteration_results.bench) == 1
+    assert iteration_results.bench[0].node_memory_used_bytes == 4_194_304 * 1024
+    assert iteration_results.bench[0].cni_memory_used_bytes == 64 * 1024 * 1024
     client.list_pods_by_selector_on_node.assert_called()
     args = client.list_pods_by_selector_on_node.call_args
     assert args.args[0] == "k8s-app=cilium"
@@ -406,9 +451,67 @@ def test_cni_memory_skipped_when_disabled(monkeypatch):
     client.top_node.return_value = {"cpu": "1000m", "memory": "1048576Ki"}
 
     runner = BenchmarkRunner(node_pair, config, client=client, cni=_cni_disabled())
-    results = runner.run()
+    iteration_results = runner.run()
 
-    assert len(results) == 1
-    assert results[0].node_memory_used_bytes == 1_048_576 * 1024
-    assert results[0].cni_memory_used_bytes is None
+    assert len(iteration_results.bench) == 1
+    assert iteration_results.bench[0].node_memory_used_bytes == 1_048_576 * 1024
+    assert iteration_results.bench[0].cni_memory_used_bytes is None
     assert client.list_pods_by_selector_on_node.call_count == 0
+
+
+def test_substages_run_sequentially_in_order():
+    """bw, fortio-sat, fortio-fixed run in that order with no overlap."""
+    node_pair = NodePair(source="kmain07", target="kmain08", hardware_class="10g")
+    config = BenchmarkConfig(duration=1, iterations=1, modes=["tcp"])
+
+    logs = {"iperf3-client-kmain07-p5201": _fake_iperf_json(1e9)}
+
+    client = _make_client(logs)
+
+    runner = BenchmarkRunner(node_pair, config, client=client)
+    runner.setup_server()
+    iteration_results = runner.run()
+
+    assert len(iteration_results.bench) == 1
+    assert len(iteration_results.latency) == 2
+
+    # Apply order: iperf server, fortio server (during setup_server),
+    # then per iteration: iperf client, fortio saturation client,
+    # fortio fixed_qps client.
+    applied_yamls = [c.args[0] for c in client.apply.call_args_list]
+    assert len(applied_yamls) == 5
+    assert "iperf3-server-" in applied_yamls[0]
+    assert "fortio-server-" in applied_yamls[1]
+    assert "iperf3-client-" in applied_yamls[2]
+    assert "saturation" in applied_yamls[3]
+    assert "fixed_qps" in applied_yamls[4]
+
+
+def test_fortio_failure_cleans_up_by_fortio_label():
+    node_pair = NodePair(source="kmain07", target="kmain08", hardware_class="10g")
+    config = BenchmarkConfig(duration=1, iterations=1, modes=["tcp"])
+
+    logs = {"iperf3-client-kmain07-p5201": _fake_iperf_json(1e9)}
+
+    client = _make_client(logs)
+
+    def _logs(_kind, name, _ns):
+        if name in logs:
+            return logs[name]
+        if name.startswith("fortio-client-"):
+            msg = "fortio failed"
+            raise RuntimeError(msg)
+        raise KeyError(name)
+
+    client.logs.side_effect = _logs
+
+    runner = BenchmarkRunner(node_pair, config, client=client)
+    with pytest.raises(RuntimeError, match="fortio failed"):
+        runner.run()
+
+    label_delete_calls = [
+        c
+        for c in client.delete_by_label.call_args_list
+        if FORTIO_CLIENT_LABEL in c.args
+    ]
+    assert label_delete_calls, "expected fortio client label cleanup on failure"

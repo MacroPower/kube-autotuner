@@ -5,22 +5,25 @@ Benchmark-driven kernel parameter tuning for Kubernetes nodes.
 ## Overview
 
 `kube-autotuner` searches for Linux sysctl values that maximise network
-performance on the nodes of a Kubernetes cluster. iperf3 between two
-nodes is the measurement. An Ax-platform multi-objective Bayesian
-optimizer proposes the next configuration, the tool applies it, and the
-benchmark runs again. The loop converges on a Pareto-optimal set of
-trade-offs between throughput, TCP retransmit rate, CPU, target-node
-memory, and CNI data-plane memory. The surface is high-dimensional,
-noisy, slow to evaluate, and conflicted across objectives, so
-brute-force grid search is out.
+performance on the nodes of a Kubernetes cluster. Each trial measures
+the target node along two axes: iperf3 for bulk throughput, and fortio
+for request/response latency and achieved RPS. An Ax-platform
+multi-objective Bayesian optimizer proposes the next configuration,
+the tool applies it, and the benchmark runs again. The loop converges
+on a Pareto-optimal set of trade-offs between throughput, TCP
+retransmit rate, CPU, target-node memory, CNI data-plane memory, RPS
+under saturation, and p50/p90/p99 latency under a fixed offered load.
 
 ## Why this is hard
 
-- **Expensive trials.** A single iteration is `duration=30s` of
-  measurement plus `omit=5s` of discarded warmup, repeated three times
-  per mode, and run for each mode in `benchmark.modes` (TCP and/or UDP),
-  before setup and teardown. A 50-trial run takes hours. Grid search
-  over the default space is infeasible by orders of magnitude.
+- **Expensive trials.** A single iteration expands into three
+  sequential sub-stages: an iperf3 bandwidth fan-out
+  (`duration=30s` + `omit=5s` warmup), a fortio saturation run
+  (`-qps 0`, `fortio.duration=30s`), and a fortio fixed-QPS run at
+  `fortio.fixedQps`. The sequence repeats `iterations` times for each
+  mode in `benchmark.modes` (TCP and/or UDP), before setup and
+  teardown. A 50-trial run takes hours. Grid search over the default
+  space is infeasible by orders of magnitude.
 - **Noisy measurements.** iperf3 throughput has real run-to-run
   variance. The optimizer collapses each metric into a `(mean, SEM)`
   pair and accounts for the fact that samples are correlated when
@@ -43,12 +46,14 @@ brute-force grid search is out.
   path. A setting that helps in isolation can regress in combination.
   That is the kind of structure a GP surrogate can pick up.
 - **Objectives conflict.** Throughput-maximising configurations often
-  raise CPU and retransmit rate. The tool returns a **Pareto front**
-  rather than a single winner. Default outcome constraints (a
-  throughput floor, a CPU ceiling, a retransmit-rate ceiling, and a
-  memory ceiling) are forwarded to Ax as hard constraints; the exact
-  values live in the `objectives` block shown under
-  [Quick start](#quick-start).
+  raise CPU and retransmit rate; configurations that win on raw Gbps
+  frequently degrade tail latency under request/response workloads,
+  so bandwidth-only tuning hides regressions. The tool returns a
+  **Pareto front** rather than a single winner. Default outcome
+  constraints (a throughput floor, a CPU ceiling, a retransmit-rate
+  ceiling, a memory ceiling, an RPS floor, and a p99 latency ceiling)
+  are forwarded to Ax as hard constraints; the exact values live in
+  the `objectives` block shown under [Quick start](#quick-start).
 - **Results are hardware- and topology-dependent.** The tool stratifies
   results by `hardwareClass` (1g/10g) and topology (intra-AZ /
   inter-AZ). Tunings found on one NIC class or AZ pair do not transfer,
@@ -58,15 +63,24 @@ brute-force grid search is out.
 Ax fits this shape: sample-efficient Bayesian optimization with native
 multi-objective support, Sobol warm-up (`optimize.nSobol`, default 15)
 to explore, then a GP surrogate that absorbs the remaining trials and
-trades off throughput, CPU, retransmit rate, and memory in one pass.
+trades off throughput, CPU, retransmit rate, memory, RPS, and latency
+percentiles in one pass.
 
 ## How it works
 
 1. You write an `experiment.yaml`.
 2. `kube-autotuner run` resolves the sysctl backend and runs preflight
    checks against the live cluster.
-3. An iperf3 server Deployment lands on the target node and iperf3 client
-   Jobs on each source node; the runner collects JSON results.
+3. An iperf3 server Deployment and a fortio server Deployment land on
+   the target node. Each iteration then drives three sub-stages
+   sequentially: an iperf3 client fan-out (bandwidth), a fortio
+   saturation fan-out (RPS), and a fortio fixed-QPS fan-out
+   (latency percentiles). Sub-stages run one at a time so fortio
+   never contends with iperf3 for NIC, CPU, or CNI state; within each
+   sub-stage the source nodes still fan out in parallel. The
+   per-iteration resource sampler straddles all three sub-stages, so
+   peak node and CNI memory reflect the whole iteration rather than
+   any one phase.
 4. In `optimize` mode the Ax loop proposes trials, applies sysctls,
    benchmarks, and appends one JSONL record per trial.
 5. Every run writes the resolved `objectives` block alongside the JSONL
@@ -176,6 +190,21 @@ iperf:
   server:
     extraArgs: ["--forceflush"]
 
+# Fortio drives the latency / RPS sub-stages. `duration` is independent
+# of benchmark.duration so fortio runs stay short. `fixedQps` is the
+# offered load for the latency sub-stage; the saturation sub-stage
+# always runs with -qps 0. Flags the tool controls (-qps, -c, -t, -n,
+# -json, -url, -H, -http1.0, -stdclient, -quiet on the client;
+# -http-port on the server) are rejected at preflight.
+fortio:
+  fixedQps: 1000
+  connections: 4
+  duration: 30                    # seconds, per fortio sub-stage
+  client:
+    extraArgs: []
+  server:
+    extraArgs: []
+
 # Selector for the CNI pods on the target node whose memory is summed
 # into the cni_memory objective, sampled from metrics.k8s.io per tick
 # alongside whole-node memory. Set enabled: false to skip CNI sampling;
@@ -217,34 +246,58 @@ objectives:
     - { metric: retransmit_rate, direction: minimize }
     - { metric: node_memory, direction: minimize }
     - { metric: cni_memory, direction: minimize }
+    - { metric: rps, direction: maximize }
+    - { metric: latency_p50, direction: minimize }
+    - { metric: latency_p90, direction: minimize }
+    - { metric: latency_p99, direction: minimize }
   constraints:
     - "throughput >= 1e6"
     - "cpu <= 200"
     - "retransmit_rate <= 1e-6"   # retransmits per byte sent; 1e-6 ≈ 1 retx/MB
     - "node_memory <= 1e10"
+    - "rps >= 100"                # requests/sec; only the saturation sub-stage feeds rps,
+                                  # so this floor only fails on fortio server crash.
+    - "latency_p99 <= 1000"       # milliseconds; from the fixed_qps sub-stage only.
   recommendationWeights:
     cpu: 0.15
     retransmit_rate: 0.3
-    node_memory: 0.15
+    node_memory: 0.15             # latency metrics default to weight 0 so they enter the
+                                  # Pareto set without skewing the post-hoc recommendation
+                                  # score until you opt in.
 
 output: out/results.jsonl
 ```
 
-Supplying `constraints:` or `recommendationWeights:` replaces the
-default list wholesale rather than extending it. Weights are only valid
-on minimize-direction metrics and must reference a metric present in
-`pareto`. Valid metric names: `throughput`, `cpu`, `node_memory`,
-`cni_memory`, `retransmit_rate`. `node_memory` is whole-node memory on
-the iperf target, sampled from `metrics.k8s.io/v1beta1 nodes/<name>`.
-`cni_memory` is memory summed across the CNI pods selected by the
-`cni:` section on the target node; it is what most sysctl tweaks
-actually move on the data-plane side. `retransmit_rate` is measured as
-retransmits per byte sent, which is scale-invariant across throughput
-levels and keeps a high-throughput / high-loss configuration from
-winning on absolute retransmit counts alone. UDP-only benchmarks cannot
-observe it; the optimizer strips `retransmit_rate` from the objective
-and any referencing constraints with a logged warning when
-`benchmark.modes` does not include `tcp`.
+A few rules govern how the `objectives:` block is interpreted:
+
+- Supplying `constraints:` or `recommendationWeights:` **replaces**
+  the default list wholesale rather than extending it.
+- Weights are only valid on minimize-direction metrics and must
+  reference a metric present in `pareto`.
+- UDP-only benchmarks cannot observe `retransmit_rate`; the optimizer
+  strips it from the objective and any referencing constraints with a
+  logged warning when `benchmark.modes` does not include `tcp`. Both
+  fortio sub-stages run every iteration regardless of mode, so the
+  fortio-sourced metrics below are always observable.
+
+Valid metric names and their sources:
+
+| Metric            | Direction | Source sub-stage         | Notes                                                                                                  |
+|-------------------|-----------|--------------------------|--------------------------------------------------------------------------------------------------------|
+| `throughput`      | maximize  | iperf3 bandwidth         | Bits per second; summed across source clients per iteration, averaged across iterations.              |
+| `cpu`             | minimize  | iperf3 bandwidth         | Percent; server-side CPU when every record reports it, per-client host CPU otherwise.                 |
+| `retransmit_rate` | minimize  | iperf3 bandwidth         | Retransmits per byte sent; scale-invariant, so high-throughput/high-loss does not win on raw count.   |
+| `node_memory`     | minimize  | iperf3 (peak over iter.) | Whole-node memory on the iperf target, from `metrics.k8s.io/v1beta1 nodes/<name>`.                    |
+| `cni_memory`      | minimize  | iperf3 (peak over iter.) | Memory summed across the CNI pods selected by `cni:`; what most sysctl tweaks actually move.          |
+| `rps`             | maximize  | fortio saturation        | Achieved QPS under `-qps 0`. Fixed-QPS RPS would clamp to the offered load, so it is not a source.    |
+| `latency_p50`     | minimize  | fortio fixed-QPS         | Milliseconds; measured under the configured `fortio.fixedQps` offered load.                           |
+| `latency_p90`     | minimize  | fortio fixed-QPS         | Milliseconds; see `latency_p50`.                                                                      |
+| `latency_p99`     | minimize  | fortio fixed-QPS         | Milliseconds; comparable across trials because offered load is stable.                                |
+
+Splitting latency and RPS across two fortio sub-stages avoids the
+"overloaded system has high latency because it's overloaded" confound:
+RPS is only meaningful under saturation, and latency percentiles are
+only comparable across trials under a stable offered load.
 
 See [`tests/fixtures/experiment_example.yaml`](tests/fixtures/experiment_example.yaml)
 for the canonical executable fixture.

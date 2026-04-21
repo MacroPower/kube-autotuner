@@ -96,7 +96,8 @@ def test_full_run_records_results(
         node_pair=runner.node_pair,
         sysctl_values={},
         config=runner.config,
-        results=results,
+        results=results.bench,
+        latency_results=results.latency,
     )
     TrialLog.append(output, trial)
 
@@ -110,3 +111,7 @@ def test_full_run_records_results(
     assert t.results[0].mode == "tcp"
     assert t.node_pair.source == node_names["source"]
     assert t.node_pair.target == node_names["target"]
+    # Both fortio sub-stages fire per iteration.
+    assert len(t.latency_results) >= 2
+    workloads = {lr.workload for lr in t.latency_results}
+    assert workloads == {"saturation", "fixed_qps"}

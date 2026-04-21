@@ -42,6 +42,10 @@ METRIC_TO_DF_COLUMN: dict[str, str] = {
     "node_memory": "mean_node_memory",
     "cni_memory": "mean_cni_memory",
     "retransmit_rate": "retransmit_rate",
+    "rps": "mean_rps",
+    "latency_p50": "mean_latency_p50_ms",
+    "latency_p90": "mean_latency_p90_ms",
+    "latency_p99": "mean_latency_p99_ms",
 }
 
 DEFAULT_OBJECTIVES: list[tuple[str, str]] = [
@@ -50,6 +54,10 @@ DEFAULT_OBJECTIVES: list[tuple[str, str]] = [
     (METRIC_TO_DF_COLUMN["retransmit_rate"], "minimize"),
     (METRIC_TO_DF_COLUMN["node_memory"], "minimize"),
     (METRIC_TO_DF_COLUMN["cni_memory"], "minimize"),
+    (METRIC_TO_DF_COLUMN["rps"], "maximize"),
+    (METRIC_TO_DF_COLUMN["latency_p50"], "minimize"),
+    (METRIC_TO_DF_COLUMN["latency_p90"], "minimize"),
+    (METRIC_TO_DF_COLUMN["latency_p99"], "minimize"),
 ]
 
 _FRAME_BASE_COLUMNS: list[str] = [
@@ -63,6 +71,10 @@ _FRAME_BASE_COLUMNS: list[str] = [
     "mean_node_memory",
     "mean_cni_memory",
     "retransmit_rate",
+    "mean_rps",
+    "mean_latency_p50_ms",
+    "mean_latency_p90_ms",
+    "mean_latency_p99_ms",
 ]
 
 _MIN_SPEARMAN_SAMPLES = 3
@@ -207,6 +219,10 @@ def trials_to_dataframe(
             "mean_node_memory": t.mean_node_memory(),
             "mean_cni_memory": t.mean_cni_memory(),
             "retransmit_rate": t.retransmit_rate(),
+            "mean_rps": t.mean_rps(),
+            "mean_latency_p50_ms": t.mean_latency_p50_ms(),
+            "mean_latency_p90_ms": t.mean_latency_p90_ms(),
+            "mean_latency_p99_ms": t.mean_latency_p99_ms(),
         }
         for key in _SYSCTL_COLUMNS:
             row[key] = t.sysctl_values.get(key)
@@ -477,11 +493,14 @@ def recommend_configs(
 
     Returns:
         A list of recommendation dicts. Each dict always contains
-        ``rank``, ``trial_id``, ``sysctl_values``, the five base
+        ``rank``, ``trial_id``, ``sysctl_values``, the nine base
         metric values (``mean_throughput``, ``mean_cpu``,
         ``mean_node_memory``, ``mean_cni_memory``,
-        ``retransmit_rate``) regardless of the configured Pareto set,
-        and a ``score``. Returns an empty list when no trials match.
+        ``retransmit_rate``, ``mean_rps``,
+        ``mean_latency_p50_ms``, ``mean_latency_p90_ms``,
+        ``mean_latency_p99_ms``) regardless of the configured Pareto
+        set, and a ``score``. Returns an empty list when no trials
+        match.
     """
     pd = _require_pandas()
     from kube_autotuner.experiment import ObjectivesSection  # noqa: PLC0415
@@ -540,6 +559,10 @@ def recommend_configs(
                 "mean_node_memory": row["mean_node_memory"],
                 "mean_cni_memory": row["mean_cni_memory"],
                 "retransmit_rate": (None if pd.isna(rate_val) else float(rate_val)),
+                "mean_rps": row["mean_rps"],
+                "mean_latency_p50_ms": row["mean_latency_p50_ms"],
+                "mean_latency_p90_ms": row["mean_latency_p90_ms"],
+                "mean_latency_p99_ms": row["mean_latency_p99_ms"],
                 "score": round(row["score"], 4),
             },
         )

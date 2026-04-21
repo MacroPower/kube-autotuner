@@ -18,24 +18,27 @@ from unittest.mock import MagicMock, patch
 
 from kube_autotuner import runs
 from kube_autotuner.experiment import ExperimentConfig
-from kube_autotuner.models import BenchmarkResult
+from kube_autotuner.models import BenchmarkResult, IterationResults
 from kube_autotuner.sysctl.params import PARAM_SPACE
 
 if TYPE_CHECKING:
     from pathlib import Path
 
 
-def _results() -> list[BenchmarkResult]:
-    return [
-        BenchmarkResult(
-            timestamp=datetime.now(UTC),
-            mode="tcp",
-            bits_per_second=9_000_000_000,
-            retransmits=5,
-            bytes_sent=33_750_000_000,
-            cpu_utilization_percent=30.0,
-        ),
-    ]
+def _results() -> IterationResults:
+    return IterationResults(
+        bench=[
+            BenchmarkResult(
+                timestamp=datetime.now(UTC),
+                mode="tcp",
+                bits_per_second=9_000_000_000,
+                retransmits=5,
+                bytes_sent=33_750_000_000,
+                cpu_utilization_percent=30.0,
+            ),
+        ],
+        latency=[],
+    )
 
 
 def _snapshot(names):

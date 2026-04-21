@@ -218,6 +218,27 @@ class TestSplitByHardwareClass:
 # --- pareto_front --------------------------------------------------------
 
 
+def _pad_latency_cols(rows: int) -> dict[str, list[float]]:
+    """Pad a synthetic pareto DataFrame with constant latency/RPS columns.
+
+    The new default :data:`DEFAULT_OBJECTIVES` spans nine axes; filling
+    the latency/RPS columns with constants keeps the dominance scan
+    deterministic so the pre-existing throughput/CPU/memory tests still
+    exercise the exact trials they were designed for.
+
+    Returns:
+        A mapping of latency/RPS column name to a list of ``rows``
+        constant values suitable for splatting into a DataFrame
+        constructor.
+    """
+    return {
+        "mean_rps": [1000.0] * rows,
+        "mean_latency_p50_ms": [1.0] * rows,
+        "mean_latency_p90_ms": [5.0] * rows,
+        "mean_latency_p99_ms": [10.0] * rows,
+    }
+
+
 class TestParetoFront:
     def test_dominated_removed(self) -> None:
         df = pd.DataFrame(
@@ -228,6 +249,7 @@ class TestParetoFront:
                 "mean_node_memory": [1e8, 2e8, 3e8, 5e8],
                 "mean_cni_memory": [1e7, 2e7, 3e7, 5e7],
                 "retransmit_rate": [1, 2, 0, 5],
+                **_pad_latency_cols(4),
             },
         )
         front = pareto_front(df)
@@ -244,6 +266,7 @@ class TestParetoFront:
                 "mean_node_memory": [1e8, 2e8],
                 "mean_cni_memory": [1e7, 2e7],
                 "retransmit_rate": [5, 5],
+                **_pad_latency_cols(2),
             },
         )
         front = pareto_front(df)
@@ -258,6 +281,7 @@ class TestParetoFront:
                 "mean_node_memory": [1e8],
                 "mean_cni_memory": [1e7],
                 "retransmit_rate": [1],
+                **_pad_latency_cols(1),
             },
         )
         assert len(pareto_front(df)) == 1
@@ -271,6 +295,7 @@ class TestParetoFront:
                 "mean_node_memory": [1e8, 5e7],
                 "mean_cni_memory": [1e7, 1e7],
                 "retransmit_rate": [1, 1],
+                **_pad_latency_cols(2),
             },
         )
         ids = set(pareto_front(df)["trial_id"])
@@ -285,15 +310,21 @@ class TestParetoFront:
                 "mean_node_memory",
                 "mean_cni_memory",
                 "retransmit_rate",
+                "mean_rps",
+                "mean_latency_p50_ms",
+                "mean_latency_p90_ms",
+                "mean_latency_p99_ms",
             ],
         )
         assert pareto_front(df).empty
 
     def test_default_objectives_shape(self) -> None:
-        assert len(DEFAULT_OBJECTIVES) == 5
+        assert len(DEFAULT_OBJECTIVES) == 9
         names = [n for n, _ in DEFAULT_OBJECTIVES]
         assert "mean_node_memory" in names
         assert "mean_cni_memory" in names
+        assert "mean_rps" in names
+        assert "mean_latency_p99_ms" in names
 
     def test_drops_nan_rows_with_warning(
         self,
@@ -307,6 +338,7 @@ class TestParetoFront:
                 "mean_node_memory": [1e8, 2e8],
                 "mean_cni_memory": [1e7, 2e7],
                 "retransmit_rate": [1e-7, float("nan")],
+                **_pad_latency_cols(2),
             },
         )
         with caplog.at_level("WARNING", logger="kube_autotuner.analysis"):
@@ -323,6 +355,7 @@ class TestParetoFront:
                 "mean_node_memory": [1e8, 2e8],
                 "mean_cni_memory": [1e7, 2e7],
                 "retransmit_rate": [float("nan"), float("nan")],
+                **_pad_latency_cols(2),
             },
         )
         assert pareto_front(df).empty
@@ -424,16 +457,17 @@ class TestRecommendConfigs:
     def test_default_scoring_snapshot(self) -> None:
         """Pin default scores against the baseline formula.
 
-        With two non-dominated trials whose ``cpu`` and
-        ``retransmit_rate`` are constant, ``_norm`` clamps those
-        columns to ``0.5``. For the surviving ``throughput`` and
-        ``memory`` axes, trial A (higher throughput, higher memory)
-        normalizes to ``(1.0, 1.0)`` and trial B (lower throughput,
-        lower memory) to ``(0.0, 0.0)``. The baseline formula is
-        ``tp - 0.15 * cpu - 0.15 * mem - 0.3 * rate``:
+        With two non-dominated trials whose ``cpu``, ``retransmit_rate``,
+        ``cni_memory``, ``rps`` and every latency percentile are
+        constant, ``_norm`` clamps those columns to ``0.5``. For the
+        surviving ``throughput`` and ``node_memory`` axes, trial A
+        (higher throughput, higher memory) normalizes to ``(1.0, 1.0)``
+        and trial B (lower throughput, lower memory) to ``(0.0, 0.0)``.
+        The default formula with the added ``rps`` maximize objective
+        (unweighted ``+0.5`` for both) is:
 
-        - score_A = 1.0 - 0.15 * 0.5 - 0.15 * 1.0 - 0.3 * 0.5 = 0.625
-        - score_B = 0.0 - 0.15 * 0.5 - 0.15 * 0.0 - 0.3 * 0.5 = -0.225
+        - score_A = 1.0 + 0.5 - 0.15 * 0.5 - 0.15 * 1.0 - 0.3 * 0.5 = 1.125
+        - score_B = 0.0 + 0.5 - 0.15 * 0.5 - 0.15 * 0.0 - 0.3 * 0.5 = 0.275
         """
 
         def _mk(
@@ -462,8 +496,8 @@ class TestRecommendConfigs:
         trials = [_mk(10.0, 100, "a"), _mk(5.0, 50, "b")]
         recs = recommend_configs(trials, "10g", n=2)
         assert [r["trial_id"] for r in recs] == ["a", "b"]
-        assert recs[0]["score"] == pytest.approx(0.625)
-        assert recs[1]["score"] == pytest.approx(-0.225)
+        assert recs[0]["score"] == pytest.approx(1.125)
+        assert recs[1]["score"] == pytest.approx(0.275)
 
     def test_rate_metric_reranks_over_absolute_count(self) -> None:
         """Per-byte rate reorders candidates vs. absolute retransmit count.
@@ -519,6 +553,10 @@ class TestRecommendConfigs:
                 "node_memory",
                 "cni_memory",
                 "retransmit_rate",
+                "rps",
+                "latency_p50",
+                "latency_p90",
+                "latency_p99",
             )
         }
         default_cols = {col for col, _ in DEFAULT_OBJECTIVES}

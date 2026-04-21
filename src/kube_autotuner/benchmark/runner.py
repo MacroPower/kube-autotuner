@@ -1,9 +1,19 @@
-"""Concurrent iperf3 benchmark runner.
+"""Concurrent iperf3 + fortio benchmark runner.
 
-:class:`BenchmarkRunner` launches one iperf3 server Deployment on the
-target node and one iperf3 client Job per source node. Client jobs run
-concurrently through :class:`concurrent.futures.ThreadPoolExecutor`, and
-the wait loop uses
+:class:`BenchmarkRunner` launches one iperf3 server Deployment and one
+fortio server Deployment on the target node, then drives each iteration
+as three sub-stages executed sequentially:
+
+1. **bandwidth** (iperf3 fan-out).
+2. **fortio-saturation** (fortio ``-qps 0`` fan-out; sole source of
+   the ``rps`` metric).
+3. **fortio-fixed-qps** (fortio at the configured ``fixed_qps``; sole
+   source of the latency percentiles).
+
+Sub-stages run sequentially so fortio never contends with iperf3 for
+NIC, CPU, or CNI state. Within each sub-stage the source nodes still
+fan out in parallel through
+:class:`concurrent.futures.ThreadPoolExecutor`. The wait loop uses
 :data:`concurrent.futures.FIRST_EXCEPTION` on purpose:
 
 * On a clean run, ``wait(... FIRST_EXCEPTION)`` returns only once every
@@ -12,7 +22,7 @@ the wait loop uses
 * When any client raises, ``FIRST_EXCEPTION`` returns early with that
   future in ``done`` and the still-running ones in ``not_done``. We then
   cancel the pending futures, fire a label-based cleanup against the
-  namespace (belt-and-braces -- each ``_run_one_client`` also cleans up
+  namespace (belt-and-braces -- each per-client runner also cleans up
   its own Job in ``finally``), drain ``not_done`` so their own cleanup
   paths get a chance to run, and finally re-raise the primary failure.
 
@@ -29,24 +39,37 @@ import json
 import logging
 import queue
 import threading
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, cast
 
 from kube_autotuner.benchmark.client_spec import build_client_yaml
+from kube_autotuner.benchmark.fortio_client_spec import build_fortio_client_yaml
+from kube_autotuner.benchmark.fortio_parser import parse_fortio_json
+from kube_autotuner.benchmark.fortio_server_spec import build_fortio_server_yaml
 from kube_autotuner.benchmark.parser import parse_iperf_json, parse_k8s_memory
 from kube_autotuner.benchmark.patch import apply_patches
 from kube_autotuner.benchmark.server_spec import build_server_yaml
-from kube_autotuner.experiment import CniSection, IperfSection
+from kube_autotuner.experiment import CniSection, FortioSection, IperfSection
 from kube_autotuner.k8s.client import K8sApiError, K8sClient
+from kube_autotuner.models import IterationResults
 from kube_autotuner.progress import NullObserver
 
 if TYPE_CHECKING:
+    from kube_autotuner.benchmark.fortio_client_spec import Workload
     from kube_autotuner.experiment import Patch
-    from kube_autotuner.models import BenchmarkConfig, BenchmarkResult, NodePair
+    from kube_autotuner.models import (
+        BenchmarkConfig,
+        BenchmarkResult,
+        LatencyResult,
+        NodePair,
+    )
     from kube_autotuner.progress import ProgressObserver
 
 logger = logging.getLogger(__name__)
 
 CLIENT_LABEL = "app.kubernetes.io/name=iperf3-client"
+SERVER_LABEL = "app.kubernetes.io/name=iperf3-server"
+FORTIO_CLIENT_LABEL = "app.kubernetes.io/name=fortio-client"
+FORTIO_SERVER_LABEL = "app.kubernetes.io/name=fortio-server"
 _IPERF_BASE_PORT = 5201
 _CLIENT_WAIT_TIMEOUT_SECONDS = 180
 SAMPLE_INTERVAL_S = 5.0
@@ -55,7 +78,7 @@ SAMPLE_INTERVAL_S = 5.0
 class BenchmarkRunner:
     """Orchestrates iperf3 server/client lifecycle via the Kubernetes API."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         node_pair: NodePair,
         config: BenchmarkConfig,
@@ -64,6 +87,7 @@ class BenchmarkRunner:
         patches: list[Patch] | None = None,
         cni: CniSection | None = None,
         *,
+        fortio_args: FortioSection | None = None,
         observer: ProgressObserver | None = None,
     ) -> None:
         """Wire the runner to a node pair and benchmark config.
@@ -81,6 +105,9 @@ class BenchmarkRunner:
                 Job) via :func:`kube_autotuner.benchmark.patch.apply_patches`.
             cni: Selector for CNI pods to track on the target node. When
                 ``enabled`` is ``False``, CNI sampling is skipped.
+            fortio_args: Optional fortio per-role ``extra_args`` plus
+                ``fixed_qps`` / ``connections`` / ``duration`` for the
+                latency sub-stages.
             observer: Optional progress callback. Defaults to
                 :class:`~kube_autotuner.progress.NullObserver` so
                 library consumers and tests see no output side-effects.
@@ -89,15 +116,17 @@ class BenchmarkRunner:
         self.config = config
         self.client = client or K8sClient()
         self.iperf_args = iperf_args or IperfSection()
+        self.fortio_args = fortio_args or FortioSection()
         self.patches = patches or []
         self.cni = cni or CniSection()
         self.observer: ProgressObserver = observer or NullObserver()
         self._server_name = f"iperf3-server-{node_pair.target}"
+        self._fortio_server_name = f"fortio-server-{node_pair.target}"
         self._clients = list(node_pair.all_sources)
         self._ports = {c: _IPERF_BASE_PORT + i for i, c in enumerate(self._clients)}
 
     def setup_server(self) -> None:
-        """Deploy the iperf3 server on the target node and await rollout."""
+        """Deploy the iperf3 + fortio servers on the target node and await rollout."""
         server_yaml = build_server_yaml(
             node=self.node_pair.target,
             ports=list(self._ports.values()),
@@ -114,6 +143,20 @@ class BenchmarkRunner:
             self.node_pair.target,
             sorted(self._ports.values()),
         )
+
+        fortio_server_yaml = build_fortio_server_yaml(
+            node=self.node_pair.target,
+            ip_family_policy=self.node_pair.ip_family_policy,
+            extra_args=self.fortio_args.server.extra_args,
+        )
+        fortio_server_yaml = apply_patches(fortio_server_yaml, self.patches)
+        self.client.apply(fortio_server_yaml, self.node_pair.namespace)
+        self.client.rollout_status(
+            "deployment",
+            self._fortio_server_name,
+            self.node_pair.namespace,
+        )
+        logger.info("fortio server ready on %s", self.node_pair.target)
 
     def _run_one_client(
         self,
@@ -180,6 +223,68 @@ class BenchmarkRunner:
                 # ``__context__``; we wrap the cleanup error explicitly so
                 # the chain is visible in tracebacks.
                 msg = f"cleanup of client job {job_name} failed"
+                raise RuntimeError(msg) from cleanup_err
+
+    def _run_one_fortio_client(
+        self,
+        client: str,
+        iteration: int,
+        workload: Workload,
+    ) -> LatencyResult:
+        """Run a single fortio client Job and return a parsed result.
+
+        Returns:
+            The parsed :class:`LatencyResult` for this client,
+            iteration, and sub-stage workload.
+
+        Raises:
+            RuntimeError: When the best-effort Job cleanup in
+                ``finally`` fails; the original cleanup
+                :class:`K8sApiError` is attached as the cause.
+        """
+        job_name = f"fortio-client-{client}-{workload}-i{iteration}"
+        ns = self.node_pair.namespace
+        qps = 0 if workload == "saturation" else self.fortio_args.fixed_qps
+
+        client_yaml = build_fortio_client_yaml(
+            node=client,
+            target=self.node_pair.target,
+            iteration=iteration,
+            workload=workload,
+            qps=qps,
+            connections=self.fortio_args.connections,
+            duration=self.fortio_args.duration,
+            extra_args=self.fortio_args.client.extra_args,
+        )
+        client_yaml = apply_patches(client_yaml, self.patches)
+
+        try:
+            self.client.apply(client_yaml, ns)
+            self.client.wait(
+                "job",
+                job_name,
+                "condition=complete",
+                ns,
+                timeout=_CLIENT_WAIT_TIMEOUT_SECONDS,
+            )
+            output = self.client.logs("job", job_name, ns)
+            raw = json.loads(output)
+            return parse_fortio_json(
+                raw,
+                client_node=client,
+                iteration=iteration,
+                workload=workload,
+            )
+        finally:
+            try:
+                self.client.delete("job", job_name, ns, ignore_not_found=True)
+            except K8sApiError as cleanup_err:
+                logger.warning(
+                    "Best-effort delete of fortio client job %s failed",
+                    job_name,
+                    exc_info=True,
+                )
+                msg = f"cleanup of fortio client job {job_name} failed"
                 raise RuntimeError(msg) from cleanup_err
 
     def _sum_cni_memory(self, target: str) -> int | None:
@@ -255,16 +360,25 @@ class BenchmarkRunner:
                 sink.put(sample)
             stop.wait(SAMPLE_INTERVAL_S)
 
-    def run(self) -> list[BenchmarkResult]:
+    def run(self) -> IterationResults:  # noqa: C901, PLR0912, PLR0915
         """Run all configured benchmark iterations and modes.
 
+        Each iteration expands into three sub-stages (bandwidth,
+        fortio saturation, fortio fixed-qps) executed sequentially so
+        fortio never contends with iperf3 for NIC, CPU, or CNI state.
+        The resource sampler straddles the whole iteration so peak
+        node and CNI memory reflect all three sub-stages rather than
+        any one phase.
+
         Returns:
-            Every :class:`BenchmarkResult` recorded across iterations
-            and modes, tagged with the peak node and CNI memory
-            observed during each iteration when sampling produced any
-            data.
+            An :class:`IterationResults` holding every
+            :class:`BenchmarkResult` and :class:`LatencyResult`
+            produced across iterations and modes, tagged with the
+            peak node and CNI memory observed during each iteration
+            when sampling produced any data.
         """
-        results: list[BenchmarkResult] = []
+        all_bench: list[BenchmarkResult] = []
+        all_latency: list[LatencyResult] = []
         for mode in self.config.modes:
             self.observer.on_mode_start(mode, self.config.iterations)
             for i in range(self.config.iterations):
@@ -286,8 +400,25 @@ class BenchmarkRunner:
                     daemon=True,
                 )
                 sampler.start()
+                bench: list[BenchmarkResult] = []
+                sat: list[LatencyResult] = []
+                fixed: list[LatencyResult] = []
                 try:
-                    iter_results = self._run_iteration(mode, i)
+                    self.observer.on_stage_start("bw", mode, i)
+                    try:
+                        bench = self._run_bandwidth_stage(mode, i)
+                    finally:
+                        self.observer.on_stage_end("bw", mode, i)
+                    self.observer.on_stage_start("fortio-sat", mode, i)
+                    try:
+                        sat = self._run_latency_stage(i, workload="saturation")
+                    finally:
+                        self.observer.on_stage_end("fortio-sat", mode, i)
+                    self.observer.on_stage_start("fortio-fixed", mode, i)
+                    try:
+                        fixed = self._run_latency_stage(i, workload="fixed_qps")
+                    finally:
+                        self.observer.on_stage_end("fortio-fixed", mode, i)
                 finally:
                     stop.set()
                     sampler.join(timeout=SAMPLE_INTERVAL_S * 2)
@@ -303,20 +434,27 @@ class BenchmarkRunner:
                     for k, v in sample.items():
                         cur = peaks.get(k)
                         peaks[k] = v if cur is None else max(cur, v)
-                for r in iter_results:
+                for r in bench:
                     if "node" in peaks:
                         r.node_memory_used_bytes = peaks["node"]
                     if "cni" in peaks:
                         r.cni_memory_used_bytes = peaks["cni"]
-                results.extend(iter_results)
-        return results
+                latency_records = [*sat, *fixed]
+                for lr in latency_records:
+                    if "node" in peaks:
+                        lr.node_memory_used_bytes = peaks["node"]
+                    if "cni" in peaks:
+                        lr.cni_memory_used_bytes = peaks["cni"]
+                all_bench.extend(bench)
+                all_latency.extend(latency_records)
+        return IterationResults(bench=all_bench, latency=all_latency)
 
-    def _run_iteration(
+    def _run_bandwidth_stage(
         self,
         mode: Literal["tcp", "udp"],
         iteration: int,
     ) -> list[BenchmarkResult]:
-        """Launch one client Job per client concurrently; clean up on failure.
+        """Launch one iperf3 client Job per client concurrently.
 
         Returns:
             The list of :class:`BenchmarkResult`, one per client, for
@@ -349,15 +487,74 @@ class BenchmarkRunner:
                     break
 
             if first_exc is not None:
-                self._cleanup_after_failure(not_done, first_exc)
+                self._cleanup_after_failure(
+                    cast(
+                        "set[concurrent.futures.Future[BenchmarkResult | LatencyResult]]",  # noqa: E501
+                        not_done,
+                    ),
+                    first_exc,
+                    CLIENT_LABEL,
+                )
+                raise first_exc
+
+            return [f.result() for f in done]
+
+    def _run_latency_stage(
+        self,
+        iteration: int,
+        *,
+        workload: Workload,
+    ) -> list[LatencyResult]:
+        """Launch one fortio client Job per client concurrently.
+
+        Returns:
+            The list of :class:`LatencyResult`, one per client, for
+            this iteration and sub-stage. On any client failure the
+            first failure is re-raised and no partial results are
+            returned.
+        """
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=len(self._clients),
+        ) as executor:
+            future_to_client = {
+                executor.submit(
+                    self._run_one_fortio_client,
+                    client,
+                    iteration,
+                    workload,
+                ): client
+                for client in self._clients
+            }
+            done, not_done = concurrent.futures.wait(
+                future_to_client,
+                return_when=concurrent.futures.FIRST_EXCEPTION,
+            )
+
+            first_exc: BaseException | None = None
+            for f in done:
+                exc = f.exception()
+                if exc is not None:
+                    first_exc = exc
+                    break
+
+            if first_exc is not None:
+                self._cleanup_after_failure(
+                    cast(
+                        "set[concurrent.futures.Future[BenchmarkResult | LatencyResult]]",  # noqa: E501
+                        not_done,
+                    ),
+                    first_exc,
+                    FORTIO_CLIENT_LABEL,
+                )
                 raise first_exc
 
             return [f.result() for f in done]
 
     def _cleanup_after_failure(
         self,
-        not_done: set[concurrent.futures.Future[BenchmarkResult]],
+        not_done: set[concurrent.futures.Future[BenchmarkResult | LatencyResult]],
         first_exc: BaseException,
+        label: str,
     ) -> None:
         """Cancel pending client Jobs, sweep by label, drain remaining futures.
 
@@ -365,6 +562,15 @@ class BenchmarkRunner:
         with ``first_exc`` as its explicit cause so the operator sees
         both the original client failure and the cleanup failure in one
         chained traceback.
+
+        Args:
+            not_done: Futures that had not completed when the first
+                exception surfaced.
+            first_exc: The primary failure to re-raise, attached as the
+                cause of any cleanup failure.
+            label: Selector (e.g. ``CLIENT_LABEL`` /
+                ``FORTIO_CLIENT_LABEL``) used to sweep the matching
+                client Jobs in the namespace.
 
         Raises:
             RuntimeError: The label-based cleanup API call returned
@@ -376,20 +582,21 @@ class BenchmarkRunner:
         try:
             self.client.delete_by_label(
                 "job",
-                CLIENT_LABEL,
+                label,
                 self.node_pair.namespace,
             )
         except K8sApiError as cleanup_err:
             logger.warning(
-                "Failed label-based cleanup of client jobs",
+                "Failed label-based cleanup of client jobs (label=%s)",
+                label,
                 exc_info=True,
             )
             msg = f"label-based cleanup failed after primary failure: {cleanup_err}"
             raise RuntimeError(msg) from first_exc
         # Drain remaining futures so their own finally blocks complete.
         # The primary failure is already captured in ``first_exc``; any
-        # per-client cleanup error was handled inside
-        # ``_run_one_client``. Log at debug and move on.
+        # per-client cleanup error was handled inside the per-client
+        # runner. Log at debug and move on.
         for f in not_done:
             try:
                 f.result()
@@ -397,13 +604,11 @@ class BenchmarkRunner:
                 logger.debug("drained client future after failure", exc_info=True)
 
     def cleanup(self) -> None:
-        """Remove iperf3 server/client resources by label."""
+        """Remove iperf3 + fortio server/client resources by label."""
         ns = self.node_pair.namespace
-        self.client.delete_by_label(
-            "deployment", "app.kubernetes.io/name=iperf3-server", ns
-        )
-        self.client.delete_by_label(
-            "service", "app.kubernetes.io/name=iperf3-server", ns
-        )
-        self.client.delete_by_label("job", CLIENT_LABEL, ns)
-        logger.info("iperf3 resources cleaned up")
+        for label in (SERVER_LABEL, FORTIO_SERVER_LABEL):
+            self.client.delete_by_label("deployment", label, ns)
+            self.client.delete_by_label("service", label, ns)
+        for label in (CLIENT_LABEL, FORTIO_CLIENT_LABEL):
+            self.client.delete_by_label("job", label, ns)
+        logger.info("iperf3 + fortio resources cleaned up")

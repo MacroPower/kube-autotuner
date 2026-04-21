@@ -160,6 +160,31 @@ class ProgressObserver(Protocol):
         """
         ...
 
+    def on_stage_start(self, stage: str, mode: str, iteration: int) -> None:
+        """Report that a sub-stage within an iteration is starting.
+
+        Each iteration expands into three sub-stages: ``"bw"`` (iperf3),
+        ``"fortio-sat"`` (fortio ``-qps 0``), and ``"fortio-fixed"``
+        (fortio at the configured fixed QPS). Observers can use the
+        label to show which sub-stage is live.
+
+        Args:
+            stage: Sub-stage label.
+            mode: ``"tcp"`` or ``"udp"``.
+            iteration: Zero-based iteration index within ``mode``.
+        """
+        ...
+
+    def on_stage_end(self, stage: str, mode: str, iteration: int) -> None:
+        """Report that a sub-stage within an iteration has finished.
+
+        Args:
+            stage: Sub-stage label.
+            mode: ``"tcp"`` or ``"udp"``.
+            iteration: Zero-based iteration index within ``mode``.
+        """
+        ...
+
 
 class NullObserver:
     """No-op :class:`ProgressObserver` used when progress UI is off."""
@@ -208,6 +233,12 @@ class NullObserver:
         """No-op."""
 
     def on_iteration_end(self, mode: str, iteration: int) -> None:
+        """No-op."""
+
+    def on_stage_start(self, stage: str, mode: str, iteration: int) -> None:
+        """No-op."""
+
+    def on_stage_end(self, stage: str, mode: str, iteration: int) -> None:
         """No-op."""
 
 
@@ -262,7 +293,14 @@ class _IterEtaColumn(ProgressColumn):
 class _TrialRow:
     """One row of the live "best so far" table."""
 
-    __slots__ = ("cpu", "index", "phase", "retx_per_mb", "throughput_mbps")
+    __slots__ = (
+        "cpu",
+        "index",
+        "p99_ms",
+        "phase",
+        "retx_per_mb",
+        "throughput_mbps",
+    )
 
     def __init__(
         self,
@@ -272,6 +310,7 @@ class _TrialRow:
         throughput_mbps: float,
         cpu: float,
         retx_per_mb: float,
+        p99_ms: float,
     ) -> None:
         """Store one trial's summary for display.
 
@@ -282,12 +321,15 @@ class _TrialRow:
             cpu: Mean target-node CPU utilization, 0-100.
             retx_per_mb: Retransmits per megabyte; ``NaN`` when the
                 mode cannot observe it (e.g. pure UDP).
+            p99_ms: Fixed-QPS p99 latency in milliseconds; ``NaN``
+                when the trial produced no fortio records.
         """
         self.index = index
         self.phase = phase
         self.throughput_mbps = throughput_mbps
         self.cpu = cpu
         self.retx_per_mb = retx_per_mb
+        self.p99_ms = p99_ms
 
 
 class _TtyEchoSuppressor:
@@ -381,6 +423,7 @@ class RichProgressObserver:
         self._top: list[_TrialRow] = []
         self._phase: str = "sobol"
         self._current_mode: str = ""
+        self._current_stage: str = ""
         self._live: Live | None = None
         self._echo: _TtyEchoSuppressor | None = None
 
@@ -458,14 +501,17 @@ class RichProgressObserver:
         table.add_column("Throughput", justify="right")
         table.add_column("CPU", justify="right")
         table.add_column("retx/MB", justify="right")
+        table.add_column("p99 ms", justify="right")
         for row in self._top:
             retx = "n/a" if math.isnan(row.retx_per_mb) else f"{row.retx_per_mb:.2f}"
+            p99 = "n/a" if math.isnan(row.p99_ms) else f"{row.p99_ms:.1f}"
             table.add_row(
                 str(row.index + 1),
                 row.phase,
                 f"{row.throughput_mbps:,.1f} Mbps",
                 f"{row.cpu:.1f}%",
                 retx,
+                p99,
             )
         return Group(self._trials, self._iters, table)
 
@@ -557,16 +603,19 @@ class RichProgressObserver:
         tp_pair = metrics.get("throughput")
         cpu_pair = metrics.get("cpu")
         rate_pair = metrics.get("retransmit_rate")
+        p99_pair = metrics.get("latency_p99")
         tp = (tp_pair[0] if tp_pair is not None else 0.0) / 1e6
         cpu = cpu_pair[0] if cpu_pair is not None else 0.0
         rate = rate_pair[0] if rate_pair is not None else math.nan
         retx_per_mb = math.nan if math.isnan(rate) else rate * 1e6
+        p99 = p99_pair[0] if p99_pair is not None else math.nan
         row = _TrialRow(
             index=index,
             phase=phase,
             throughput_mbps=tp,
             cpu=cpu,
             retx_per_mb=retx_per_mb,
+            p99_ms=p99,
         )
         self._top.append(row)
         self._top.sort(key=lambda r: r.throughput_mbps, reverse=True)
@@ -638,6 +687,32 @@ class RichProgressObserver:
             self._iter_start = None
         if self._iter_task_id is not None:
             self._iters.update(self._iter_task_id, advance=1)
+        self._current_stage = ""
+        self._refresh()
+
+    def on_stage_start(
+        self,
+        stage: str,
+        mode: str,
+        iteration: int,  # noqa: ARG002 stage/mode carry the signal
+    ) -> None:
+        """Update the iteration-bar description to reflect the active sub-stage."""
+        self._current_stage = stage
+        if self._iter_task_id is not None:
+            self._iters.update(
+                self._iter_task_id,
+                description=f"Current [{mode} / {stage}]",
+            )
+        self._refresh()
+
+    def on_stage_end(
+        self,
+        stage: str,  # noqa: ARG002 description rolls back to mode-only
+        mode: str,  # noqa: ARG002
+        iteration: int,  # noqa: ARG002
+    ) -> None:
+        """Clear the sub-stage label; kept as a hook for future extensions."""
+        self._current_stage = ""
         self._refresh()
 
 

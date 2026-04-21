@@ -47,6 +47,7 @@ if TYPE_CHECKING:
 
     from kube_autotuner.experiment import (
         CniSection,
+        FortioSection,
         IperfSection,
         ObjectivesSection,
         Patch,
@@ -54,6 +55,7 @@ if TYPE_CHECKING:
     from kube_autotuner.models import (
         BenchmarkConfig,
         BenchmarkResult,
+        LatencyResult,
         NodePair,
         ParamSpace,
     )
@@ -237,18 +239,49 @@ def _memory_mean_sem(
     return _mean_sem(vals)
 
 
-def _compute_metrics(
-    results: list[BenchmarkResult],
+def _aggregate_latency_by_iteration(
+    results: list[LatencyResult],
+    value_fn: Callable[[LatencyResult], float | None],
+    reducer: Callable[[list[float]], float],
+) -> list[float]:
+    """Reduce per-record fortio values into one value per iteration.
+
+    Mirrors :func:`_aggregate_by_iteration` for
+    :class:`~kube_autotuner.models.LatencyResult`: records are grouped
+    by their ``iteration`` index, ``value_fn`` extracts a scalar or
+    ``None``, and ``reducer`` collapses each iteration's values.
+
+    Args:
+        results: Fortio records for a single trial.
+        value_fn: Extractor returning the scalar to aggregate, or
+            ``None`` to skip the record.
+        reducer: Aggregator applied to each iteration's surviving
+            values (e.g. :func:`sum` or :func:`statistics.mean`).
+
+    Returns:
+        One reduced float per iteration that had at least one
+        non-``None`` value.
+    """
+    grouped: dict[int, list[float]] = defaultdict(list)
+    for r in results:
+        v = value_fn(r)
+        if v is not None:
+            grouped[r.iteration].append(v)
+    return [reducer(vals) for vals in grouped.values() if vals]
+
+
+def _compute_metrics(  # noqa: PLR0914
+    trial: TrialResult,
 ) -> dict[str, tuple[float, float]]:
-    """Collapse raw iperf3 results into per-metric ``(mean, SEM)`` pairs.
+    """Collapse raw trial results into per-metric ``(mean, SEM)`` pairs.
 
     Aggregation proceeds in two stages: :func:`_aggregate_by_iteration`
-    folds multi-client samples into one value per iteration, then
-    :func:`_mean_sem` computes the mean and SEM across iterations. The
-    ``iterations=1`` multi-client corner case collapses to a single
-    iteration with zero SEM; the fallback replaces it with a per-client
-    SEM (best-effort — the samples share server state and are
-    correlated).
+    (or its latency counterpart) folds multi-client samples into one
+    value per iteration, then :func:`_mean_sem` computes the mean and
+    SEM across iterations. The ``iterations=1`` multi-client corner
+    case collapses to a single iteration with zero SEM; the fallback
+    replaces it with a per-client SEM (best-effort — the samples share
+    server state and are correlated).
 
     ``retransmit_rate`` is the per-iteration ratio
     ``sum(retransmits) / sum(bytes_sent)`` averaged across iterations.
@@ -257,15 +290,25 @@ def _compute_metrics(
     the mean is ``NaN`` and callers are expected to drop the key
     before handing results to Ax.
 
+    ``rps`` is sourced from the fortio saturation sub-stage only (it
+    is meaningless under fixed-QPS load). The latency percentiles are
+    sourced from the fortio fixed-QPS sub-stage only (they are
+    meaningless under saturation). When the corresponding sub-stage
+    produced no records, the mean is ``NaN`` and callers drop the
+    key before handing results to Ax — exactly as they do for
+    ``retransmit_rate``.
+
     Args:
-        results: Raw benchmark records for a single trial.
+        trial: The trial whose raw records are to be summarised.
 
     Returns:
         A dict keyed by ``"throughput"`` / ``"cpu"`` /
-        ``"retransmit_rate"`` / ``"node_memory"`` / ``"cni_memory"``
-        with ``(mean, SEM)`` values ready for
+        ``"retransmit_rate"`` / ``"node_memory"`` / ``"cni_memory"`` /
+        ``"rps"`` / ``"latency_p50"`` / ``"latency_p90"`` /
+        ``"latency_p99"`` with ``(mean, SEM)`` values ready for
         :meth:`ax.api.client.Client.complete_trial`.
     """
+    results = trial.results
     throughput_vals = _aggregate_by_iteration(
         results,
         lambda r: r.bits_per_second,
@@ -289,12 +332,37 @@ def _compute_metrics(
             "approximation (samples are correlated via shared server)",
         )
 
+    saturation = [r for r in trial.latency_results if r.workload == "saturation"]
+    fixed_qps = [r for r in trial.latency_results if r.workload == "fixed_qps"]
+
+    rps_vals = _aggregate_latency_by_iteration(
+        saturation,
+        lambda r: r.rps,
+        sum,
+    )
+    if rps_vals:
+        rps_mean, rps_sem = _mean_sem(rps_vals)
+    else:
+        rps_mean, rps_sem = float("nan"), 0.0
+
+    def _pct_mean_sem(
+        field: Callable[[LatencyResult], float | None],
+    ) -> tuple[float, float]:
+        vals = _aggregate_latency_by_iteration(fixed_qps, field, statistics.mean)
+        if vals:
+            return _mean_sem(vals)
+        return float("nan"), 0.0
+
     return {
         "throughput": (throughput_mean, throughput_sem),
         "cpu": (cpu_mean, cpu_sem),
         "retransmit_rate": (rate_mean, rate_sem),
         "node_memory": _memory_mean_sem(results, lambda r: r.node_memory_used_bytes),
         "cni_memory": _memory_mean_sem(results, lambda r: r.cni_memory_used_bytes),
+        "rps": (rps_mean, rps_sem),
+        "latency_p50": _pct_mean_sem(lambda r: r.latency_p50_ms),
+        "latency_p90": _pct_mean_sem(lambda r: r.latency_p90_ms),
+        "latency_p99": _pct_mean_sem(lambda r: r.latency_p99_ms),
     }
 
 
@@ -347,7 +415,11 @@ def filter_objectives_for_observability(
     ``recommendation_weights``, and any outcome constraint that
     references one of the unobservable metrics. Used when the
     configured benchmark cannot produce a metric (e.g. UDP-only
-    runs cannot observe ``retransmit_rate``).
+    runs cannot observe ``retransmit_rate``). The fortio-sourced
+    metrics (``rps``, ``latency_p50/p90/p99``) are always observable
+    as long as the fortio sub-stages run, so they never feed this
+    set; their NaN-on-empty handling lives in :func:`_compute_metrics`
+    instead.
 
     Args:
         section: The objectives block loaded from user config.
@@ -407,6 +479,7 @@ class OptimizationLoop:
         *,
         apply_source: bool = False,
         iperf_args: IperfSection | None = None,
+        fortio_args: FortioSection | None = None,
         patches: list[Patch] | None = None,
         objectives: ObjectivesSection,
         cni: CniSection | None = None,
@@ -427,6 +500,10 @@ class OptimizationLoop:
                 every source client in addition to the target.
             iperf_args: Optional extra iperf3 client/server flags
                 threaded into :class:`BenchmarkRunner`.
+            fortio_args: Optional fortio per-role ``extra_args`` plus
+                ``fixed_qps`` / ``connections`` / ``duration`` threaded
+                into :class:`BenchmarkRunner` for the latency
+                sub-stages.
             patches: Optional kustomize patches applied to the
                 rendered benchmark manifests.
             objectives: Pareto objectives and outcome constraints
@@ -447,6 +524,7 @@ class OptimizationLoop:
         self.n_sobol: int = n_sobol
         self.apply_source: bool = apply_source
         self.iperf_args: IperfSection | None = iperf_args
+        self.fortio_args: FortioSection | None = fortio_args
         self.patches: list[Patch] | None = patches
         self.cni: CniSection | None = cni
         self.observer: ProgressObserver = observer or NullObserver()
@@ -511,6 +589,7 @@ class OptimizationLoop:
             iperf_args=iperf_args,
             patches=patches,
             cni=cni,
+            fortio_args=fortio_args,
             observer=self.observer,
         )
         self._completed: list[TrialResult] = []
@@ -574,7 +653,7 @@ class OptimizationLoop:
                 self.target_setter.apply(sysctl_params)
                 for setter in self.client_setters.values():
                     setter.apply(sysctl_params)
-                results = self.runner.run()
+                iteration_results = self.runner.run()
             finally:
                 self.target_setter.restore(original_target)
                 for name, setter in self.client_setters.items():
@@ -585,12 +664,13 @@ class OptimizationLoop:
             sysctl_values=sysctl_params,
             kernel_version=kernel_version,
             config=self.config,
-            results=results,
+            results=iteration_results.bench,
+            latency_results=iteration_results.latency,
         )
         TrialLog.append(self.output, trial_result)
         self._completed.append(trial_result)
 
-        return _compute_metrics(results)
+        return _compute_metrics(trial_result)
 
     def _should_stop(self, completed_iterations: int) -> bool:
         """Return ``True`` when the main loop should terminate.
@@ -665,15 +745,21 @@ class OptimizationLoop:
         cpu = metrics["cpu"][0]
         rate = metrics["retransmit_rate"][0]
         rate_str = "NaN" if math.isnan(rate) else f"{rate * 1e6:.2f}"
+        rps = metrics.get("rps", (float("nan"), 0.0))[0]
+        rps_str = "NaN" if math.isnan(rps) else f"{rps:.1f}"
+        p99 = metrics.get("latency_p99", (float("nan"), 0.0))[0]
+        p99_str = "NaN" if math.isnan(p99) else f"{p99:.1f}"
         logger.info(
             "Trial %d/%d [%s] throughput=%.1f Mbps cpu=%.1f%% "
-            "retransmit_rate=%s retx/MB",
+            "retransmit_rate=%s retx/MB rps=%s p99=%s ms",
             i + 1,
             self.n_trials,
             phase,
             tp / 1e6,
             cpu,
             rate_str,
+            rps_str,
+            p99_str,
         )
         self.observer.on_trial_complete(i, phase, metrics)
 

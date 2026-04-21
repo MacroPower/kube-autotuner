@@ -20,7 +20,14 @@ pytest.importorskip("ax")
 
 from kube_autotuner.experiment import ObjectivesSection, ParetoObjective
 from kube_autotuner.k8s.lease import LeaseHeldError
-from kube_autotuner.models import BenchmarkConfig, BenchmarkResult, NodePair
+from kube_autotuner.models import (
+    BenchmarkConfig,
+    BenchmarkResult,
+    IterationResults,
+    LatencyResult,
+    NodePair,
+    TrialResult,
+)
 from kube_autotuner.optimizer import (
     OptimizationLoop,
     _aggregate_by_iteration,  # noqa: PLC2701
@@ -50,6 +57,47 @@ def _make_results(n: int = 3) -> list[BenchmarkResult]:
         )
         for i in range(n)
     ]
+
+
+def _make_latency_results(n: int = 3) -> list[LatencyResult]:
+    records: list[LatencyResult] = []
+    for i in range(n):
+        records.extend([
+            LatencyResult(
+                timestamp=datetime.now(UTC),
+                workload="saturation",
+                client_node="kmain07",
+                iteration=i,
+                rps=1000.0 + i,
+                latency_p50_ms=None,
+                latency_p90_ms=None,
+                latency_p99_ms=None,
+            ),
+            LatencyResult(
+                timestamp=datetime.now(UTC),
+                workload="fixed_qps",
+                client_node="kmain07",
+                iteration=i,
+                rps=1000.0,
+                latency_p50_ms=1.0 + i,
+                latency_p90_ms=5.0 + i,
+                latency_p99_ms=10.0 + i,
+            ),
+        ])
+    return records
+
+
+def _trial_from(
+    results: list[BenchmarkResult],
+    latency_results: list[LatencyResult] | None = None,
+) -> TrialResult:
+    return TrialResult(
+        node_pair=NodePair(source="a", target="b", hardware_class="10g"),
+        sysctl_values={},
+        config=BenchmarkConfig(),
+        results=results,
+        latency_results=latency_results or [],
+    )
 
 
 def _mock_snapshot(param_names):
@@ -127,7 +175,10 @@ class TestOptimizationLoop:
         mock_setter_cls.return_value = mock_setter
 
         mock_runner = MagicMock()
-        mock_runner.run.return_value = _make_results()
+        mock_runner.run.return_value = IterationResults(
+            bench=_make_results(),
+            latency=_make_latency_results(),
+        )
         mock_runner_cls.return_value = mock_runner
 
         loop = OptimizationLoop(
@@ -183,7 +234,10 @@ class TestOptimizationLoop:
             call_count += 1
             if call_count == 2:
                 raise RuntimeError("benchmark failed")  # noqa: TRY003
-            return _make_results()
+            return IterationResults(
+                bench=_make_results(),
+                latency=_make_latency_results(),
+            )
 
         mock_runner.run.side_effect = run_side_effect
         mock_runner_cls.return_value = mock_runner
@@ -262,7 +316,10 @@ class TestOptimizationLoop:
         mock_setter_cls.return_value = mock_setter
 
         mock_runner = MagicMock()
-        mock_runner.run.return_value = _make_results()
+        mock_runner.run.return_value = IterationResults(
+            bench=_make_results(),
+            latency=_make_latency_results(),
+        )
         mock_runner_cls.return_value = mock_runner
 
         loop = OptimizationLoop(
@@ -313,7 +370,10 @@ class TestOptimizationLoop:
         mock_setter_cls.side_effect = _setter_factory
 
         mock_runner = MagicMock()
-        mock_runner.run.return_value = _make_results()
+        mock_runner.run.return_value = IterationResults(
+            bench=_make_results(),
+            latency=_make_latency_results(),
+        )
         mock_runner_cls.return_value = mock_runner
 
         loop = OptimizationLoop(
@@ -431,7 +491,7 @@ class TestIterationsOneSEMFallback:
             )
 
         results = [_r(4e9, "c1"), _r(6e9, "c2")]
-        metrics = _compute_metrics(results)
+        metrics = _compute_metrics(_trial_from(results))
         assert metrics["throughput"][0] == pytest.approx(1e10)
         assert metrics["throughput"][1] > 0.0
 
@@ -439,14 +499,17 @@ class TestIterationsOneSEMFallback:
 class TestBuildAxObjective:
     def test_default_section(self) -> None:
         objective, constraints = build_ax_objective(ObjectivesSection())
-        assert (
-            objective == "throughput, -cpu, -retransmit_rate, -node_memory, -cni_memory"
+        assert objective == (
+            "throughput, -cpu, -retransmit_rate, -node_memory, -cni_memory, "
+            "rps, -latency_p50, -latency_p90, -latency_p99"
         )
         assert constraints == [
             "throughput >= 1e6",
             "cpu <= 200",
             "retransmit_rate <= 1e-6",
             "node_memory <= 1e10",
+            "rps >= 100",
+            "latency_p99 <= 1000",
         ]
 
     def test_reduced_two_metric_section(self) -> None:
@@ -466,7 +529,7 @@ class TestBuildAxObjective:
 class TestComputeMetricsMemory:
     def test_node_and_cni_keys_present(self) -> None:
         results = _make_results(2)
-        metrics = _compute_metrics(results)
+        metrics = _compute_metrics(_trial_from(results))
         assert "node_memory" in metrics
         assert "cni_memory" in metrics
         assert "memory" not in metrics
@@ -487,7 +550,7 @@ class TestComputeMetricsRate:
                 iteration=0,
             ),
         ]
-        metrics = _compute_metrics(results)
+        metrics = _compute_metrics(_trial_from(results))
         assert math.isnan(metrics["retransmit_rate"][0])
 
     def test_rate_zero_when_no_retransmits(self) -> None:
@@ -502,9 +565,56 @@ class TestComputeMetricsRate:
                 iteration=0,
             ),
         ]
-        metrics = _compute_metrics(results)
+        metrics = _compute_metrics(_trial_from(results))
         assert metrics["retransmit_rate"][0] == pytest.approx(0.0)
         assert not math.isnan(metrics["retransmit_rate"][0])
+
+
+class TestComputeMetricsLatency:
+    def test_rps_and_latency_keys_present(self) -> None:
+        metrics = _compute_metrics(
+            _trial_from(_make_results(2), _make_latency_results(2)),
+        )
+        for key in ("rps", "latency_p50", "latency_p90", "latency_p99"):
+            assert key in metrics
+        # rps: per-iteration sum across clients, averaged across
+        # iterations. Single client per iter: 1000, 1001 -> 1000.5.
+        assert metrics["rps"][0] == pytest.approx(1000.5)
+        # p99 from fixed_qps only: iter0=10, iter1=11 -> 10.5.
+        assert metrics["latency_p99"][0] == pytest.approx(10.5)
+
+    def test_rps_nan_when_no_saturation(self) -> None:
+        bench = _make_results(1)
+        # Only fixed_qps, no saturation.
+        latency = [
+            LatencyResult(
+                timestamp=datetime.now(UTC),
+                workload="fixed_qps",
+                client_node="c1",
+                iteration=0,
+                rps=1000.0,
+                latency_p99_ms=5.0,
+            ),
+        ]
+        metrics = _compute_metrics(_trial_from(bench, latency))
+        assert math.isnan(metrics["rps"][0])
+        assert metrics["latency_p99"][0] == pytest.approx(5.0)
+
+    def test_latency_nan_when_no_fixed_qps(self) -> None:
+        bench = _make_results(1)
+        latency = [
+            LatencyResult(
+                timestamp=datetime.now(UTC),
+                workload="saturation",
+                client_node="c1",
+                iteration=0,
+                rps=1500.0,
+            ),
+        ]
+        metrics = _compute_metrics(_trial_from(bench, latency))
+        assert metrics["rps"][0] == pytest.approx(1500.0)
+        for key in ("latency_p50", "latency_p90", "latency_p99"):
+            assert math.isnan(metrics[key][0])
 
 
 class TestFilterObjectivesForObservability:

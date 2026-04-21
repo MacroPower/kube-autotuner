@@ -14,6 +14,8 @@ import pytest
 from kube_autotuner import experiment as experiment_mod
 from kube_autotuner.experiment import (
     CLIENT_FLAG_DENYLIST,
+    FORTIO_CLIENT_FLAG_DENYLIST,
+    FORTIO_SERVER_FLAG_DENYLIST,
     SERVER_FLAG_DENYLIST,
     ExperimentConfig,
     ExperimentConfigError,
@@ -780,6 +782,53 @@ def test_denylist_constants_split_correctly():
     assert "--json" not in SERVER_FLAG_DENYLIST
 
 
+@pytest.mark.parametrize("flag", sorted(FORTIO_CLIENT_FLAG_DENYLIST))
+def test_fortio_client_denylist_flags_every_entry(tmp_path: Path, flag: str):
+    path = _write(
+        tmp_path,
+        f"""\
+mode: baseline
+nodes:
+  sources: [a]
+  target: b
+fortio:
+  client:
+    extraArgs: ["{flag}"]
+""",
+    )
+    exp = ExperimentConfig.from_yaml(path)
+    result = exp._check_denylists()
+    assert not result.passed
+    assert "reserved flag" in result.detail
+    assert flag in result.detail
+
+
+def test_fortio_server_denylist(tmp_path: Path):
+    path = _write(
+        tmp_path,
+        """\
+mode: baseline
+nodes:
+  sources: [a]
+  target: b
+fortio:
+  server:
+    extraArgs: ["-http-port"]
+""",
+    )
+    exp = ExperimentConfig.from_yaml(path)
+    result = exp._check_denylists()
+    assert not result.passed
+    assert "reserved flag" in result.detail
+    assert "-http-port" in result.detail
+
+
+def test_fortio_denylist_constants():
+    assert "-qps" in FORTIO_CLIENT_FLAG_DENYLIST
+    assert "-json" in FORTIO_CLIENT_FLAG_DENYLIST
+    assert "-http-port" in FORTIO_SERVER_FLAG_DENYLIST
+
+
 class TestObjectivesSection:
     def test_defaults_round_trip(self) -> None:
         section = ObjectivesSection()
@@ -795,6 +844,10 @@ class TestObjectivesSection:
             ("retransmit_rate", "minimize"),
             ("node_memory", "minimize"),
             ("cni_memory", "minimize"),
+            ("rps", "maximize"),
+            ("latency_p50", "minimize"),
+            ("latency_p90", "minimize"),
+            ("latency_p99", "minimize"),
         ]
 
     def test_legacy_memory_metric_rejected(self) -> None:

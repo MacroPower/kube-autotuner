@@ -81,6 +81,28 @@ SERVER_FLAG_DENYLIST: frozenset[str] = frozenset({
     "--logfile",
 })
 
+# fortio flags the tool controls. ``-qps`` / ``-c`` / ``-t`` and ``-n``
+# are owned by :class:`FortioSection`; ``-json`` and the trailing URL
+# shape are required by the parser and runner; ``-H``, ``-http1.0``,
+# ``-stdclient`` and ``-quiet`` change the request shape or output
+# format in ways that break the parser.
+FORTIO_CLIENT_FLAG_DENYLIST: frozenset[str] = frozenset({
+    "-qps",
+    "-c",
+    "-t",
+    "-n",
+    "-json",
+    "-url",
+    "-H",
+    "-http1.0",
+    "-stdclient",
+    "-quiet",
+})
+
+FORTIO_SERVER_FLAG_DENYLIST: frozenset[str] = frozenset({
+    "-http-port",
+})
+
 SYSCTL_NAME_RE = re.compile(r"^[a-z][a-z0-9._]+$")
 
 
@@ -202,6 +224,41 @@ class IperfSection(BaseModel):
     server: IperfArgs = Field(default_factory=IperfArgs)
 
 
+class FortioArgs(BaseModel):
+    """Extra command-line arguments for a fortio invocation."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        alias_generator=to_camel,
+        populate_by_name=True,
+    )
+
+    extra_args: list[str] = Field(default_factory=list)
+
+
+class FortioSection(BaseModel):
+    """Per-role ``extra_args`` and run shape for the fortio sub-stages.
+
+    ``duration`` is intentionally independent of
+    :attr:`BenchmarkConfig.duration` so operators can keep fortio runs
+    short without shortening the iperf3 bandwidth window. ``fixed_qps``
+    drives the latency percentile sub-stage; ``connections`` is
+    forwarded to fortio's ``-c`` flag for both sub-stages.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+        alias_generator=to_camel,
+        populate_by_name=True,
+    )
+
+    client: FortioArgs = Field(default_factory=FortioArgs)
+    server: FortioArgs = Field(default_factory=FortioArgs)
+    fixed_qps: int = Field(default=1000, ge=1)
+    connections: int = Field(default=4, ge=1)
+    duration: int = Field(default=30, ge=1)
+
+
 class CniSection(BaseModel):
     """Selector for CNI pods to track on the target node."""
 
@@ -261,11 +318,15 @@ Metric = Literal[
     "retransmit_rate",
     "node_memory",
     "cni_memory",
+    "rps",
+    "latency_p50",
+    "latency_p90",
+    "latency_p99",
 ]
 Direction = Literal["maximize", "minimize"]
 
 _CONSTRAINT_RE = re.compile(
-    r"^\s*(?P<metric>[a-z_]+)\s*(?P<op><=|>=|==)\s*(?P<value>[+-]?"
+    r"^\s*(?P<metric>[a-z_0-9]+)\s*(?P<op><=|>=|==)\s*(?P<value>[+-]?"
     r"(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)\s*$",
 )
 
@@ -274,6 +335,12 @@ _DEFAULT_CONSTRAINTS: list[str] = [
     "cpu <= 200",
     "retransmit_rate <= 1e-6",
     "node_memory <= 1e10",
+    # requests/sec; only the saturation sub-stage feeds ``rps``, so
+    # this floor only fails on fortio server crash (zero achieved
+    # QPS). Not intended as a performance gate.
+    "rps >= 100",
+    # milliseconds; from the fixed_qps sub-stage only.
+    "latency_p99 <= 1000",
 ]
 
 _DEFAULT_WEIGHTS: dict[str, float] = {
@@ -300,8 +367,9 @@ def _default_pareto() -> list[ParetoObjective]:
     """Return the default Pareto objective list.
 
     Returns:
-        Five objectives: throughput (max), cpu (min), retransmit_rate
-        (min), node_memory (min), cni_memory (min).
+        Nine objectives: throughput (max), cpu (min),
+        retransmit_rate (min), node_memory (min), cni_memory (min),
+        rps (max), latency_p50/p90/p99 (min).
     """
     return [
         ParetoObjective(metric="throughput", direction="maximize"),
@@ -309,6 +377,10 @@ def _default_pareto() -> list[ParetoObjective]:
         ParetoObjective(metric="retransmit_rate", direction="minimize"),
         ParetoObjective(metric="node_memory", direction="minimize"),
         ParetoObjective(metric="cni_memory", direction="minimize"),
+        ParetoObjective(metric="rps", direction="maximize"),
+        ParetoObjective(metric="latency_p50", direction="minimize"),
+        ParetoObjective(metric="latency_p90", direction="minimize"),
+        ParetoObjective(metric="latency_p99", direction="minimize"),
     ]
 
 
@@ -380,6 +452,10 @@ class ObjectivesSection(BaseModel):
             "retransmit_rate",
             "node_memory",
             "cni_memory",
+            "rps",
+            "latency_p50",
+            "latency_p90",
+            "latency_p99",
         }
         for constraint in self.constraints:
             match = _CONSTRAINT_RE.match(constraint)
@@ -410,6 +486,7 @@ class ExperimentConfig(BaseModel):
     optimize: OptimizeSection | None = None
     trial: TrialSection | None = None
     iperf: IperfSection = Field(default_factory=IperfSection)
+    fortio: FortioSection = Field(default_factory=FortioSection)
     cni: CniSection = Field(default_factory=CniSection)
     patches: list[Patch] = Field(default_factory=list)
     objectives: ObjectivesSection = Field(default_factory=ObjectivesSection)
@@ -527,12 +604,13 @@ class ExperimentConfig(BaseModel):
         ]
 
     def _check_denylists(self) -> PreflightResult:
-        """Verify no reserved iperf3 flags appear in user ``extra_args``.
+        """Verify no reserved iperf3 or fortio flags appear in user ``extra_args``.
 
         Returns:
-            A passing result when every entry in ``iperf.client.extra_args``
-            and ``iperf.server.extra_args`` avoids the denylists, otherwise
-            a failing result naming the first offending flag.
+            A passing result when every entry in the iperf3 and fortio
+            client/server ``extra_args`` lists avoids the denylists,
+            otherwise a failing result naming the first offending
+            flag.
         """
         name = "denylists"
         for tok in self.iperf.client.extra_args:
@@ -549,6 +627,22 @@ class ExperimentConfig(BaseModel):
                     f"iperf.server.extra_args contains reserved flag {tok!r}; "
                     f"these are controlled by the server invariants: "
                     f"{sorted(SERVER_FLAG_DENYLIST)}"
+                )
+                return PreflightResult(name=name, passed=False, detail=detail)
+        for tok in self.fortio.client.extra_args:
+            if tok in FORTIO_CLIENT_FLAG_DENYLIST:
+                detail = (
+                    f"fortio.client.extra_args contains reserved flag {tok!r}; "
+                    f"these are controlled by fortio config or parser "
+                    f"invariants: {sorted(FORTIO_CLIENT_FLAG_DENYLIST)}"
+                )
+                return PreflightResult(name=name, passed=False, detail=detail)
+        for tok in self.fortio.server.extra_args:
+            if tok in FORTIO_SERVER_FLAG_DENYLIST:
+                detail = (
+                    f"fortio.server.extra_args contains reserved flag {tok!r}; "
+                    f"these are controlled by the fortio server invariants: "
+                    f"{sorted(FORTIO_SERVER_FLAG_DENYLIST)}"
                 )
                 return PreflightResult(name=name, passed=False, detail=detail)
         return PreflightResult(name=name, passed=True)
@@ -729,6 +823,12 @@ class ExperimentConfig(BaseModel):
         from kube_autotuner.benchmark.client_spec import (  # noqa: PLC0415
             build_client_yaml,
         )
+        from kube_autotuner.benchmark.fortio_client_spec import (  # noqa: PLC0415
+            build_fortio_client_yaml,
+        )
+        from kube_autotuner.benchmark.fortio_server_spec import (  # noqa: PLC0415
+            build_fortio_server_yaml,
+        )
         from kube_autotuner.benchmark.patch import apply_patches  # noqa: PLC0415
         from kube_autotuner.benchmark.server_spec import (  # noqa: PLC0415
             build_server_yaml,
@@ -752,7 +852,25 @@ class ExperimentConfig(BaseModel):
             ip_family_policy=self.nodes.ip_family_policy,
             extra_args=self.iperf.server.extra_args,
         )
-        combined = client_yaml + "\n---\n" + server_yaml
+        fortio_server_yaml = build_fortio_server_yaml(
+            node=self.nodes.target,
+            ip_family_policy=self.nodes.ip_family_policy,
+            extra_args=self.fortio.server.extra_args,
+        )
+        fortio_client_yaml = build_fortio_client_yaml(
+            node=primary,
+            target=self.nodes.target,
+            iteration=0,
+            workload="fixed_qps",
+            qps=self.fortio.fixed_qps,
+            connections=self.fortio.connections,
+            duration=self.fortio.duration,
+            extra_args=self.fortio.client.extra_args,
+        )
+        combined = (
+            f"{client_yaml}\n---\n{server_yaml}\n---\n"
+            f"{fortio_server_yaml}\n---\n{fortio_client_yaml}"
+        )
         base_docs = list(yaml.safe_load_all(combined))
 
         try:

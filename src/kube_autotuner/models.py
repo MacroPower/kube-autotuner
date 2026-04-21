@@ -20,7 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Callable, Mapping
     from pathlib import Path
 
     from kube_autotuner.experiment import ObjectivesSection
@@ -137,6 +137,44 @@ class BenchmarkResult(BaseModel):
     raw_json: dict[str, Any] = Field(default_factory=dict)
 
 
+class LatencyResult(BaseModel):
+    """Parsed metrics from one fortio load run.
+
+    Fortio drives a request/response workload against the fortio server
+    pod and returns per-run latency percentiles plus the achieved QPS.
+    ``workload`` disambiguates the two sub-stages: ``"saturation"``
+    runs fortio with ``-qps 0`` and is the sole source of the ``rps``
+    metric, while ``"fixed_qps"`` runs at a stable offered rate and is
+    the sole source of the latency percentiles.
+    """
+
+    timestamp: datetime
+    workload: Literal["saturation", "fixed_qps"]
+    client_node: str = ""
+    iteration: int = 0
+    rps: float = 0.0
+    total_requests: int | None = None
+    latency_p50_ms: float | None = None
+    latency_p90_ms: float | None = None
+    latency_p99_ms: float | None = None
+    node_memory_used_bytes: int | None = None
+    cni_memory_used_bytes: int | None = None
+    raw_json: dict[str, Any] = Field(default_factory=dict)
+
+
+class IterationResults(BaseModel):
+    """Container for the two record streams produced by a single run.
+
+    :class:`~kube_autotuner.benchmark.runner.BenchmarkRunner.run`
+    returns one of these per call so callers can thread both the
+    iperf3 ``bench`` records and the fortio ``latency`` records into
+    the :class:`TrialResult` without adding a second return value.
+    """
+
+    bench: list[BenchmarkResult] = Field(default_factory=list)
+    latency: list[LatencyResult] = Field(default_factory=list)
+
+
 def compute_sysctl_hash(sysctl_values: Mapping[str, str | int]) -> str:
     """Compute a short SHA-256 hash over sorted sysctl key-value pairs.
 
@@ -200,6 +238,22 @@ def _group_by_iteration(
     return grouped
 
 
+def _group_latency_by_iteration(
+    results: list[LatencyResult],
+) -> dict[int, list[LatencyResult]]:
+    """Group fortio ``results`` by their ``iteration`` index.
+
+    Returns:
+        A mapping from iteration index to the latency records recorded
+        at that iteration, preserving insertion order within each
+        group.
+    """
+    grouped: dict[int, list[LatencyResult]] = defaultdict(list)
+    for r in results:
+        grouped[r.iteration].append(r)
+    return grouped
+
+
 class TrialResult(BaseModel):
     """Aggregated result for one set of sysctls across iterations."""
 
@@ -211,6 +265,7 @@ class TrialResult(BaseModel):
     topology: Literal["intra-az", "inter-az", "unknown"] = "unknown"
     config: BenchmarkConfig
     results: list[BenchmarkResult] = Field(default_factory=list)
+    latency_results: list[LatencyResult] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
     def model_post_init(self, _context: Any, /) -> None:  # noqa: ANN401
@@ -349,6 +404,79 @@ class TrialResult(BaseModel):
                 for r in group
                 if r.cni_memory_used_bytes is not None
             ]
+            if vals:
+                per_iter_means.append(sum(vals) / len(vals))
+        if not per_iter_means:
+            return 0.0
+        return sum(per_iter_means) / len(per_iter_means)
+
+    def mean_rps(self) -> float:
+        """Return the mean achieved RPS from fortio saturation runs.
+
+        RPS is summed across source clients within each iteration
+        (mirroring the throughput aggregation) and then averaged
+        across iterations. Only records tagged
+        ``workload == "saturation"`` contribute; fixed-QPS runs are
+        ignored because their RPS is clamped to the offered load.
+
+        Returns:
+            The averaged achieved RPS, or ``0.0`` when no saturation
+            record is available.
+        """
+        saturation = [r for r in self.latency_results if r.workload == "saturation"]
+        if not saturation:
+            return 0.0
+        per_iter_sums = [
+            sum(r.rps for r in group)
+            for group in _group_latency_by_iteration(saturation).values()
+        ]
+        return sum(per_iter_sums) / len(per_iter_sums)
+
+    def mean_latency_p50_ms(self) -> float:
+        """Return the mean p50 latency from fortio fixed-QPS runs.
+
+        Returns:
+            The averaged p50 latency in milliseconds, or ``0.0`` when
+            no fixed-QPS record reports p50.
+        """
+        return self._mean_fixed_qps_latency(lambda r: r.latency_p50_ms)
+
+    def mean_latency_p90_ms(self) -> float:
+        """Return the mean p90 latency from fortio fixed-QPS runs.
+
+        Returns:
+            The averaged p90 latency in milliseconds, or ``0.0`` when
+            no fixed-QPS record reports p90.
+        """
+        return self._mean_fixed_qps_latency(lambda r: r.latency_p90_ms)
+
+    def mean_latency_p99_ms(self) -> float:
+        """Return the mean p99 latency from fortio fixed-QPS runs.
+
+        Returns:
+            The averaged p99 latency in milliseconds, or ``0.0`` when
+            no fixed-QPS record reports p99.
+        """
+        return self._mean_fixed_qps_latency(lambda r: r.latency_p99_ms)
+
+    def _mean_fixed_qps_latency(
+        self,
+        extractor: Callable[[LatencyResult], float | None],
+    ) -> float:
+        """Average a fixed-QPS latency field across clients then iterations.
+
+        Args:
+            extractor: Callable returning the latency field for one
+                record, or ``None`` when the record did not report it.
+
+        Returns:
+            The averaged latency in milliseconds, or ``0.0`` when no
+            fixed-QPS record supplied a value.
+        """
+        fixed = [r for r in self.latency_results if r.workload == "fixed_qps"]
+        per_iter_means: list[float] = []
+        for group in _group_latency_by_iteration(fixed).values():
+            vals = [v for r in group if (v := extractor(r)) is not None]
             if vals:
                 per_iter_means.append(sum(vals) / len(vals))
         if not per_iter_means:

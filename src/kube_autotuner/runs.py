@@ -207,6 +207,7 @@ def run_baseline(ctx: RunContext) -> None:
             iperf_args=exp.iperf,
             patches=exp.patches,
             cni=exp.cni,
+            fortio_args=exp.fortio,
             observer=ctx.observer,
         )
         try:
@@ -220,10 +221,16 @@ def run_baseline(ctx: RunContext) -> None:
         sysctl_values=cast("dict[str, str | int]", snapshot),
         kernel_version=kernel_version,
         config=config,
-        results=results,
+        results=results.bench,
+        latency_results=results.latency,
     )
     TrialLog.append(ctx.output, trial)
-    logger.info("Wrote %d results to %s", len(results), ctx.output)
+    logger.info(
+        "Wrote %d bench + %d latency results to %s",
+        len(results.bench),
+        len(results.latency),
+        ctx.output,
+    )
     logger.info("Mean throughput: %.1f Mbps", trial.mean_throughput() / 1e6)
     logger.info("Mean CPU: %.1f%%", trial.mean_cpu())
     nmem = trial.mean_node_memory()
@@ -232,9 +239,15 @@ def run_baseline(ctx: RunContext) -> None:
     cmem = trial.mean_cni_memory()
     if cmem > 0:
         logger.info("Mean CNI memory: %.1f MiB", cmem / 1024 / 1024)
+    rps = trial.mean_rps()
+    if rps > 0:
+        logger.info("Mean RPS (saturation): %.1f", rps)
+    p99 = trial.mean_latency_p99_ms()
+    if p99 > 0:
+        logger.info("Mean p99 latency (fixed_qps): %.2f ms", p99)
 
 
-def run_trial(ctx: RunContext) -> None:
+def run_trial(ctx: RunContext) -> None:  # noqa: PLR0914, PLR0915
     """Apply a fixed sysctl set, benchmark, and restore.
 
     Snapshots only the keys being applied (plus ``kernel.osrelease``),
@@ -290,6 +303,7 @@ def run_trial(ctx: RunContext) -> None:
             iperf_args=exp.iperf,
             patches=exp.patches,
             cni=exp.cni,
+            fortio_args=exp.fortio,
             observer=ctx.observer,
         )
         try:
@@ -305,10 +319,16 @@ def run_trial(ctx: RunContext) -> None:
         sysctl_values=cast("dict[str, str | int]", params),
         kernel_version=kernel_version,
         config=config,
-        results=results,
+        results=results.bench,
+        latency_results=results.latency,
     )
     TrialLog.append(ctx.output, trial_result)
-    logger.info("Wrote %d results to %s", len(results), ctx.output)
+    logger.info(
+        "Wrote %d bench + %d latency results to %s",
+        len(results.bench),
+        len(results.latency),
+        ctx.output,
+    )
     logger.info(
         "Mean throughput: %.1f Mbps",
         trial_result.mean_throughput() / 1e6,
@@ -320,9 +340,15 @@ def run_trial(ctx: RunContext) -> None:
     cmem = trial_result.mean_cni_memory()
     if cmem > 0:
         logger.info("Mean CNI memory: %.1f MiB", cmem / 1024 / 1024)
+    rps = trial_result.mean_rps()
+    if rps > 0:
+        logger.info("Mean RPS (saturation): %.1f", rps)
+    p99 = trial_result.mean_latency_p99_ms()
+    if p99 > 0:
+        logger.info("Mean p99 latency (fixed_qps): %.2f ms", p99)
 
 
-def run_optimize(ctx: RunContext) -> None:
+def run_optimize(ctx: RunContext) -> None:  # noqa: PLR0914
     """Drive the Ax Bayesian optimization loop.
 
     Per-trial lease acquisition lives inside
@@ -370,6 +396,7 @@ def run_optimize(ctx: RunContext) -> None:
         n_sobol=exp.optimize.n_sobol,
         apply_source=exp.optimize.apply_source,
         iperf_args=exp.iperf,
+        fortio_args=exp.fortio,
         patches=exp.patches,
         objectives=exp.objectives,
         cni=exp.cni,
@@ -391,6 +418,8 @@ def run_optimize(ctx: RunContext) -> None:
         tp = metrics.get("throughput", 0)
         cpu = metrics.get("cpu", 0)
         rate = metrics.get("retransmit_rate")
+        rps = metrics.get("rps")
+        p99 = metrics.get("latency_p99")
         tp_val = tp[0] if isinstance(tp, tuple) else tp
         cpu_val = cpu[0] if isinstance(cpu, tuple) else cpu
         if rate is None:
@@ -398,10 +427,38 @@ def run_optimize(ctx: RunContext) -> None:
         else:
             raw = rate[0] if isinstance(rate, tuple) else rate
             rate_val = None if math.isnan(raw) else float(raw)
+        rps_val = _scalar_or_nan(rps)
+        p99_val = _scalar_or_nan(p99)
+        rps_str = "n/a" if math.isnan(rps_val) else f"{rps_val:.1f}"
+        p99_str = "n/a" if math.isnan(p99_val) else f"{p99_val:.1f}"
         logger.info(
-            "  [%d] throughput=%.1f Mbps cpu=%.1f%% rate=%s retx/MB",
+            "  [%d] throughput=%.1f Mbps cpu=%.1f%% rate=%s retx/MB rps=%s p99=%s ms",
             trial_idx,
             float(tp_val) / 1e6,
             float(cpu_val),
             format_retransmit_rate(rate_val),
+            rps_str,
+            p99_str,
         )
+
+
+def _scalar_or_nan(
+    raw: float | tuple[int | float, int | float] | None,
+) -> float:
+    """Extract the scalar mean from an Ax metric entry, defaulting to NaN.
+
+    Ax's :meth:`get_pareto_frontier` mixes scalar and ``(mean, SEM)``
+    values per metric. The optimize pareto log needs the mean only;
+    missing keys map to NaN so the caller can render ``"n/a"``.
+
+    Args:
+        raw: Ax metric entry (scalar, tuple, or ``None``).
+
+    Returns:
+        The scalar mean as a float, or ``math.nan`` when missing.
+    """
+    if raw is None:
+        return math.nan
+    if isinstance(raw, tuple):
+        return float(raw[0])
+    return float(raw)

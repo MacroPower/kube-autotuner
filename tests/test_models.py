@@ -11,6 +11,8 @@ from kube_autotuner.experiment import ObjectivesSection, ParetoObjective
 from kube_autotuner.models import (
     BenchmarkConfig,
     BenchmarkResult,
+    IterationResults,
+    LatencyResult,
     NodePair,
     TrialLog,
     TrialResult,
@@ -729,6 +731,217 @@ def test_benchmark_result_new_fields_round_trip():
     assert restored.cpu_server_percent == pytest.approx(42.0)
     assert restored.client_node == "c7"
     assert restored.iteration == 2
+
+
+class TestLatencyAggregation:
+    def _latency(
+        self,
+        *,
+        workload,
+        iteration: int,
+        client_node: str,
+        rps: float = 0.0,
+        p50: float | None = None,
+        p90: float | None = None,
+        p99: float | None = None,
+    ) -> LatencyResult:
+        return LatencyResult(
+            timestamp=datetime.now(UTC),
+            workload=workload,
+            client_node=client_node,
+            iteration=iteration,
+            rps=rps,
+            latency_p50_ms=p50,
+            latency_p90_ms=p90,
+            latency_p99_ms=p99,
+        )
+
+    def test_mean_rps_sums_across_clients_per_iteration(self) -> None:
+        trial = TrialResult(
+            node_pair=NodePair(
+                source="c1",
+                target="t",
+                hardware_class="10g",
+                extra_sources=["c2"],
+            ),
+            sysctl_values={},
+            config=BenchmarkConfig(),
+            latency_results=[
+                self._latency(
+                    workload="saturation",
+                    iteration=0,
+                    client_node="c1",
+                    rps=1000.0,
+                ),
+                self._latency(
+                    workload="saturation",
+                    iteration=0,
+                    client_node="c2",
+                    rps=2000.0,
+                ),
+                self._latency(
+                    workload="saturation",
+                    iteration=1,
+                    client_node="c1",
+                    rps=1500.0,
+                ),
+                self._latency(
+                    workload="saturation",
+                    iteration=1,
+                    client_node="c2",
+                    rps=1500.0,
+                ),
+                # fixed_qps must be ignored by mean_rps.
+                self._latency(
+                    workload="fixed_qps",
+                    iteration=0,
+                    client_node="c1",
+                    rps=10_000.0,
+                ),
+            ],
+        )
+        # Iter 0 sum = 3000, iter 1 sum = 3000 -> mean 3000.
+        assert trial.mean_rps() == pytest.approx(3000.0)
+
+    def test_mean_rps_zero_without_saturation_records(self) -> None:
+        trial = TrialResult(
+            node_pair=NodePair(source="n", target="t", hardware_class="10g"),
+            sysctl_values={},
+            config=BenchmarkConfig(),
+            latency_results=[
+                self._latency(
+                    workload="fixed_qps",
+                    iteration=0,
+                    client_node="n",
+                    rps=1000.0,
+                ),
+            ],
+        )
+        assert trial.mean_rps() == pytest.approx(0.0)
+
+    def test_mean_latency_p99_ignores_saturation_records(self) -> None:
+        trial = TrialResult(
+            node_pair=NodePair(source="n", target="t", hardware_class="10g"),
+            sysctl_values={},
+            config=BenchmarkConfig(),
+            latency_results=[
+                # fixed_qps records: p99 values 10 and 20 -> mean 15.
+                self._latency(
+                    workload="fixed_qps",
+                    iteration=0,
+                    client_node="n",
+                    p99=10.0,
+                ),
+                self._latency(
+                    workload="fixed_qps",
+                    iteration=1,
+                    client_node="n",
+                    p99=20.0,
+                ),
+                # saturation records with nonsense p99 to confirm they are
+                # not included in the mean.
+                self._latency(
+                    workload="saturation",
+                    iteration=0,
+                    client_node="n",
+                    p99=999.0,
+                ),
+            ],
+        )
+        assert trial.mean_latency_p99_ms() == pytest.approx(15.0)
+
+    def test_mean_latency_percentiles_per_client_mean(self) -> None:
+        trial = TrialResult(
+            node_pair=NodePair(
+                source="c1",
+                target="t",
+                hardware_class="10g",
+                extra_sources=["c2"],
+            ),
+            sysctl_values={},
+            config=BenchmarkConfig(),
+            latency_results=[
+                self._latency(
+                    workload="fixed_qps",
+                    iteration=0,
+                    client_node="c1",
+                    p50=1.0,
+                    p90=2.0,
+                    p99=3.0,
+                ),
+                self._latency(
+                    workload="fixed_qps",
+                    iteration=0,
+                    client_node="c2",
+                    p50=3.0,
+                    p90=4.0,
+                    p99=5.0,
+                ),
+            ],
+        )
+        # Single iteration; per-client mean -> (1+3)/2 = 2 for p50.
+        assert trial.mean_latency_p50_ms() == pytest.approx(2.0)
+        assert trial.mean_latency_p90_ms() == pytest.approx(3.0)
+        assert trial.mean_latency_p99_ms() == pytest.approx(4.0)
+
+
+class TestIterationResults:
+    def test_round_trip(self) -> None:
+        ir = IterationResults(
+            bench=[
+                BenchmarkResult(
+                    timestamp=datetime.now(UTC),
+                    mode="tcp",
+                    bits_per_second=1e9,
+                ),
+            ],
+            latency=[
+                LatencyResult(
+                    timestamp=datetime.now(UTC),
+                    workload="saturation",
+                    client_node="c1",
+                    iteration=0,
+                    rps=100.0,
+                ),
+            ],
+        )
+        loaded = IterationResults.model_validate_json(ir.model_dump_json())
+        assert len(loaded.bench) == 1
+        assert len(loaded.latency) == 1
+        assert loaded.latency[0].workload == "saturation"
+
+
+def test_trial_result_latency_results_defaults_empty() -> None:
+    trial = TrialResult(
+        node_pair=NodePair(source="n1", target="n2", hardware_class="10g"),
+        sysctl_values={},
+        config=BenchmarkConfig(),
+    )
+    assert trial.latency_results == []
+
+
+def test_trial_result_round_trip_preserves_latency_results(tmp_path: Path) -> None:
+    path = tmp_path / "trials.jsonl"
+    trial = TrialResult(
+        node_pair=NodePair(source="n1", target="n2", hardware_class="10g"),
+        sysctl_values={},
+        config=BenchmarkConfig(),
+        latency_results=[
+            LatencyResult(
+                timestamp=datetime.now(UTC),
+                workload="fixed_qps",
+                client_node="c1",
+                iteration=0,
+                rps=1000.0,
+                latency_p99_ms=5.0,
+            ),
+        ],
+    )
+    TrialLog.append(path, trial)
+    loaded = TrialLog.load(path)
+    assert len(loaded) == 1
+    assert len(loaded[0].latency_results) == 1
+    assert loaded[0].latency_results[0].workload == "fixed_qps"
 
 
 class TestTrialLogMetadata:
