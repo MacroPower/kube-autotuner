@@ -71,6 +71,12 @@ class ProgressObserver(Protocol):
     ``on_mode_start`` is not guaranteed before ``on_iteration_start``
     for callers that do not know the mode structure up front).
 
+    One ordering invariant is guaranteed: inside a single benchmark
+    run, ``on_benchmark_start`` fires once before any ``on_mode_start``
+    or ``on_iteration_start`` from that run. This lets implementations
+    size a trial-wide iteration progress bar up front instead of
+    inferring the total per-mode.
+
     Implementations must also be usable as context managers; the CLI
     wraps the entire run in ``with observer:`` so live displays have a
     defined lifecycle.
@@ -130,6 +136,24 @@ class ProgressObserver(Protocol):
         Args:
             index: Zero-based trial index.
             exc: The exception that aborted the trial.
+        """
+        ...
+
+    def on_benchmark_start(self, total_iterations: int) -> None:
+        """Report that a benchmark run is starting.
+
+        Fires once per :meth:`BenchmarkRunner.run` call, before any
+        ``on_mode_start``. Defines the trial-wide iteration budget so
+        implementations can size their iteration progress bar across
+        all modes rather than per-mode. Implementations must preserve
+        any cumulative iteration history (mean-duration samples used
+        to compute ETA) across this call -- only the current
+        benchmark's progress-bar state should be reset.
+
+        Args:
+            total_iterations: Total iterations planned for the
+                benchmark run, i.e.
+                ``len(config.modes) * config.iterations``.
         """
         ...
 
@@ -224,6 +248,9 @@ class NullObserver:
         """No-op."""
 
     def on_trial_failed(self, index: int, exc: BaseException) -> None:
+        """No-op."""
+
+    def on_benchmark_start(self, total_iterations: int) -> None:
         """No-op."""
 
     def on_mode_start(self, mode: str, total_iterations: int) -> None:
@@ -632,23 +659,24 @@ class RichProgressObserver:
             self._trials.update(self._trial_task_id, advance=1)
         self._refresh()
 
-    def on_mode_start(self, mode: str, total_iterations: int) -> None:
-        """Reset the iteration bar for the new mode.
+    def on_benchmark_start(self, total_iterations: int) -> None:
+        """Size the iteration bar for the trial's full iteration budget.
 
-        The cumulative iteration history (``_iter_count`` /
+        Fired once per :meth:`BenchmarkRunner.run` call. The iteration
+        bar spans every mode in the trial, so its ``total`` is set to
+        ``len(modes) * iterations`` and its ``completed`` starts at
+        zero. The cumulative iteration history (``_iter_count`` /
         ``_iter_total_seconds``) is deliberately preserved so the
         custom :class:`_IterEtaColumn` can keep producing a real ETA
-        across mode and trial boundaries. Only the transient
+        across trial boundaries. Only the transient
         start-of-iteration timestamp is cleared, covering the case
         where a prior iteration was aborted before
         :meth:`on_iteration_end` fired.
         """
         self._iter_start = None
-        self._current_mode = mode
-        description = f"Current [{mode}]"
         if self._iter_task_id is None:
             self._iter_task_id = self._iters.add_task(
-                description,
+                "Current",
                 total=total_iterations,
                 completed=0,
             )
@@ -657,7 +685,29 @@ class RichProgressObserver:
                 self._iter_task_id,
                 total=total_iterations,
                 completed=0,
-                description=description,
+                description="Current",
+            )
+        self._refresh()
+
+    def on_mode_start(
+        self,
+        mode: str,
+        total_iterations: int,  # noqa: ARG002 kept on protocol for non-Rich observers
+    ) -> None:
+        """Repaint the iteration-bar description for the new mode.
+
+        The iteration bar itself is sized by :meth:`on_benchmark_start`
+        and spans the whole trial, so no ``reset`` happens here. The
+        transient start-of-iteration timestamp is still cleared in
+        case a prior iteration was aborted before
+        :meth:`on_iteration_end` fired.
+        """
+        self._iter_start = None
+        self._current_mode = mode
+        if self._iter_task_id is not None:
+            self._iters.update(
+                self._iter_task_id,
+                description=f"Current [{mode}]",
             )
         self._refresh()
 

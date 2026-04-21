@@ -42,6 +42,7 @@ def test_null_observer_is_protocol_compliant() -> None:
     with obs as active:
         assert active is obs
         active.on_trial_start(0, 5, "sobol", {"net.core.rmem_max": "1048576"})
+        active.on_benchmark_start(3)
         active.on_mode_start("tcp", 3)
         active.on_iteration_start("tcp", 0)
         active.on_iteration_end("tcp", 0)
@@ -58,6 +59,7 @@ def test_rich_observer_renders_bars_and_table() -> None:
     observer = RichProgressObserver(console)
     with observer:
         observer.on_trial_start(0, 3, "sobol", {"net.core.rmem_max": "1048576"})
+        observer.on_benchmark_start(2)
         observer.on_mode_start("tcp", 2)
         observer.on_iteration_start("tcp", 0)
         observer.on_iteration_end("tcp", 0)
@@ -110,6 +112,7 @@ def test_rich_observer_refresh_does_not_force_immediate_paint(
 
         monkeypatch.setattr(observer._live, "update", spy)
         observer.on_trial_start(0, 2, "sobol", {})
+        observer.on_benchmark_start(2)
         observer.on_mode_start("tcp", 2)
         observer.on_iteration_start("tcp", 0)
         observer.on_iteration_end("tcp", 0)
@@ -193,7 +196,7 @@ def _find_iter_eta_column(observer: RichProgressObserver) -> _IterEtaColumn:
 def test_rich_observer_iteration_eta_survives_mode_change(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Iteration-bar ETA persists across ``on_mode_start`` resets."""
+    """Iteration-bar ETA stays trial-wide across ``on_mode_start`` boundaries."""
     console = _capture_console()
     observer = RichProgressObserver(console)
     clock = {"t": 1000.0}
@@ -205,6 +208,8 @@ def test_rich_observer_iteration_eta_survives_mode_change(
     monkeypatch.setattr(observer._iters, "get_time", _fake)
     monkeypatch.setattr(progress_module.time, "monotonic", _fake)
     with observer:
+        # One trial: modes=["tcp","udp"], iterations=3 -> total = 6.
+        observer.on_benchmark_start(6)
         observer.on_mode_start("tcp", 3)
         observer.on_iteration_start("tcp", 0)
         clock["t"] += 60.0
@@ -215,14 +220,14 @@ def test_rich_observer_iteration_eta_survives_mode_change(
         assert observer._iter_count == 2
         assert observer._iter_total_seconds == pytest.approx(120.0)
         column = _find_iter_eta_column(observer)
-        # Mid-mode: 1 iteration remaining * 60s mean = 0:01:00.
-        assert column.render(observer._iters.tasks[0]).plain == "0:01:00"
+        # Mid-trial: 4 iterations remaining (1 more tcp + 3 udp) * 60s = 0:04:00.
+        assert column.render(observer._iters.tasks[0]).plain == "0:04:00"
         clock["t"] += 60.0
         observer.on_mode_start("udp", 3)
-        # History survives the reset.
+        # Description flips; bar does not reset.
         assert observer._iter_count == 2
-        # 3 remaining * 60s mean = 0:03:00 — no "-:--:--" flash.
-        assert column.render(observer._iters.tasks[0]).plain == "0:03:00"
+        # Still 4 remaining * 60s mean = 0:04:00 — no "-:--:--" flash.
+        assert column.render(observer._iters.tasks[0]).plain == "0:04:00"
 
 
 def test_iter_eta_column_renders_dashes_without_history() -> None:
@@ -255,17 +260,21 @@ def test_rich_observer_iteration_history_survives_across_trials(
         observer.on_iteration_end(mode, iteration)
 
     with observer:
+        # Trial 1: modes=["tcp","udp"], iterations=2 -> total = 4.
+        observer.on_benchmark_start(4)
         observer.on_mode_start("tcp", 2)
         _do_iter("tcp", 0, 30.0)
         _do_iter("tcp", 1, 30.0)
         observer.on_mode_start("udp", 2)
         _do_iter("udp", 0, 30.0)
         _do_iter("udp", 1, 30.0)
+        # Trial 2: modes=["tcp"], iterations=3 -> total = 3.
+        observer.on_benchmark_start(3)
         observer.on_mode_start("tcp", 3)
         assert observer._iter_count == 4
         assert observer._iter_total_seconds == pytest.approx(120.0)
         column = _find_iter_eta_column(observer)
-        # Fresh trial-2 tcp task: 3 remaining * 30s mean = 0:01:30.
+        # Fresh trial-2 bar: 3 remaining * 30s mean = 0:01:30.
         assert column.render(observer._iters.tasks[0]).plain == "0:01:30"
 
 
@@ -284,6 +293,7 @@ def test_rich_observer_aborted_iteration_does_not_pollute_history(
     monkeypatch.setattr(observer._iters, "get_time", _fake)
     monkeypatch.setattr(progress_module.time, "monotonic", _fake)
     with observer:
+        observer.on_benchmark_start(6)
         observer.on_mode_start("tcp", 3)
         observer.on_iteration_start("tcp", 0)
         clock["t"] += 9999.0  # aborted iteration, huge elapsed
@@ -293,6 +303,143 @@ def test_rich_observer_aborted_iteration_does_not_pollute_history(
         observer.on_iteration_end("udp", 0)
     assert observer._iter_count == 1
     assert observer._iter_total_seconds == pytest.approx(45.0)
+
+
+def test_rich_observer_iteration_bar_spans_whole_trial(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The iteration bar is sized to ``modes * iterations`` and spans mode changes."""
+    console = _capture_console()
+    observer = RichProgressObserver(console)
+    clock = {"t": 0.0}
+
+    def _fake() -> float:
+        return clock["t"]
+
+    monkeypatch.setattr(observer._trials, "get_time", _fake)
+    monkeypatch.setattr(observer._iters, "get_time", _fake)
+    monkeypatch.setattr(progress_module.time, "monotonic", _fake)
+
+    def _do_iter(mode: str, iteration: int) -> None:
+        observer.on_iteration_start(mode, iteration)
+        clock["t"] += 10.0
+        observer.on_iteration_end(mode, iteration)
+
+    with observer:
+        observer.on_benchmark_start(6)
+        observer.on_mode_start("tcp", 3)
+        _do_iter("tcp", 0)
+        _do_iter("tcp", 1)
+        _do_iter("tcp", 2)
+        observer.on_mode_start("udp", 3)
+        _do_iter("udp", 0)
+        task = observer._iters.tasks[0]
+        assert task.total == 6
+        assert task.completed == 4
+        assert "[udp]" in task.description
+
+
+def test_rich_observer_iteration_bar_resets_between_trials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``on_benchmark_start`` re-scopes the bar while history is preserved."""
+    console = _capture_console()
+    observer = RichProgressObserver(console)
+    clock = {"t": 0.0}
+
+    def _fake() -> float:
+        return clock["t"]
+
+    monkeypatch.setattr(observer._trials, "get_time", _fake)
+    monkeypatch.setattr(observer._iters, "get_time", _fake)
+    monkeypatch.setattr(progress_module.time, "monotonic", _fake)
+
+    def _do_iter(mode: str, iteration: int) -> None:
+        observer.on_iteration_start(mode, iteration)
+        clock["t"] += 15.0
+        observer.on_iteration_end(mode, iteration)
+
+    with observer:
+        observer.on_benchmark_start(4)
+        observer.on_mode_start("tcp", 4)
+        for i in range(4):
+            _do_iter("tcp", i)
+        # Trial 2 begins.
+        observer.on_benchmark_start(4)
+        task = observer._iters.tasks[0]
+        assert task.total == 4
+        assert task.completed == 0
+        # History survives across trials.
+        assert observer._iter_count == 4
+
+
+def test_rich_observer_iteration_eta_covers_upcoming_modes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ETA reflects iterations that have not yet started in later modes."""
+    console = _capture_console()
+    observer = RichProgressObserver(console)
+    clock = {"t": 0.0}
+
+    def _fake() -> float:
+        return clock["t"]
+
+    monkeypatch.setattr(observer._trials, "get_time", _fake)
+    monkeypatch.setattr(observer._iters, "get_time", _fake)
+    monkeypatch.setattr(progress_module.time, "monotonic", _fake)
+
+    def _do_iter(mode: str, iteration: int) -> None:
+        observer.on_iteration_start(mode, iteration)
+        clock["t"] += 60.0
+        observer.on_iteration_end(mode, iteration)
+
+    with observer:
+        # One trial: modes=["tcp","udp"], iterations=3 -> total = 6.
+        observer.on_benchmark_start(6)
+        observer.on_mode_start("tcp", 3)
+        _do_iter("tcp", 0)
+        _do_iter("tcp", 1)
+        _do_iter("tcp", 2)
+        column = _find_iter_eta_column(observer)
+        # After all tcp iterations, 3 udp iterations remain at 60s each.
+        assert column.render(observer._iters.tasks[0]).plain == "0:03:00"
+
+
+def test_rich_observer_iteration_bar_resets_after_mid_trial_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mid-trial failure leaves the bar partial; the next trial re-scopes it."""
+    console = _capture_console()
+    observer = RichProgressObserver(console)
+    clock = {"t": 0.0}
+
+    def _fake() -> float:
+        return clock["t"]
+
+    monkeypatch.setattr(observer._trials, "get_time", _fake)
+    monkeypatch.setattr(observer._iters, "get_time", _fake)
+    monkeypatch.setattr(progress_module.time, "monotonic", _fake)
+
+    def _do_iter(mode: str, iteration: int) -> None:
+        observer.on_iteration_start(mode, iteration)
+        clock["t"] += 20.0
+        observer.on_iteration_end(mode, iteration)
+
+    with observer:
+        # Trial 1 begins but fails after 2 of 6 iterations.
+        observer.on_benchmark_start(6)
+        observer.on_mode_start("tcp", 3)
+        _do_iter("tcp", 0)
+        _do_iter("tcp", 1)
+        # Simulate runner raising out: no further callbacks for this trial.
+
+        # Trial 2 starts fresh.
+        observer.on_benchmark_start(6)
+        task = observer._iters.tasks[0]
+        assert task.total == 6
+        assert task.completed == 0
+        # History survives the failed trial.
+        assert observer._iter_count == 2
 
 
 def test_make_observer_enabled_returns_rich_implementation() -> None:

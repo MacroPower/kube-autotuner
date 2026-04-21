@@ -370,6 +370,11 @@ class BenchmarkRunner:
         node and CNI memory reflect all three sub-stages rather than
         any one phase.
 
+        Fires :meth:`ProgressObserver.on_benchmark_start` once up
+        front with the trial-wide iteration budget
+        (``len(modes) * iterations``) so observers can size a
+        trial-scoped progress bar before the per-mode callbacks start.
+
         Returns:
             An :class:`IterationResults` holding every
             :class:`BenchmarkResult` and :class:`LatencyResult`
@@ -377,6 +382,9 @@ class BenchmarkRunner:
             peak node and CNI memory observed during each iteration
             when sampling produced any data.
         """
+        self.observer.on_benchmark_start(
+            len(self.config.modes) * self.config.iterations,
+        )
         all_bench: list[BenchmarkResult] = []
         all_latency: list[LatencyResult] = []
         for mode in self.config.modes:
