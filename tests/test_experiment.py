@@ -117,6 +117,36 @@ patches:
     assert exp.optimize.param_space[0].name == "net.core.rmem_max"
 
 
+def test_custom_hardware_class_roundtrips(tmp_path: Path):
+    path = _write(
+        tmp_path,
+        """\
+mode: baseline
+nodes:
+  sources: [kmain07]
+  target: kmain08
+  hardwareClass: epyc-9454p
+""",
+    )
+    exp = ExperimentConfig.from_yaml(path)
+    assert exp.nodes.hardware_class == "epyc-9454p"
+
+
+def test_empty_hardware_class_raises(tmp_path: Path):
+    path = _write(
+        tmp_path,
+        """\
+mode: baseline
+nodes:
+  sources: [kmain07]
+  target: kmain08
+  hardwareClass: ""
+""",
+    )
+    with pytest.raises(ExperimentConfigError):
+        ExperimentConfig.from_yaml(path)
+
+
 def test_fixture_yaml_roundtrips():
     """The shipped fixture must load cleanly and survive model validation."""
     exp = ExperimentConfig.from_yaml(FIXTURE_YAML)

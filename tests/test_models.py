@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
+from pydantic import ValidationError
 import pytest
 
 from kube_autotuner.experiment import ObjectivesSection, ParetoObjective
@@ -124,6 +125,16 @@ def test_node_pair_defaults():
     assert pair.namespace == "default"
     assert not pair.source_zone
     assert not pair.target_zone
+
+
+def test_node_pair_accepts_arbitrary_hardware_class():
+    pair = NodePair(source="a", target="b", hardware_class="graviton4")
+    assert pair.hardware_class == "graviton4"
+
+
+def test_node_pair_rejects_empty_hardware_class():
+    with pytest.raises(ValidationError):
+        NodePair(source="a", target="b", hardware_class="")
 
 
 def test_node_pair_topology_intra_az():

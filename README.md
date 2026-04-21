@@ -56,10 +56,11 @@ under saturation, and p50/p90/p99 latency under a fixed offered load.
   are forwarded to Ax as hard constraints; the exact values live in
   the `objectives` block shown under [Quick start](#quick-start).
 - **Results are hardware- and topology-dependent.** The tool stratifies
-  results by `hardwareClass` (1g/10g) and topology (intra-AZ /
-  inter-AZ). Tunings found on one NIC class or AZ pair do not transfer,
-  so the tool re-runs against the live cluster rather than shipping a
-  static recommendation.
+  results by `hardwareClass` (a free-form label you choose, e.g.
+  `graviton4` or `epyc-9454p`) and topology (intra-AZ / inter-AZ).
+  Tunings found on one NIC class or AZ pair do not transfer, so the
+  tool re-runs against the live cluster rather than shipping a static
+  recommendation.
 
 Ax fits this shape: sample-efficient Bayesian optimization with native
 multi-objective support, Sobol warm-up (`optimize.nSobol`, default 15)
@@ -158,7 +159,7 @@ mode: optimize
 nodes:
   sources: [nodeA]               # >=1 source node; first entry is primary
   target: nodeB
-  hardwareClass: 10g             # 1g | 10g
+  hardwareClass: 10g             # free-form label; stratifies results
   namespace: default
   ipFamilyPolicy: RequireDualStack
 

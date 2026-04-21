@@ -225,7 +225,7 @@ def _apply_overrides(
     mode: Literal["baseline", "trial", "optimize"],
     sources: list[str],
     target: str,
-    hardware_class: Literal["1g", "10g"],
+    hardware_class: str,
     namespace: str,
     ip_family_policy: str,
     output: str,
@@ -388,8 +388,11 @@ def baseline(
     ],
     target: Annotated[str, typer.Option("--target", help="Target node hostname.")],
     hardware_class: Annotated[
-        Literal["1g", "10g"],
-        typer.Option("--hardware-class", help="Hardware class (1g or 10g)."),
+        str,
+        typer.Option(
+            "--hardware-class",
+            help="Hardware class label (free-form; used to stratify results).",
+        ),
     ] = "10g",
     namespace: Annotated[
         str,
@@ -468,8 +471,11 @@ def trial(
         ),
     ],
     hardware_class: Annotated[
-        Literal["1g", "10g"],
-        typer.Option("--hardware-class", help="Hardware class (1g or 10g)."),
+        str,
+        typer.Option(
+            "--hardware-class",
+            help="Hardware class label (free-form; used to stratify results).",
+        ),
     ] = "10g",
     namespace: Annotated[
         str,
@@ -542,8 +548,11 @@ def optimize(
     ],
     target: Annotated[str, typer.Option("--target", help="Target node hostname.")],
     hardware_class: Annotated[
-        Literal["1g", "10g"],
-        typer.Option("--hardware-class", help="Hardware class (1g or 10g)."),
+        str,
+        typer.Option(
+            "--hardware-class",
+            help="Hardware class label (free-form; used to stratify results).",
+        ),
     ] = "10g",
     namespace: Annotated[
         str,
@@ -801,10 +810,10 @@ def analyze(
         ),
     ] = Path("analysis_output"),
     hardware_class: Annotated[
-        Literal["1g", "10g"] | None,
+        str | None,
         typer.Option(
             "--hardware-class",
-            help="Filter to a single hardware class (default: analyze all).",
+            help="Filter to a single hardware class label (default: analyze all).",
         ),
     ] = None,
     top_n: Annotated[

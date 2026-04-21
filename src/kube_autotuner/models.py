@@ -51,7 +51,7 @@ class NodePair(BaseModel):
 
     source: str
     target: str
-    hardware_class: Literal["1g", "10g"]
+    hardware_class: str = Field(min_length=1)
     namespace: str = "default"
     source_zone: str = ""
     target_zone: str = ""

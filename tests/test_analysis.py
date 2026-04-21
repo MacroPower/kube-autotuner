@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 import json
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
@@ -74,7 +74,7 @@ def _trial(  # noqa: PLR0913, PLR0917
         node_pair=NodePair(
             source="a",
             target="b",
-            hardware_class=cast("Literal['1g', '10g']", hw),
+            hardware_class=hw,
             source_zone=source_zone,
             target_zone=target_zone,
         ),
@@ -154,7 +154,7 @@ class TestTrialsToDataframe:
         self,
         mixed_trials: list[TrialResult],
     ) -> None:
-        df, _ = trials_to_dataframe(mixed_trials, hardware_class="99g")  # type: ignore[arg-type]
+        df, _ = trials_to_dataframe(mixed_trials, hardware_class="99g")
         assert df.empty
         assert "mean_throughput" in df.columns
 

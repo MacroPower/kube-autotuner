@@ -303,7 +303,7 @@ class NodesSection(BaseModel):
 
     sources: list[str] = Field(min_length=1)
     target: str
-    hardware_class: Literal["1g", "10g"] = "10g"
+    hardware_class: str = Field(default="10g", min_length=1)
     namespace: str = "default"
     ip_family_policy: str = "RequireDualStack"
 
