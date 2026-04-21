@@ -129,6 +129,17 @@ def _render_recommendations(recs: list[dict[str, Any]]) -> str:
         if cmem is not None:
             row["cni memory (MiB)"] = f"{cmem / 1024 / 1024:.0f}"
         row["retx/MB"] = format_retransmit_rate(r["retransmit_rate"])
+        rps = r.get("mean_rps")
+        if rps is not None:
+            row["rps"] = f"{rps:,.1f}"
+        for key, label in (
+            ("mean_latency_p50_ms", "p50 (ms)"),
+            ("mean_latency_p90_ms", "p90 (ms)"),
+            ("mean_latency_p99_ms", "p99 (ms)"),
+        ):
+            v = r.get(key)
+            if v is not None:
+                row[label] = f"{v:.1f}"
         row["score"] = r["score"]
         return row
 

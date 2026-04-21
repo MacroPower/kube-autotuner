@@ -879,6 +879,43 @@ def analyze(
         typer.echo(f"\nCombined report: {index_path}")
 
 
+def _format_top_recommendation(r: dict[str, Any]) -> str:
+    """Format the top recommendation line for CLI stdout.
+
+    Args:
+        r: A single recommendation dict as returned by
+            :func:`kube_autotuner.analysis.recommend_configs`.
+
+    Returns:
+        A comma-separated summary covering every measured metric: all
+        metrics whose value is ``None`` (e.g. ``mean_cni_memory`` when
+        CNI is disabled) are skipped.
+    """
+    parts: list[str] = [
+        f"{r['mean_throughput'] / 1e6:.1f} Mbps",
+        f"{r['mean_cpu']:.1f}% CPU",
+    ]
+    nmem = r["mean_node_memory"]
+    if nmem is not None:
+        parts.append(f"node {nmem / 1024 / 1024:.0f} MiB")
+    cmem = r["mean_cni_memory"]
+    if cmem is not None:
+        parts.append(f"cni {cmem / 1024 / 1024:.0f} MiB")
+    parts.append(f"{format_retransmit_rate(r['retransmit_rate'])} retx/MB")
+    rps = r.get("mean_rps")
+    if rps is not None:
+        parts.append(f"{rps:,.1f} rps")
+    for key, label in (
+        ("mean_latency_p50_ms", "p50"),
+        ("mean_latency_p90_ms", "p90"),
+        ("mean_latency_p99_ms", "p99"),
+    ):
+        v = r.get(key)
+        if v is not None:
+            parts.append(f"{label} {v:.1f} ms")
+    return ", ".join(parts)
+
+
 def _analyze_one_class(
     trials: list[Any],
     *,
@@ -993,19 +1030,7 @@ def _analyze_one_class(
     )
     typer.echo(f"Output: {hw_dir}")
     if recs:
-        r = recs[0]
-        parts: list[str] = [
-            f"{r['mean_throughput'] / 1e6:.1f} Mbps",
-            f"{r['mean_cpu']:.1f}% CPU",
-        ]
-        nmem = r["mean_node_memory"]
-        if nmem is not None:
-            parts.append(f"node {nmem / 1024 / 1024:.0f} MiB")
-        cmem = r["mean_cni_memory"]
-        if cmem is not None:
-            parts.append(f"cni {cmem / 1024 / 1024:.0f} MiB")
-        parts.append(f"{format_retransmit_rate(r['retransmit_rate'])} retx/MB")
-        typer.echo(f"Top recommendation: {', '.join(parts)}")
+        typer.echo(f"Top recommendation: {_format_top_recommendation(recs[0])}")
 
     return {
         "hardware_class": hardware_class,
