@@ -31,6 +31,7 @@ def test_build_tcp_default_port():
     assert node_sel["kubernetes.io/hostname"] == "kmain08"
 
     container = doc["spec"]["template"]["spec"]["containers"][0]
+    assert container["image"].startswith("nicolaka/netshoot")
     assert container["command"] == ["iperf3"]
     args = container["args"]
     assert "-c" in args

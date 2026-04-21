@@ -16,7 +16,7 @@ def _container_block(port: int, extra_args: list[str] | None = None) -> str:
         args.extend(extra_args)
     args_yaml = json.dumps(args)
     return f"""        - name: iperf3-server-{port}
-          image: networkstatic/iperf3:latest
+          image: nicolaka/netshoot:v0.15
           command: ["iperf3"]
           args: {args_yaml}
           ports:

@@ -81,7 +81,7 @@ spec:
           effect: "NoSchedule"
       containers:
         - name: iperf3-client
-          image: networkstatic/iperf3:latest
+          image: nicolaka/netshoot:v0.15
           command: ["iperf3"]
           args: {args_yaml}
           resources:

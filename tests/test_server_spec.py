@@ -22,6 +22,7 @@ def test_build_single_port():
     containers = dep["spec"]["template"]["spec"]["containers"]
     assert len(containers) == 1
     assert containers[0]["name"] == "iperf3-server-5201"
+    assert containers[0]["image"].startswith("nicolaka/netshoot")
     assert containers[0]["args"] == ["-s", "-p", "5201"]
     assert containers[0]["ports"][0]["containerPort"] == 5201
 

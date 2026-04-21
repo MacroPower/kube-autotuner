@@ -55,6 +55,7 @@ def test_render_sysctl_setter():
     assert doc["spec"]["hostNetwork"] is True
     assert "hostPID" not in doc["spec"]
     container = doc["spec"]["containers"][0]
+    assert container["image"].startswith("nicolaka/netshoot")
     assert container["securityContext"]["privileged"] is True
     assert "sysctl -w net.core.rmem_max=67108864" in " ".join(
         str(a) for a in container["command"]

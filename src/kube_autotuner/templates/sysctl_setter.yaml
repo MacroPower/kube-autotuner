@@ -8,7 +8,7 @@ spec:
   restartPolicy: Never
   containers:
     - name: sysctl-setter
-      image: nicolaka/netshoot
+      image: nicolaka/netshoot:v0.15
       command:
         - /bin/sh
         - -c
