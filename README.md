@@ -269,9 +269,12 @@ objectives:
   recommendationWeights:
     cpu: 0.15
     retransmit_rate: 0.3
-    node_memory: 0.15             # latency metrics default to weight 0 so they enter the
-                                  # Pareto set without skewing the post-hoc recommendation
-                                  # score until you opt in.
+    node_memory: 0.15
+    latency_p90: 0.1              # tail-latency weights keep the live Best-so-far panel
+    latency_p99: 0.15             # and the post-hoc recommendation from over-indexing on
+                                  # raw throughput; latency_p50 stays unweighted so the
+                                  # mean-latency axis enters the Pareto set without
+                                  # dominating the score.
 
 output: out/results.jsonl
 ```

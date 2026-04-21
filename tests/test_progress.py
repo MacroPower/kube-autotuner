@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import math
+import operator
 import os
 import pty
 from typing import TYPE_CHECKING, Any, cast
@@ -13,6 +14,7 @@ from rich.console import Console
 from rich.progress import Progress
 
 from kube_autotuner import progress as progress_module
+from kube_autotuner.experiment import ObjectivesSection
 from kube_autotuner.progress import (
     NullObserver,
     RichProgressObserver,
@@ -550,6 +552,181 @@ def test_make_observer_disabled_returns_null() -> None:
     console = _capture_console()
     obs = make_observer(enabled=False, console=console)
     assert isinstance(obs, NullObserver)
+
+
+# --- score-based Best-so-far ranking --------------------------------------
+
+
+def _score_row_complete(  # noqa: PLR0913 - keyword-only metric bundle
+    observer: RichProgressObserver,
+    *,
+    index: int,
+    phase: str = "bayesian",
+    throughput: float,
+    cpu: float = 50.0,
+    node_memory: float = 1e9,
+    retransmit_rate: float = 1e-8,
+    rps: float = 1000.0,
+    latency_p50: float = 1.0,
+    latency_p90: float = 2.0,
+    latency_p99: float = 4.0,
+    cni_memory: float = 1e8,
+) -> None:
+    """Drive ``observer.on_trial_complete`` with a full metric bundle."""
+    observer.on_trial_complete(
+        index,
+        phase,
+        {
+            "throughput": (throughput, 0.0),
+            "cpu": (cpu, 0.0),
+            "node_memory": (node_memory, 0.0),
+            "cni_memory": (cni_memory, 0.0),
+            "retransmit_rate": (retransmit_rate, 0.0),
+            "rps": (rps, 0.0),
+            "latency_p50": (latency_p50, 0.0),
+            "latency_p90": (latency_p90, 0.0),
+            "latency_p99": (latency_p99, 0.0),
+        },
+    )
+
+
+def test_top5_ranks_by_score_when_objectives_provided() -> None:
+    """Two trials: A +1% throughput, B +5% RPS with lower latency -> B wins.
+
+    Under the default objectives and weights, RPS (maximize,
+    unweighted) and latency (minimize, weighted) outpull a 1%
+    throughput advantage. The throughput-only fallback would put A
+    first; the scored path must put B first.
+    """
+    console = _capture_console()
+    observer = RichProgressObserver(console, objectives=ObjectivesSection())
+    _score_row_complete(
+        observer,
+        index=0,
+        throughput=1.01e9,
+        cpu=50.0,
+        rps=1000.0,
+        latency_p90=5.0,
+        latency_p99=10.0,
+    )
+    _score_row_complete(
+        observer,
+        index=1,
+        throughput=1.00e9,
+        cpu=50.0,
+        rps=1050.0,
+        latency_p90=2.0,
+        latency_p99=4.0,
+    )
+    assert [row.index for row in observer._top] == [1, 0]
+
+
+def test_top5_holds_every_completed_trial_for_rerank() -> None:
+    """All rows stay in ``_all_rows`` so the top-5 tracks true rank.
+
+    Append ten monotonically improving trials one at a time; after
+    each completion, the ``_top`` must reflect the best five across
+    every row seen so far. Guards against a bug where ``_all_rows``
+    is pruned alongside ``_top`` (freezing the table on the first
+    five arrivals).
+    """
+    console = _capture_console()
+    observer = RichProgressObserver(console, objectives=ObjectivesSection())
+    for i in range(10):
+        _score_row_complete(
+            observer,
+            index=i,
+            throughput=(1.0 + 0.01 * i) * 1e9,
+            cpu=50.0,
+            latency_p99=10.0 - i,
+        )
+        assert len(observer._all_rows) == i + 1
+        expected_top = sorted(range(i + 1), key=operator.neg)[:5]
+        assert [row.index for row in observer._top] == expected_top
+
+
+def test_top5_phase_labels_roundtrip_through_rerank() -> None:
+    """A row's ``phase`` string survives reordering on each refresh.
+
+    Append sobol rows first, then bayesian rows. After the scored
+    rerank, every row in ``_top`` must still carry the phase it was
+    appended under. Prevents silent label corruption during sort.
+    """
+    console = _capture_console()
+    observer = RichProgressObserver(console, objectives=ObjectivesSection())
+    for i in range(3):
+        _score_row_complete(
+            observer,
+            index=i,
+            phase="sobol",
+            throughput=(1.0 + 0.01 * i) * 1e9,
+        )
+    for i in range(3, 6):
+        _score_row_complete(
+            observer,
+            index=i,
+            phase="bayesian",
+            throughput=(1.0 + 0.1 * i) * 1e9,
+        )
+    by_index = {row.index: row.phase for row in observer._top}
+    for idx, phase in by_index.items():
+        assert phase == ("sobol" if idx < 3 else "bayesian")
+
+
+def test_top5_handles_nan_metrics() -> None:
+    """A UDP-only trial (NaN retx_per_mb, NaN latency) still ranks."""
+    console = _capture_console()
+    observer = RichProgressObserver(console, objectives=ObjectivesSection())
+    # TCP trial with a full bundle.
+    _score_row_complete(
+        observer,
+        index=0,
+        throughput=1.5e9,
+        retransmit_rate=1e-8,
+        latency_p90=2.0,
+        latency_p99=4.0,
+    )
+    # UDP-only trial: retransmit_rate and every latency percentile NaN.
+    observer.on_trial_complete(
+        1,
+        "bayesian",
+        {
+            "throughput": (2.0e9, 0.0),
+            "cpu": (50.0, 0.0),
+            "node_memory": (1e9, 0.0),
+            "retransmit_rate": (math.nan, math.nan),
+            "rps": (math.nan, math.nan),
+            "latency_p50": (math.nan, math.nan),
+            "latency_p90": (math.nan, math.nan),
+            "latency_p99": (math.nan, math.nan),
+        },
+    )
+    top_indices = [row.index for row in observer._top]
+    assert set(top_indices) == {0, 1}
+
+
+def test_top5_fallback_sorts_by_throughput_when_objectives_none() -> None:
+    """Bare construction falls back to throughput-descending + legacy title."""
+    console = _capture_console()
+    observer = RichProgressObserver(console)
+    assert observer._objectives is None
+    with observer:
+        for i, tp in enumerate([1, 9, 5, 7, 3, 8, 2]):
+            observer.on_trial_start(i, 10, "bayesian", {})
+            observer.on_trial_complete(
+                i,
+                "bayesian",
+                {
+                    "throughput": (tp * 1e9, 0.0),
+                    "cpu": (10.0, 0.0),
+                    "retransmit_rate": (0.0, 0.0),
+                },
+            )
+    top_mbps = [int(r.throughput_mbps / 1000) for r in observer._top]
+    assert top_mbps == [9, 8, 7, 5, 3]
+    output = cast("io.StringIO", console.file).getvalue()
+    assert "by throughput" in output
+    assert "by weighted score" not in output
 
 
 # --- _TtyEchoSuppressor coverage -------------------------------------------

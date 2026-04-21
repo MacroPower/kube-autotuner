@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
+from kube_autotuner.scoring import METRIC_TO_DF_COLUMN, score_rows
 from kube_autotuner.sysctl.params import PARAM_SPACE, PARAM_TO_CATEGORY
 
 logger = logging.getLogger(__name__)
@@ -35,18 +36,6 @@ _ANALYSIS_HINT = "install analysis group: uv sync --group analysis"
 
 _PARAM_TYPE_LOOKUP: dict[str, str] = {p.name: p.param_type for p in PARAM_SPACE.params}
 _SYSCTL_COLUMNS: list[str] = PARAM_SPACE.param_names()
-
-METRIC_TO_DF_COLUMN: dict[str, str] = {
-    "throughput": "mean_throughput",
-    "cpu": "mean_cpu",
-    "node_memory": "mean_node_memory",
-    "cni_memory": "mean_cni_memory",
-    "retransmit_rate": "retransmit_rate",
-    "rps": "mean_rps",
-    "latency_p50": "mean_latency_p50_ms",
-    "latency_p90": "mean_latency_p90_ms",
-    "latency_p99": "mean_latency_p99_ms",
-}
 
 DEFAULT_OBJECTIVES: list[tuple[str, str]] = [
     (METRIC_TO_DF_COLUMN["throughput"], "maximize"),
@@ -513,15 +502,18 @@ def recommend_configs(
     """Return the top ``n`` recommended sysctl configurations for a class.
 
     The ranking picks from the Pareto frontier of the filtered trials
-    and scores each candidate as
+    and scores each candidate through
+    :func:`kube_autotuner.scoring.score_rows`, which implements
     ``sum(+norm(metric) for maximize metrics) -
     sum(weights[metric] * norm(metric) for minimize metrics)``
-    where each term is min-max normalized across the Pareto set.
+    with per-column min-max normalization across the Pareto set.
     Maximize metrics always contribute ``+1.0 * norm`` and cannot be
-    re-weighted. The default weights are
-    ``{cpu: 0.15, node_memory: 0.15, retransmit_rate: 0.3}``,
-    reproducing the formula ``tp_norm - 0.15 * cpu_norm - 0.15 *
-    node_mem_norm - 0.3 * rate_norm``.
+    re-weighted. Default weights come from
+    :class:`~kube_autotuner.experiment.ObjectivesSection` --
+    ``{cpu: 0.15, node_memory: 0.15, retransmit_rate: 0.3,
+    latency_p90: 0.1, latency_p99: 0.15}`` at the time of writing --
+    so the live ``Best so far`` panel and this recommendation output
+    rank trials identically.
 
     Args:
         trials: Input trial records (any number of hardware classes).
@@ -529,7 +521,7 @@ def recommend_configs(
         n: Maximum number of recommendations to return.
         topology: Optional topology filter.
         objectives: Pareto objectives driving both frontier selection
-            and scoring. Defaults to the four built-in metrics.
+            and scoring. Defaults to the nine built-in metrics.
         weights: Per-metric negative coefficients for
             minimize-direction metrics. Missing metrics default to
             ``0.0`` (i.e. they do not influence the score).
@@ -571,34 +563,24 @@ def recommend_configs(
         (METRIC_TO_DF_COLUMN[obj.metric], obj.direction) for obj in objectives
     ]
     # Suppress the log here so the CLI's direct pareto_front call is
-    # the single source of truth for "excluded" INFO lines. We still
-    # need the filtered list locally for kept_cols below.
+    # the single source of truth for "excluded" INFO lines.
     tuple_objectives = _objectives_with_data(df, tuple_objectives, log=False)
     front = pareto_front(df, objectives=tuple_objectives)
     if front.empty:
         return []
 
-    def _norm(series: pd.Series) -> pd.Series:
-        lo = series.min(skipna=True)
-        hi = series.max(skipna=True)
-        if pd.isna(lo) or pd.isna(hi) or hi == lo:
-            return pd.Series(0.5, index=series.index)
-        return ((series - lo) / (hi - lo)).fillna(0.5)
-
-    kept_cols = {col for col, _ in tuple_objectives}
-    front = front.copy()
-    score = pd.Series(0.0, index=front.index)
-    for obj in objectives:
-        col = METRIC_TO_DF_COLUMN[obj.metric]
-        if col not in kept_cols:
-            continue
-        norm = _norm(front[col])
-        if obj.direction == "maximize":
-            score += norm
-        else:
-            score -= weights.get(obj.metric, 0.0) * norm
-    front["score"] = score
-    front = front.sort_values("score", ascending=False).reset_index(drop=True)
+    metric_columns = list(METRIC_TO_DF_COLUMN.values())
+    records = front[metric_columns].to_dict(orient="records")
+    raw_scores = score_rows(records, objectives, weights)
+    front = front.assign(score=raw_scores)
+    # trial_id tiebreak + mergesort keeps tied rows order-stable, which
+    # matters when the live panel's top-5 is compared against this
+    # post-hoc ordering during eyeball checks.
+    front = front.sort_values(
+        by=["score", "trial_id"],
+        ascending=[False, True],
+        kind="mergesort",
+    ).reset_index(drop=True)
 
     def _maybe(row: pd.Series, col: str) -> float | None:
         v = row[col]

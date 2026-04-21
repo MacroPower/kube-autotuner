@@ -630,6 +630,11 @@ class TestFilterObjectivesForObservability:
         )
         assert all(obj.metric != "retransmit_rate" for obj in filtered.pareto)
         assert "retransmit_rate" not in filtered.recommendation_weights
+        # Insurance against the default weights shrinking to a single
+        # key again: with the latency defaults in place, filtering
+        # retransmit_rate must leave the two latency weights alone.
+        assert "latency_p90" in filtered.recommendation_weights
+        assert "latency_p99" in filtered.recommendation_weights
         assert all("retransmit_rate" not in c for c in filtered.constraints)
 
     def test_raises_when_pareto_becomes_empty(self) -> None:

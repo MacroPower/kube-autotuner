@@ -19,6 +19,8 @@ MUST NOT import ``ax-platform``, ``pandas``, ``plotly``,
 ``kube_autotuner.analysis`` / ``kube_autotuner.plots`` /
 ``kube_autotuner.report``. Keep the import set to ``rich``, the
 standard library, and pure-typing helpers.
+:mod:`kube_autotuner.scoring` is pure-stdlib and :mod:`kube_autotuner.experiment`
+is Pydantic-only, so both are safe to import here.
 """
 
 from __future__ import annotations
@@ -44,6 +46,8 @@ from rich.progress import (
 from rich.table import Table
 from rich.text import Text
 
+from kube_autotuner.scoring import METRIC_TO_DF_COLUMN, score_rows
+
 try:
     import termios
     import tty
@@ -58,6 +62,8 @@ if TYPE_CHECKING:
 
     from rich.console import Console
     from rich.progress import Task, TaskID
+
+    from kube_autotuner.experiment import ObjectivesSection
 
 
 _TOP_N = 5
@@ -343,6 +349,7 @@ class _TrialRow:
     __slots__ = (
         "cpu",
         "index",
+        "metrics",
         "node_memory_mib",
         "p99_ms",
         "phase",
@@ -362,8 +369,9 @@ class _TrialRow:
         rps: float,
         node_memory_mib: float,
         p99_ms: float,
+        metrics: dict[str, float],
     ) -> None:
-        """Store one trial's summary for display.
+        """Store one trial's summary for display and scoring.
 
         Args:
             index: Zero-based trial index within this run.
@@ -379,6 +387,14 @@ class _TrialRow:
                 ``NaN`` when the trial produced no memory samples.
             p99_ms: Fixed-QPS p99 latency in milliseconds; ``NaN``
                 when the trial produced no fortio records.
+            metrics: Raw-domain per-metric means keyed by the
+                :data:`kube_autotuner.scoring.METRIC_TO_DF_COLUMN`
+                DataFrame column name (``mean_throughput``,
+                ``mean_cpu``, ...). Fed to
+                :func:`kube_autotuner.scoring.score_rows` for the
+                live top-N ranking, which min-max normalizes across
+                every stored row on each refresh. Stores ``NaN`` for
+                metrics the trial did not observe.
         """
         self.index = index
         self.phase = phase
@@ -388,6 +404,78 @@ class _TrialRow:
         self.rps = rps
         self.node_memory_mib = node_memory_mib
         self.p99_ms = p99_ms
+        self.metrics = metrics
+
+
+def _build_trial_row(
+    index: int,
+    phase: str,
+    metrics: Mapping[str, tuple[float, float]],
+) -> _TrialRow:
+    """Project a completed-trial metric bundle into a :class:`_TrialRow`.
+
+    Handles two concerns in one pass:
+
+    * derives the display-domain floats (Mbps / MiB / retx/MB) for
+      the rendered table, and
+    * captures the full raw-domain metric bundle keyed by
+      :data:`kube_autotuner.scoring.METRIC_TO_DF_COLUMN` so
+      :func:`kube_autotuner.scoring.score_rows` can min-max normalize
+      across every metric the user's objectives reference.
+
+    Without the raw bundle, metrics not surfaced by the display
+    (``cni_memory``, ``rps``, ``latency_p50`` / ``p90`` / ``p99``)
+    would be NaN across every row and collapse to the
+    degenerate-column fallback, making the live ranking diverge
+    from :func:`kube_autotuner.analysis.recommend_configs`.
+
+    Args:
+        index: Zero-based trial index within this run.
+        phase: ``"sobol"`` or ``"bayesian"``.
+        metrics: The ``(mean, SEM)`` bundle from the optimizer.
+
+    Returns:
+        A :class:`_TrialRow` ready to append to ``_all_rows``.
+    """
+    tp_pair = metrics.get("throughput")
+    cpu_pair = metrics.get("cpu")
+    rate_pair = metrics.get("retransmit_rate")
+    rps_pair = metrics.get("rps")
+    nmem_pair = metrics.get("node_memory")
+    p99_pair = metrics.get("latency_p99")
+    tp = (tp_pair[0] if tp_pair is not None else 0.0) / 1e6
+    cpu = cpu_pair[0] if cpu_pair is not None else 0.0
+    rate = rate_pair[0] if rate_pair is not None else math.nan
+    retx_per_mb = math.nan if math.isnan(rate) else rate * 1e6
+    rps = rps_pair[0] if rps_pair is not None else math.nan
+    nmem_bytes = nmem_pair[0] if nmem_pair is not None else math.nan
+    node_memory_mib = math.nan if math.isnan(nmem_bytes) else nmem_bytes / (1024 * 1024)
+    p99 = p99_pair[0] if p99_pair is not None else math.nan
+    raw_metrics: dict[str, float] = {
+        METRIC_TO_DF_COLUMN[key]: (pair[0] if pair is not None else math.nan)
+        for key, pair in (
+            ("throughput", tp_pair),
+            ("cpu", cpu_pair),
+            ("retransmit_rate", rate_pair),
+            ("node_memory", nmem_pair),
+            ("cni_memory", metrics.get("cni_memory")),
+            ("rps", rps_pair),
+            ("latency_p50", metrics.get("latency_p50")),
+            ("latency_p90", metrics.get("latency_p90")),
+            ("latency_p99", p99_pair),
+        )
+    }
+    return _TrialRow(
+        index=index,
+        phase=phase,
+        throughput_mbps=tp,
+        cpu=cpu,
+        retx_per_mb=retx_per_mb,
+        rps=rps,
+        node_memory_mib=node_memory_mib,
+        p99_ms=p99,
+        metrics=raw_metrics,
+    )
 
 
 class _TtyEchoSuppressor:
@@ -459,7 +547,11 @@ class RichProgressObserver:
     not nested.
     """
 
-    def __init__(self, console: Console) -> None:
+    def __init__(
+        self,
+        console: Console,
+        objectives: ObjectivesSection | None = None,
+    ) -> None:
         """Bind the observer to a shared ``rich`` console.
 
         Args:
@@ -467,8 +559,19 @@ class RichProgressObserver:
                 instance passed to any ``RichHandler`` attached to
                 the root logger so log records interleave above the
                 live region instead of tearing through it.
+            objectives: Pareto objectives and recommendation weights
+                from the active
+                :class:`~kube_autotuner.experiment.ExperimentConfig`.
+                When set, the ``Best so far`` panel ranks every
+                completed trial through
+                :func:`kube_autotuner.scoring.score_rows` so the
+                live view matches the post-hoc recommendation output.
+                When ``None`` (bare construction, e.g. unit tests or
+                non-optimize flows), the panel falls back to a
+                throughput-descending sort.
         """
         self._console = console
+        self._objectives = objectives
         self._iter_start: float | None = None
         self._iter_count: int = 0
         self._iter_total_seconds: float = 0.0
@@ -483,6 +586,7 @@ class RichProgressObserver:
         )
         self._trial_task_id: TaskID | None = None
         self._iter_task_id: TaskID | None = None
+        self._all_rows: list[_TrialRow] = []
         self._top: list[_TrialRow] = []
         self._phase: str = "sobol"
         self._current_mode: str = ""
@@ -569,8 +673,9 @@ class RichProgressObserver:
         """
         if not self._top:
             return Group(self._trials, self._iters)
+        sort_key = "weighted score" if self._objectives is not None else "throughput"
         table = Table(
-            title=f"Best so far (top {_TOP_N} by throughput)",
+            title=f"Best so far (top {_TOP_N} by {sort_key})",
             title_style="bold",
             show_header=True,
             header_style="bold",
@@ -695,36 +800,41 @@ class RichProgressObserver:
             self._trial_start = None
         if self._trial_task_id is not None:
             self._trials.update(self._trial_task_id, advance=1)
-        tp_pair = metrics.get("throughput")
-        cpu_pair = metrics.get("cpu")
-        rate_pair = metrics.get("retransmit_rate")
-        rps_pair = metrics.get("rps")
-        nmem_pair = metrics.get("node_memory")
-        p99_pair = metrics.get("latency_p99")
-        tp = (tp_pair[0] if tp_pair is not None else 0.0) / 1e6
-        cpu = cpu_pair[0] if cpu_pair is not None else 0.0
-        rate = rate_pair[0] if rate_pair is not None else math.nan
-        retx_per_mb = math.nan if math.isnan(rate) else rate * 1e6
-        rps = rps_pair[0] if rps_pair is not None else math.nan
-        nmem_bytes = nmem_pair[0] if nmem_pair is not None else math.nan
-        node_memory_mib = (
-            math.nan if math.isnan(nmem_bytes) else nmem_bytes / (1024 * 1024)
-        )
-        p99 = p99_pair[0] if p99_pair is not None else math.nan
-        row = _TrialRow(
-            index=index,
-            phase=phase,
-            throughput_mbps=tp,
-            cpu=cpu,
-            retx_per_mb=retx_per_mb,
-            rps=rps,
-            node_memory_mib=node_memory_mib,
-            p99_ms=p99,
-        )
-        self._top.append(row)
-        self._top.sort(key=lambda r: r.throughput_mbps, reverse=True)
-        del self._top[_TOP_N:]
+        row = _build_trial_row(index, phase, metrics)
+        self._all_rows.append(row)
+        self._rerank()
         self._refresh()
+
+    def _rerank(self) -> None:
+        """Refresh ``self._top`` from ``self._all_rows``.
+
+        When an :class:`~kube_autotuner.experiment.ObjectivesSection`
+        is bound the ranking goes through
+        :func:`kube_autotuner.scoring.score_rows` so the panel
+        matches ``recommend_configs``. Without one (bare observer
+        construction, ``baseline`` / ``trial`` flows) the legacy
+        throughput-descending sort is used.
+        """
+        if self._objectives is not None:
+            scores = score_rows(
+                [r.metrics for r in self._all_rows],
+                self._objectives.pareto,
+                self._objectives.recommendation_weights,
+            )
+            # Rank by score desc, break ties by arrival order (lower
+            # _all_rows index first) to match the stable-mergesort
+            # tiebreak in recommend_configs.
+            order = sorted(
+                range(len(self._all_rows)),
+                key=lambda i: (-scores[i], i),
+            )
+            self._top = [self._all_rows[i] for i in order[:_TOP_N]]
+        else:
+            self._top = sorted(
+                self._all_rows,
+                key=lambda r: r.throughput_mbps,
+                reverse=True,
+            )[:_TOP_N]
 
     def on_trial_failed(
         self,
@@ -847,7 +957,12 @@ class RichProgressObserver:
         self._refresh()
 
 
-def make_observer(*, enabled: bool, console: Console) -> ProgressObserver:
+def make_observer(
+    *,
+    enabled: bool,
+    console: Console,
+    objectives: ObjectivesSection | None = None,
+) -> ProgressObserver:
     """Pick the right observer for the current run.
 
     Args:
@@ -855,11 +970,16 @@ def make_observer(*, enabled: bool, console: Console) -> ProgressObserver:
             ``console.is_terminal and not --no-progress``.
         console: Shared console that any :class:`RichProgressObserver`
             must render through (also the target of ``RichHandler``).
+        objectives: Pareto objectives and recommendation weights for
+            the active experiment; forwarded to
+            :class:`RichProgressObserver` so the live ``Best so far``
+            panel ranks by weighted score. ``None`` (the default)
+            keeps the throughput-descending fallback.
 
     Returns:
         A :class:`RichProgressObserver` when ``enabled`` is true,
         otherwise a :class:`NullObserver`.
     """
     if enabled:
-        return RichProgressObserver(console)
+        return RichProgressObserver(console, objectives=objectives)
     return NullObserver()

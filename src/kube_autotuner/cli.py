@@ -65,8 +65,21 @@ class AppState:
     console: Console
     progress_enabled: bool
 
-    def make_observer(self) -> ProgressObserver:
+    def make_observer(
+        self,
+        objectives: ObjectivesSection | None = None,
+    ) -> ProgressObserver:
         """Build a progress observer honoring the current CLI flags.
+
+        Args:
+            objectives: Pareto objectives and recommendation weights
+                for the active experiment. Forwarded to the observer
+                so the live ``Best so far`` panel ranks trials by
+                the same weighted score used by
+                :func:`kube_autotuner.analysis.recommend_configs`.
+                ``None`` keeps the legacy throughput-descending
+                fallback, which is used by flows that never call
+                ``on_trial_complete`` (``baseline`` / ``trial``).
 
         Returns:
             A :class:`~kube_autotuner.progress.RichProgressObserver`
@@ -76,6 +89,7 @@ class AppState:
         return make_observer(
             enabled=self.progress_enabled,
             console=self.console,
+            objectives=objectives,
         )
 
 
@@ -426,7 +440,7 @@ def baseline(
         iterations=iterations,
         udp=udp,
     )
-    observer = _app_state(ctx).make_observer()
+    observer = _app_state(ctx).make_observer(objectives=exp.objectives)
     run_ctx = _build_context(
         exp,
         backend=backend,
@@ -508,7 +522,7 @@ def trial(
         udp=udp,
         sysctls=params,
     )
-    observer = _app_state(ctx).make_observer()
+    observer = _app_state(ctx).make_observer(objectives=exp.objectives)
     run_ctx = _build_context(
         exp,
         backend=backend,
@@ -600,7 +614,7 @@ def optimize(
             "apply_source": apply_source,
         },
     )
-    observer = _app_state(ctx).make_observer()
+    observer = _app_state(ctx).make_observer(objectives=exp.objectives)
     run_ctx = _build_context(
         exp,
         backend=backend,
@@ -661,7 +675,7 @@ def run(
         client=client,
         fake_state_path=fake_state_path,
     )
-    observer = _app_state(ctx).make_observer()
+    observer = _app_state(ctx).make_observer(objectives=exp.objectives)
     run_ctx = runs.RunContext(
         exp=exp,
         client=client,

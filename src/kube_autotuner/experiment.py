@@ -366,6 +366,8 @@ _DEFAULT_WEIGHTS: dict[str, float] = {
     "cpu": 0.15,
     "node_memory": 0.15,
     "retransmit_rate": 0.3,
+    "latency_p90": 0.1,
+    "latency_p99": 0.15,
 }
 
 
@@ -409,12 +411,21 @@ class ObjectivesSection(BaseModel):
     Drives both the live Ax optimization loop and post-hoc analysis.
     ``pareto`` selects which metrics form the Pareto frontier and
     whether each is maximized or minimized. ``constraints`` are
-    forwarded verbatim to Ax as outcome constraints. ``recommendation_weights``
-    (YAML key ``recommendationWeights``) scales minimize-direction
-    metrics in the post-hoc scoring formula used by
-    :func:`kube_autotuner.analysis.recommend_configs`; weights on
-    maximize-direction metrics are rejected because the gain term is
-    always ``+1.0 * norm`` in the normalized score.
+    forwarded verbatim to Ax as outcome constraints.
+    ``recommendation_weights`` (YAML key ``recommendationWeights``)
+    scales minimize-direction metrics in the shared scoring formula
+    implemented by :func:`kube_autotuner.scoring.score_rows` -- the
+    same formula drives both the live ``Best so far`` panel and the
+    post-hoc :func:`kube_autotuner.analysis.recommend_configs`
+    ranking. Weights on maximize-direction metrics are rejected
+    because the gain term is always ``+1.0 * norm`` in the normalized
+    score.
+
+    The default weights are
+    ``{cpu: 0.15, node_memory: 0.15, retransmit_rate: 0.3,
+    latency_p90: 0.1, latency_p99: 0.15}``; ``latency_p50`` is left
+    unweighted so the mean-latency axis enters the Pareto set without
+    dominating the recommendation score.
     """
 
     model_config = ConfigDict(
