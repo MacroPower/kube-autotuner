@@ -39,9 +39,10 @@ import json
 import logging
 import queue
 import threading
-from typing import TYPE_CHECKING, Literal, cast
+from typing import TYPE_CHECKING, Literal, TypeVar, cast
 
 from kube_autotuner.benchmark.client_spec import build_client_yaml
+from kube_autotuner.benchmark.errors import JobAttemptError, ResultValidationError
 from kube_autotuner.benchmark.fortio_client_spec import (
     build_fortio_client_yaml,
     fortio_client_job_name,
@@ -55,11 +56,17 @@ from kube_autotuner.benchmark.parser import parse_iperf_json, parse_k8s_memory
 from kube_autotuner.benchmark.patch import apply_patches
 from kube_autotuner.benchmark.server_spec import build_server_yaml
 from kube_autotuner.experiment import CniSection, FortioSection, IperfSection
-from kube_autotuner.k8s.client import K8sApiError, K8sClient
+from kube_autotuner.k8s.client import (
+    JobFailedConditionError,
+    K8sApiError,
+    K8sClient,
+)
 from kube_autotuner.models import IterationResults
 from kube_autotuner.progress import NullObserver
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from kube_autotuner.benchmark.fortio_client_spec import Workload
     from kube_autotuner.experiment import Patch
     from kube_autotuner.models import (
@@ -69,6 +76,8 @@ if TYPE_CHECKING:
         NodePair,
     )
     from kube_autotuner.progress import ProgressObserver
+
+_T = TypeVar("_T")
 
 logger = logging.getLogger(__name__)
 
@@ -170,128 +179,306 @@ class BenchmarkRunner:
         port: int,
         mode: Literal["tcp", "udp"],
         iteration: int,
+        abort: threading.Event | None = None,
     ) -> BenchmarkResult:
-        """Run a single iperf3 client Job and return a parsed result.
+        """Run a single iperf3 client Job with retries.
+
+        Delegates to :meth:`_run_client_job_with_retries`; see there
+        for the detection/retry/abort semantics and the raise contract.
+
+        Args:
+            client: Source node name.
+            port: Server-side port for this client.
+            mode: ``"tcp"`` or ``"udp"``.
+            iteration: Iteration index (zero-based).
+            abort: Stage-level early-abort signal shared with sibling
+                threads. When set, the retry loop bails out on the next
+                iteration instead of burning its remaining budget.
 
         Returns:
             The parsed :class:`BenchmarkResult` for this client and
             iteration.
-
-        Raises:
-            RuntimeError: When the best-effort Job cleanup in
-                ``finally`` fails; the original cleanup
-                :class:`K8sApiError` is attached as the cause.
         """
         job_name = f"iperf3-client-{client}-p{port}"
-        ns = self.node_pair.namespace
-
-        client_yaml = build_client_yaml(
-            node=client,
-            target=self.node_pair.target,
-            port=port,
-            duration=self.config.duration,
-            omit=self.config.omit,
-            parallel=self.config.parallel,
-            mode=mode,
-            window=self.config.window,
-            extra_args=self.iperf_args.client.extra_args,
+        client_yaml = apply_patches(
+            build_client_yaml(
+                node=client,
+                target=self.node_pair.target,
+                port=port,
+                duration=self.config.duration,
+                omit=self.config.omit,
+                parallel=self.config.parallel,
+                mode=mode,
+                window=self.config.window,
+                extra_args=self.iperf_args.client.extra_args,
+            ),
+            self.patches,
         )
-        client_yaml = apply_patches(client_yaml, self.patches)
 
-        try:
-            self.client.apply(client_yaml, ns)
-            self.client.wait(
-                "job",
-                job_name,
-                "condition=complete",
-                ns,
-                timeout=_CLIENT_WAIT_TIMEOUT_SECONDS,
-            )
-            output = self.client.logs("job", job_name, ns)
-            raw = json.loads(output)
+        def parse(output: str) -> BenchmarkResult:
+            try:
+                raw = json.loads(output)
+            except ValueError as exc:
+                msg = f"iperf3 log is not valid JSON: {exc}"
+                raise ResultValidationError(msg) from exc
             return parse_iperf_json(
                 raw,
                 mode,
                 client_node=client,
                 iteration=iteration,
             )
-        finally:
-            try:
-                self.client.delete("job", job_name, ns, ignore_not_found=True)
-            except K8sApiError as cleanup_err:
-                logger.warning(
-                    "Best-effort delete of client job %s failed",
-                    job_name,
-                    exc_info=True,
-                )
-                # Don't swallow: surface the cleanup failure. If a primary
-                # exception is in flight, Python chains it via
-                # ``__context__``; we wrap the cleanup error explicitly so
-                # the chain is visible in tracebacks.
-                msg = f"cleanup of client job {job_name} failed"
-                raise RuntimeError(msg) from cleanup_err
+
+        return self._run_client_job_with_retries(
+            job_name=job_name,
+            job_yaml=client_yaml,
+            max_attempts=self.iperf_args.max_attempts,
+            parse=parse,
+            kind="iperf3",
+            abort=abort,
+        )
 
     def _run_one_fortio_client(
         self,
         client: str,
         iteration: int,
         workload: Workload,
+        abort: threading.Event | None = None,
     ) -> LatencyResult:
-        """Run a single fortio client Job and return a parsed result.
+        """Run a single fortio client Job with retries.
+
+        Delegates to :meth:`_run_client_job_with_retries`; see there
+        for the detection/retry/abort semantics and the raise contract.
+
+        Args:
+            client: Source node name.
+            iteration: Iteration index (zero-based).
+            workload: ``"saturation"`` or ``"fixed_qps"``.
+            abort: Stage-level early-abort signal shared with sibling
+                threads. When set, the retry loop bails out on the next
+                iteration instead of burning its remaining budget.
 
         Returns:
             The parsed :class:`LatencyResult` for this client,
             iteration, and sub-stage workload.
-
-        Raises:
-            RuntimeError: When the best-effort Job cleanup in
-                ``finally`` fails; the original cleanup
-                :class:`K8sApiError` is attached as the cause.
         """
         job_name = fortio_client_job_name(client, workload, iteration)
-        ns = self.node_pair.namespace
         qps = 0 if workload == "saturation" else self.fortio_args.fixed_qps
-
-        client_yaml = build_fortio_client_yaml(
-            node=client,
-            target=self.node_pair.target,
-            iteration=iteration,
-            workload=workload,
-            qps=qps,
-            connections=self.fortio_args.connections,
-            duration=self.fortio_args.duration,
-            extra_args=self.fortio_args.client.extra_args,
+        client_yaml = apply_patches(
+            build_fortio_client_yaml(
+                node=client,
+                target=self.node_pair.target,
+                iteration=iteration,
+                workload=workload,
+                qps=qps,
+                connections=self.fortio_args.connections,
+                duration=self.fortio_args.duration,
+                extra_args=self.fortio_args.client.extra_args,
+            ),
+            self.patches,
         )
-        client_yaml = apply_patches(client_yaml, self.patches)
 
-        try:
-            self.client.apply(client_yaml, ns)
-            self.client.wait(
-                "job",
-                job_name,
-                "condition=complete",
-                ns,
-                timeout=_CLIENT_WAIT_TIMEOUT_SECONDS,
-            )
-            output = self.client.logs("job", job_name, ns)
-            raw = extract_fortio_result_json(output)
+        def parse(output: str) -> LatencyResult:
+            try:
+                raw = extract_fortio_result_json(output)
+            except ValueError as exc:
+                raise ResultValidationError(str(exc)) from exc
             return parse_fortio_json(
                 raw,
                 client_node=client,
                 iteration=iteration,
                 workload=workload,
             )
-        finally:
+
+        return self._run_client_job_with_retries(
+            job_name=job_name,
+            job_yaml=client_yaml,
+            max_attempts=self.fortio_args.max_attempts,
+            parse=parse,
+            kind="fortio",
+            abort=abort,
+        )
+
+    def _run_client_job_with_retries(  # noqa: PLR0915 - one cohesive retry loop with three interleaved signals
+        self,
+        *,
+        job_name: str,
+        job_yaml: str,
+        max_attempts: int,
+        parse: Callable[[str], _T],
+        kind: str,
+        abort: threading.Event | None,
+    ) -> _T:
+        """Run one client Job with the three-signal detection + retry loop.
+
+        Detection signals on every attempt, in order:
+
+        1. Job status: :meth:`K8sClient.wait` with both success
+           (``Complete``) and failure (``Failed``) predicates. On a
+           Failed transition we exit promptly with
+           :class:`JobFailedConditionError` rather than waiting the full
+           watch timeout.
+        2. Log-source pod phase: :meth:`K8sClient._job_log_pod`
+           returns ``None`` unless a ``Succeeded`` pod exists, so a
+           Job that only managed Failed/Error pods but still hit
+           ``Complete=True`` is treated as an attempt failure.
+        3. Payload sanity: ``parse`` is expected to raise
+           :class:`ResultValidationError` when the decoded payload is
+           structurally valid JSON but semantically degenerate.
+
+        The ``finally`` block deletes the Job every attempt so retries
+        land on a fresh object; diagnostics are captured **before**
+        delete because pod events vanish with the pod's garbage
+        collection. The ``attempt_ok`` flag gates the diagnostic log so
+        the happy path produces zero warnings.
+
+        ``abort`` is a shared :class:`threading.Event` set by the first
+        sibling client in the stage to exhaust its retry budget.
+        Siblings checking at loop-top bail out immediately so a
+        cluster-wide outage does not multiply wall time by N. Setting
+        ``abort`` on heterogeneous failures (one flaky source among
+        healthy ones) is the intentional policy given the runner's
+        "raise and fail the trial" contract: the trial is going to be
+        marked failed either way once one client has exhausted.
+
+        Args:
+            job_name: Job metadata.name.
+            job_yaml: Rendered Job manifest.
+            max_attempts: Total attempts including the first try.
+            parse: Callable converting the container log body into
+                ``_T``. Must raise :class:`ResultValidationError` on
+                degenerate payloads.
+            kind: Short label (``"iperf3"`` / ``"fortio"``) used in log
+                messages.
+            abort: Optional stage-level early-abort signal.
+
+        Returns:
+            The value produced by ``parse`` on the first successful
+            attempt.
+
+        Raises:
+            RuntimeError: ``max_attempts`` were exhausted, or the
+                per-attempt ``delete`` failed.
+            JobAttemptError: Stage-level ``abort`` fired before the
+                first attempt completed successfully.
+        """
+        ns = self.node_pair.namespace
+        last_error: Exception | None = None
+        for attempt in range(1, max_attempts + 1):
+            if abort is not None and abort.is_set():
+                break
+            attempt_ok = False
             try:
-                self.client.delete("job", job_name, ns, ignore_not_found=True)
-            except K8sApiError as cleanup_err:
+                self.client.apply(job_yaml, ns)
+                try:
+                    self.client.wait(
+                        "job",
+                        job_name,
+                        "condition=complete",
+                        ns,
+                        timeout=_CLIENT_WAIT_TIMEOUT_SECONDS,
+                        failure_condition="condition=failed",
+                    )
+                    log_pod = self.client._job_log_pod(job_name, ns)  # noqa: SLF001
+                    if log_pod is None:
+                        msg = (
+                            f"Job {job_name} completed but has no Succeeded pod "
+                            f"(attempt {attempt}/{max_attempts})"
+                        )
+                        raise JobAttemptError(msg)
+                    output = self.client.logs("pod", log_pod, ns)
+                    result = parse(output)
+                    attempt_ok = True
+                    return result
+                finally:
+                    if not attempt_ok:
+                        self._log_job_diagnostics(job_name, ns, kind, attempt)
+                    try:
+                        self.client.delete("job", job_name, ns, ignore_not_found=True)
+                    except K8sApiError as cleanup_err:
+                        logger.warning(
+                            "Best-effort delete of %s client job %s failed",
+                            kind,
+                            job_name,
+                            exc_info=True,
+                        )
+                        msg = f"cleanup of {kind} client job {job_name} failed"
+                        raise RuntimeError(msg) from cleanup_err
+            except (
+                K8sApiError,
+                JobFailedConditionError,
+                JobAttemptError,
+                ResultValidationError,
+            ) as exc:
+                last_error = exc
                 logger.warning(
-                    "Best-effort delete of fortio client job %s failed",
+                    "%s client Job %s attempt %d/%d failed: %s",
+                    kind,
                     job_name,
-                    exc_info=True,
+                    attempt,
+                    max_attempts,
+                    exc,
                 )
-                msg = f"cleanup of fortio client job {job_name} failed"
-                raise RuntimeError(msg) from cleanup_err
+                continue
+        if abort is not None and abort.is_set():
+            msg = f"{kind} client Job {job_name} aborted by sibling failure"
+            if last_error is not None:
+                raise JobAttemptError(msg) from last_error
+            raise JobAttemptError(msg)
+        if abort is not None:
+            abort.set()
+        if last_error is None:
+            msg = (
+                f"{kind} client Job {job_name}: retry loop exited with no error"
+                f" recorded (max_attempts={max_attempts})"
+            )
+            raise RuntimeError(msg)
+        msg = f"{kind} client Job {job_name} failed after {max_attempts} attempts"
+        raise RuntimeError(msg) from last_error
+
+    def _log_job_diagnostics(
+        self,
+        job_name: str,
+        namespace: str,
+        kind: str,
+        attempt: int,
+    ) -> None:
+        """Emit a single warning line describing a failed Job attempt.
+
+        Pulls :meth:`K8sClient.describe_job_failure` and renders the
+        returned :class:`JobFailureDiagnostics` into one structured log
+        record. Diagnostics must never mask the primary failure: every
+        downstream call in the diagnostic path is best-effort and we
+        log at ``warning`` rather than raising.
+
+        Invariant: this method MUST NOT propagate any exception. The
+        retry loop's per-attempt ``finally`` block runs this before the
+        Job ``delete``; if this raised, ``delete`` would be skipped and
+        the Job would leak until the stage-level label sweep runs.
+
+        Args:
+            job_name: Job metadata.name.
+            namespace: Target namespace.
+            kind: Short label for log grouping (``"iperf3"``, ``"fortio"``).
+            attempt: 1-based attempt index.
+        """
+        try:
+            diag = self.client.describe_job_failure(job_name, namespace)
+        except Exception:
+            logger.warning(
+                "Could not describe %s client job %s (attempt %d)",
+                kind,
+                job_name,
+                attempt,
+                exc_info=True,
+            )
+            return
+        logger.warning(
+            "%s client Job %s attempt %d diagnostics: %s",
+            kind,
+            job_name,
+            attempt,
+            diag,
+        )
 
     def _sum_cni_memory(self, target: str) -> int | None:
         """Return summed CNI-pod memory on ``target``, or ``None`` when empty.
@@ -475,6 +662,7 @@ class BenchmarkRunner:
             this iteration. On any client failure the first failure is
             re-raised and no partial results are returned.
         """
+        abort = threading.Event()
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=len(self._clients),
         ) as executor:
@@ -485,6 +673,7 @@ class BenchmarkRunner:
                     self._ports[client],
                     mode,
                     iteration,
+                    abort,
                 ): client
                 for client in self._clients
             }
@@ -527,6 +716,7 @@ class BenchmarkRunner:
             first failure is re-raised and no partial results are
             returned.
         """
+        abort = threading.Event()
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=len(self._clients),
         ) as executor:
@@ -536,6 +726,7 @@ class BenchmarkRunner:
                     client,
                     iteration,
                     workload,
+                    abort,
                 ): client
                 for client in self._clients
             }

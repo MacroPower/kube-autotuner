@@ -6,6 +6,7 @@ import json
 
 import pytest
 
+from kube_autotuner.benchmark.errors import ResultValidationError
 from kube_autotuner.benchmark.fortio_parser import (
     extract_fortio_result_json,
     parse_fortio_json,
@@ -61,29 +62,38 @@ def test_missing_percentile_is_none():
     assert result.latency_p99_ms is None
 
 
-def test_missing_duration_histogram():
-    result = parse_fortio_json(
-        {"ActualQPS": 500.0},
-        client_node="c1",
-        iteration=0,
-        workload="saturation",
-    )
-    assert result.rps == pytest.approx(500.0)
-    assert result.total_requests is None
-    assert result.latency_p50_ms is None
-    assert result.latency_p90_ms is None
-    assert result.latency_p99_ms is None
+def test_missing_duration_histogram_raises():
+    """A payload without ``DurationHistogram`` is degenerate; parser raises."""
+    with pytest.raises(ResultValidationError, match="Count="):
+        parse_fortio_json(
+            {"ActualQPS": 500.0},
+            client_node="c1",
+            iteration=0,
+            workload="saturation",
+        )
+
+
+def test_zero_count_histogram_raises():
+    """``Count=0`` means no requests were issued; parser raises."""
+    with pytest.raises(ResultValidationError, match="Count=0"):
+        parse_fortio_json(
+            {"DurationHistogram": {"Count": 0, "Percentiles": []}},
+            client_node="c1",
+            iteration=0,
+            workload="saturation",
+        )
 
 
 def test_missing_actual_qps_defaults_to_zero():
+    """Missing ``ActualQPS`` is tolerated when the histogram is populated."""
     result = parse_fortio_json(
-        {"DurationHistogram": {"Count": 0, "Percentiles": []}},
+        {"DurationHistogram": {"Count": 3, "Percentiles": []}},
         client_node="c1",
         iteration=0,
         workload="saturation",
     )
     assert result.rps == pytest.approx(0.0)
-    assert result.total_requests == 0
+    assert result.total_requests == 3
 
 
 def test_workload_tag_preserved():

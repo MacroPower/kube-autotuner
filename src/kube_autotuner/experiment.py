@@ -216,12 +216,24 @@ class IperfArgs(BaseModel):
 
 
 class IperfSection(BaseModel):
-    """Per-role ``extra_args`` for iperf3 client and server pods."""
+    """Per-role ``extra_args`` and retry budget for iperf3 client Jobs.
+
+    ``max_attempts`` is the number of full Job lifecycles the benchmark
+    runner may try per client per iteration before giving up and
+    raising. It is independent of the pod-level ``backoffLimit: 1`` in
+    the Job manifest; that still controls how many times the Kubernetes
+    Job controller retries a failed pod within one Job, while
+    ``max_attempts`` gates how many times the runner rebuilds the Job
+    from scratch. Worst-case wall time per client is
+    ``max_attempts * _CLIENT_WAIT_TIMEOUT_SECONDS`` (default 3 * 180s =
+    9 minutes) when every attempt hits the watch deadline.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     client: IperfArgs = Field(default_factory=IperfArgs)
     server: IperfArgs = Field(default_factory=IperfArgs)
+    max_attempts: int = Field(default=3, ge=1)
 
 
 class FortioArgs(BaseModel):
@@ -244,6 +256,12 @@ class FortioSection(BaseModel):
     short without shortening the iperf3 bandwidth window. ``fixed_qps``
     drives the latency percentile sub-stage; ``connections`` is
     forwarded to fortio's ``-c`` flag for both sub-stages.
+
+    ``max_attempts`` is the number of full Job lifecycles the benchmark
+    runner may try per client per iteration before giving up and
+    raising. See :class:`IperfSection` for the relationship with the
+    pod-level ``backoffLimit`` and the worst-case wall-time
+    calculation.
     """
 
     model_config = ConfigDict(
@@ -257,6 +275,7 @@ class FortioSection(BaseModel):
     fixed_qps: int = Field(default=1000, ge=1)
     connections: int = Field(default=4, ge=1)
     duration: int = Field(default=30, ge=1)
+    max_attempts: int = Field(default=3, ge=1)
 
 
 class CniSection(BaseModel):

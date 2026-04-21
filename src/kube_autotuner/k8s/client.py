@@ -18,9 +18,10 @@ first-run/re-run distinction for Deployments, Services, Pods, and Jobs.
 from __future__ import annotations
 
 import json
+import operator
 import os
 import time
-from typing import TYPE_CHECKING, Any, NoReturn
+from typing import TYPE_CHECKING, Any, NoReturn, TypedDict
 
 from kubernetes import client as _k8s, config as _k8s_config, watch as _k8s_watch
 from kubernetes.client.exceptions import ApiException
@@ -78,6 +79,102 @@ class K8sApiError(Exception):
         super().__init__(
             f"{op} failed (status={status}, reason={reason!r}): {message}",
         )
+
+
+class JobFailedConditionError(RuntimeError):
+    """Raised when a Job watch observes ``status.conditions[Failed]=True``.
+
+    Kept out of :class:`K8sApiError` on purpose: that type's contract is
+    "HTTP-level API error raised via ``_raise`` from
+    :class:`ApiException`" and reusing it for a condition-based failure
+    would make the outer ``except K8sApiError`` in current callers pick
+    up a semantically different failure.
+
+    Attributes:
+        job: ``namespace/name`` of the Job that transitioned to Failed.
+        conditions: The Job's ``status.conditions`` snippet at the
+            moment of failure. Each entry is a dict with ``type``,
+            ``status``, ``reason`` (empty string when absent), and
+            ``message`` keys.
+    """
+
+    def __init__(self, *, job: str, conditions: list[dict[str, str]]) -> None:
+        """Store the Job identifier and the failing conditions snippet.
+
+        Args:
+            job: ``namespace/name`` of the Job.
+            conditions: Snippet from ``job.status.conditions``.
+        """
+        self.job = job
+        self.conditions = conditions
+        reason = _first_failed_reason(conditions)
+        super().__init__(
+            f"Job {job} reached status.conditions[Failed]=True (reason={reason!r})",
+        )
+
+
+def _first_failed_reason(conditions: list[dict[str, str]]) -> str:
+    """Pull the first ``Failed=True`` condition's ``reason`` for logging.
+
+    Args:
+        conditions: ``status.conditions`` list.
+
+    Returns:
+        The ``reason`` string, or ``""`` when no Failed condition
+        carries one.
+    """
+    for c in conditions:
+        if c.get("type") == "Failed" and c.get("status") == "True":
+            return c.get("reason", "") or ""
+    return ""
+
+
+class JobConditionRow(TypedDict):
+    """One row in :class:`JobFailureDiagnostics.conditions`."""
+
+    type: str
+    status: str
+    reason: str
+    message: str
+
+
+class ContainerTerminationRow(TypedDict):
+    """One container status row (terminated or waiting) on a failed pod."""
+
+    container: str
+    exit_code: int | None
+    reason: str
+    message: str
+
+
+class PodEventRow(TypedDict):
+    """One Kubernetes Event tied to a failing pod."""
+
+    type: str
+    reason: str
+    message: str
+    count: int
+    last_timestamp: str
+
+
+class PodFailureDiagnostics(TypedDict):
+    """Per-pod diagnostic snapshot attached to :class:`JobFailureDiagnostics`."""
+
+    name: str
+    phase: str
+    terminations: list[ContainerTerminationRow]
+    waiting: list[ContainerTerminationRow]
+    events: list[PodEventRow]
+
+
+class JobFailureDiagnostics(TypedDict):
+    """Structured diagnostics for one failed Job attempt."""
+
+    job_name: str
+    succeeded: int
+    failed: int
+    conditions: list[JobConditionRow]
+    pods: list[PodFailureDiagnostics]
 
 
 def _raise(op: str, e: ApiException) -> NoReturn:
@@ -376,6 +473,8 @@ class K8sClient:
         condition: str,
         namespace: str,
         timeout: int = 120,
+        *,
+        failure_condition: str | None = None,
     ) -> None:
         """Block until a predicate on ``resource_type/name`` holds.
 
@@ -388,19 +487,37 @@ class K8sClient:
         * ``jsonpath={.status.phase}=<value>`` — wait until
           ``status.phase == value`` exactly.
 
+        When ``failure_condition`` is set, both predicates are evaluated
+        against the **same** parsed object snapshot on each watch event.
+        Success wins when both fire on one event; Kubernetes briefly
+        reports ``Complete=True`` alongside ``Failed=True`` on some
+        terminal transitions and the Job did run to completion in that
+        case.
+
         Args:
             resource_type: ``"pod"`` or ``"job"``.
             name: Object name.
-            condition: Predicate string (see above).
+            condition: Success predicate string (see above).
             namespace: Target namespace.
             timeout: Seconds before raising.
+            failure_condition: Optional failure predicate string. When
+                it fires and the success predicate does not,
+                :class:`JobFailedConditionError` is raised instead of
+                timing out.
 
         Raises:
             ValueError: Unsupported predicate form or ``resource_type``.
             K8sApiError: ``reason="Timeout"`` on elapsed timeout, or a
                 forwarded API error from the watch stream.
+            JobFailedConditionError: ``failure_condition`` fired on a
+                watch event without the success predicate also firing.
         """
         predicate = _parse_wait_predicate(condition)
+        failure_predicate = (
+            _parse_wait_predicate(failure_condition)
+            if failure_condition is not None
+            else None
+        )
         list_fn, field_selector = self._wait_list_fn(resource_type, name, namespace)
         deadline = time.monotonic() + timeout
         watcher = _k8s_watch.Watch()
@@ -415,9 +532,20 @@ class K8sClient:
                         timeout_seconds=remaining,
                     ):
                         obj = event.get("object")
-                        if obj is not None and predicate(_object_to_dict(obj)):
+                        if obj is None:
+                            continue
+                        obj_dict = _object_to_dict(obj)
+                        if predicate(obj_dict):
                             watcher.stop()
                             return
+                        if failure_predicate is not None and failure_predicate(
+                            obj_dict
+                        ):
+                            watcher.stop()
+                            raise JobFailedConditionError(
+                                job=f"{namespace}/{name}",
+                                conditions=_condition_snippet(obj_dict),
+                            )
                 except ApiException as e:
                     _raise(f"wait {resource_type}/{name}", e)
                 if time.monotonic() >= deadline:
@@ -590,27 +718,32 @@ class K8sClient:
         finally:
             resp.release_conn()
 
-    def _job_pod_name(self, job_name: str, namespace: str) -> str:
-        """Return the name of a pod backing ``job_name``.
+    def _list_job_pods(self, job_name: str, namespace: str) -> list[Any]:
+        """Return pods matching ``job_name``.
 
-        Tries the modern ``batch.kubernetes.io/job-name`` label first,
-        falls back to the legacy ``job-name`` label.
-
-        With ``backoffLimit > 0`` a Job can spawn multiple pods (one per
-        retry); ``list_namespaced_pod`` makes no ordering guarantee,
-        so naively returning ``items[0]`` may hand back a Failed
-        attempt's logs even when the Job ultimately Succeeded. Prefer a
-        ``Succeeded`` pod when one is present so callers reading
-        results-bearing logs (e.g. the fortio runner) get the attempt
-        whose stdout actually contains the result document.
+        Tries the modern ``batch.kubernetes.io/job-name`` label selector
+        first, falls back to the legacy ``job-name`` label. Returns the
+        first non-empty match. An empty list means the modern selector
+        matched no pods (and the legacy fallback also matched none);
+        callers should treat that as "no pods yet" rather than as an
+        API failure.
 
         Args:
             job_name: Job name.
             namespace: Target namespace.
 
         Returns:
-            The pod name, or an empty string if none found.
+            Pod objects as returned by the typed CoreV1 API, or an
+            empty list when neither selector matched any pod.
+
+        Raises:
+            K8sApiError: Both selector listings raised
+                :class:`ApiException`. Callers must not swallow this
+                and turn it into a "no pods" signal; that would mask
+                real API-level outages.
         """
+        op = f"list pods for job/{job_name}"
+        last_error: ApiException | None = None
         for selector in (
             f"batch.kubernetes.io/job-name={job_name}",
             f"job-name={job_name}",
@@ -619,17 +752,191 @@ class K8sClient:
                 listing = self.core_v1.list_namespaced_pod(
                     namespace, label_selector=selector
                 )
-            except ApiException:
+            except ApiException as e:
+                last_error = e
                 continue
             items = list(listing.items)
-            if not items:
-                continue
-            for pod in items:
-                phase = getattr(getattr(pod, "status", None), "phase", None)
-                if phase == "Succeeded":
-                    return str(pod.metadata.name)
-            return str(items[0].metadata.name)
-        return ""
+            if items:
+                return items
+        if last_error is not None:
+            _raise(op, last_error)
+        return []
+
+    def _job_pod_name(self, job_name: str, namespace: str) -> str:
+        """Return the name of a pod backing ``job_name``.
+
+        With ``backoffLimit > 0`` a Job can spawn multiple pods (one per
+        retry); ``list_namespaced_pod`` makes no ordering guarantee,
+        so naively returning ``items[0]`` may hand back a Failed
+        attempt's logs even when the Job ultimately Succeeded. Prefer a
+        ``Succeeded`` pod when one is present so diagnostic callers
+        still get the attempt whose stdout actually contains any
+        available result document; otherwise return the first pod in
+        the listing so :meth:`logs` can surface crash diagnostics.
+
+        Args:
+            job_name: Job name.
+            namespace: Target namespace.
+
+        Returns:
+            The pod name, or an empty string if none found.
+        """
+        items = self._list_job_pods(job_name, namespace)
+        if not items:
+            return ""
+        for pod in items:
+            phase = getattr(getattr(pod, "status", None), "phase", None)
+            if phase == "Succeeded":
+                return str(pod.metadata.name)
+        return str(items[0].metadata.name)
+
+    def _job_log_pod(self, job_name: str, namespace: str) -> str | None:
+        """Return a ``Succeeded``-phase pod for ``job_name``, or ``None``.
+
+        Used by the benchmark runner's retry loop to fetch the payload
+        log, so a Job that hit ``Complete=True`` but whose only pods
+        are ``Failed`` / ``Error`` is treated as an attempt failure
+        rather than silently returning garbage logs.
+
+        Args:
+            job_name: Job name.
+            namespace: Target namespace.
+
+        Returns:
+            Pod name if a pod in ``phase=="Succeeded"`` exists, else
+            ``None`` (Job deleted mid-attempt, Job failed before
+            spawning any pod, or all pods are in a non-Succeeded
+            phase).
+
+        Raises:
+            K8sApiError: The underlying pod listing failed on both the
+                modern and legacy label selectors.
+        """
+        for pod in self._list_job_pods(job_name, namespace):
+            phase = getattr(getattr(pod, "status", None), "phase", None)
+            if phase == "Succeeded":
+                return str(pod.metadata.name)
+        return None
+
+    def describe_job_failure(
+        self,
+        job_name: str,
+        namespace: str,
+        *,
+        event_limit: int = 5,
+    ) -> JobFailureDiagnostics:
+        """Return a structured snapshot of a failing Job for logging.
+
+        Pod events must be captured **before** the Job is deleted: the
+        garbage collector removes them along with the pod, so callers
+        in a retry loop's ``finally`` block should run this helper
+        before ``delete``.
+
+        Best-effort: every downstream API call is wrapped so a missing
+        Job, vanished pod, or events-listing failure degrades to empty
+        fields rather than raising. Diagnostics must never mask the
+        primary failure they describe.
+
+        Args:
+            job_name: Job name.
+            namespace: Target namespace.
+            event_limit: Max number of recent pod events per pod.
+
+        Returns:
+            A :class:`JobFailureDiagnostics` payload with Job counters,
+            condition rows, and per-pod phase/container/event rows.
+        """
+        succeeded = 0
+        failed = 0
+        conditions: list[JobConditionRow] = []
+        try:
+            job = self.batch_v1.read_namespaced_job(job_name, namespace)
+        except ApiException:
+            job = None
+        if job is not None:
+            status = getattr(job, "status", None)
+            succeeded = int(getattr(status, "succeeded", 0) or 0)
+            failed = int(getattr(status, "failed", 0) or 0)
+            raw_conditions = getattr(status, "conditions", None) or []
+            conditions.extend(
+                JobConditionRow(
+                    type=str(getattr(c, "type", "") or ""),
+                    status=str(getattr(c, "status", "") or ""),
+                    reason=str(getattr(c, "reason", "") or ""),
+                    message=str(getattr(c, "message", "") or ""),
+                )
+                for c in raw_conditions
+            )
+        pods: list[PodFailureDiagnostics] = []
+        try:
+            pod_items = self._list_job_pods(job_name, namespace)
+        except K8sApiError:
+            pod_items = []
+        for pod in pod_items:
+            pod_name = str(getattr(getattr(pod, "metadata", None), "name", "") or "")
+            phase = str(getattr(getattr(pod, "status", None), "phase", "") or "")
+            terminations, waiting = _container_status_rows(pod)
+            events = self._recent_pod_events(pod_name, namespace, event_limit)
+            pods.append(
+                PodFailureDiagnostics(
+                    name=pod_name,
+                    phase=phase,
+                    terminations=terminations,
+                    waiting=waiting,
+                    events=events,
+                )
+            )
+        return JobFailureDiagnostics(
+            job_name=job_name,
+            succeeded=succeeded,
+            failed=failed,
+            conditions=conditions,
+            pods=pods,
+        )
+
+    def _recent_pod_events(
+        self,
+        pod_name: str,
+        namespace: str,
+        limit: int,
+    ) -> list[PodEventRow]:
+        """Return the last ``limit`` events for ``pod_name``.
+
+        Args:
+            pod_name: Pod name. Empty string returns ``[]`` without an
+                API call.
+            namespace: Target namespace.
+            limit: Max number of events, sorted by ``last_timestamp``
+                descending (most recent first).
+
+        Returns:
+            Event rows in reverse-chronological order. API failures
+            degrade to ``[]`` rather than raising; diagnostics must
+            never mask the primary failure.
+        """
+        if not pod_name:
+            return []
+        try:
+            listing = self.core_v1.list_namespaced_event(
+                namespace,
+                field_selector=f"involvedObject.name={pod_name}",
+            )
+        except ApiException:
+            return []
+        rows: list[PodEventRow] = []
+        for ev in getattr(listing, "items", None) or []:
+            last_ts = getattr(ev, "last_timestamp", None)
+            rows.append(
+                PodEventRow(
+                    type=str(getattr(ev, "type", "") or ""),
+                    reason=str(getattr(ev, "reason", "") or ""),
+                    message=str(getattr(ev, "message", "") or ""),
+                    count=int(getattr(ev, "count", 0) or 0),
+                    last_timestamp=last_ts.isoformat() if last_ts else "",
+                )
+            )
+        rows.sort(key=operator.itemgetter("last_timestamp"), reverse=True)
+        return rows[:limit]
 
     # ---- metrics ------------------------------------------------------
 
@@ -970,6 +1277,74 @@ def _object_to_dict(obj: Any) -> dict[str, Any]:  # noqa: ANN401
         return obj
     result = _k8s.ApiClient().sanitize_for_serialization(obj)
     return result if isinstance(result, dict) else {}
+
+
+def _condition_snippet(obj_dict: dict[str, Any]) -> list[dict[str, str]]:
+    """Return ``status.conditions`` flattened to plain string dicts.
+
+    Used by :class:`JobFailedConditionError` so the failure exception
+    carries the exact reason/message the API server emitted.
+
+    Args:
+        obj_dict: Parsed object dict (camelCase keys).
+
+    Returns:
+        A list of ``{"type", "status", "reason", "message"}`` dicts.
+        Missing fields are rendered as empty strings.
+    """
+    return [
+        {
+            "type": str(c.get("type") or ""),
+            "status": str(c.get("status") or ""),
+            "reason": str(c.get("reason") or ""),
+            "message": str(c.get("message") or ""),
+        }
+        for c in (obj_dict.get("status") or {}).get("conditions") or []
+    ]
+
+
+def _container_status_rows(
+    pod: Any,  # noqa: ANN401
+) -> tuple[list[ContainerTerminationRow], list[ContainerTerminationRow]]:
+    """Split a pod's container statuses into (terminated, waiting) rows.
+
+    Args:
+        pod: Typed pod object from the CoreV1 API.
+
+    Returns:
+        ``(terminations, waiting)`` where each entry mirrors the
+        :class:`ContainerTerminationRow` shape. ``exit_code`` is set
+        only on terminated containers.
+    """
+    terminations: list[ContainerTerminationRow] = []
+    waiting: list[ContainerTerminationRow] = []
+    statuses = getattr(getattr(pod, "status", None), "container_statuses", None) or []
+    for cs in statuses:
+        name = str(getattr(cs, "name", "") or "")
+        state = getattr(cs, "state", None)
+        term = getattr(state, "terminated", None)
+        if term is not None:
+            exit_code = getattr(term, "exit_code", None)
+            terminations.append(
+                ContainerTerminationRow(
+                    container=name,
+                    exit_code=int(exit_code) if exit_code is not None else None,
+                    reason=str(getattr(term, "reason", "") or ""),
+                    message=str(getattr(term, "message", "") or ""),
+                )
+            )
+            continue
+        wait_state = getattr(state, "waiting", None)
+        if wait_state is not None:
+            waiting.append(
+                ContainerTerminationRow(
+                    container=name,
+                    exit_code=None,
+                    reason=str(getattr(wait_state, "reason", "") or ""),
+                    message=str(getattr(wait_state, "message", "") or ""),
+                )
+            )
+    return terminations, waiting
 
 
 def _deployment_ready(obj: Any) -> bool:  # noqa: ANN401

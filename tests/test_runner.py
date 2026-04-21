@@ -6,12 +6,15 @@ import json
 import shutil
 import threading
 import time
+from typing import TYPE_CHECKING
 from unittest.mock import MagicMock
 
 import pytest
 import yaml
 
 from kube_autotuner.benchmark import runner as runner_module
+from kube_autotuner.benchmark.errors import ResultValidationError
+from kube_autotuner.benchmark.parser import parse_iperf_json
 from kube_autotuner.benchmark.runner import (
     CLIENT_LABEL,
     FORTIO_CLIENT_LABEL,
@@ -26,6 +29,9 @@ from kube_autotuner.experiment import (
 )
 from kube_autotuner.k8s.client import K8sApiError
 from kube_autotuner.models import BenchmarkConfig, NodePair
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 def _fake_iperf_json(bps: float, remote_total: float = 12.3) -> str:
@@ -69,6 +75,10 @@ def _make_client(logs_by_job: dict[str, str]) -> MagicMock:
     client.rollout_status.return_value = None
     client.delete.return_value = None
     client.delete_by_label.return_value = None
+    # The runner now fetches the log-source pod name via _job_log_pod,
+    # then calls logs("pod", <pod>, ns). Fake it by returning the job
+    # name so the existing job-name keyed log fixtures still resolve.
+    client._job_log_pod.side_effect = lambda job_name, _ns: job_name
 
     def _logs(_kind, name, _ns):
         if name in logs_by_job:
@@ -78,6 +88,7 @@ def _make_client(logs_by_job: dict[str, str]) -> MagicMock:
         raise KeyError(name)
 
     client.logs.side_effect = _logs
+    client.describe_job_failure.return_value = {}
     client.top_pod_containers.return_value = []
     client.top_node.return_value = {}
     client.list_pods_by_selector_on_node.return_value = []
@@ -515,3 +526,235 @@ def test_fortio_failure_cleans_up_by_fortio_label():
         if FORTIO_CLIENT_LABEL in c.args
     ]
     assert label_delete_calls, "expected fortio client label cleanup on failure"
+
+
+# ---- retry / failure-detection coverage ------------------------------------
+
+
+def _retry_runner(
+    *,
+    iperf_logs: list[str],
+    iperf_max_attempts: int = 3,
+    iperf_log_pod: Callable | None = None,
+) -> tuple[BenchmarkRunner, MagicMock]:
+    """Build a single-iteration TCP-only runner with a retry harness.
+
+    The fortio sub-stages stay happy-path so each iteration's retry
+    behavior is entirely driven by ``iperf_logs`` / ``iperf_log_pod``.
+
+    Returns:
+        ``(runner, client_mock)``.
+    """
+    node_pair = NodePair(source="kmain07", target="kmain08", hardware_class="10g")
+    config = BenchmarkConfig(duration=1, iterations=1, modes=["tcp"])
+
+    iperf_iter = iter(iperf_logs)
+    client = _make_client(logs_by_job={})
+
+    def _logs(kind, name, _ns):
+        if kind == "pod" and name.startswith("iperf3-client-"):
+            return next(iperf_iter)
+        if kind == "pod" and name.startswith("fortio-client-"):
+            return _fake_fortio_json()
+        raise KeyError((kind, name))
+
+    client.logs.side_effect = _logs
+    if iperf_log_pod is not None:
+
+        def _log_pod(job_name, ns):
+            if job_name.startswith("iperf3-client-"):
+                return iperf_log_pod(job_name, ns)
+            return job_name  # fortio: happy path
+
+        client._job_log_pod.side_effect = _log_pod
+
+    runner = BenchmarkRunner(
+        node_pair,
+        config,
+        client=client,
+        iperf_args=IperfSection(max_attempts=iperf_max_attempts),
+    )
+    return runner, client
+
+
+def test_retry_succeeds_after_first_attempt_fails(caplog):
+    """(a) First attempt raises; second attempt returns a valid payload."""
+    runner, client = _retry_runner(
+        iperf_logs=[
+            json.dumps({"error": "connection refused"}),
+            _fake_iperf_json(9e9),
+        ],
+    )
+    with caplog.at_level("WARNING"):
+        results = runner.run()
+    assert len(results.bench) == 1
+    assert results.bench[0].bits_per_second == pytest.approx(9e9)
+    # Exactly one "attempt 1/3 failed" warning; no "after 3 attempts".
+    attempt_failed = [
+        r for r in caplog.records if "attempt 1/3 failed" in r.getMessage()
+    ]
+    assert len(attempt_failed) == 1
+    assert all("after 3 attempts" not in r.getMessage() for r in caplog.records)
+    # apply/delete happened twice (one per attempt).
+    iperf_applies = [
+        c for c in client.apply.call_args_list if "iperf3-client-" in c.args[0]
+    ]
+    assert len(iperf_applies) == 2
+
+
+def test_retry_exhaustion_raises_runtime_error_with_cause():
+    """(b) All attempts fail; final RuntimeError chains the last cause."""
+    runner, _ = _retry_runner(
+        iperf_logs=[json.dumps({"error": "x"}) for _ in range(3)],
+    )
+    with pytest.raises(RuntimeError, match="after 3 attempts") as exc_info:
+        runner.run()
+    assert exc_info.value.__cause__ is not None
+    assert isinstance(exc_info.value.__cause__, ResultValidationError)
+
+
+def test_retry_when_no_succeeded_pod(caplog):
+    """(c) Job Complete but _job_log_pod returns None → JobAttemptError retry."""
+    # First call returns None (no Succeeded pod); second returns a name.
+    pod_side = iter([None, "iperf3-client-kmain07-p5201"])
+    runner, _ = _retry_runner(
+        iperf_logs=[_fake_iperf_json(8e9)],  # single good log, used on 2nd attempt
+        iperf_log_pod=lambda _jn, _ns: next(pod_side),
+    )
+    with caplog.at_level("WARNING"):
+        results = runner.run()
+    assert len(results.bench) == 1
+    assert any("no Succeeded pod" in r.getMessage() for r in caplog.records)
+
+
+def test_retry_on_iperf_error_payload():
+    """(d) iperf3 payload has top-level error field → retry until clean."""
+    runner, _ = _retry_runner(
+        iperf_logs=[
+            json.dumps({"error": "unable to connect"}),
+            _fake_iperf_json(7e9),
+        ],
+    )
+    results = runner.run()
+    assert results.bench[0].bits_per_second == pytest.approx(7e9)
+
+
+def test_retry_on_fortio_zero_count():
+    """(e) fortio DurationHistogram.Count==0 → retry until Count > 0."""
+    node_pair = NodePair(source="kmain07", target="kmain08", hardware_class="10g")
+    config = BenchmarkConfig(duration=1, iterations=1, modes=["tcp"])
+
+    fortio_iter = iter([
+        json.dumps({
+            "ActualQPS": 0.0,
+            "DurationHistogram": {"Count": 0, "Percentiles": []},
+        }),
+        _fake_fortio_json(rps=500.0),
+        _fake_fortio_json(rps=600.0),  # fixed_qps sub-stage
+    ])
+    client = _make_client(
+        logs_by_job={"iperf3-client-kmain07-p5201": _fake_iperf_json(1e9)},
+    )
+
+    def _logs(kind, name, _ns):
+        if name.startswith("iperf3-client-"):
+            return _fake_iperf_json(1e9)
+        if name.startswith("fortio-client-"):
+            return next(fortio_iter)
+        raise KeyError((kind, name))
+
+    client.logs.side_effect = _logs
+    runner = BenchmarkRunner(node_pair, config, client=client)
+    results = runner.run()
+    assert len(results.latency) == 2  # saturation + fixed_qps
+    rps_values = sorted(lr.rps for lr in results.latency)
+    assert rps_values == [pytest.approx(500.0), pytest.approx(600.0)]
+
+
+def test_happy_path_emits_no_diagnostics(caplog):
+    """(f) Diagnostics log is silent when every attempt succeeds first time."""
+    runner, client = _retry_runner(iperf_logs=[_fake_iperf_json(9e9)])
+    with caplog.at_level("WARNING"):
+        runner.run()
+    diag_records = [r for r in caplog.records if "diagnostics:" in r.getMessage()]
+    assert diag_records == []
+    client.describe_job_failure.assert_not_called()
+
+
+def test_udp_zero_bps_nonzero_packets_does_not_raise():
+    """(g) UDP false-positive regression: packets>0 + bps=0.0 must NOT raise."""
+    r = parse_iperf_json(
+        {"end": {"sum": {"packets": 42, "bits_per_second": 0.0}}}, "udp"
+    )
+    assert r.bits_per_second == pytest.approx(0.0)
+
+
+def test_zero_pods_returns_none_triggers_retry(caplog):
+    """(h) _job_log_pod returns None (Job deleted externally) → retry."""
+    pod_side = iter([None, None, "iperf3-client-kmain07-p5201"])
+    runner, _ = _retry_runner(
+        iperf_logs=[_fake_iperf_json(6e9)],
+        iperf_log_pod=lambda _jn, _ns: next(pod_side),
+    )
+    with caplog.at_level("WARNING"):
+        results = runner.run()
+    assert results.bench[0].bits_per_second == pytest.approx(6e9)
+    # Two "no Succeeded pod" warnings: one per missing-pod attempt.
+    msgs = [r.getMessage() for r in caplog.records]
+    assert sum("no Succeeded pod" in m for m in msgs) == 2
+
+
+def test_sibling_abort_caps_retry_amplification():
+    """(i) Once one sibling exhausts, other siblings bail early.
+
+    Assert ``sibling_attempts < max_attempts`` rather than an exact
+    count; thread scheduling decides how far the siblings got before
+    they observed the abort Event.
+    """
+    node_pair = NodePair(
+        source="kmain07",
+        target="kmain08",
+        hardware_class="10g",
+        extra_sources=["kmain09"],
+    )
+    config = BenchmarkConfig(duration=1, iterations=1, modes=["tcp"])
+
+    max_attempts = 4
+    attempts_per_client: dict[str, int] = {"kmain07": 0, "kmain09": 0}
+    attempts_lock = threading.Lock()
+
+    client = _make_client(logs_by_job={})
+
+    def _logs(_kind, name, _ns):
+        # All iperf3 attempts return a degenerate payload so every
+        # attempt raises ResultValidationError. Fortio payloads are
+        # happy-path but the stage never reaches them.
+        if name.startswith("iperf3-client-"):
+            # Extract the node slug from the job name
+            # ("iperf3-client-<node>-p<port>").
+            node = name.split("-")[2]
+            with attempts_lock:
+                attempts_per_client[node] += 1
+            # Stall kmain09 so kmain07 exhausts first and sets abort.
+            if node == "kmain09":
+                time.sleep(0.05)
+            return json.dumps({"error": "connection refused"})
+        if name.startswith("fortio-client-"):
+            return _fake_fortio_json()
+        raise KeyError(name)
+
+    client.logs.side_effect = _logs
+
+    runner = BenchmarkRunner(
+        node_pair,
+        config,
+        client=client,
+        iperf_args=IperfSection(max_attempts=max_attempts),
+    )
+    with pytest.raises(RuntimeError, match="after"):
+        runner.run()
+    # The node whose thread exhausted first hits max_attempts. The
+    # sibling observes the abort Event before using up its full budget.
+    exhaustion_counts = sorted(attempts_per_client.values())
+    assert exhaustion_counts[-1] == max_attempts
+    assert exhaustion_counts[0] < max_attempts

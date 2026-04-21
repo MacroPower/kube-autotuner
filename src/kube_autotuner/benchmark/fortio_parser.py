@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 import json
 from typing import Any, Literal
 
+from kube_autotuner.benchmark.errors import ResultValidationError
 from kube_autotuner.models import LatencyResult
 
 _MS_PER_SECOND = 1000.0
@@ -142,6 +143,13 @@ def parse_fortio_json(
 ) -> LatencyResult:
     """Extract latency metrics from ``fortio load -json`` output.
 
+    Raises :class:`ResultValidationError` when the histogram carries no
+    samples (``Count`` missing or zero). That is unambiguously a
+    degenerate run (fortio always records at least one request when
+    the test actually executed) and the benchmark runner's retry loop
+    detects it before the zero-valued latencies pollute the optimizer's
+    objective.
+
     Args:
         raw: Parsed fortio JSON document (``HTTPRunnerResults`` shape
             at the top level; ``ActualQPS`` is embedded from
@@ -158,13 +166,11 @@ def parse_fortio_json(
         A :class:`LatencyResult` with parsed metrics. Missing
         percentile entries map to ``None`` rather than zero to
         preserve the "unobserved" signal for aggregation.
-    """
-    actual_qps = raw.get("ActualQPS")
-    try:
-        rps = float(actual_qps) if actual_qps is not None else 0.0
-    except TypeError, ValueError:
-        rps = 0.0
 
+    Raises:
+        ResultValidationError: ``DurationHistogram.Count`` is missing
+            or zero.
+    """
     histogram = raw.get("DurationHistogram") or {}
     total_requests_raw = histogram.get("Count")
     try:
@@ -173,6 +179,15 @@ def parse_fortio_json(
         )
     except TypeError, ValueError:
         total_requests = None
+    if not total_requests:
+        msg = f"fortio histogram is empty (Count={total_requests_raw!r})"
+        raise ResultValidationError(msg)
+
+    actual_qps = raw.get("ActualQPS")
+    try:
+        rps = float(actual_qps) if actual_qps is not None else 0.0
+    except TypeError, ValueError:
+        rps = 0.0
 
     percentiles = histogram.get("Percentiles") or []
     if not isinstance(percentiles, list):

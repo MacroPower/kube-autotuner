@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from kube_autotuner.benchmark.errors import ResultValidationError
 from kube_autotuner.benchmark.parser import parse_iperf_json, parse_k8s_memory
 
 SAMPLE_TCP_JSON = {
@@ -99,12 +100,44 @@ def test_parse_udp():
     assert result.cpu_utilization_percent == pytest.approx(12.5)
 
 
-def test_parse_minimal_json():
-    """Parser handles missing fields gracefully."""
-    result = parse_iperf_json({"end": {}}, "tcp")
+def test_parse_minimal_json_raises_on_missing_sum_sent():
+    """TCP without ``end.sum_sent`` is degenerate; the parser raises."""
+    with pytest.raises(ResultValidationError, match="sum_sent"):
+        parse_iperf_json({"end": {}}, "tcp")
+
+
+def test_parse_raises_on_iperf_error_field():
+    with pytest.raises(ResultValidationError, match="connection refused"):
+        parse_iperf_json({"error": "unable to connect: connection refused"}, "tcp")
+
+
+def test_parse_raises_on_missing_end_block():
+    with pytest.raises(ResultValidationError, match="'end' block"):
+        parse_iperf_json({}, "tcp")
+
+
+def test_parse_raises_on_tcp_zero_bytes_and_zero_bps():
+    raw = {"end": {"sum_sent": {"bytes": 0, "bits_per_second": 0.0}}}
+    with pytest.raises(ResultValidationError, match="zero bytes"):
+        parse_iperf_json(raw, "tcp")
+
+
+def test_parse_tcp_accepts_nonzero_bytes_even_if_bps_zero():
+    raw = {"end": {"sum_sent": {"bytes": 1024, "bits_per_second": 0.0}}}
+    result = parse_iperf_json(raw, "tcp")
+    assert result.bytes_sent == 1024
+
+
+def test_parse_udp_accepts_nonzero_packets_even_if_bps_zero():
+    raw = {"end": {"sum": {"packets": 7, "bits_per_second": 0.0}}}
+    result = parse_iperf_json(raw, "udp")
     assert result.bits_per_second == pytest.approx(0.0)
-    assert result.retransmits is None
-    assert result.cpu_utilization_percent == pytest.approx(0.0)
+
+
+def test_parse_raises_on_udp_zero_packets_and_zero_bps():
+    raw = {"end": {"sum": {"packets": 0, "bits_per_second": 0.0}}}
+    with pytest.raises(ResultValidationError, match="zero packets"):
+        parse_iperf_json(raw, "udp")
 
 
 def test_parse_preserves_raw():

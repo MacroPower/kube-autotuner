@@ -14,7 +14,12 @@ from unittest.mock import MagicMock
 from kubernetes.client.exceptions import ApiException
 import pytest
 
-from kube_autotuner.k8s.client import FIELD_MANAGER, K8sApiError, K8sClient
+from kube_autotuner.k8s.client import (
+    FIELD_MANAGER,
+    JobFailedConditionError,
+    K8sApiError,
+    K8sClient,
+)
 
 
 def _client_with_mocks() -> K8sClient:
@@ -320,6 +325,78 @@ def test_wait_raises_timeout(monkeypatch):
     with pytest.raises(K8sApiError) as excinfo:
         c.wait("pod", "p", "condition=ready", "ns", timeout=0)
     assert excinfo.value.reason == "Timeout"
+
+
+def test_wait_failure_condition_raises_without_timeout(monkeypatch):
+    """Job ``Failed=True`` short-circuits the wait rather than timing out."""
+    c = _client_with_mocks()
+    job = {
+        "status": {
+            "conditions": [
+                {
+                    "type": "Failed",
+                    "status": "True",
+                    "reason": "BackoffLimitExceeded",
+                    "message": "Job has reached the specified backoff limit",
+                },
+            ],
+        },
+    }
+    monkeypatch.setattr(
+        "kube_autotuner.k8s.client._k8s_watch.Watch",
+        lambda: _FakeWatch([{"object": job}]),
+    )
+    with pytest.raises(JobFailedConditionError) as exc:
+        c.wait(
+            "job",
+            "j",
+            "condition=complete",
+            "ns",
+            timeout=5,
+            failure_condition="condition=failed",
+        )
+    assert exc.value.job == "ns/j"
+    assert any(
+        row["type"] == "Failed" and row["reason"] == "BackoffLimitExceeded"
+        for row in exc.value.conditions
+    )
+
+
+def test_wait_same_event_success_wins_over_failure(monkeypatch):
+    """When Complete and Failed both fire on one event, success wins."""
+    c = _client_with_mocks()
+    job = {
+        "status": {
+            "conditions": [
+                {"type": "Complete", "status": "True"},
+                {"type": "Failed", "status": "True", "reason": "x"},
+            ],
+        },
+    }
+    monkeypatch.setattr(
+        "kube_autotuner.k8s.client._k8s_watch.Watch",
+        lambda: _FakeWatch([{"object": job}]),
+    )
+    # Should return normally; no raise.
+    c.wait(
+        "job",
+        "j",
+        "condition=complete",
+        "ns",
+        timeout=5,
+        failure_condition="condition=failed",
+    )
+
+
+def test_wait_backcompat_without_failure_condition(monkeypatch):
+    """Existing callers that omit ``failure_condition`` still work."""
+    c = _client_with_mocks()
+    job = {"status": {"conditions": [{"type": "Complete", "status": "True"}]}}
+    monkeypatch.setattr(
+        "kube_autotuner.k8s.client._k8s_watch.Watch",
+        lambda: _FakeWatch([{"object": job}]),
+    )
+    c.wait("job", "j", "condition=complete", "ns", timeout=5)
 
 
 # ---- rollout_status ----------------------------------------------------

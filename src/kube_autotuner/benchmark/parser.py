@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 import re
 from typing import Any, Literal
 
+from kube_autotuner.benchmark.errors import ResultValidationError
 from kube_autotuner.models import BenchmarkResult
 
 _K8S_MEM_RE = re.compile(r"^(\d+)(Ki|Mi|Gi|Ti|k|M|G|T)?$")
@@ -45,13 +46,29 @@ def parse_k8s_memory(mem_str: str) -> int:
     return value * _K8S_MEM_MULTIPLIERS[suffix]
 
 
-def parse_iperf_json(
+def parse_iperf_json(  # noqa: PLR0915 - linear sanity-check ladder, no branching
     raw: dict[str, Any],
     mode: Literal["tcp", "udp"],
     client_node: str = "",
     iteration: int = 0,
 ) -> BenchmarkResult:
     """Extract metrics from ``iperf3 --json`` output.
+
+    Raises :class:`ResultValidationError` on unambiguously degenerate
+    payloads so the benchmark runner's retry loop detects them before
+    they pollute the optimizer's objective:
+
+    * iperf3 reported a connection-level ``error`` field.
+    * The ``end`` block is missing entirely.
+    * For TCP, ``end.sum_sent`` is missing, or both ``bytes`` and
+      ``bits_per_second`` are zero.
+    * For UDP, ``end.sum`` is missing, or both ``packets`` and
+      ``bits_per_second`` are zero.
+
+    Cross-checking throughput against an independent counter
+    (``bytes``/``packets``) avoids false positives from legitimate
+    interval rounding that can push the end-of-run ``bits_per_second``
+    to ``0.0`` on very short or UDP-heavy runs.
 
     Args:
         raw: Parsed iperf3 JSON document.
@@ -67,21 +84,44 @@ def parse_iperf_json(
         ``raw`` document is preserved in ``raw_json`` for downstream
         analysis. Missing timestamps default to :func:`datetime.now` in
         UTC.
+
+    Raises:
+        ResultValidationError: Payload is degenerate (see above).
     """
-    end = raw.get("end", {})
+    err = raw.get("error")
+    if err:
+        msg = f"iperf3 reported error: {err!r}"
+        raise ResultValidationError(msg)
+    end = raw.get("end")
+    if end is None:
+        msg = "iperf3 result missing 'end' block"
+        raise ResultValidationError(msg)
 
     if mode == "tcp":
-        sum_sent = end.get("sum_sent", {})
+        sum_sent = end.get("sum_sent")
+        if not sum_sent:
+            msg = "iperf3 TCP result missing 'end.sum_sent'"
+            raise ResultValidationError(msg)
         bits_per_second = sum_sent.get("bits_per_second", 0.0)
         retransmits = sum_sent.get("retransmits")
         bytes_sent = sum_sent.get("bytes")
         jitter_ms = None
+        if not bytes_sent and not bits_per_second:
+            msg = "iperf3 TCP produced zero bytes and zero bits_per_second"
+            raise ResultValidationError(msg)
     else:
-        sum_data = end.get("sum", {})
+        sum_data = end.get("sum")
+        if not sum_data:
+            msg = "iperf3 UDP result missing 'end.sum'"
+            raise ResultValidationError(msg)
         bits_per_second = sum_data.get("bits_per_second", 0.0)
         jitter_ms = sum_data.get("jitter_ms")
         retransmits = None
         bytes_sent = None
+        packets = sum_data.get("packets")
+        if not packets and not bits_per_second:
+            msg = "iperf3 UDP produced zero packets and zero bits_per_second"
+            raise ResultValidationError(msg)
 
     cpu = end.get("cpu_utilization_percent", {})
     cpu_pct = cpu.get("host_total", 0.0)
