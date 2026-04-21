@@ -27,6 +27,7 @@ import contextlib
 import math
 import os
 import sys
+import time
 from typing import TYPE_CHECKING, Protocol, Self
 
 from rich.console import Group
@@ -35,11 +36,13 @@ from rich.progress import (
     BarColumn,
     MofNCompleteColumn,
     Progress,
+    ProgressColumn,
     TextColumn,
     TimeElapsedColumn,
     TimeRemainingColumn,
 )
 from rich.table import Table
+from rich.text import Text
 
 try:
     import termios
@@ -49,12 +52,12 @@ except ImportError:  # Windows
     tty = None  # ty: ignore[invalid-assignment]
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Callable, Mapping
     from types import TracebackType
     from typing import Any
 
     from rich.console import Console
-    from rich.progress import TaskID
+    from rich.progress import Task, TaskID
 
 
 _TOP_N = 5
@@ -208,6 +211,54 @@ class NullObserver:
         """No-op."""
 
 
+class _IterEtaColumn(ProgressColumn):
+    """ETA column backed by an observer-owned duration history.
+
+    Rich's ``TimeRemainingColumn`` reads ``Task.speed``, whose sample
+    deque is cleared by ``Progress.reset()``. The iteration bar is
+    reset on every mode boundary to restore the per-mode ``x/N``
+    display, so those samples would vanish at every mode and trial
+    boundary. This column reads a ``(count, total_seconds)`` snapshot
+    supplied by a caller-provided callable, letting the history span
+    the entire run.
+    """
+
+    def __init__(self, history: Callable[[], tuple[int, float]]) -> None:
+        """Bind the column to a ``(count, total_seconds)`` supplier.
+
+        Args:
+            history: Zero-arg callable returning the observer's
+                cumulative iteration count and total observed duration
+                in seconds.
+        """
+        super().__init__()
+        self._history = history
+
+    def render(self, task: Task) -> Text:
+        """Render the ETA as ``H:MM:SS`` or ``-:--:--`` when unknown.
+
+        Args:
+            task: The Rich task whose remaining work is being measured.
+
+        Returns:
+            A styled :class:`rich.text.Text` carrying the ETA string.
+        """
+        if task.total is None:
+            return Text("-:--:--", style="progress.remaining")
+        remaining = int(task.total) - int(task.completed)
+        count, total_seconds = self._history()
+        if count == 0 or remaining <= 0:
+            return Text("-:--:--", style="progress.remaining")
+        mean = total_seconds / count
+        eta_seconds = int(remaining * mean)
+        minutes, seconds = divmod(eta_seconds, 60)
+        hours, minutes = divmod(minutes, 60)
+        return Text(
+            f"{hours:d}:{minutes:02d}:{seconds:02d}",
+            style="progress.remaining",
+        )
+
+
 class _TrialRow:
     """One row of the live "best so far" table."""
 
@@ -318,8 +369,13 @@ class RichProgressObserver:
                 live region instead of tearing through it.
         """
         self._console = console
+        self._iter_start: float | None = None
+        self._iter_count: int = 0
+        self._iter_total_seconds: float = 0.0
         self._trials: Progress = self._make_progress()
-        self._iters: Progress = self._make_progress()
+        self._iters: Progress = self._make_progress(
+            eta_column=_IterEtaColumn(self._iter_history),
+        )
         self._trial_task_id: TaskID | None = None
         self._iter_task_id: TaskID | None = None
         self._top: list[_TrialRow] = []
@@ -328,14 +384,36 @@ class RichProgressObserver:
         self._live: Live | None = None
         self._echo: _TtyEchoSuppressor | None = None
 
+    def _iter_history(self) -> tuple[int, float]:
+        """Return the observer's cumulative iteration history.
+
+        Returns:
+            A ``(count, total_seconds)`` snapshot aggregated across
+            every completed iteration since the observer was
+            constructed. The custom ETA column reads from this method
+            so its samples survive ``Progress.reset()`` at mode and
+            trial boundaries.
+        """
+        return (self._iter_count, self._iter_total_seconds)
+
     @staticmethod
-    def _make_progress() -> Progress:
+    def _make_progress(eta_column: ProgressColumn | None = None) -> Progress:
         """Build a :class:`rich.progress.Progress` with the standard columns.
+
+        Args:
+            eta_column: Optional replacement for the default
+                :class:`TimeRemainingColumn`. The iteration bar swaps
+                in :class:`_IterEtaColumn` so its ETA survives the
+                per-mode ``reset()`` that would otherwise clear
+                Rich's task-local speed samples.
 
         Returns:
             A fresh :class:`Progress` composed of the bar, M-of-N, and
             elapsed/ETA columns used throughout the live display.
         """
+        eta: ProgressColumn = (
+            eta_column if eta_column is not None else TimeRemainingColumn()
+        )
         return Progress(
             TextColumn("[bold]{task.description}[/bold]"),
             BarColumn(bar_width=None),
@@ -343,7 +421,7 @@ class RichProgressObserver:
             TextColumn("[dim]elapsed[/dim]"),
             TimeElapsedColumn(),
             TextColumn("[dim]eta[/dim]"),
-            TimeRemainingColumn(),
+            eta,
             expand=True,
             # Rich's default 30s speed window is shorter than a single
             # trial or iperf iteration, so samples age out before the
@@ -506,7 +584,17 @@ class RichProgressObserver:
         self._refresh()
 
     def on_mode_start(self, mode: str, total_iterations: int) -> None:
-        """Reset the iteration bar for the new mode."""
+        """Reset the iteration bar for the new mode.
+
+        The cumulative iteration history (``_iter_count`` /
+        ``_iter_total_seconds``) is deliberately preserved so the
+        custom :class:`_IterEtaColumn` can keep producing a real ETA
+        across mode and trial boundaries. Only the transient
+        start-of-iteration timestamp is cleared, covering the case
+        where a prior iteration was aborted before
+        :meth:`on_iteration_end` fired.
+        """
+        self._iter_start = None
         self._current_mode = mode
         description = f"Current [{mode}]"
         if self._iter_task_id is None:
@@ -530,6 +618,7 @@ class RichProgressObserver:
         iteration: int,  # noqa: ARG002 start is just a label change
     ) -> None:
         """Refresh the iteration-bar description to reflect ``mode``."""
+        self._iter_start = time.monotonic()
         if self._iter_task_id is not None:
             self._iters.update(
                 self._iter_task_id,
@@ -543,6 +632,10 @@ class RichProgressObserver:
         iteration: int,  # noqa: ARG002 advance is the signal
     ) -> None:
         """Advance the iteration bar by one completed iteration."""
+        if self._iter_start is not None:
+            self._iter_total_seconds += time.monotonic() - self._iter_start
+            self._iter_count += 1
+            self._iter_start = None
         if self._iter_task_id is not None:
             self._iters.update(self._iter_task_id, advance=1)
         self._refresh()
