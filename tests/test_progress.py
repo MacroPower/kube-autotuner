@@ -84,6 +84,38 @@ def test_rich_observer_renders_bars_and_table() -> None:
     assert "0.12" in output  # retx/MB rendered
 
 
+def test_rich_observer_refresh_does_not_force_immediate_paint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: every _refresh must hand Live the renderable with refresh=False.
+
+    Rich's ``Live`` auto-refreshes at 8 Hz; passing ``refresh=True`` on
+    every callback stacks event-driven paints on top of the timer's
+    paints and produces visible flicker around trial and mode
+    boundaries where multiple callbacks fire back-to-back.
+    """
+    console = _capture_console()
+    observer = RichProgressObserver(console)
+    calls: list[dict[str, Any]] = []
+    with observer:
+        assert observer._live is not None
+        original_update = observer._live.update
+
+        def spy(renderable: Any, **kwargs: Any) -> None:
+            calls.append(dict(kwargs))
+            original_update(renderable, **kwargs)
+
+        monkeypatch.setattr(observer._live, "update", spy)
+        observer.on_trial_start(0, 2, "sobol", {})
+        observer.on_mode_start("tcp", 2)
+        observer.on_iteration_start("tcp", 0)
+        observer.on_iteration_end("tcp", 0)
+        observer.on_trial_complete(0, "sobol", {"throughput": (1e9, 0.0)})
+        observer.on_trial_failed(1, RuntimeError("boom"))
+    assert calls, "expected at least one Live.update call"
+    assert all(not kwargs.get("refresh", False) for kwargs in calls)
+
+
 def test_rich_observer_handles_missing_metrics() -> None:
     console = _capture_console()
     observer = RichProgressObserver(console)

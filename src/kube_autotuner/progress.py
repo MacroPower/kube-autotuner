@@ -392,9 +392,9 @@ class RichProgressObserver:
         return Group(self._trials, self._iters, table)
 
     def _refresh(self) -> None:
-        """Push the current renderable into the live display."""
+        """Stage the current renderable for the next auto-refresh tick."""
         if self._live is not None:
-            self._live.update(self._render(), refresh=True)
+            self._live.update(self._render())
 
     def __enter__(self) -> Self:
         """Start the ``rich.live.Live`` display on the bound console.
