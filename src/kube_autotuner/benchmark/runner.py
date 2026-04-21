@@ -42,8 +42,14 @@ import threading
 from typing import TYPE_CHECKING, Literal, cast
 
 from kube_autotuner.benchmark.client_spec import build_client_yaml
-from kube_autotuner.benchmark.fortio_client_spec import build_fortio_client_yaml
-from kube_autotuner.benchmark.fortio_parser import parse_fortio_json
+from kube_autotuner.benchmark.fortio_client_spec import (
+    build_fortio_client_yaml,
+    fortio_client_job_name,
+)
+from kube_autotuner.benchmark.fortio_parser import (
+    extract_fortio_result_json,
+    parse_fortio_json,
+)
 from kube_autotuner.benchmark.fortio_server_spec import build_fortio_server_yaml
 from kube_autotuner.benchmark.parser import parse_iperf_json, parse_k8s_memory
 from kube_autotuner.benchmark.patch import apply_patches
@@ -242,7 +248,7 @@ class BenchmarkRunner:
                 ``finally`` fails; the original cleanup
                 :class:`K8sApiError` is attached as the cause.
         """
-        job_name = f"fortio-client-{client}-{workload}-i{iteration}"
+        job_name = fortio_client_job_name(client, workload, iteration)
         ns = self.node_pair.namespace
         qps = 0 if workload == "saturation" else self.fortio_args.fixed_qps
 
@@ -268,7 +274,7 @@ class BenchmarkRunner:
                 timeout=_CLIENT_WAIT_TIMEOUT_SECONDS,
             )
             output = self.client.logs("job", job_name, ns)
-            raw = json.loads(output)
+            raw = extract_fortio_result_json(output)
             return parse_fortio_json(
                 raw,
                 client_node=client,

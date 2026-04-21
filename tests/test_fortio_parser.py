@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
-from kube_autotuner.benchmark.fortio_parser import parse_fortio_json
+from kube_autotuner.benchmark.fortio_parser import (
+    extract_fortio_result_json,
+    parse_fortio_json,
+)
 
 
 def _full_payload() -> dict:
@@ -127,6 +132,71 @@ def test_percentile_float_tolerance_matches_near_integers():
         workload="fixed_qps",
     )
     assert result.latency_p99_ms == pytest.approx(5.0)
+
+
+def test_extract_returns_pure_json_unchanged():
+    body = json.dumps(_full_payload(), indent=2)
+    assert extract_fortio_result_json(body)["ActualQPS"] == pytest.approx(1234.5)
+
+
+def test_extract_skips_leading_json_log_line():
+    """Reproduces the prod failure: a JSON log record precedes the result."""
+    log_line = json.dumps(
+        {"ts": "2026-04-20T22:02:10Z", "level": "info", "msg": "starting load"},
+    )
+    body = log_line + "\n" + json.dumps(_full_payload(), indent=2)
+    result = extract_fortio_result_json(body)
+    assert "DurationHistogram" in result
+    assert result["ActualQPS"] == pytest.approx(1234.5)
+
+
+def test_extract_skips_non_json_banner_and_trailing_log():
+    body = (
+        "Fortio 1.69.0 running...\n"
+        "Aki: target 1000 QPS\n"
+        + json.dumps(_full_payload(), indent=2)
+        + "\nAll done 5000 calls\n"
+    )
+    result = extract_fortio_result_json(body)
+    assert result["DurationHistogram"]["Count"] == 5000
+
+
+def test_extract_picks_result_when_multiple_json_objects_present():
+    """An incidental log object before the result must not win."""
+    earlier = json.dumps({"msg": "warmup", "qps": 100})
+    body = earlier + "\n" + json.dumps(_full_payload()) + "\n"
+    result = extract_fortio_result_json(body)
+    assert "DurationHistogram" in result
+
+
+def test_extract_raises_when_no_result_object_present():
+    body = json.dumps({"msg": "fortio crashed"}) + "\nstack trace...\n"
+    with pytest.raises(ValueError, match="DurationHistogram"):
+        extract_fortio_result_json(body)
+
+
+def test_extract_error_includes_log_snippet_and_size():
+    body = "Aborting because of lookup nonexistent.local: no such host\n"
+    with pytest.raises(ValueError, match="DurationHistogram") as exc:
+        extract_fortio_result_json(body)
+    msg = str(exc.value)
+    assert f"total {len(body)} bytes" in msg
+    assert "Aborting" in msg
+
+
+def test_extract_error_marks_empty_log_clearly():
+    with pytest.raises(ValueError, match="<empty log>") as exc:
+        extract_fortio_result_json("")
+    assert "total 0 bytes" in str(exc.value)
+
+
+def test_extract_error_truncates_huge_log_with_byte_count():
+    body = "x" * 5000
+    with pytest.raises(ValueError, match="bytes omitted") as exc:
+        extract_fortio_result_json(body)
+    msg = str(exc.value)
+    assert "total 5000 bytes" in msg
+    assert len(msg) < len(body)
 
 
 def test_percentile_entry_without_value_returns_none():

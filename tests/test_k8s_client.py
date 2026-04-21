@@ -421,6 +421,41 @@ def test_logs_returns_json_body_verbatim():
     assert json.loads(out) == {"k": 1}
 
 
+def _pod(name: str, phase: str | None = None) -> SimpleNamespace:
+    return SimpleNamespace(
+        metadata=SimpleNamespace(name=name),
+        status=SimpleNamespace(phase=phase) if phase is not None else None,
+    )
+
+
+def test_logs_job_prefers_succeeded_pod_over_failed_attempt():
+    """Picking the Succeeded retry hands back the pod whose log holds results."""
+    c = _client_with_mocks()
+    failed = _pod("p-attempt-1", phase="Failed")
+    succeeded = _pod("p-attempt-2", phase="Succeeded")
+    # Listing order isn't guaranteed; put the Failed pod first to prove
+    # we pick by phase, not by index.
+    c.core_v1.list_namespaced_pod.return_value = SimpleNamespace(
+        items=[failed, succeeded]
+    )
+    c.core_v1.read_namespaced_pod_log.return_value = _log_response(b"result")
+    assert c.logs("job", "j", "ns") == "result"
+    c.core_v1.read_namespaced_pod_log.assert_called_once_with(
+        "p-attempt-2", "ns", _preload_content=False
+    )
+
+
+def test_logs_job_falls_back_to_first_pod_when_none_succeeded():
+    c = _client_with_mocks()
+    pending = _pod("p-only", phase="Pending")
+    c.core_v1.list_namespaced_pod.return_value = SimpleNamespace(items=[pending])
+    c.core_v1.read_namespaced_pod_log.return_value = _log_response(b"partial")
+    assert c.logs("job", "j", "ns") == "partial"
+    c.core_v1.read_namespaced_pod_log.assert_called_once_with(
+        "p-only", "ns", _preload_content=False
+    )
+
+
 def test_logs_job_raises_not_found_when_no_pod():
     c = _client_with_mocks()
     c.core_v1.list_namespaced_pod.return_value = SimpleNamespace(items=[])

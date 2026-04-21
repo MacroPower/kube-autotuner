@@ -3,11 +3,34 @@
 from __future__ import annotations
 
 import json
+import shlex
 from typing import Literal
 
 _FORTIO_HTTP_PORT = 8080
+_FORTIO_RESULT_FILE = "/tmp/fortio-result.json"  # noqa: S108
 
 Workload = Literal["saturation", "fixed_qps"]
+
+
+def fortio_client_job_name(node: str, workload: Workload, iteration: int) -> str:
+    """Return the RFC 1123 subdomain Job name for a fortio client run.
+
+    The ``fixed_qps`` workload literal contains an underscore, which the
+    Kubernetes API rejects in ``metadata.name``. The slug here normalises
+    underscores to hyphens so both this builder and the runner agree on
+    the same (valid) Job name.
+
+    Args:
+        node: Client node name; embedded verbatim.
+        workload: Workload literal; underscores are replaced with
+            hyphens before embedding.
+        iteration: Zero-based iteration index.
+
+    Returns:
+        A Job name that satisfies the RFC 1123 subdomain regex.
+    """
+    slug = workload.replace("_", "-")
+    return f"fortio-client-{node}-{slug}-i{iteration}"
 
 
 def build_fortio_client_yaml(  # noqa: PLR0913, PLR0917 - fortio load flag surface
@@ -43,8 +66,17 @@ def build_fortio_client_yaml(  # noqa: PLR0913, PLR0917 - fortio load flag surfa
     Returns:
         The fully rendered Job manifest as a multi-line YAML string.
     """
-    job_name = f"fortio-client-{node}-{workload}-i{iteration}"
-    args: list[str] = [
+    job_name = fortio_client_job_name(node, workload, iteration)
+    # Write the result document to a file and ``cat`` it back on stdout
+    # AFTER fortio exits. fortio's logger writes JSON-formatted records
+    # to stderr during the run; ``kubectl logs`` merges stdout and
+    # stderr line-by-line, so writing the result JSON to stdout would
+    # let those stderr log lines interleave inside the pretty-printed
+    # result document and break parsing. With this two-step shell
+    # wrapper, the result JSON arrives as one contiguous block at the
+    # end of the merged log.
+    fortio_argv: list[str] = [
+        "fortio",
         "load",
         "-qps",
         str(qps),
@@ -53,12 +85,15 @@ def build_fortio_client_yaml(  # noqa: PLR0913, PLR0917 - fortio load flag surfa
         "-t",
         f"{duration}s",
         "-json",
-        "-",
+        _FORTIO_RESULT_FILE,
     ]
     if extra_args:
-        args.extend(extra_args)
-    args.append(f"http://fortio-server-{target}:{_FORTIO_HTTP_PORT}/")
-    args_yaml = json.dumps(args)
+        fortio_argv.extend(extra_args)
+    fortio_argv.append(f"http://fortio-server-{target}:{_FORTIO_HTTP_PORT}/")
+    script = (
+        f"set -e ; {shlex.join(fortio_argv)} ; cat {shlex.quote(_FORTIO_RESULT_FILE)}"
+    )
+    args_yaml = json.dumps([script])
 
     return f"""apiVersion: batch/v1
 kind: Job
@@ -84,7 +119,7 @@ spec:
       containers:
         - name: fortio-client
           image: nicolaka/netshoot:v0.15
-          command: ["fortio"]
+          command: ["sh", "-c"]
           args: {args_yaml}
           resources:
             requests:

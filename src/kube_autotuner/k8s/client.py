@@ -591,10 +591,18 @@ class K8sClient:
             resp.release_conn()
 
     def _job_pod_name(self, job_name: str, namespace: str) -> str:
-        """Return the name of the first pod backing ``job_name``.
+        """Return the name of a pod backing ``job_name``.
 
         Tries the modern ``batch.kubernetes.io/job-name`` label first,
         falls back to the legacy ``job-name`` label.
+
+        With ``backoffLimit > 0`` a Job can spawn multiple pods (one per
+        retry); ``list_namespaced_pod`` makes no ordering guarantee,
+        so naively returning ``items[0]`` may hand back a Failed
+        attempt's logs even when the Job ultimately Succeeded. Prefer a
+        ``Succeeded`` pod when one is present so callers reading
+        results-bearing logs (e.g. the fortio runner) get the attempt
+        whose stdout actually contains the result document.
 
         Args:
             job_name: Job name.
@@ -613,8 +621,14 @@ class K8sClient:
                 )
             except ApiException:
                 continue
-            if listing.items:
-                return str(listing.items[0].metadata.name)
+            items = list(listing.items)
+            if not items:
+                continue
+            for pod in items:
+                phase = getattr(getattr(pod, "status", None), "phase", None)
+                if phase == "Succeeded":
+                    return str(pod.metadata.name)
+            return str(items[0].metadata.name)
         return ""
 
     # ---- metrics ------------------------------------------------------

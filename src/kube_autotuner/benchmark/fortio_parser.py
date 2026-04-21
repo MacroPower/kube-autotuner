@@ -3,14 +3,95 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+import json
 from typing import Any, Literal
 
 from kube_autotuner.models import LatencyResult
 
 _MS_PER_SECOND = 1000.0
 _PERCENTILE_MATCH_TOLERANCE = 1e-6
+_FORTIO_RESULT_MARKER = "DurationHistogram"
+_LOG_SNIPPET_HEAD = 400
+_LOG_SNIPPET_TAIL = 400
 
 Workload = Literal["saturation", "fixed_qps"]
+
+
+def extract_fortio_result_json(output: str) -> dict[str, Any]:
+    """Find the fortio results JSON document inside a noisy log stream.
+
+    ``kubectl logs`` merges container stdout and stderr, so any
+    non-result output (a startup banner, a structured log line, a
+    warning) can appear before or after fortio's pretty-printed
+    ``-json -`` document. A naive ``json.loads`` on the whole stream
+    then fails with ``Extra data`` once the parser eats the first valid
+    JSON value it encounters.
+
+    This helper walks every ``{`` in ``output``, attempts to parse a
+    JSON object starting at that position with
+    :class:`json.JSONDecoder`'s ``raw_decode``, and returns the first
+    object that carries the ``DurationHistogram`` key. That key
+    distinguishes a fortio ``HTTPRunnerResults`` document from any
+    incidental log object.
+
+    Args:
+        output: Raw container log body from a fortio client pod.
+
+    Returns:
+        The decoded results document.
+
+    Raises:
+        ValueError: When no JSON object containing ``DurationHistogram``
+            is found in ``output``.
+    """
+    decoder = json.JSONDecoder()
+    idx = 0
+    length = len(output)
+    while idx < length:
+        next_brace = output.find("{", idx)
+        if next_brace == -1:
+            break
+        try:
+            obj, end = decoder.raw_decode(output, next_brace)
+        except json.JSONDecodeError:
+            idx = next_brace + 1
+            continue
+        if isinstance(obj, dict) and _FORTIO_RESULT_MARKER in obj:
+            return obj
+        idx = end
+    raise ValueError(_no_result_message(output))
+
+
+def _no_result_message(output: str) -> str:
+    """Build the diagnostic error for a log stream missing the result JSON.
+
+    Includes the head and tail of the log so the operator can tell the
+    difference between an empty pod log (a failed first-attempt pod that
+    the Job logs path picked up), a fortio crash with only stderr text,
+    and a JSON document with the wrong shape.
+
+    Args:
+        output: The raw log body that was scanned.
+
+    Returns:
+        A multi-line error message.
+    """
+    length = len(output)
+    if length == 0:
+        snippet = "<empty log>"
+    elif length <= _LOG_SNIPPET_HEAD + _LOG_SNIPPET_TAIL:
+        snippet = output
+    else:
+        omitted = length - _LOG_SNIPPET_HEAD - _LOG_SNIPPET_TAIL
+        snippet = (
+            output[:_LOG_SNIPPET_HEAD]
+            + f"\n... [{omitted} bytes omitted] ...\n"
+            + output[-_LOG_SNIPPET_TAIL:]
+        )
+    return (
+        f"no fortio results JSON object (with {_FORTIO_RESULT_MARKER!r}) found "
+        f"in container log output (total {length} bytes); log snippet:\n{snippet}"
+    )
 
 
 def _percentile_value_ms(
