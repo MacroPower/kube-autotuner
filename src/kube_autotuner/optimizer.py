@@ -30,6 +30,7 @@ import logging
 import math
 import statistics
 from typing import TYPE_CHECKING
+import warnings
 
 from kube_autotuner.benchmark.runner import BenchmarkRunner
 from kube_autotuner.k8s.client import K8sClient
@@ -65,6 +66,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _OPTIMIZE_HINT = "install optimize group: uv sync --group optimize"
+
+# pyro.ops.stats has an unescaped \g in a docstring; silence on import.
+warnings.filterwarnings("ignore", category=SyntaxWarning, module=r"pyro\..*")
 
 
 def _require_ax_client() -> type[Client]:
