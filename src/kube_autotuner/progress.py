@@ -269,25 +269,40 @@ class NullObserver:
         """No-op."""
 
 
-class _IterEtaColumn(ProgressColumn):
+class _HistoryEtaColumn(ProgressColumn):
     """ETA column backed by an observer-owned duration history.
 
-    Rich's ``TimeRemainingColumn`` reads ``Task.speed``, whose sample
-    deque is cleared by ``Progress.reset()``. The iteration bar is
-    reset on every mode boundary to restore the per-mode ``x/N``
-    display, so those samples would vanish at every mode and trial
-    boundary. This column reads a ``(count, total_seconds)`` snapshot
-    supplied by a caller-provided callable, letting the history span
-    the entire run.
+    The same column powers two progress bars for two reasons that both
+    rule out Rich's stock ``TimeRemainingColumn`` (which reads
+    ``Task.speed``):
+
+    1. *Iteration bar.* ``Task.speed`` is backed by a sample deque that
+       ``Progress.reset()`` clears. The iteration bar used to be reset
+       on every mode boundary to restore the per-mode ``x/N`` display,
+       so those samples vanished at every mode and trial boundary even
+       after ``speed_estimate_period`` pruning was disabled.
+    2. *Trials bar.* ``Task.speed`` requires **at least two** progress
+       samples to produce a value (independent of pruning). With only
+       one ``advance=1`` call posted after the first completion, the
+       column would render ``-:--:--`` until the second trial finished
+       — roughly 19 minutes into a 9.5-min-per-trial run.
+
+    Both bars supply a ``(count, total_seconds)`` snapshot through a
+    caller-provided callable, letting the ETA be available after the
+    very first completion and span the entire run.
     """
 
-    def __init__(self, history: Callable[[], tuple[int, float]]) -> None:
-        """Bind the column to a ``(count, total_seconds)`` supplier.
+    def __init__(self, history: Callable[[], tuple[int, float, float]]) -> None:
+        """Bind the column to a ``(count, total_seconds, in_flight)`` supplier.
 
         Args:
             history: Zero-arg callable returning the observer's
-                cumulative iteration count and total observed duration
-                in seconds.
+                cumulative completed count, total observed duration in
+                seconds, and the elapsed time of the currently
+                in-flight unit (``0.0`` when no unit is active). The
+                in-flight component lets Rich's 8 Hz refresh tick the
+                ETA down second-by-second within a unit instead of
+                holding flat until the next completion.
         """
         super().__init__()
         self._history = history
@@ -304,11 +319,16 @@ class _IterEtaColumn(ProgressColumn):
         if task.total is None:
             return Text("-:--:--", style="progress.remaining")
         remaining = int(task.total) - int(task.completed)
-        count, total_seconds = self._history()
+        count, total_seconds, in_flight = self._history()
         if count == 0 or remaining <= 0:
             return Text("-:--:--", style="progress.remaining")
         mean = total_seconds / count
-        eta_seconds = int(remaining * mean)
+        # (remaining - 1) future units at the mean, plus whatever is
+        # left of the in-flight one. Floors at 0 when the in-flight
+        # unit has already exceeded the mean; parks the ETA on
+        # (remaining - 1) * mean until it completes and the mean
+        # recalculates.
+        eta_seconds = int((remaining - 1) * mean + max(0.0, mean - in_flight))
         minutes, seconds = divmod(eta_seconds, 60)
         hours, minutes = divmod(minutes, 60)
         return Text(
@@ -441,9 +461,14 @@ class RichProgressObserver:
         self._iter_start: float | None = None
         self._iter_count: int = 0
         self._iter_total_seconds: float = 0.0
-        self._trials: Progress = self._make_progress()
+        self._trial_start: float | None = None
+        self._trial_count: int = 0
+        self._trial_total_seconds: float = 0.0
+        self._trials: Progress = self._make_progress(
+            eta_column=_HistoryEtaColumn(self._trial_history),
+        )
         self._iters: Progress = self._make_progress(
-            eta_column=_IterEtaColumn(self._iter_history),
+            eta_column=_HistoryEtaColumn(self._iter_history),
         )
         self._trial_task_id: TaskID | None = None
         self._iter_task_id: TaskID | None = None
@@ -454,17 +479,40 @@ class RichProgressObserver:
         self._live: Live | None = None
         self._echo: _TtyEchoSuppressor | None = None
 
-    def _iter_history(self) -> tuple[int, float]:
+    def _iter_history(self) -> tuple[int, float, float]:
         """Return the observer's cumulative iteration history.
 
         Returns:
-            A ``(count, total_seconds)`` snapshot aggregated across
-            every completed iteration since the observer was
-            constructed. The custom ETA column reads from this method
-            so its samples survive ``Progress.reset()`` at mode and
-            trial boundaries.
+            A ``(count, total_seconds, in_flight_seconds)`` snapshot
+            aggregated across every completed iteration since the
+            observer was constructed. ``in_flight_seconds`` is the
+            elapsed time of the currently running iteration (``0.0``
+            when none is active), so the ETA column can tick the
+            estimate down every refresh.
         """
-        return (self._iter_count, self._iter_total_seconds)
+        in_flight = (
+            time.monotonic() - self._iter_start if self._iter_start is not None else 0.0
+        )
+        return (self._iter_count, self._iter_total_seconds, in_flight)
+
+    def _trial_history(self) -> tuple[int, float, float]:
+        """Return the observer's cumulative trial history.
+
+        Returns:
+            A ``(count, total_seconds, in_flight_seconds)`` snapshot
+            aggregated across every completed or failed trial since
+            the observer was constructed. ``in_flight_seconds`` is the
+            elapsed time of the currently running trial (``0.0`` when
+            between trials). Failed trials contribute because they
+            still consumed wall time; omitting them would
+            under-estimate the ETA on runs with failures.
+        """
+        in_flight = (
+            time.monotonic() - self._trial_start
+            if self._trial_start is not None
+            else 0.0
+        )
+        return (self._trial_count, self._trial_total_seconds, in_flight)
 
     @staticmethod
     def _make_progress(eta_column: ProgressColumn | None = None) -> Progress:
@@ -472,10 +520,10 @@ class RichProgressObserver:
 
         Args:
             eta_column: Optional replacement for the default
-                :class:`TimeRemainingColumn`. The iteration bar swaps
-                in :class:`_IterEtaColumn` so its ETA survives the
-                per-mode ``reset()`` that would otherwise clear
-                Rich's task-local speed samples.
+                :class:`TimeRemainingColumn`. Both the trials bar and
+                iteration bar supply a :class:`_HistoryEtaColumn` so
+                the ETA is available after the first completion and
+                survives per-mode resets.
 
         Returns:
             A fresh :class:`Progress` composed of the bar, M-of-N, and
@@ -493,12 +541,6 @@ class RichProgressObserver:
             TextColumn("[dim]eta[/dim]"),
             eta,
             expand=True,
-            # Rich's default 30s speed window is shorter than a single
-            # trial or iperf iteration, so samples age out before the
-            # next completion lands and ETA collapses to "-:--:--".
-            # Disable pruning so Task.speed averages across all samples
-            # since task start.
-            speed_estimate_period=float("inf"),
         )
 
     def _render(self) -> Group:
@@ -616,6 +658,7 @@ class RichProgressObserver:
                 description=description,
                 total=total,
             )
+        self._trial_start = time.monotonic()
         self._refresh()
 
     def on_trial_complete(
@@ -625,6 +668,10 @@ class RichProgressObserver:
         metrics: Mapping[str, tuple[float, float]],
     ) -> None:
         """Advance the trials bar and fold the result into the top-N table."""
+        if self._trial_start is not None:
+            self._trial_total_seconds += time.monotonic() - self._trial_start
+            self._trial_count += 1
+            self._trial_start = None
         if self._trial_task_id is not None:
             self._trials.update(self._trial_task_id, advance=1)
         tp_pair = metrics.get("throughput")
@@ -655,6 +702,10 @@ class RichProgressObserver:
         exc: BaseException,  # noqa: ARG002
     ) -> None:
         """Advance the trials bar without adding a row to the results table."""
+        if self._trial_start is not None:
+            self._trial_total_seconds += time.monotonic() - self._trial_start
+            self._trial_count += 1
+            self._trial_start = None
         if self._trial_task_id is not None:
             self._trials.update(self._trial_task_id, advance=1)
         self._refresh()

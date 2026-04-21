@@ -19,7 +19,7 @@ from kube_autotuner.progress import (
     make_observer,
 )
 
-_IterEtaColumn = progress_module._IterEtaColumn
+_HistoryEtaColumn = progress_module._HistoryEtaColumn
 
 _TtyEchoSuppressor = progress_module._TtyEchoSuppressor
 
@@ -158,11 +158,9 @@ def test_rich_observer_trial_eta_survives_long_gaps_between_completions(
 ) -> None:
     """Trials spaced farther apart than Rich's default 30s window still yield an ETA.
 
-    Rich's default ``speed_estimate_period`` of 30s prunes samples older
-    than that on every ``update()``. With trials taking minutes, only
-    one sample survives the window and ``Task.speed`` is ``None``. The
-    observer overrides that by setting ``speed_estimate_period`` on the
-    trials ``Progress``.
+    History-backed ETA is driven by observer-owned timestamps rather
+    than Rich's task-local sample deque, so gaps longer than Rich's
+    default 30s ``speed_estimate_period`` cannot prune the signal.
     """
     console = _capture_console()
     observer = RichProgressObserver(console)
@@ -173,23 +171,33 @@ def test_rich_observer_trial_eta_survives_long_gaps_between_completions(
 
     monkeypatch.setattr(observer._trials, "get_time", _fake)
     monkeypatch.setattr(observer._iters, "get_time", _fake)
+    monkeypatch.setattr(progress_module.time, "monotonic", _fake)
     with observer:
         observer.on_trial_start(0, 5, "sobol", {})
         clock["t"] += 120.0
         observer.on_trial_complete(0, "sobol", {"throughput": (1e9, 0.0)})
         clock["t"] += 120.0  # >> 30s default speed window
+        observer.on_trial_start(1, 5, "sobol", {})
+        clock["t"] += 120.0
         observer.on_trial_complete(1, "sobol", {"throughput": (1e9, 0.0)})
-        trial_task = observer._trials.tasks[0]
-        assert trial_task.speed is not None
-        assert trial_task.time_remaining is not None
-        assert trial_task.time_remaining > 0
+        column = _find_trials_eta_column(observer)
+        rendered = column.render(observer._trials.tasks[0]).plain
+        assert rendered != "-:--:--"
 
 
-def _find_iter_eta_column(observer: RichProgressObserver) -> _IterEtaColumn:
+def _find_iter_eta_column(observer: RichProgressObserver) -> _HistoryEtaColumn:
     for column in observer._iters.columns:
-        if isinstance(column, _IterEtaColumn):
+        if isinstance(column, _HistoryEtaColumn):
             return column
-    msg = "observer._iters is missing an _IterEtaColumn"
+    msg = "observer._iters is missing a _HistoryEtaColumn"
+    raise AssertionError(msg)
+
+
+def _find_trials_eta_column(observer: RichProgressObserver) -> _HistoryEtaColumn:
+    for column in observer._trials.columns:
+        if isinstance(column, _HistoryEtaColumn):
+            return column
+    msg = "observer._trials is missing a _HistoryEtaColumn"
     raise AssertionError(msg)
 
 
@@ -232,11 +240,101 @@ def test_rich_observer_iteration_eta_survives_mode_change(
 
 def test_iter_eta_column_renders_dashes_without_history() -> None:
     """The column falls back to ``-:--:--`` when the history is empty."""
-    column = _IterEtaColumn(lambda: (0, 0.0))
+    column = _HistoryEtaColumn(lambda: (0, 0.0, 0.0))
     progress = Progress(column)
     progress.add_task("x", total=3, completed=0)
     rendered = column.render(progress.tasks[0])
     assert rendered.plain == "-:--:--"
+
+
+def test_rich_observer_trial_eta_ticks_down_mid_trial(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """In-flight trial elapsed reduces the ETA every refresh, not just on completion."""
+    console = _capture_console()
+    observer = RichProgressObserver(console)
+    clock = {"t": 0.0}
+
+    def _fake() -> float:
+        return clock["t"]
+
+    monkeypatch.setattr(observer._trials, "get_time", _fake)
+    monkeypatch.setattr(observer._iters, "get_time", _fake)
+    monkeypatch.setattr(progress_module.time, "monotonic", _fake)
+    with observer:
+        observer.on_trial_start(0, 3, "sobol", {})
+        clock["t"] += 120.0
+        observer.on_trial_complete(0, "sobol", {"throughput": (1e9, 0.0)})
+        observer.on_trial_start(1, 3, "sobol", {})
+        column = _find_trials_eta_column(observer)
+        task = observer._trials.tasks[0]
+        # Trial 1 just started: 2 remaining * 120s mean = 0:04:00.
+        assert column.render(task).plain == "0:04:00"
+        clock["t"] += 30.0
+        # 30s in: 1*120 + max(0, 120-30) = 210s = 0:03:30.
+        assert column.render(task).plain == "0:03:30"
+        clock["t"] += 60.0
+        # 90s in: 1*120 + max(0, 120-90) = 150s = 0:02:30.
+        assert column.render(task).plain == "0:02:30"
+        clock["t"] += 60.0
+        # 150s in (over mean): floors at 1*120 = 0:02:00.
+        assert column.render(task).plain == "0:02:00"
+
+
+def test_rich_observer_trial_eta_available_after_first_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Trials-bar ETA is concrete after a single completion.
+
+    Rich's ``TimeRemainingColumn`` requires two samples to compute
+    ``Task.speed``. The history-backed column reads observer-owned
+    timestamps, so one completed trial is enough.
+    """
+    console = _capture_console()
+    observer = RichProgressObserver(console)
+    clock = {"t": 0.0}
+
+    def _fake() -> float:
+        return clock["t"]
+
+    monkeypatch.setattr(observer._trials, "get_time", _fake)
+    monkeypatch.setattr(observer._iters, "get_time", _fake)
+    monkeypatch.setattr(progress_module.time, "monotonic", _fake)
+    with observer:
+        observer.on_trial_start(0, 5, "sobol", {})
+        clock["t"] += 120.0
+        observer.on_trial_complete(0, "sobol", {"throughput": (1e9, 0.0)})
+        column = _find_trials_eta_column(observer)
+        # 4 remaining trials * 120s mean = 0:08:00.
+        assert column.render(observer._trials.tasks[0]).plain == "0:08:00"
+
+
+def test_rich_observer_trial_eta_counts_failed_trials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failed trials contribute wall time to the trial ETA mean."""
+    console = _capture_console()
+    observer = RichProgressObserver(console)
+    clock = {"t": 0.0}
+
+    def _fake() -> float:
+        return clock["t"]
+
+    monkeypatch.setattr(observer._trials, "get_time", _fake)
+    monkeypatch.setattr(observer._iters, "get_time", _fake)
+    monkeypatch.setattr(progress_module.time, "monotonic", _fake)
+    with observer:
+        observer.on_trial_start(0, 5, "sobol", {})
+        clock["t"] += 60.0
+        observer.on_trial_failed(0, RuntimeError("x"))
+        observer.on_trial_start(1, 5, "sobol", {})
+        clock["t"] += 120.0
+        observer.on_trial_complete(1, "sobol", {"throughput": (1e9, 0.0)})
+        assert observer._trial_count == 2
+        assert observer._trial_total_seconds == pytest.approx(180.0)
+        column = _find_trials_eta_column(observer)
+        # 3 remaining * 90s mean = 0:04:30.
+        assert column.render(observer._trials.tasks[0]).plain == "0:04:30"
 
 
 def test_rich_observer_iteration_history_survives_across_trials(
