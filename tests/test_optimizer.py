@@ -509,6 +509,10 @@ class TestBuildAxObjective:
             "node_memory <= 1e10",
             "rps >= 100",
             "latency_p99 <= 1000",
+            "jitter <= 10",
+            "cni_memory <= 1e9",
+            "latency_p50 <= 100",
+            "latency_p90 <= 500",
         ]
 
     def test_reduced_two_metric_section(self) -> None:
@@ -1021,3 +1025,205 @@ class TestComputeMetricsTcpFilter:
         # With 2 TCP samples (single iteration), SEM must be non-zero
         # and computed over TCP samples only (not mixed with UDP).
         assert metrics["throughput"][1] > 0.0
+
+
+class TestWarnOnCollapsedObjectives:
+    """``_warn_on_collapsed_objectives`` flags zero-variance Pareto metrics."""
+
+    @pytest.fixture
+    def node_pair(self) -> NodePair:
+        return NodePair(
+            source="a",
+            target="b",
+            hardware_class="10g",
+            namespace="default",
+        )
+
+    @pytest.fixture
+    def config(self) -> BenchmarkConfig:
+        return BenchmarkConfig(duration=10, iterations=3)
+
+    @staticmethod
+    def _trial(bps: float, retransmits: int = 5) -> TrialResult:
+        return TrialResult(
+            node_pair=NodePair(source="a", target="b", hardware_class="10g"),
+            sysctl_values={"net.core.rmem_max": 1048576},
+            config=BenchmarkConfig(),
+            results=[
+                BenchmarkResult(
+                    timestamp=datetime.now(UTC),
+                    mode="tcp",
+                    bits_per_second=bps,
+                    retransmits=retransmits,
+                    bytes_sent=1_000_000_000,
+                    cpu_utilization_percent=10.0,
+                    iteration=0,
+                ),
+            ],
+        )
+
+    @staticmethod
+    def _reduced_objectives() -> ObjectivesSection:
+        """Two-metric Pareto set that matches the synthetic fixtures' signal.
+
+        The ``_trial`` fixture only varies ``throughput`` and
+        ``retransmit_rate``; every other metric is constant or unset. A
+        reduced Pareto set keeps the tests from tripping the helper on
+        unrelated collapsed axes.
+
+        Returns:
+            An :class:`ObjectivesSection` whose Pareto set contains only
+            ``throughput`` and ``retransmit_rate``.
+        """
+        return ObjectivesSection(
+            pareto=[
+                ParetoObjective(metric="throughput", direction="maximize"),
+                ParetoObjective(metric="retransmit_rate", direction="minimize"),
+            ],
+            constraints=["throughput >= 1e6"],
+            recommendation_weights={"retransmit_rate": 0.5},
+        )
+
+    @patch("kube_autotuner.optimizer.BenchmarkRunner")
+    @patch("kube_autotuner.optimizer.make_sysctl_setter_from_env")
+    @patch("kube_autotuner.optimizer._require_ax_client")
+    def test_detects_collapsed_metric_and_dedups(
+        self,
+        mock_require_client,
+        mock_setter_cls,  # noqa: ARG002
+        mock_runner_cls,  # noqa: ARG002
+        node_pair,
+        config,
+        tmp_path,
+        caplog,
+    ):
+        fake_client = MagicMock()
+        fake_client.attach_trial.side_effect = [1, 2, 3, 4]
+        mock_require_client.return_value = lambda: fake_client
+
+        # Four trials with varying throughput but identical retransmit
+        # counts AND identical bytes_sent => retransmit_rate is constant
+        # across trials, throughput is not.
+        priors = [
+            self._trial(bps=8e9, retransmits=5),
+            self._trial(bps=9e9, retransmits=5),
+            self._trial(bps=9.5e9, retransmits=5),
+            self._trial(bps=8.5e9, retransmits=5),
+        ]
+
+        from kube_autotuner.optimizer import OptimizationLoop  # noqa: PLC0415
+
+        loop = OptimizationLoop(
+            node_pair=node_pair,
+            config=config,
+            param_space=PARAM_SPACE,
+            output=tmp_path / "r.jsonl",
+            n_trials=10,
+            n_sobol=1,
+            objectives=self._reduced_objectives(),
+            prior_trials=priors,
+        )
+
+        caplog.set_level("WARNING", logger="kube_autotuner.optimizer")
+        warned = loop._warn_on_collapsed_objectives()
+
+        assert warned == ["retransmit_rate"]
+        collapse_records = [
+            rec
+            for rec in caplog.records
+            if "collapsed to near-constant variance" in rec.message
+        ]
+        assert len(collapse_records) == 1
+        assert "retransmit_rate" in collapse_records[0].message
+
+        caplog.clear()
+        warned_again = loop._warn_on_collapsed_objectives()
+        assert warned_again == []
+        assert not [
+            rec
+            for rec in caplog.records
+            if "collapsed to near-constant variance" in rec.message
+        ]
+
+    @patch("kube_autotuner.optimizer.BenchmarkRunner")
+    @patch("kube_autotuner.optimizer.make_sysctl_setter_from_env")
+    @patch("kube_autotuner.optimizer._require_ax_client")
+    def test_no_warning_when_variance_healthy(
+        self,
+        mock_require_client,
+        mock_setter_cls,  # noqa: ARG002
+        mock_runner_cls,  # noqa: ARG002
+        node_pair,
+        config,
+        tmp_path,
+        caplog,
+    ):
+        fake_client = MagicMock()
+        fake_client.attach_trial.side_effect = [1, 2, 3]
+        mock_require_client.return_value = lambda: fake_client
+
+        priors = [
+            self._trial(bps=8e9, retransmits=3),
+            self._trial(bps=9e9, retransmits=5),
+            self._trial(bps=9.5e9, retransmits=7),
+        ]
+
+        from kube_autotuner.optimizer import OptimizationLoop  # noqa: PLC0415
+
+        loop = OptimizationLoop(
+            node_pair=node_pair,
+            config=config,
+            param_space=PARAM_SPACE,
+            output=tmp_path / "r.jsonl",
+            n_trials=10,
+            n_sobol=1,
+            objectives=self._reduced_objectives(),
+            prior_trials=priors,
+        )
+
+        caplog.set_level("WARNING", logger="kube_autotuner.optimizer")
+        warned = loop._warn_on_collapsed_objectives()
+        assert warned == []
+
+
+class TestUpstreamNoiseFilters:
+    """``_register_noise_filters`` registers the four expected entries."""
+
+    def test_filter_entries_registered(self) -> None:
+        import warnings  # noqa: PLC0415
+
+        from kube_autotuner.optimizer import (  # noqa: PLC0415
+            _register_noise_filters,  # noqa: PLC2701
+        )
+
+        def _pat(obj) -> str | None:
+            if obj is None:
+                return None
+            pat = getattr(obj, "pattern", obj)
+            return pat or None
+
+        def _canonical(filt: tuple) -> tuple:
+            action, msg, cat, mod, lineno = filt
+            return (action, _pat(msg), cat, _pat(mod), lineno)
+
+        # ``catch_warnings`` saves and restores ``warnings.filters`` so
+        # re-registering here does not pollute other tests.
+        with warnings.catch_warnings():
+            warnings.resetwarnings()
+            _register_noise_filters()
+            canonical = [_canonical(f) for f in warnings.filters]
+
+        expected = [
+            ("ignore", None, SyntaxWarning, r"pyro\..*", 0),
+            (
+                "ignore",
+                r"To copy construct from a tensor.*",
+                UserWarning,
+                None,
+                0,
+            ),
+            ("ignore", None, Warning, r"botorch($|\.)", 0),
+            ("ignore", None, RuntimeWarning, r"gpytorch($|\.)", 0),
+        ]
+        for entry in expected:
+            assert entry in canonical, (entry, canonical)

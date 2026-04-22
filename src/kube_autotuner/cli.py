@@ -174,6 +174,21 @@ def main(
             format="%(levelname)s: %(message)s",
             force=True,
         )
+    if not verbose:
+        # ``ax.api.client`` emits two INFO lines per Bayesian step
+        # (``Generated new trial...`` and ``Trial N marked COMPLETED``)
+        # that duplicate the kube-autotuner-owned per-trial summary.
+        # Narrow to this child logger so future INFOs from other ax
+        # submodules still surface if anyone wires a handler at that
+        # level.
+        logging.getLogger("ax.api.client").setLevel(logging.WARNING)
+        # ``standardize_y`` logs "Outcome X is constant, within
+        # tolerance." once per Bayesian generate when a metric has
+        # collapsed. ``OptimizationLoop`` emits one actionable warning
+        # for the same condition, so suppress the upstream duplicate.
+        logging.getLogger("ax.adapter.transforms.standardize_y").setLevel(
+            logging.ERROR,
+        )
 
 
 # --- helpers ------------------------------------------------------------

@@ -67,8 +67,55 @@ logger = logging.getLogger(__name__)
 
 _OPTIMIZE_HINT = "install optimize group: uv sync --group optimize"
 
-# pyro.ops.stats has an unescaped \g in a docstring; silence on import.
-warnings.filterwarnings("ignore", category=SyntaxWarning, module=r"pyro\..*")
+
+def _register_noise_filters() -> None:
+    """Register ``warnings.filterwarnings`` entries for upstream noise.
+
+    Called once at module import. Exposed as a standalone function so
+    tests can re-register filters after pytest swaps
+    :data:`warnings.filters` between tests.
+    """
+    # pyro.ops.stats has an unescaped ``\g`` in a docstring.
+    warnings.filterwarnings(
+        "ignore",
+        category=SyntaxWarning,
+        module=r"pyro\..*",
+    )
+    # torch's "To copy construct from a tensor..." UserWarning is
+    # reissued on every Bayesian generate because
+    # ``ax.generators.torch.botorch_moo_utils`` calls
+    # ``torch.tensor(sourceTensor)``. The warning is emitted inside
+    # torch internals, so a ``module=`` regex on ``ax\..*`` would not
+    # match (the filter is compared against the frame that called
+    # ``warnings.warn``, which is torch's). Match on message instead.
+    warnings.filterwarnings(
+        "ignore",
+        category=UserWarning,
+        message=r"To copy construct from a tensor.*",
+    )
+    # botorch ``InputDataWarning`` fires once per generate when any
+    # outcome has near-zero std (typically because a Pareto metric has
+    # collapsed; the ``_warn_on_collapsed_objectives`` helper surfaces
+    # that as one kube-autotuner-owned warning instead).
+    # ``BotorchWarning`` inherits from ``Warning`` directly (not
+    # ``UserWarning``), so the category must be ``Warning``.
+    warnings.filterwarnings(
+        "ignore",
+        category=Warning,
+        module=r"botorch($|\.)",
+    )
+    # gpytorch ``NumericalWarning``: MLE noise parameter collapses to
+    # ~0 during GP fit and is rounded up to 1e-6 for Cholesky
+    # stability. Benign at our sample sizes. ``NumericalWarning``
+    # subclasses ``RuntimeWarning``.
+    warnings.filterwarnings(
+        "ignore",
+        category=RuntimeWarning,
+        module=r"gpytorch($|\.)",
+    )
+
+
+_register_noise_filters()
 
 
 def _require_ax_client() -> type[Client]:
@@ -556,6 +603,8 @@ class OptimizationLoop:
         )
         self._completed: list[TrialResult] = []
         self.prior_count: int = len(prior_trials or [])
+        self._first_bayesian_generate: bool = True
+        self._collapse_warned: set[str] = set()
         self._seed_prior_trials(prior_trials or [])
 
     def _seed_prior_trials(self, prior: list[TrialResult]) -> None:
@@ -774,6 +823,66 @@ class OptimizationLoop:
         )
         self.observer.on_trial_complete(self.prior_count + i, phase, metrics)
 
+    def _warn_on_collapsed_objectives(self) -> list[str]:
+        """Warn once per Pareto objective whose observed variance has collapsed.
+
+        Ax cannot learn a gradient on a metric whose observed std is
+        effectively zero; upstream responds with a cascade of
+        ``standardize_y`` WARNINGs and botorch ``InputDataWarning``
+        lines on every Bayesian generate. This helper surfaces one
+        actionable kube-autotuner warning instead, pointing the user
+        at ``objectives.pareto`` and ``objectives.recommendationWeights``.
+
+        The check iterates ``objectives.pareto`` metric names only;
+        constraint-only metrics are expected to be bounded and a
+        zero-variance constraint is not noteworthy. A metric is
+        "collapsed" when its sample std across ``self._completed`` is
+        below ``1e-12`` (absolute floor for near-zero means) or below
+        ``1e-9 * abs(mean)`` (relative floor otherwise). Fires once per
+        metric per :class:`OptimizationLoop` instance via
+        :attr:`_collapse_warned`.
+
+        Returns:
+            The metric names that triggered a warning on this call
+            (may be empty). Exposed primarily for tests; callers in
+            :meth:`run` discard it.
+        """
+        if len(self._completed) < 2:  # noqa: PLR2004 - stdev needs >= 2
+            return []
+        abs_floor = 1e-12
+        rel_floor = 1e-9
+        pareto_metrics = [obj.metric for obj in self.objectives.pareto]
+        per_trial_metrics = [_compute_metrics(tr) for tr in self._completed]
+        newly_warned: list[str] = []
+        for name in pareto_metrics:
+            if name in self._collapse_warned:
+                continue
+            vals = [
+                m[name][0]
+                for m in per_trial_metrics
+                if name in m and not math.isnan(m[name][0])
+            ]
+            if len(vals) < 2:  # noqa: PLR2004 - stdev needs >= 2
+                continue
+            std = statistics.stdev(vals)
+            mean = statistics.mean(vals)
+            threshold = max(abs_floor, rel_floor * abs(mean))
+            if std < threshold:
+                logger.warning(
+                    "Objective %r has collapsed to near-constant variance "
+                    "(std=%.2e, n=%d). Ax cannot learn a gradient on this "
+                    "metric; consider removing it from `objectives.pareto` "
+                    "AND `objectives.recommendationWeights`. It will still "
+                    "act as a feasibility gate via any matching entry in "
+                    "`objectives.constraints`.",
+                    name,
+                    std,
+                    len(vals),
+                )
+                self._collapse_warned.add(name)
+                newly_warned.append(name)
+        return newly_warned
+
     def run(self) -> list[TrialResult]:
         """Execute the full optimization loop.
 
@@ -793,6 +902,9 @@ class OptimizationLoop:
             i = 0
             while not self._should_stop(i):
                 trial_index, parameterization, phase = self._suggest(i)
+                if phase == "bayesian" and self._first_bayesian_generate:
+                    self._warn_on_collapsed_objectives()
+                    self._first_bayesian_generate = False
                 self.observer.on_trial_start(
                     self.prior_count + i,
                     self.n_trials,

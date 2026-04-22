@@ -361,6 +361,18 @@ _DEFAULT_CONSTRAINTS: list[str] = [
     "rps >= 100",
     # milliseconds; from the fixed_qps sub-stage only.
     "latency_p99 <= 1000",
+    # Explicit thresholds for every remaining Pareto objective. Ax's
+    # string parser auto-converts these into ObjectiveThresholds, which
+    # silences the per-generate ``AxOptimizationWarning: Encountered a
+    # MultiObjective without objective thresholds`` from
+    # ``ax.adapter.transforms.winsorize``. Values are loose caps chosen
+    # to stay close to observed ranges so hypervolume geometry remains
+    # informative; final recommendation ranking runs through
+    # ``score_rows`` min-max normalization, not Ax's hypervolume.
+    "jitter <= 10",
+    "cni_memory <= 1e9",
+    "latency_p50 <= 100",
+    "latency_p90 <= 500",
 ]
 
 _DEFAULT_WEIGHTS: dict[str, float] = {
