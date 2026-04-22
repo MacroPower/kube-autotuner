@@ -744,10 +744,12 @@ class RichProgressObserver:
         echo = _TtyEchoSuppressor()
         echo.__enter__()
         try:
+            # Rely on Rich's default refresh cadence (4 Hz); higher rates
+            # strobe on backgrounded macOS terminals whose paint loop is
+            # throttled below our write cadence.
             live = Live(
                 self._render(),
                 console=self._console,
-                refresh_per_second=8,
                 transient=False,
             )
             live.__enter__()
