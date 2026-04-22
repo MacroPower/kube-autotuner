@@ -297,8 +297,7 @@ def test_rich_observer_trial_eta_survives_long_gaps_between_completions(
     def _fake() -> float:
         return clock["t"]
 
-    monkeypatch.setattr(observer._trials, "get_time", _fake)
-    monkeypatch.setattr(observer._iters, "get_time", _fake)
+    monkeypatch.setattr(observer._progress, "get_time", _fake)
     monkeypatch.setattr(progress_module.time, "monotonic", _fake)
     with observer:
         observer.on_trial_start(0, 5, "sobol", {})
@@ -308,25 +307,22 @@ def test_rich_observer_trial_eta_survives_long_gaps_between_completions(
         observer.on_trial_start(1, 5, "sobol", {})
         clock["t"] += 120.0
         observer.on_trial_complete(1, _stub_trial("sobol"), {"throughput": (1e9, 0.0)})
-        column = _find_trials_eta_column(observer)
-        rendered = column.render(observer._trials.tasks[0]).plain
+        column = _find_eta_column(observer)
+        rendered = column.render(_task_for(observer, observer._trial_task_id)).plain
         assert rendered != "-:--:--"
 
 
-def _find_iter_eta_column(observer: RichProgressObserver) -> _HistoryEtaColumn:
-    for column in observer._iters.columns:
+def _find_eta_column(observer: RichProgressObserver) -> _HistoryEtaColumn:
+    for column in observer._progress.columns:
         if isinstance(column, _HistoryEtaColumn):
             return column
-    msg = "observer._iters is missing a _HistoryEtaColumn"
+    msg = "observer._progress is missing a _HistoryEtaColumn"
     raise AssertionError(msg)
 
 
-def _find_trials_eta_column(observer: RichProgressObserver) -> _HistoryEtaColumn:
-    for column in observer._trials.columns:
-        if isinstance(column, _HistoryEtaColumn):
-            return column
-    msg = "observer._trials is missing a _HistoryEtaColumn"
-    raise AssertionError(msg)
+def _task_for(observer: RichProgressObserver, task_id: object) -> Any:
+    """Return the Rich task in ``observer._progress`` with ``task_id``."""
+    return next(t for t in observer._progress.tasks if t.id == task_id)
 
 
 def test_rich_observer_iteration_eta_survives_stage_transitions(
@@ -340,8 +336,7 @@ def test_rich_observer_iteration_eta_survives_stage_transitions(
     def _fake() -> float:
         return clock["t"]
 
-    monkeypatch.setattr(observer._trials, "get_time", _fake)
-    monkeypatch.setattr(observer._iters, "get_time", _fake)
+    monkeypatch.setattr(observer._progress, "get_time", _fake)
     monkeypatch.setattr(progress_module.time, "monotonic", _fake)
     with observer:
         observer.on_benchmark_start(6)
@@ -353,20 +348,21 @@ def test_rich_observer_iteration_eta_survives_stage_transitions(
         observer.on_iteration_end(1)
         assert observer._iter_count == 2
         assert observer._iter_total_seconds == pytest.approx(120.0)
-        column = _find_iter_eta_column(observer)
+        column = _find_eta_column(observer)
+        iter_task = _task_for(observer, observer._iter_task_id)
         # Mid-trial: 4 iterations remaining * 60s mean = 0:04:00.
-        assert column.render(observer._iters.tasks[0]).plain == "0:04:00"
+        assert column.render(iter_task).plain == "0:04:00"
         clock["t"] += 60.0
         # Advance into a stage transition without completing an iteration.
         observer.on_stage_start("bw-udp", 2)
         assert observer._iter_count == 2
         # History preserved; still 4 remaining * 60s mean = 0:04:00.
-        assert column.render(observer._iters.tasks[0]).plain == "0:04:00"
+        assert column.render(iter_task).plain == "0:04:00"
 
 
 def test_iter_eta_column_renders_dashes_without_history() -> None:
     """The column falls back to ``-:--:--`` when the history is empty."""
-    column = _HistoryEtaColumn(lambda: (0, 0.0, 0.0))
+    column = _HistoryEtaColumn(lambda _task_id: (0, 0.0, 0.0))
     progress = Progress(column)
     progress.add_task("x", total=3, completed=0)
     rendered = column.render(progress.tasks[0])
@@ -384,16 +380,15 @@ def test_rich_observer_trial_eta_ticks_down_mid_trial(
     def _fake() -> float:
         return clock["t"]
 
-    monkeypatch.setattr(observer._trials, "get_time", _fake)
-    monkeypatch.setattr(observer._iters, "get_time", _fake)
+    monkeypatch.setattr(observer._progress, "get_time", _fake)
     monkeypatch.setattr(progress_module.time, "monotonic", _fake)
     with observer:
         observer.on_trial_start(0, 3, "sobol", {})
         clock["t"] += 120.0
         observer.on_trial_complete(0, _stub_trial("sobol"), {"throughput": (1e9, 0.0)})
         observer.on_trial_start(1, 3, "sobol", {})
-        column = _find_trials_eta_column(observer)
-        task = observer._trials.tasks[0]
+        column = _find_eta_column(observer)
+        task = _task_for(observer, observer._trial_task_id)
         # Trial 1 just started: 2 remaining * 120s mean = 0:04:00.
         assert column.render(task).plain == "0:04:00"
         clock["t"] += 30.0
@@ -423,16 +418,16 @@ def test_rich_observer_trial_eta_available_after_first_completion(
     def _fake() -> float:
         return clock["t"]
 
-    monkeypatch.setattr(observer._trials, "get_time", _fake)
-    monkeypatch.setattr(observer._iters, "get_time", _fake)
+    monkeypatch.setattr(observer._progress, "get_time", _fake)
     monkeypatch.setattr(progress_module.time, "monotonic", _fake)
     with observer:
         observer.on_trial_start(0, 5, "sobol", {})
         clock["t"] += 120.0
         observer.on_trial_complete(0, _stub_trial("sobol"), {"throughput": (1e9, 0.0)})
-        column = _find_trials_eta_column(observer)
+        column = _find_eta_column(observer)
+        trial_task = _task_for(observer, observer._trial_task_id)
         # 4 remaining trials * 120s mean = 0:08:00.
-        assert column.render(observer._trials.tasks[0]).plain == "0:08:00"
+        assert column.render(trial_task).plain == "0:08:00"
 
 
 def test_rich_observer_trial_eta_counts_failed_trials(
@@ -446,8 +441,7 @@ def test_rich_observer_trial_eta_counts_failed_trials(
     def _fake() -> float:
         return clock["t"]
 
-    monkeypatch.setattr(observer._trials, "get_time", _fake)
-    monkeypatch.setattr(observer._iters, "get_time", _fake)
+    monkeypatch.setattr(observer._progress, "get_time", _fake)
     monkeypatch.setattr(progress_module.time, "monotonic", _fake)
     with observer:
         observer.on_trial_start(0, 5, "sobol", {})
@@ -458,9 +452,10 @@ def test_rich_observer_trial_eta_counts_failed_trials(
         observer.on_trial_complete(1, _stub_trial("sobol"), {"throughput": (1e9, 0.0)})
         assert observer._trial_count == 2
         assert observer._trial_total_seconds == pytest.approx(180.0)
-        column = _find_trials_eta_column(observer)
+        column = _find_eta_column(observer)
+        trial_task = _task_for(observer, observer._trial_task_id)
         # 3 remaining * 90s mean = 0:04:30.
-        assert column.render(observer._trials.tasks[0]).plain == "0:04:30"
+        assert column.render(trial_task).plain == "0:04:30"
 
 
 def test_rich_observer_iteration_history_survives_across_trials(
@@ -474,8 +469,7 @@ def test_rich_observer_iteration_history_survives_across_trials(
     def _fake() -> float:
         return clock["t"]
 
-    monkeypatch.setattr(observer._trials, "get_time", _fake)
-    monkeypatch.setattr(observer._iters, "get_time", _fake)
+    monkeypatch.setattr(observer._progress, "get_time", _fake)
     monkeypatch.setattr(progress_module.time, "monotonic", _fake)
 
     def _do_iter(iteration: int, duration: float) -> None:
@@ -492,9 +486,10 @@ def test_rich_observer_iteration_history_survives_across_trials(
         observer.on_benchmark_start(3)
         assert observer._iter_count == 4
         assert observer._iter_total_seconds == pytest.approx(120.0)
-        column = _find_iter_eta_column(observer)
+        column = _find_eta_column(observer)
+        iter_task = _task_for(observer, observer._iter_task_id)
         # Fresh trial-2 bar: 3 remaining * 30s mean = 0:01:30.
-        assert column.render(observer._iters.tasks[0]).plain == "0:01:30"
+        assert column.render(iter_task).plain == "0:01:30"
 
 
 def test_rich_observer_aborted_iteration_does_not_pollute_history(
@@ -508,8 +503,7 @@ def test_rich_observer_aborted_iteration_does_not_pollute_history(
     def _fake() -> float:
         return clock["t"]
 
-    monkeypatch.setattr(observer._trials, "get_time", _fake)
-    monkeypatch.setattr(observer._iters, "get_time", _fake)
+    monkeypatch.setattr(observer._progress, "get_time", _fake)
     monkeypatch.setattr(progress_module.time, "monotonic", _fake)
     with observer:
         observer.on_benchmark_start(3)
@@ -534,8 +528,7 @@ def test_rich_observer_iteration_bar_spans_whole_trial(
     def _fake() -> float:
         return clock["t"]
 
-    monkeypatch.setattr(observer._trials, "get_time", _fake)
-    monkeypatch.setattr(observer._iters, "get_time", _fake)
+    monkeypatch.setattr(observer._progress, "get_time", _fake)
     monkeypatch.setattr(progress_module.time, "monotonic", _fake)
 
     def _do_iter(iteration: int) -> None:
@@ -553,7 +546,7 @@ def test_rich_observer_iteration_bar_spans_whole_trial(
         # closing it, so the description reflects the active stage.
         observer.on_iteration_start(4)
         observer.on_stage_start("bw-udp", 4)
-        task = observer._iters.tasks[0]
+        task = _task_for(observer, observer._iter_task_id)
         assert task.total == 6
         assert task.completed == 4
         assert "[bw-udp]" in task.description
@@ -570,8 +563,7 @@ def test_rich_observer_iteration_bar_resets_between_trials(
     def _fake() -> float:
         return clock["t"]
 
-    monkeypatch.setattr(observer._trials, "get_time", _fake)
-    monkeypatch.setattr(observer._iters, "get_time", _fake)
+    monkeypatch.setattr(observer._progress, "get_time", _fake)
     monkeypatch.setattr(progress_module.time, "monotonic", _fake)
 
     def _do_iter(iteration: int) -> None:
@@ -585,7 +577,7 @@ def test_rich_observer_iteration_bar_resets_between_trials(
             _do_iter(i)
         # Trial 2 begins.
         observer.on_benchmark_start(4)
-        task = observer._iters.tasks[0]
+        task = _task_for(observer, observer._iter_task_id)
         assert task.total == 4
         assert task.completed == 0
         # History survives across trials.
@@ -603,8 +595,7 @@ def test_rich_observer_iteration_eta_covers_remaining_iterations(
     def _fake() -> float:
         return clock["t"]
 
-    monkeypatch.setattr(observer._trials, "get_time", _fake)
-    monkeypatch.setattr(observer._iters, "get_time", _fake)
+    monkeypatch.setattr(observer._progress, "get_time", _fake)
     monkeypatch.setattr(progress_module.time, "monotonic", _fake)
 
     def _do_iter(iteration: int) -> None:
@@ -616,9 +607,10 @@ def test_rich_observer_iteration_eta_covers_remaining_iterations(
         observer.on_benchmark_start(6)
         for i in range(3):
             _do_iter(i)
-        column = _find_iter_eta_column(observer)
+        column = _find_eta_column(observer)
+        iter_task = _task_for(observer, observer._iter_task_id)
         # 3 iterations remain at 60s each.
-        assert column.render(observer._iters.tasks[0]).plain == "0:03:00"
+        assert column.render(iter_task).plain == "0:03:00"
 
 
 def test_rich_observer_iteration_bar_resets_after_mid_trial_failure(
@@ -632,8 +624,7 @@ def test_rich_observer_iteration_bar_resets_after_mid_trial_failure(
     def _fake() -> float:
         return clock["t"]
 
-    monkeypatch.setattr(observer._trials, "get_time", _fake)
-    monkeypatch.setattr(observer._iters, "get_time", _fake)
+    monkeypatch.setattr(observer._progress, "get_time", _fake)
     monkeypatch.setattr(progress_module.time, "monotonic", _fake)
 
     def _do_iter(iteration: int) -> None:
@@ -650,7 +641,7 @@ def test_rich_observer_iteration_bar_resets_after_mid_trial_failure(
 
         # Trial 2 starts fresh.
         observer.on_benchmark_start(6)
-        task = observer._iters.tasks[0]
+        task = _task_for(observer, observer._iter_task_id)
         assert task.total == 6
         assert task.completed == 0
         # History survives the failed trial.

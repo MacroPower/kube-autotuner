@@ -41,7 +41,6 @@ from rich.progress import (
     ProgressColumn,
     TextColumn,
     TimeElapsedColumn,
-    TimeRemainingColumn,
 )
 from rich.table import Table
 from rich.text import Text
@@ -328,17 +327,23 @@ class _HistoryEtaColumn(ProgressColumn):
     very first completion and span the entire run.
     """
 
-    def __init__(self, history: Callable[[], tuple[int, float, float]]) -> None:
-        """Bind the column to a ``(count, total_seconds, in_flight)`` supplier.
+    def __init__(
+        self,
+        history: Callable[[TaskID], tuple[int, float, float]],
+    ) -> None:
+        """Bind the column to a per-task ``(count, total_seconds, in_flight)`` supplier.
 
         Args:
-            history: Zero-arg callable returning the observer's
-                cumulative completed count, total observed duration in
-                seconds, and the elapsed time of the currently
-                in-flight unit (``0.0`` when no unit is active). The
-                in-flight component lets Rich's 8 Hz refresh tick the
-                ETA down second-by-second within a unit instead of
-                holding flat until the next completion.
+            history: One-arg callable taking the Rich ``TaskID`` and
+                returning the observer's cumulative completed count,
+                total observed duration in seconds, and the elapsed
+                time of the currently in-flight unit (``0.0`` when no
+                unit is active). The in-flight component lets Rich's
+                8 Hz refresh tick the ETA down second-by-second within
+                a unit instead of holding flat until the next
+                completion. Dispatching by task id lets a single
+                column serve every task in a shared ``Progress``
+                (trials bar, iteration bar, verification bar).
         """
         super().__init__()
         self._history = history
@@ -355,7 +360,7 @@ class _HistoryEtaColumn(ProgressColumn):
         if task.total is None:
             return Text("-:--:--", style="progress.remaining")
         remaining = int(task.total) - int(task.completed)
-        count, total_seconds, in_flight = self._history()
+        count, total_seconds, in_flight = self._history(task.id)
         if count == 0 or remaining <= 0:
             return Text("-:--:--", style="progress.remaining")
         mean = total_seconds / count
@@ -639,15 +644,19 @@ class RichProgressObserver:
         self._trial_start: float | None = None
         self._trial_count: int = 0
         self._trial_total_seconds: float = 0.0
-        self._trials: Progress = self._make_progress(
-            eta_column=_HistoryEtaColumn(self._trial_history),
-        )
-        self._iters: Progress = self._make_progress(
-            eta_column=_HistoryEtaColumn(self._iter_history),
-        )
         self._trial_task_id: TaskID | None = None
         self._iter_task_id: TaskID | None = None
         self._verify_task_id: TaskID | None = None
+        self._progress: Progress = Progress(
+            TextColumn("[bold]{task.description}[/bold]"),
+            BarColumn(bar_width=None),
+            MofNCompleteColumn(),
+            TextColumn("[dim]elapsed[/dim]"),
+            TimeElapsedColumn(),
+            TextColumn("[dim]eta[/dim]"),
+            _HistoryEtaColumn(self._history_for_task),
+            expand=True,
+        )
         self._all_rows: list[_TrialRow] = []
         self._top: list[_TrialRow] = []
         self._phase: str = "sobol"
@@ -690,37 +699,36 @@ class RichProgressObserver:
         )
         return (self._trial_count, self._trial_total_seconds, in_flight)
 
-    @staticmethod
-    def _make_progress(eta_column: ProgressColumn | None = None) -> Progress:
-        """Build a :class:`rich.progress.Progress` with the standard columns.
+    def _history_for_task(
+        self,
+        task_id: TaskID,
+    ) -> tuple[int, float, float]:
+        """Return the ``(count, total_seconds, in_flight)`` snapshot for ``task_id``.
+
+        The single :class:`_HistoryEtaColumn` routed into
+        ``self._progress`` calls this for every task it renders. The
+        trials and verification tasks share the observer-owned trial
+        history (both measure wall-time per Ax trial), while the
+        iteration bar uses its own per-iteration history. Unknown task
+        ids fall through to the empty snapshot so ``render`` draws
+        ``-:--:--`` instead of raising.
 
         Args:
-            eta_column: Optional replacement for the default
-                :class:`TimeRemainingColumn`. Both the trials bar and
-                iteration bar supply a :class:`_HistoryEtaColumn` so
-                the ETA is available after the first completion and
-                survives per-mode resets.
+            task_id: The Rich ``TaskID`` of the task whose ETA is
+                being rendered.
 
         Returns:
-            A fresh :class:`Progress` composed of the bar, M-of-N, and
-            elapsed/ETA columns used throughout the live display.
+            The matching history tuple, or ``(0, 0.0, 0.0)`` when the
+            task id is not one the observer owns.
         """
-        eta: ProgressColumn = (
-            eta_column if eta_column is not None else TimeRemainingColumn()
-        )
-        return Progress(
-            TextColumn("[bold]{task.description}[/bold]"),
-            BarColumn(bar_width=None),
-            MofNCompleteColumn(),
-            TextColumn("[dim]elapsed[/dim]"),
-            TimeElapsedColumn(),
-            TextColumn("[dim]eta[/dim]"),
-            eta,
-            expand=True,
-        )
+        if task_id in {self._trial_task_id, self._verify_task_id}:
+            return self._trial_history()
+        if task_id == self._iter_task_id:
+            return self._iter_history()
+        return (0, 0.0, 0.0)
 
     def _render(self) -> Group:
-        """Compose the live renderable (two bars stacked over a table).
+        """Compose the live renderable (the shared bars over a table).
 
         The "best so far" table is omitted until at least one trial
         has completed, so the ``baseline`` and ``trial`` runs (which
@@ -728,12 +736,14 @@ class RichProgressObserver:
         than an empty table frame.
 
         Returns:
-            A :class:`rich.console.Group` of the trials bar, the
-            iteration bar, and (when any trial has completed) the
-            current "best so far" table.
+            A :class:`rich.console.Group` of the shared progress
+            region (trials, iteration, and verification tasks render
+            inside one ``Progress`` so their columns stay aligned)
+            and, when any trial has completed, the current "best so
+            far" table.
         """
         if not self._top:
-            return Group(self._trials, self._iters)
+            return Group(self._progress)
         sort_key = "weighted score" if self._objectives is not None else "throughput"
         has_verification = any(r.phase == "verification" for r in self._all_rows)
         suffix = ", verified" if has_verification else ""
@@ -774,7 +784,7 @@ class RichProgressObserver:
                 nmem,
                 p99,
             )
-        return Group(self._trials, self._iters, table)
+        return Group(self._progress, table)
 
     def _refresh(self) -> None:
         """Stage the current renderable for the next auto-refresh tick."""
@@ -841,13 +851,13 @@ class RichProgressObserver:
         self._phase = phase
         description = f"Trials [{phase}]"
         if self._trial_task_id is None:
-            self._trial_task_id = self._trials.add_task(
+            self._trial_task_id = self._progress.add_task(
                 description,
                 total=total,
                 completed=index,
             )
         else:
-            self._trials.update(
+            self._progress.update(
                 self._trial_task_id,
                 description=description,
                 total=total,
@@ -868,9 +878,9 @@ class RichProgressObserver:
             self._trial_count += 1
             self._trial_start = None
         if phase != "verification" and self._trial_task_id is not None:
-            self._trials.update(self._trial_task_id, advance=1)
+            self._progress.update(self._trial_task_id, advance=1)
         if phase == "verification" and self._verify_task_id is not None:
-            self._trials.update(self._verify_task_id, advance=1)
+            self._progress.update(self._verify_task_id, advance=1)
         row = _build_trial_row(
             index,
             phase,
@@ -1071,13 +1081,13 @@ class RichProgressObserver:
         """
         description = f"Verification [{top_k} configs, {total_remaining} runs]"
         if self._verify_task_id is None:
-            self._verify_task_id = self._trials.add_task(
+            self._verify_task_id = self._progress.add_task(
                 description,
                 total=total_remaining,
                 completed=0,
             )
         else:
-            self._trials.update(
+            self._progress.update(
                 self._verify_task_id,
                 description=description,
                 total=total_remaining,
@@ -1096,7 +1106,7 @@ class RichProgressObserver:
             self._trial_count += 1
             self._trial_start = None
         if self._trial_task_id is not None:
-            self._trials.update(self._trial_task_id, advance=1)
+            self._progress.update(self._trial_task_id, advance=1)
         self._refresh()
 
     def on_benchmark_start(self, total_iterations: int) -> None:
@@ -1115,13 +1125,13 @@ class RichProgressObserver:
         """
         self._iter_start = None
         if self._iter_task_id is None:
-            self._iter_task_id = self._iters.add_task(
+            self._iter_task_id = self._progress.add_task(
                 "Current",
                 total=total_iterations,
                 completed=0,
             )
         else:
-            self._iters.reset(
+            self._progress.reset(
                 self._iter_task_id,
                 total=total_iterations,
                 completed=0,
@@ -1151,7 +1161,7 @@ class RichProgressObserver:
             self._iter_count += 1
             self._iter_start = None
         if self._iter_task_id is not None:
-            self._iters.update(self._iter_task_id, advance=1)
+            self._progress.update(self._iter_task_id, advance=1)
         self._current_stage = ""
         self._refresh()
 
@@ -1163,7 +1173,7 @@ class RichProgressObserver:
         """Update the iteration-bar description to reflect the active sub-stage."""
         self._current_stage = stage
         if self._iter_task_id is not None:
-            self._iters.update(
+            self._progress.update(
                 self._iter_task_id,
                 description=f"Current [{stage}]",
             )
