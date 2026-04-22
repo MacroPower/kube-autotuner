@@ -139,16 +139,40 @@ class ProgressObserver(Protocol):
     def on_trial_complete(
         self,
         index: int,
-        phase: str,
+        trial: TrialResult,
         metrics: Mapping[str, tuple[float, float]],
     ) -> None:
         """Report that trial ``index`` finished successfully.
 
         Args:
             index: Zero-based trial index.
-            phase: ``"sobol"`` or ``"bayesian"``.
+            trial: The :class:`TrialResult` just persisted. Carries
+                ``phase``, ``trial_id``, and ``parent_trial_id`` so the
+                observer can key its internal aggregation and render
+                correctly for both primary and verification rows.
             metrics: The per-metric ``(mean, SEM)`` table returned by
                 the optimizer's metric aggregation.
+        """
+        ...
+
+    def on_verification_start(self, top_k: int, total_remaining: int) -> None:
+        """Announce the start of the post-primary verification phase.
+
+        Called once by
+        :meth:`kube_autotuner.optimizer.OptimizationLoop.run_verification`
+        before the first verification ``on_trial_start``. Rich-backed
+        observers use ``total_remaining`` to size a dedicated
+        verification progress bar; ``total_remaining`` already reflects
+        work skipped by a resume (it is
+        ``sum(max(0, repeats - already_done_by_parent.get(p, 0))
+        for p in parents)``), so the bar does not overshoot on partial
+        resumes. There is no matching ``on_verification_end`` -- the
+        existing ``__exit__`` handles teardown.
+
+        Args:
+            top_k: Number of parent configs selected for verification.
+            total_remaining: Total verification runs yet to execute in
+                the current session (post-``already_done_by_parent``).
         """
         ...
 
@@ -254,9 +278,12 @@ class NullObserver:
     def on_trial_complete(
         self,
         index: int,
-        phase: str,
+        trial: TrialResult,
         metrics: Mapping[str, tuple[float, float]],
     ) -> None:
+        """No-op."""
+
+    def on_verification_start(self, top_k: int, total_remaining: int) -> None:
         """No-op."""
 
     def on_trial_failed(self, index: int, exc: BaseException) -> None:
@@ -356,10 +383,12 @@ class _TrialRow:
         "metrics",
         "node_memory_mib",
         "p99_ms",
+        "parent_trial_id",
         "phase",
         "retx_per_mb",
         "rps",
         "throughput_mbps",
+        "trial_id",
     )
 
     def __init__(  # noqa: PLR0913 keyword-only summary bundle for one trial row
@@ -367,6 +396,8 @@ class _TrialRow:
         *,
         index: int,
         phase: str,
+        trial_id: str,
+        parent_trial_id: str | None,
         throughput_mbps: float,
         cpu: float,
         retx_per_mb: float,
@@ -380,7 +411,13 @@ class _TrialRow:
 
         Args:
             index: Zero-based trial index within this run.
-            phase: ``"sobol"`` or ``"bayesian"``.
+            phase: ``"sobol"``, ``"bayesian"``, or ``"verification"``.
+            trial_id: The trial's stable ``TrialResult.trial_id``.
+                Primary rows key their own aggregation group by this
+                value; verification rows link to the parent via
+                ``parent_trial_id``.
+            parent_trial_id: The primary trial's ``trial_id`` when
+                ``phase == "verification"``; ``None`` otherwise.
             throughput_mbps: Mean throughput in megabits-per-second.
             cpu: Mean target-node CPU utilization, 0-100.
             retx_per_mb: Retransmits per megabyte; ``NaN`` when the
@@ -407,6 +444,8 @@ class _TrialRow:
         """
         self.index = index
         self.phase = phase
+        self.trial_id = trial_id
+        self.parent_trial_id = parent_trial_id
         self.throughput_mbps = throughput_mbps
         self.cpu = cpu
         self.retx_per_mb = retx_per_mb
@@ -421,6 +460,9 @@ def _build_trial_row(  # noqa: PLR0914 one-pass projection over the full metric 
     index: int,
     phase: str,
     metrics: Mapping[str, tuple[float, float]],
+    *,
+    trial_id: str,
+    parent_trial_id: str | None,
 ) -> _TrialRow:
     """Project a completed-trial metric bundle into a :class:`_TrialRow`.
 
@@ -441,8 +483,11 @@ def _build_trial_row(  # noqa: PLR0914 one-pass projection over the full metric 
 
     Args:
         index: Zero-based trial index within this run.
-        phase: ``"sobol"`` or ``"bayesian"``.
+        phase: ``"sobol"``, ``"bayesian"``, or ``"verification"``.
         metrics: The ``(mean, SEM)`` bundle from the optimizer.
+        trial_id: The trial's stable ``TrialResult.trial_id``.
+        parent_trial_id: The primary trial's ``trial_id`` when
+            ``phase == "verification"``; ``None`` otherwise.
 
     Returns:
         A :class:`_TrialRow` ready to append to ``_all_rows``.
@@ -481,6 +526,8 @@ def _build_trial_row(  # noqa: PLR0914 one-pass projection over the full metric 
     return _TrialRow(
         index=index,
         phase=phase,
+        trial_id=trial_id,
+        parent_trial_id=parent_trial_id,
         throughput_mbps=tp,
         cpu=cpu,
         retx_per_mb=retx_per_mb,
@@ -600,6 +647,7 @@ class RichProgressObserver:
         )
         self._trial_task_id: TaskID | None = None
         self._iter_task_id: TaskID | None = None
+        self._verify_task_id: TaskID | None = None
         self._all_rows: list[_TrialRow] = []
         self._top: list[_TrialRow] = []
         self._phase: str = "sobol"
@@ -687,8 +735,10 @@ class RichProgressObserver:
         if not self._top:
             return Group(self._trials, self._iters)
         sort_key = "weighted score" if self._objectives is not None else "throughput"
+        has_verification = any(r.phase == "verification" for r in self._all_rows)
+        suffix = ", verified" if has_verification else ""
         table = Table(
-            title=f"Best so far (top {_TOP_N} by {sort_key})",
+            title=f"Best so far (top {_TOP_N} by {sort_key}{suffix})",
             title_style="bold",
             show_header=True,
             header_style="bold",
@@ -808,17 +858,26 @@ class RichProgressObserver:
     def on_trial_complete(
         self,
         index: int,
-        phase: str,
+        trial: TrialResult,
         metrics: Mapping[str, tuple[float, float]],
     ) -> None:
         """Advance the trials bar and fold the result into the top-N table."""
+        phase = trial.phase or "bayesian"
         if self._trial_start is not None:
             self._trial_total_seconds += time.monotonic() - self._trial_start
             self._trial_count += 1
             self._trial_start = None
-        if self._trial_task_id is not None:
+        if phase != "verification" and self._trial_task_id is not None:
             self._trials.update(self._trial_task_id, advance=1)
-        row = _build_trial_row(index, phase, metrics)
+        if phase == "verification" and self._verify_task_id is not None:
+            self._trials.update(self._verify_task_id, advance=1)
+        row = _build_trial_row(
+            index,
+            phase,
+            metrics,
+            trial_id=trial.trial_id,
+            parent_trial_id=trial.parent_trial_id,
+        )
         self._all_rows.append(row)
         self._rerank()
         self._refresh()
@@ -827,9 +886,15 @@ class RichProgressObserver:
         """Pre-populate the "best so far" table from prior trials.
 
         Called once at loop-start when resuming from a prior session.
-        The phase of each seeded row is inferred from its index versus
-        ``n_sobol`` -- this is sound because the compat check rejects
-        resumes whose ``n_sobol`` differs from the sidecar's.
+        Primary rows get a phase from ``TrialResult.phase`` when set;
+        legacy rows without the field fall back to the index-based
+        ``n_sobol`` split. Verification rows carry
+        ``phase="verification"`` and do not shift the Sobol/Bayesian
+        index over primary rows. The two ranges are interleaved in the
+        observer's ``_all_rows`` so JSONL file order is preserved, and
+        :meth:`_rerank` routes through the aggregation path when any
+        verification row is present.
+
         ``_trial_count`` / ``_trial_total_seconds`` are deliberately
         left at zero so the ETA re-learns from live wall-clock; the
         first ``on_trial_start`` advances the Rich bar to
@@ -839,22 +904,47 @@ class RichProgressObserver:
             prior: Prior successful :class:`TrialResult` records in
                 file order.
             n_sobol: The current experiment's Sobol budget; used to
-                infer the phase label per seeded row.
+                infer the phase label per seeded primary row when the
+                row has no stored ``phase``.
         """
-        # Lazy import: ``_compute_metrics`` lives in ``optimizer`` which
+        # Lazy imports: ``_compute_metrics`` lives in ``optimizer`` which
         # is reachable only when the ``optimize`` dep group is
-        # installed. Keeping this import inside the method preserves
+        # installed. Keeping both imports inside the method preserves
         # the module-level constraint that ``progress`` stays
-        # optimize-free for ``task completions``.
+        # optimize-free for ``task completions``. ``is_primary`` /
+        # ``effective_phase`` are cheap stdlib helpers but live in
+        # ``models`` which imports Pydantic; importing them inside the
+        # method keeps ``progress``'s import graph tidy.
+        from kube_autotuner.models import (  # noqa: PLC0415
+            effective_phase,
+            is_primary,
+        )
         from kube_autotuner.optimizer import _compute_metrics  # noqa: PLC0415
 
+        primary_order: list[int] = [
+            idx for idx, tr in enumerate(prior) if is_primary(tr)
+        ]
+        primary_rank: dict[int, int] = {
+            idx: rank for rank, idx in enumerate(primary_order)
+        }
         for idx, tr in enumerate(prior):
-            phase = "sobol" if idx < n_sobol else "bayesian"
             metrics = _compute_metrics(tr)
-            self._all_rows.append(_build_trial_row(idx, phase, metrics))
+            if is_primary(tr):
+                phase = effective_phase(tr, primary_rank[idx], n_sobol)
+            else:
+                phase = "verification"
+            self._all_rows.append(
+                _build_trial_row(
+                    idx,
+                    phase,
+                    metrics,
+                    trial_id=tr.trial_id,
+                    parent_trial_id=tr.parent_trial_id,
+                ),
+            )
         self._rerank()
-        if prior:
-            self._phase = "sobol" if len(prior) < n_sobol else "bayesian"
+        if primary_order:
+            self._phase = "sobol" if len(primary_order) < n_sobol else "bayesian"
 
     def _rerank(self) -> None:
         """Refresh ``self._top`` from ``self._all_rows``.
@@ -865,27 +955,135 @@ class RichProgressObserver:
         matches ``recommend_configs``. Without one (bare observer
         construction, ``baseline`` / ``trial`` flows) the legacy
         throughput-descending sort is used.
+
+        Once any ``_all_rows`` entry carries ``phase="verification"``,
+        ranking aggregates each parent's primary + verification
+        samples first (mirroring
+        :func:`kube_autotuner.scoring.aggregate_verification`) and
+        keys the rendered top by the parent's stored ``_TrialRow``.
+        The pre-verification path stays ungrouped -- hot path, no
+        per-refresh allocation change.
         """
-        if self._objectives is not None:
-            scores = score_rows(
-                [r.metrics for r in self._all_rows],
-                self._objectives.pareto,
-                self._objectives.recommendation_weights,
-            )
-            # Rank by score desc, break ties by arrival order (lower
-            # _all_rows index first) to match the stable-mergesort
-            # tiebreak in recommend_configs.
-            order = sorted(
-                range(len(self._all_rows)),
-                key=lambda i: (-scores[i], i),
-            )
-            self._top = [self._all_rows[i] for i in order[:_TOP_N]]
-        else:
+        if self._objectives is None:
             self._top = sorted(
                 self._all_rows,
                 key=lambda r: r.throughput_mbps,
                 reverse=True,
             )[:_TOP_N]
+            return
+
+        has_verification = any(r.phase == "verification" for r in self._all_rows)
+        if has_verification:
+            self._top = self._rerank_aggregated()
+            return
+
+        scores = score_rows(
+            [r.metrics for r in self._all_rows],
+            self._objectives.pareto,
+            self._objectives.recommendation_weights,
+        )
+        # Rank by score desc, break ties by trial_id ascending to
+        # match recommend_configs (analysis.py) and
+        # OptimizationLoop.run_verification's top-K selector.
+        order = sorted(
+            range(len(self._all_rows)),
+            key=lambda i: (-scores[i], self._all_rows[i].trial_id),
+        )
+        self._top = [self._all_rows[i] for i in order[:_TOP_N]]
+
+    def _rerank_aggregated(self) -> list[_TrialRow]:
+        """Return the top rows grouped by parent for verification panels.
+
+        Groups ``_all_rows`` by ``parent_trial_id or trial_id`` (same
+        key as :func:`kube_autotuner.scoring.aggregate_verification`),
+        means each group's raw metrics into a single row dict, scores
+        those, and returns the parent's stored ``_TrialRow`` for each
+        winning group so the live panel keeps rendering display-domain
+        fields unchanged.
+
+        Returns:
+            The top ``_TOP_N`` parent rows ranked by combined score,
+            with ties broken by ``trial_id`` ascending.
+        """
+        # ``_objectives is not None`` is an invariant of the caller --
+        # the aggregated branch is only selected in that case.
+        assert self._objectives is not None  # noqa: S101 - caller invariant
+
+        groups: dict[str, list[_TrialRow]] = {}
+        group_order: list[str] = []
+        for row in self._all_rows:
+            key = row.parent_trial_id or row.trial_id
+            if key not in groups:
+                group_order.append(key)
+                groups[key] = []
+            groups[key].append(row)
+
+        aggregated: list[dict[str, float]] = []
+        for key in group_order:
+            samples = groups[key]
+            agg: dict[str, float] = {}
+            for col in METRIC_TO_DF_COLUMN.values():
+                values = [
+                    r.metrics[col]
+                    for r in samples
+                    if not math.isnan(r.metrics.get(col, math.nan))
+                ]
+                agg[col] = math.nan if not values else sum(values) / len(values)
+            aggregated.append(agg)
+
+        scores = score_rows(
+            aggregated,
+            self._objectives.pareto,
+            self._objectives.recommendation_weights,
+        )
+        # Pick each group's "primary row" for display: prefer a
+        # non-verification sample (the original primary); fall back to
+        # whatever sample is first in the group (orphaned verification
+        # rows on a dropped parent).
+        display_rows: list[_TrialRow] = []
+        for key in group_order:
+            samples = groups[key]
+            primary = next(
+                (r for r in samples if r.phase != "verification"),
+                samples[0],
+            )
+            display_rows.append(primary)
+
+        order = sorted(
+            range(len(group_order)),
+            key=lambda i: (-scores[i], display_rows[i].trial_id),
+        )
+        return [display_rows[i] for i in order[:_TOP_N]]
+
+    def on_verification_start(self, top_k: int, total_remaining: int) -> None:
+        """Create a second progress task for the verification phase.
+
+        The primary trials bar is left in place so the live panel keeps
+        its completed-primary history visible. ``total_remaining`` has
+        already been trimmed by ``already_done_by_parent`` in
+        :meth:`OptimizationLoop.run_verification`, so the bar sizes
+        correctly on partial resumes and reaches 100% when every
+        remaining run has completed.
+
+        Args:
+            top_k: Number of parent configs selected for verification.
+            total_remaining: Total verification runs yet to execute.
+        """
+        description = f"Verification [{top_k} configs, {total_remaining} runs]"
+        if self._verify_task_id is None:
+            self._verify_task_id = self._trials.add_task(
+                description,
+                total=total_remaining,
+                completed=0,
+            )
+        else:
+            self._trials.update(
+                self._verify_task_id,
+                description=description,
+                total=total_remaining,
+                completed=0,
+            )
+        self._refresh()
 
     def on_trial_failed(
         self,

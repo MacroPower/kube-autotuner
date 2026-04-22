@@ -321,6 +321,8 @@ class OptimizeSection(BaseModel):
     n_sobol: int = Field(default=15, ge=1)
     apply_source: bool = False
     param_space: list[SysctlParam] | None = None
+    verification_trials: int = Field(default=0, ge=0)
+    verification_top_k: int = Field(default=3, ge=1)
 
 
 class TrialSection(BaseModel):

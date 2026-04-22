@@ -619,6 +619,20 @@ def optimize(
             help="Ignore prior results; move them aside before starting.",
         ),
     ] = False,
+    verification_trials: Annotated[
+        int,
+        typer.Option(
+            "--verification-trials",
+            help="Re-runs per top config after the primary loop. 0 disables.",
+        ),
+    ] = 0,
+    verification_top_k: Annotated[
+        int,
+        typer.Option(
+            "--verification-top-k",
+            help="Number of top configs to verify.",
+        ),
+    ] = 3,
 ) -> None:
     """Run the Bayesian optimization loop (requires the optimize group)."""
     exp = _apply_overrides(
@@ -635,6 +649,8 @@ def optimize(
             "n_trials": n_trials,
             "n_sobol": n_sobol,
             "apply_source": apply_source,
+            "verification_trials": verification_trials,
+            "verification_top_k": verification_top_k,
         },
     )
     observer = _app_state(ctx).make_observer(objectives=exp.objectives)

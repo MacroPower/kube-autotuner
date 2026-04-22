@@ -35,7 +35,12 @@ import warnings
 from kube_autotuner.benchmark.runner import BenchmarkRunner
 from kube_autotuner.k8s.client import K8sClient
 from kube_autotuner.k8s.lease import NodeLease
-from kube_autotuner.models import TrialLog, TrialResult, retransmit_rate_by_iteration
+from kube_autotuner.models import (
+    TrialLog,
+    TrialResult,
+    is_primary,
+    retransmit_rate_by_iteration,
+)
 from kube_autotuner.progress import NullObserver
 from kube_autotuner.sysctl.setter import make_sysctl_setter_from_env
 
@@ -602,20 +607,27 @@ class OptimizationLoop:
             observer=self.observer,
         )
         self._completed: list[TrialResult] = []
-        self.prior_count: int = len(prior_trials or [])
+        self.prior_count: int = sum(1 for t in (prior_trials or []) if is_primary(t))
         self._first_bayesian_generate: bool = True
         self._collapse_warned: set[str] = set()
         self._seed_prior_trials(prior_trials or [])
 
     def _seed_prior_trials(self, prior: list[TrialResult]) -> None:
-        """Replay ``prior`` into the Ax client via attach + complete.
+        """Replay ``prior`` into the Ax client and the completion list.
 
-        Each seeded trial lands in Ax's history with the same metric
-        aggregation the live loop would produce (:func:`_compute_metrics`),
-        and the NaN filter mirrors :meth:`_record` so
-        ``complete_trial`` cannot abort mid-seeding. Seeded trials are
-        also appended to ``self._completed`` so the pareto log sees the
-        combined history.
+        Primary rows (sobol / bayesian / legacy) are replayed through
+        Ax via ``attach_trial`` + ``complete_trial`` so the surrogate
+        sees the full history, using the same metric aggregation the
+        live loop would produce (:func:`_compute_metrics`) and the
+        NaN filter from :meth:`_record` so ``complete_trial`` cannot
+        abort mid-seeding.
+
+        Verification rows (``phase == "verification"``) are **not**
+        attached: Ax cannot accept the same arm twice, and the
+        surrogate has no use for a repeat observation of a parent it
+        already saw. They are still appended to ``self._completed``
+        so the aggregation and re-ranking paths in the live panel and
+        the verification summary see the full sample population.
 
         Parameter names are encoded with :func:`_encode_param_name` and
         values are string-coerced to match the Ax schema built by
@@ -626,6 +638,9 @@ class OptimizationLoop:
             prior: Prior trial records in file order.
         """
         for tr in prior:
+            if not is_primary(tr):
+                self._completed.append(tr)
+                continue
             params = {
                 _encode_param_name(k): str(v) for k, v in tr.sysctl_values.items()
             }
@@ -673,15 +688,31 @@ class OptimizationLoop:
     def _evaluate(
         self,
         parameterization: dict[str, str],
-    ) -> dict[str, tuple[float, float]]:
+        *,
+        phase: str,
+        parent_trial_id: str | None,
+    ) -> tuple[TrialResult, dict[str, tuple[float, float]]]:
         """Run one trial end-to-end: lock, snapshot, apply, benchmark, restore.
+
+        The returned :class:`TrialResult` carries ``phase`` and
+        ``parent_trial_id`` so the observer and the JSONL row agree on
+        which population the sample belongs to. Primary call sites pass
+        the Ax phase label with ``parent_trial_id=None``; the
+        verification pass passes ``phase="verification"`` and the
+        primary's ``trial_id``.
 
         Args:
             parameterization: Ax-encoded parameter dict (keys use ``__``
                 separators).
+            phase: Phase label to stamp on the resulting
+                :class:`TrialResult` (``"sobol"`` / ``"bayesian"`` /
+                ``"verification"``).
+            parent_trial_id: For verification runs, the ``trial_id``
+                of the primary being verified; ``None`` otherwise.
 
         Returns:
-            The per-metric ``(mean, SEM)`` table returned by
+            A ``(trial_result, metrics)`` pair. ``metrics`` is the
+            per-metric ``(mean, SEM)`` table from
             :func:`_compute_metrics`.
         """
         sysctl_params: dict[str, str | int] = {
@@ -715,11 +746,13 @@ class OptimizationLoop:
             config=self.config,
             results=iteration_results.bench,
             latency_results=iteration_results.latency,
+            phase=phase,  # ty: ignore[invalid-argument-type]
+            parent_trial_id=parent_trial_id,
         )
         TrialLog.append(self.output, trial_result)
         self._completed.append(trial_result)
 
-        return _compute_metrics(trial_result)
+        return trial_result, _compute_metrics(trial_result)
 
     def _should_stop(self, completed_iterations: int) -> bool:
         """Return ``True`` when the main loop should terminate.
@@ -768,6 +801,7 @@ class OptimizationLoop:
         i: int,
         phase: str,
         trial_index: int,
+        trial_result: TrialResult,
         metrics: dict[str, tuple[float, float]],
     ) -> None:
         """Report a successful trial's metrics back to Ax and log a summary.
@@ -782,6 +816,9 @@ class OptimizationLoop:
             i: Zero-based iteration index.
             phase: ``"sobol"`` or ``"bayesian"``.
             trial_index: Ax trial index returned by :meth:`_suggest`.
+            trial_result: The :class:`TrialResult` persisted by
+                :meth:`_evaluate`; forwarded to the observer so it can
+                key aggregation / grouping by ``trial_id``.
             metrics: Per-metric ``(mean, SEM)`` mapping returned by
                 :meth:`_evaluate`.
         """
@@ -821,7 +858,11 @@ class OptimizationLoop:
             rps_str,
             p99_str,
         )
-        self.observer.on_trial_complete(self.prior_count + i, phase, metrics)
+        self.observer.on_trial_complete(
+            self.prior_count + i,
+            trial_result,
+            metrics,
+        )
 
     def _warn_on_collapsed_objectives(self) -> list[str]:
         """Warn once per Pareto objective whose observed variance has collapsed.
@@ -847,12 +888,13 @@ class OptimizationLoop:
             (may be empty). Exposed primarily for tests; callers in
             :meth:`run` discard it.
         """
-        if len(self._completed) < 2:  # noqa: PLR2004 - stdev needs >= 2
+        primary = [tr for tr in self._completed if is_primary(tr)]
+        if len(primary) < 2:  # noqa: PLR2004 - stdev needs >= 2
             return []
         abs_floor = 1e-12
         rel_floor = 1e-9
         pareto_metrics = [obj.metric for obj in self.objectives.pareto]
-        per_trial_metrics = [_compute_metrics(tr) for tr in self._completed]
+        per_trial_metrics = [_compute_metrics(tr) for tr in primary]
         newly_warned: list[str] = []
         for name in pareto_metrics:
             if name in self._collapse_warned:
@@ -912,8 +954,12 @@ class OptimizationLoop:
                     parameterization,
                 )
                 try:
-                    metrics = self._evaluate(parameterization)
-                    self._record(i, phase, trial_index, metrics)
+                    trial_result, metrics = self._evaluate(
+                        parameterization,
+                        phase=phase,
+                        parent_trial_id=None,
+                    )
+                    self._record(i, phase, trial_index, trial_result, metrics)
                 except KeyboardInterrupt:
                     raise
                 except Exception as e:
@@ -937,6 +983,167 @@ class OptimizationLoop:
             self.cleanup()
         return self._completed
 
+    def run_verification(  # noqa: PLR0914, PLR0915
+        self,
+        top_k: int,
+        repeats: int,
+        already_done_by_parent: dict[str, int] | None = None,
+    ) -> list[TrialResult]:
+        """Re-run the top-K primary configs for confidence gain.
+
+        Computes the current top-K primaries by weighted score using
+        :func:`kube_autotuner.scoring.score_rows` (ties broken by
+        ``trial_id`` ascending -- same key as
+        :func:`kube_autotuner.analysis.recommend_configs`), and for
+        each selected parent runs
+        ``max(0, repeats - already_done_by_parent.get(trial_id, 0))``
+        further benchmarks with ``phase="verification"`` and
+        ``parent_trial_id`` pointing at the primary's id. Verification
+        runs are **not** attached to the Ax client: Ax rejects
+        duplicate arms and the surrogate has no use for a repeat
+        observation.
+
+        An ``already_done_by_parent`` entry whose ``trial_id`` is
+        absent from the current top-K is logged at INFO (``"prior
+        verification of %s is stranded; current top-K has re-ranked"``)
+        so users can tell their resume skipped work when primary
+        ranking shifted.
+
+        The observer sees a single ``on_verification_start(top_k,
+        total_remaining)`` call and one ``on_trial_start`` /
+        ``on_trial_complete`` pair per run, with ``phase="verification"``.
+        Observer indices continue the primary counter
+        (``prior_count + primary_live_count + verification_ordinal``)
+        so :class:`~kube_autotuner.progress.RichProgressObserver`'s
+        ``_all_rows`` can index every row unambiguously. The summary
+        table renders the parent's ``trial_id`` rather than this
+        internal counter.
+
+        Args:
+            top_k: Number of top primary configs to verify.
+            repeats: Number of verification runs per parent (the
+                absolute target; resumes subtract
+                ``already_done_by_parent``).
+            already_done_by_parent: Optional map of
+                ``parent_trial_id -> completed_count`` from a prior
+                partial run; used to trim ``repeats`` per parent so
+                resumes pick up where they left off.
+
+        Returns:
+            The newly created verification :class:`TrialResult`
+            records, in execution order.
+
+        Raises:
+            KeyboardInterrupt: Propagated when the user interrupts
+                mid-verification; :meth:`cleanup` still runs through
+                the ``finally`` block before re-raising.
+        """
+        already = dict(already_done_by_parent or {})
+        primary = [tr for tr in self._completed if is_primary(tr)]
+        if not primary or top_k <= 0 or repeats <= 0:
+            return []
+
+        # Lazy import: scoring is pure stdlib but progress isn't --
+        # keep the scoring call at the top where it's intuitive and
+        # import _build_trial_row inside the function to avoid a
+        # runtime cycle between optimizer and progress.
+        from kube_autotuner.progress import _build_trial_row  # noqa: PLC0415
+        from kube_autotuner.scoring import score_rows  # noqa: PLC0415
+
+        primary_rows = []
+        for tr in primary:
+            row = _build_trial_row(
+                0,
+                tr.phase or "bayesian",
+                _compute_metrics(tr),
+                trial_id=tr.trial_id,
+                parent_trial_id=None,
+            )
+            primary_rows.append((tr, row))
+
+        scores = score_rows(
+            [row.metrics for _tr, row in primary_rows],
+            self.objectives.pareto,
+            self.objectives.recommendation_weights,
+        )
+        ranking = sorted(
+            range(len(primary_rows)),
+            key=lambda i: (-scores[i], primary_rows[i][0].trial_id),
+        )
+        parents = [primary_rows[i][0] for i in ranking[:top_k]]
+        parent_ids = {p.trial_id for p in parents}
+
+        for stranded in set(already) - parent_ids:
+            logger.info(
+                "prior verification of %s is stranded; current top-K has re-ranked",
+                stranded,
+            )
+
+        remaining_per_parent = {
+            p.trial_id: max(0, repeats - already.get(p.trial_id, 0)) for p in parents
+        }
+        total_remaining = sum(remaining_per_parent.values())
+        if total_remaining == 0:
+            logger.info("verification budget already satisfied; nothing to re-run")
+            return []
+
+        self.observer.on_verification_start(top_k, total_remaining)
+
+        live_primary = len(primary) - self.prior_count
+        base_index = self.prior_count + live_primary
+        ordinal = 0
+        created: list[TrialResult] = []
+        self.runner.setup_server()
+        try:
+            for parent in parents:
+                remaining = remaining_per_parent[parent.trial_id]
+                ax_params: dict[str, str] = {
+                    _encode_param_name(k): str(v)
+                    for k, v in parent.sysctl_values.items()
+                }
+                for _ in range(remaining):
+                    obs_index = base_index + ordinal
+                    self.observer.on_trial_start(
+                        obs_index,
+                        total_remaining,
+                        "verification",
+                        ax_params,
+                    )
+                    try:
+                        trial_result, metrics = self._evaluate(
+                            ax_params,
+                            phase="verification",
+                            parent_trial_id=parent.trial_id,
+                        )
+                    except KeyboardInterrupt:
+                        raise
+                    except Exception as e:
+                        logger.warning(
+                            "Verification run for parent %s failed, continuing",
+                            parent.trial_id,
+                            exc_info=True,
+                        )
+                        self.observer.on_trial_failed(obs_index, e)
+                        ordinal += 1
+                        continue
+                    logger.info(
+                        "Verification [%s] parent=%s throughput=%.1f Mbps cpu=%.1f%%",
+                        parent.trial_id,
+                        parent.trial_id,
+                        metrics["throughput"][0] / 1e6,
+                        metrics["cpu"][0],
+                    )
+                    self.observer.on_trial_complete(
+                        obs_index,
+                        trial_result,
+                        metrics,
+                    )
+                    created.append(trial_result)
+                    ordinal += 1
+        finally:
+            self.cleanup()
+        return created
+
     def pareto_front(
         self,
     ) -> list[
@@ -948,6 +1155,13 @@ class OptimizationLoop:
         ]
     ]:
         """Return the Pareto-optimal parameters and their predicted metrics.
+
+        This call reads from the Ax client, which only sees primary
+        trials (verification repeats are deliberately not attached,
+        since Ax rejects duplicate arms). The post-primary verification
+        summary table emitted by :func:`kube_autotuner.runs.run_optimize`
+        is the authoritative combined-mean view; this frontier is the
+        Ax-model view over primary observations only.
 
         Returns:
             The Ax-computed Pareto frontier, as returned by

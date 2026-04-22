@@ -47,6 +47,7 @@ place to call
 
 from __future__ import annotations
 
+from collections import Counter
 import contextlib
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -54,20 +55,27 @@ import logging
 import math
 from typing import TYPE_CHECKING, cast
 
+from rich.console import Console
+from rich.table import Table
 import typer
 
 from kube_autotuner.benchmark.runner import BenchmarkRunner
 from kube_autotuner.k8s.lease import NodeLease
-from kube_autotuner.models import ResumeMetadata, TrialLog, TrialResult
+from kube_autotuner.models import ResumeMetadata, TrialLog, TrialResult, is_primary
 from kube_autotuner.progress import NullObserver
 from kube_autotuner.report import format_retransmit_rate
+from kube_autotuner.scoring import (
+    METRIC_TO_DF_COLUMN,
+    aggregate_verification,
+    score_rows,
+)
 from kube_autotuner.sysctl.params import PARAM_SPACE
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
     from pathlib import Path
 
-    from kube_autotuner.experiment import ExperimentConfig
+    from kube_autotuner.experiment import ExperimentConfig, ObjectivesSection
     from kube_autotuner.k8s.client import K8sClient
     from kube_autotuner.models import NodePair
     from kube_autotuner.progress import ProgressObserver
@@ -184,17 +192,26 @@ class _ResumeState:
 
     Attributes:
         prior_trials: Successful :class:`TrialResult` records loaded
-            from the prior session; empty when no resume occurred.
-        remaining_trials: Live-loop attempt budget: ``max(0,
-            n_trials - len(prior_trials))``. Counts successful
-            priors only; a prior run that had failures leaves the
-            remaining budget wider than a strict
+            from the prior session, in file order. Includes both
+            primary and verification rows when present; empty when no
+            resume occurred.
+        remaining_trials: Live-loop primary-attempt budget: ``max(0,
+            n_trials - len(primary_priors))``. Counts successful
+            primary priors only; a prior run that had failures leaves
+            the remaining budget wider than a strict
             ``n_trials - attempts_so_far`` would -- accepted as the
             simplest interpretation. See the module docstring.
+        verification_done_by_parent: Map of primary ``trial_id`` ->
+            count of verification rows already in the JSONL for that
+            parent. Fed to
+            :meth:`~kube_autotuner.optimizer.OptimizationLoop.run_verification`
+            so the verification loop skips work that a prior session
+            already finished.
     """
 
     prior_trials: list[TrialResult]
     remaining_trials: int
+    verification_done_by_parent: dict[str, int] = field(default_factory=dict)
 
 
 def _move_prior_artifacts(output: Path) -> None:
@@ -220,16 +237,22 @@ def _move_prior_artifacts(output: Path) -> None:
         logger.info("moved prior results to %s", backup)
 
 
-def _check_compatibility(
+def _check_compatibility(  # noqa: C901, PLR0912
     meta: ResumeMetadata | None,
     exp: ExperimentConfig,
 ) -> None:
     """Validate that ``meta`` matches ``exp`` on the compatibility keys.
 
     Compatibility keys: ``objectives``, ``param_space``,
-    ``benchmark``, and (when the sidecar carries one) ``n_sobol``.
-    Node identity, patches, iperf/fortio args, and ``apply_source``
-    can change silently between runs.
+    ``benchmark``, and (when the sidecar carries one) ``n_sobol``,
+    ``verification_trials``, ``verification_top_k``. Node identity,
+    patches, iperf/fortio args, and ``apply_source`` can change
+    silently between runs.
+
+    Sidecars written by pre-feature binaries have ``verification_*``
+    fields set to ``None``. When the current run enables verification
+    against such a sidecar, no drift is flagged: the JSONL stays
+    usable and a refreshed sidecar will be written afterwards.
 
     A ``None`` sidecar alongside a non-empty JSONL signals a prior
     run that wrote no metadata (or a manually crafted JSONL); the
@@ -263,6 +286,29 @@ def _check_compatibility(
             changed.append("n_sobol")
     elif exp.optimize is not None and meta.n_sobol is None:
         logger.warning("sidecar has no n_sobol; not verified")
+
+    if exp.optimize is not None:
+        legacy_verification = (
+            meta.verification_trials is None and meta.verification_top_k is None
+        )
+        if legacy_verification and (
+            exp.optimize.verification_trials > 0 or exp.optimize.verification_top_k != 3  # noqa: PLR2004 - schema default
+        ):
+            logger.info(
+                "prior sidecar has no verification record; proceeding and "
+                "rewriting sidecar",
+            )
+        else:
+            if (
+                meta.verification_trials is not None
+                and meta.verification_trials != exp.optimize.verification_trials
+            ):
+                changed.append("verification_trials")
+            if (
+                meta.verification_top_k is not None
+                and meta.verification_top_k != exp.optimize.verification_top_k
+            ):
+                changed.append("verification_top_k")
 
     if changed:
         msg = (
@@ -323,14 +369,23 @@ def _prepare_resume(
     meta = TrialLog.load_resume_metadata(output)
     _check_compatibility(meta, exp)
 
-    remaining = max(0, exp.optimize.n_trials - len(prior))
+    primary_prior = [t for t in prior if is_primary(t)]
+    verification_done = Counter(t.parent_trial_id for t in prior if t.parent_trial_id)
+    remaining = max(0, exp.optimize.n_trials - len(primary_prior))
     logger.info(
-        "Resuming: %d prior trials; running %d more (budget=%d)",
+        "Resuming: %d prior trials (%d primary + %d verification); "
+        "running %d more primary (budget=%d)",
         len(prior),
+        len(primary_prior),
+        len(prior) - len(primary_prior),
         remaining,
         exp.optimize.n_trials,
     )
-    return _ResumeState(prior_trials=prior, remaining_trials=remaining)
+    return _ResumeState(
+        prior_trials=prior,
+        remaining_trials=remaining,
+        verification_done_by_parent={k: v for k, v in verification_done.items() if k},
+    )
 
 
 def run_baseline(ctx: RunContext) -> None:
@@ -582,16 +637,22 @@ def run_optimize(  # noqa: PLR0914, PLR0915
         raise RuntimeError(msg)
 
     resume = _prepare_resume(ctx.output, exp, fresh=fresh)
-    if not resume.prior_trials:
-        TrialLog.write_resume_metadata(
-            ctx.output,
-            ResumeMetadata(
-                objectives=exp.objectives,
-                param_space=exp.effective_param_space(),
-                benchmark=exp.benchmark,
-                n_sobol=exp.optimize.n_sobol,
-            ),
-        )
+    # Rewrite the sidecar on every run so a resume against a
+    # pre-feature sidecar (missing verification_*) picks up the new
+    # fields idempotently. _check_compatibility has already rejected
+    # any drift, so the write is either a no-op or a refresh of
+    # previously-None fields.
+    TrialLog.write_resume_metadata(
+        ctx.output,
+        ResumeMetadata(
+            objectives=exp.objectives,
+            param_space=exp.effective_param_space(),
+            benchmark=exp.benchmark,
+            n_sobol=exp.optimize.n_sobol,
+            verification_trials=exp.optimize.verification_trials,
+            verification_top_k=exp.optimize.verification_top_k,
+        ),
+    )
     ctx.observer.seed_history(resume.prior_trials, exp.optimize.n_sobol)
     node_pair = _resolve_zones(exp.to_node_pair(), ctx.client)
     config = exp.benchmark
@@ -632,6 +693,14 @@ def run_optimize(  # noqa: PLR0914, PLR0915
     if not trials:
         return
 
+    if exp.optimize.verification_trials > 0:
+        loop.run_verification(
+            top_k=exp.optimize.verification_top_k,
+            repeats=exp.optimize.verification_trials,
+            already_done_by_parent=resume.verification_done_by_parent,
+        )
+        _log_verification_summary(loop._completed, exp.objectives)  # noqa: SLF001
+
     try:
         pareto = loop.pareto_front()
     except Exception:
@@ -665,6 +734,139 @@ def run_optimize(  # noqa: PLR0914, PLR0915
             rps_str,
             p99_str,
         )
+
+
+def _log_verification_summary(
+    all_trials: list[TrialResult],
+    objectives: ObjectivesSection,
+) -> None:
+    """Print a Rich table comparing primary vs combined scores.
+
+    Groups ``all_trials`` by ``parent_trial_id or trial_id`` via
+    :func:`kube_autotuner.scoring.aggregate_verification`, scores both
+    the primary-only population and the combined (primary +
+    verification) population through
+    :func:`kube_autotuner.scoring.score_rows`, and prints one row per
+    verified parent showing the primary score, the combined score,
+    the score delta, and per-metric ``mean ± SEM`` for the headline
+    metrics (throughput, cpu, retransmit_rate, latency_p99).
+
+    Only parents with at least one verification child are rendered --
+    listing every primary would dilute the table and confuse the
+    user about which rows were actually re-run.
+
+    Args:
+        all_trials: Every :class:`TrialResult` from the run (primary
+            and verification, in file order).
+        objectives: The experiment's objective configuration; drives
+            the weighted score used for the "primary score" /
+            "combined score" comparison.
+    """
+    verification_parents = {t.parent_trial_id for t in all_trials if t.parent_trial_id}
+    if not verification_parents:
+        return
+
+    primary_only = [t for t in all_trials if is_primary(t)]
+    combined_rows = aggregate_verification(all_trials)
+    primary_rows = aggregate_verification(primary_only)
+
+    combined_scores = score_rows(
+        combined_rows,
+        objectives.pareto,
+        objectives.recommendation_weights,
+    )
+    primary_scores = score_rows(
+        primary_rows,
+        objectives.pareto,
+        objectives.recommendation_weights,
+    )
+    primary_score_by_id = {
+        str(r["trial_id"]): s for r, s in zip(primary_rows, primary_scores, strict=True)
+    }
+
+    ordered = sorted(
+        range(len(combined_rows)),
+        key=lambda i: (
+            -combined_scores[i],
+            str(combined_rows[i]["trial_id"]),
+        ),
+    )
+
+    table = Table(
+        title="Verification summary",
+        title_style="bold",
+        show_header=True,
+        header_style="bold",
+        expand=False,
+    )
+    table.add_column("rank", justify="right", no_wrap=True)
+    table.add_column("trial_id", no_wrap=True)
+    table.add_column("primary", justify="right")
+    table.add_column("combined", justify="right")
+    table.add_column("Δ", justify="right")
+    table.add_column("throughput", justify="right")
+    table.add_column("cpu", justify="right")
+    table.add_column("retx_rate", justify="right")
+    table.add_column("p99 ms", justify="right")
+
+    rank = 0
+    for i in ordered:
+        row = combined_rows[i]
+        trial_id = str(row["trial_id"])
+        if trial_id not in verification_parents:
+            continue
+        rank += 1
+        primary = primary_score_by_id.get(trial_id, float("nan"))
+        combined = combined_scores[i]
+        delta = combined - primary if not math.isnan(primary) else float("nan")
+        table.add_row(
+            str(rank),
+            trial_id,
+            "n/a" if math.isnan(primary) else f"{primary:.4f}",
+            f"{combined:.4f}",
+            "n/a" if math.isnan(delta) else f"{delta:+.4f}",
+            _format_mean_sem(row, METRIC_TO_DF_COLUMN["throughput"], scale=1e-6),
+            _format_mean_sem(row, METRIC_TO_DF_COLUMN["cpu"]),
+            _format_mean_sem(
+                row,
+                METRIC_TO_DF_COLUMN["retransmit_rate"],
+                scale=1e6,
+            ),
+            _format_mean_sem(row, METRIC_TO_DF_COLUMN["latency_p99"]),
+        )
+
+    Console().print(table)
+
+
+def _format_mean_sem(
+    row: dict[str, float | int | str],
+    col: str,
+    *,
+    scale: float = 1.0,
+) -> str:
+    """Render ``<mean> ± <SEM>`` for one metric in an aggregation row.
+
+    Args:
+        row: An :func:`aggregate_verification` row.
+        col: DataFrame-column name for the metric (see
+            :data:`METRIC_TO_DF_COLUMN`).
+        scale: Multiplier applied to both mean and SEM before
+            formatting (e.g. ``1e-6`` to convert bits/sec to Mbps).
+
+    Returns:
+        A human-readable ``"mean ± sem"`` string, or ``"n/a"`` when
+        the mean is NaN.
+    """
+    mean_raw = row.get(col)
+    sem_raw = row.get(f"{col}_sem", 0.0)
+    try:
+        mean = float(mean_raw)  # ty: ignore[invalid-argument-type]
+    except TypeError, ValueError:
+        return "n/a"
+    if math.isnan(mean):
+        return "n/a"
+    sem = float(sem_raw) if sem_raw is not None else 0.0
+    return f"{mean * scale:.3g} ± {sem * scale:.2g}"
 
 
 def _scalar_or_nan(

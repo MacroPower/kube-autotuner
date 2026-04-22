@@ -19,13 +19,16 @@ never surfaced by the live panel.
 
 from __future__ import annotations
 
+from collections import defaultdict
 import math
+import statistics
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
     from kube_autotuner.experiment import ParetoObjective
+    from kube_autotuner.models import TrialResult
 
 
 METRIC_TO_DF_COLUMN: dict[str, str] = {
@@ -168,3 +171,114 @@ def score_rows(
             for i, value in enumerate(norm):
                 scores[i] -= weight * value
     return scores
+
+
+def _per_trial_metric_means(t: TrialResult) -> dict[str, float]:
+    """Project one :class:`TrialResult` into METRIC_TO_DF_COLUMN means.
+
+    Uses the canonical per-trial aggregation methods on
+    :class:`~kube_autotuner.models.TrialResult` so the arithmetic
+    matches both the live panel and ``_compute_metrics``.
+
+    Args:
+        t: Trial record whose metrics should be projected.
+
+    Returns:
+        A dict keyed by the DataFrame column names in
+        :data:`METRIC_TO_DF_COLUMN`, with :data:`math.nan` in place of
+        any unreported metric.
+    """
+    nmem = t.mean_node_memory()
+    cmem = t.mean_cni_memory()
+    rate = t.retransmit_rate()
+    return {
+        METRIC_TO_DF_COLUMN["throughput"]: t.mean_throughput(),
+        METRIC_TO_DF_COLUMN["cpu"]: t.mean_cpu(),
+        METRIC_TO_DF_COLUMN["node_memory"]: (math.nan if nmem is None else nmem),
+        METRIC_TO_DF_COLUMN["cni_memory"]: (math.nan if cmem is None else cmem),
+        METRIC_TO_DF_COLUMN["retransmit_rate"]: (math.nan if rate is None else rate),
+        METRIC_TO_DF_COLUMN["jitter"]: t.mean_jitter_ms(),
+        METRIC_TO_DF_COLUMN["rps"]: t.mean_rps(),
+        METRIC_TO_DF_COLUMN["latency_p50"]: t.mean_latency_p50_ms(),
+        METRIC_TO_DF_COLUMN["latency_p90"]: t.mean_latency_p90_ms(),
+        METRIC_TO_DF_COLUMN["latency_p99"]: t.mean_latency_p99_ms(),
+    }
+
+
+def _mean_sem_of(values: list[float]) -> tuple[float, float]:
+    """Return ``(mean, SEM)`` over ``values`` dropping NaN entries.
+
+    SEM is ``stdev / sqrt(n)`` with ``n`` counting the finite samples;
+    fewer than two finite samples yields ``(mean, 0.0)``. An
+    all-NaN input yields ``(nan, 0.0)`` so callers can propagate the
+    "not measured" sentinel through the aggregated row.
+    """
+    finite = [v for v in values if not math.isnan(v)]
+    if not finite:
+        return math.nan, 0.0
+    mean = statistics.mean(finite)
+    if len(finite) < 2:  # noqa: PLR2004 - stdev needs >= 2
+        return mean, 0.0
+    sem = statistics.stdev(finite) / math.sqrt(len(finite))
+    return mean, sem
+
+
+def aggregate_verification(
+    trials: list[TrialResult],
+) -> list[dict[str, float | int | str]]:
+    """Return one row per parent config, metrics meaned across all samples.
+
+    Groups ``trials`` by ``parent_trial_id or trial_id`` so every
+    verification repeat folds back into its parent's bucket and a
+    primary trial without any verification repeats still produces a
+    single-sample row. Per-metric aggregation mirrors
+    :func:`kube_autotuner.optimizer._compute_metrics`:
+
+    * ``throughput`` / ``rps``: mean of per-trial means.
+    * ``cpu`` / ``jitter`` / ``node_memory`` / ``cni_memory`` /
+      ``latency_p50`` / ``latency_p90`` / ``latency_p99``: mean of
+      per-trial means; NaN (not measured) drops out of the mean.
+    * ``retransmit_rate``: mean of per-trial rates; NaN drops out.
+
+    Each ``<metric>_sem`` is the standard error of the mean over the
+    parent's finite samples (``stdev / sqrt(n)``); ``0.0`` when fewer
+    than two samples survive.
+
+    Verification rows whose ``parent_trial_id`` does not match any
+    primary ``trial_id`` in ``trials`` still form their own group
+    keyed by that id, which is harmless because downstream callers
+    filter by the primary ``trial_id`` they care about.
+
+    Args:
+        trials: The combined primary + verification population.
+
+    Returns:
+        One row per aggregation group, keyed by the DataFrame column
+        names in :data:`METRIC_TO_DF_COLUMN` plus ``trial_id``,
+        ``sample_count``, and ``<metric>_sem`` per metric. Rows are
+        returned in first-seen group order so callers get a stable,
+        file-order-ish iteration.
+    """
+    groups: dict[str, list[TrialResult]] = defaultdict(list)
+    order: list[str] = []
+    for t in trials:
+        key = t.parent_trial_id or t.trial_id
+        if key not in groups:
+            order.append(key)
+        groups[key].append(t)
+
+    rows: list[dict[str, float | int | str]] = []
+    for key in order:
+        samples = groups[key]
+        per_trial = [_per_trial_metric_means(t) for t in samples]
+        row: dict[str, float | int | str] = {
+            "trial_id": key,
+            "sample_count": len(samples),
+        }
+        for col in METRIC_TO_DF_COLUMN.values():
+            values = [m[col] for m in per_trial]
+            mean, sem = _mean_sem_of(values)
+            row[col] = mean
+            row[f"{col}_sem"] = sem
+        rows.append(row)
+    return rows

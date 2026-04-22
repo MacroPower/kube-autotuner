@@ -20,7 +20,11 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
-from kube_autotuner.scoring import METRIC_TO_DF_COLUMN, score_rows
+from kube_autotuner.scoring import (
+    METRIC_TO_DF_COLUMN,
+    aggregate_verification,
+    score_rows,
+)
 from kube_autotuner.sysctl.params import PARAM_SPACE, PARAM_TO_CATEGORY
 
 logger = logging.getLogger(__name__)
@@ -548,12 +552,16 @@ def recommend_configs(
     pd = _require_pandas()
     from kube_autotuner.experiment import ObjectivesSection  # noqa: PLC0415
 
-    df, _ = trials_to_dataframe(
-        trials,
-        hardware_class=hardware_class,
-        topology=topology,
-    )
-    if df.empty:
+    # Per-trial frame (one row per :class:`TrialResult`, verification
+    # rows included) is kept for any downstream caller that wants the
+    # unaggregated view -- trajectory plots, for instance.
+    filtered = [
+        t
+        for t in trials
+        if t.node_pair.hardware_class == hardware_class
+        and (topology is None or t.topology == topology)
+    ]
+    if not filtered:
         return []
 
     defaults = ObjectivesSection()
@@ -562,13 +570,28 @@ def recommend_configs(
     if weights is None:
         weights = defaults.recommendation_weights
 
+    # Aggregate verification samples back into their parents before
+    # running the Pareto / scoring pipeline, then wrap as a DataFrame
+    # so the existing _objectives_with_data / pareto_front helpers can
+    # operate on the combined-mean view. This keeps scoring.py pure
+    # stdlib (list[dict] in, list[float] out) while analysis.py stays
+    # DataFrame-native.
+    agg_rows = aggregate_verification(filtered)
+    if not agg_rows:
+        return []
+
+    agg_df = pd.DataFrame(agg_rows)
+    for col in METRIC_TO_DF_COLUMN.values():
+        if col in agg_df.columns:
+            agg_df[col] = pd.to_numeric(agg_df[col], errors="coerce")
+
     tuple_objectives: list[tuple[str, str]] = [
         (METRIC_TO_DF_COLUMN[obj.metric], obj.direction) for obj in objectives
     ]
     # Suppress the log here so the CLI's direct pareto_front call is
     # the single source of truth for "excluded" INFO lines.
-    tuple_objectives = _objectives_with_data(df, tuple_objectives, log=False)
-    front = pareto_front(df, objectives=tuple_objectives)
+    tuple_objectives = _objectives_with_data(agg_df, tuple_objectives, log=False)
+    front = pareto_front(agg_df, objectives=tuple_objectives)
     if front.empty:
         return []
 
@@ -591,7 +614,10 @@ def recommend_configs(
 
     results: list[dict[str, Any]] = []
     for rank, (_, row) in enumerate(front.head(n).iterrows(), start=1):
-        trial = next(t for t in trials if t.trial_id == row["trial_id"])
+        # row["trial_id"] is the aggregation key (``parent_trial_id
+        # or trial_id``) so it always resolves to the primary trial,
+        # not a verification repeat.
+        trial = next(t for t in filtered if t.trial_id == row["trial_id"])
         results.append(
             {
                 "rank": rank,

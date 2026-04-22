@@ -26,7 +26,38 @@ _HistoryEtaColumn = progress_module._HistoryEtaColumn
 _TtyEchoSuppressor = progress_module._TtyEchoSuppressor
 
 if TYPE_CHECKING:
+    from kube_autotuner.models import TrialResult
     from kube_autotuner.progress import ProgressObserver
+
+
+def _stub_trial(
+    phase: str,
+    *,
+    trial_id: str | None = None,
+    parent_trial_id: str | None = None,
+) -> TrialResult:
+    """Build a minimal :class:`TrialResult` for observer tests.
+
+    Returns:
+        A trial record stamped with ``phase``, ``parent_trial_id``,
+        and (optionally) a fixed ``trial_id``.
+    """
+    from kube_autotuner.models import (  # noqa: PLC0415
+        BenchmarkConfig,
+        NodePair,
+        TrialResult,
+    )
+
+    tr = TrialResult(
+        node_pair=NodePair(source="a", target="b", hardware_class="10g"),
+        sysctl_values={},
+        config=BenchmarkConfig(),
+        phase=phase,  # ty: ignore[invalid-argument-type]
+        parent_trial_id=parent_trial_id,
+    )
+    if trial_id is not None:
+        tr.trial_id = trial_id
+    return tr
 
 
 def _capture_console() -> Console:
@@ -51,7 +82,7 @@ def test_null_observer_is_protocol_compliant() -> None:
         active.on_iteration_end(0)
         active.on_trial_complete(
             0,
-            "sobol",
+            _stub_trial("sobol"),
             {"throughput": (9_400_000_000.0, 1e6), "cpu": (42.0, 0.5)},
         )
         active.on_trial_failed(1, RuntimeError("boom"))
@@ -67,7 +98,7 @@ def test_rich_observer_renders_bars_and_table() -> None:
         observer.on_iteration_end(0)
         observer.on_trial_complete(
             0,
-            "sobol",
+            _stub_trial("sobol"),
             {
                 "throughput": (9_412_000_000.0, 1e7),
                 "cpu": (42.1, 0.4),
@@ -77,7 +108,7 @@ def test_rich_observer_renders_bars_and_table() -> None:
         )
         observer.on_trial_complete(
             1,
-            "bayesian",
+            _stub_trial("bayesian"),
             {
                 "throughput": (9_188_000_000.0, 1e7),
                 "cpu": (38.4, 0.3),
@@ -121,7 +152,7 @@ def test_rich_observer_refresh_does_not_force_immediate_paint(
         observer.on_benchmark_start(2)
         observer.on_iteration_start(0)
         observer.on_iteration_end(0)
-        observer.on_trial_complete(0, "sobol", {"throughput": (1e9, 0.0)})
+        observer.on_trial_complete(0, _stub_trial("sobol"), {"throughput": (1e9, 0.0)})
         observer.on_trial_failed(1, RuntimeError("boom"))
     assert calls, "expected at least one Live.update call"
     assert all(not kwargs.get("refresh", False) for kwargs in calls)
@@ -132,7 +163,7 @@ def test_rich_observer_handles_missing_metrics() -> None:
     observer = RichProgressObserver(console)
     with observer:
         observer.on_trial_start(0, 1, "sobol", {})
-        observer.on_trial_complete(0, "sobol", {})
+        observer.on_trial_complete(0, _stub_trial("sobol"), {})
     # No KeyError; row folded in with zeros / NaN.
     assert observer._top
     assert math.isnan(observer._top[0].retx_per_mb)
@@ -226,7 +257,7 @@ def test_seed_history_importable_without_ax(
     console = _capture_console()
     observer = RichProgressObserver(console)
     # Constructing + using the non-seed methods must still work.
-    observer.on_trial_complete(0, "sobol", {"throughput": (1e9, 0.0)})
+    observer.on_trial_complete(0, _stub_trial("sobol"), {"throughput": (1e9, 0.0)})
     assert observer._top
 
 
@@ -238,7 +269,7 @@ def test_rich_observer_tracks_top_n() -> None:
             observer.on_trial_start(i, 10, "bayesian", {})
             observer.on_trial_complete(
                 i,
-                "bayesian",
+                _stub_trial("bayesian"),
                 {
                     "throughput": (tp * 1e9, 0.0),
                     "cpu": (10.0, 0.0),
@@ -272,11 +303,11 @@ def test_rich_observer_trial_eta_survives_long_gaps_between_completions(
     with observer:
         observer.on_trial_start(0, 5, "sobol", {})
         clock["t"] += 120.0
-        observer.on_trial_complete(0, "sobol", {"throughput": (1e9, 0.0)})
+        observer.on_trial_complete(0, _stub_trial("sobol"), {"throughput": (1e9, 0.0)})
         clock["t"] += 120.0  # >> 30s default speed window
         observer.on_trial_start(1, 5, "sobol", {})
         clock["t"] += 120.0
-        observer.on_trial_complete(1, "sobol", {"throughput": (1e9, 0.0)})
+        observer.on_trial_complete(1, _stub_trial("sobol"), {"throughput": (1e9, 0.0)})
         column = _find_trials_eta_column(observer)
         rendered = column.render(observer._trials.tasks[0]).plain
         assert rendered != "-:--:--"
@@ -359,7 +390,7 @@ def test_rich_observer_trial_eta_ticks_down_mid_trial(
     with observer:
         observer.on_trial_start(0, 3, "sobol", {})
         clock["t"] += 120.0
-        observer.on_trial_complete(0, "sobol", {"throughput": (1e9, 0.0)})
+        observer.on_trial_complete(0, _stub_trial("sobol"), {"throughput": (1e9, 0.0)})
         observer.on_trial_start(1, 3, "sobol", {})
         column = _find_trials_eta_column(observer)
         task = observer._trials.tasks[0]
@@ -398,7 +429,7 @@ def test_rich_observer_trial_eta_available_after_first_completion(
     with observer:
         observer.on_trial_start(0, 5, "sobol", {})
         clock["t"] += 120.0
-        observer.on_trial_complete(0, "sobol", {"throughput": (1e9, 0.0)})
+        observer.on_trial_complete(0, _stub_trial("sobol"), {"throughput": (1e9, 0.0)})
         column = _find_trials_eta_column(observer)
         # 4 remaining trials * 120s mean = 0:08:00.
         assert column.render(observer._trials.tasks[0]).plain == "0:08:00"
@@ -424,7 +455,7 @@ def test_rich_observer_trial_eta_counts_failed_trials(
         observer.on_trial_failed(0, RuntimeError("x"))
         observer.on_trial_start(1, 5, "sobol", {})
         clock["t"] += 120.0
-        observer.on_trial_complete(1, "sobol", {"throughput": (1e9, 0.0)})
+        observer.on_trial_complete(1, _stub_trial("sobol"), {"throughput": (1e9, 0.0)})
         assert observer._trial_count == 2
         assert observer._trial_total_seconds == pytest.approx(180.0)
         column = _find_trials_eta_column(observer)
@@ -659,7 +690,7 @@ def _score_row_complete(  # noqa: PLR0913 - keyword-only metric bundle
     """Drive ``observer.on_trial_complete`` with a full metric bundle."""
     observer.on_trial_complete(
         index,
-        phase,
+        _stub_trial(phase, trial_id=f"trial-{index:02d}"),
         {
             "throughput": (throughput, 0.0),
             "cpu": (cpu, 0.0),
@@ -773,7 +804,7 @@ def test_top5_handles_nan_metrics() -> None:
     # UDP-only trial: retransmit_rate and every latency percentile NaN.
     observer.on_trial_complete(
         1,
-        "bayesian",
+        _stub_trial("bayesian"),
         {
             "throughput": (2.0e9, 0.0),
             "cpu": (50.0, 0.0),
@@ -799,7 +830,7 @@ def test_top5_fallback_sorts_by_throughput_when_objectives_none() -> None:
             observer.on_trial_start(i, 10, "bayesian", {})
             observer.on_trial_complete(
                 i,
-                "bayesian",
+                _stub_trial("bayesian"),
                 {
                     "throughput": (tp * 1e9, 0.0),
                     "cpu": (10.0, 0.0),

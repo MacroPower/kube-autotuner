@@ -256,6 +256,45 @@ def _group_latency_by_iteration(
     return grouped
 
 
+def is_primary(t: TrialResult) -> bool:
+    """Return ``True`` when ``t`` is a primary (sobol/bayesian/legacy) trial.
+
+    Legacy rows written before this feature have ``phase is None`` and
+    are primary by construction -- the verification loop did not exist
+    at the time they were produced, so they cannot be verification
+    repeats.
+
+    Args:
+        t: Trial record to classify.
+
+    Returns:
+        ``True`` for rows that belong in the primary Ax population;
+        ``False`` for rows emitted by the verification pass.
+    """
+    return t.phase != "verification"
+
+
+def effective_phase(t: TrialResult, index: int, n_sobol: int) -> str:
+    """Return ``t.phase``, or infer from index for legacy primary rows.
+
+    Callers MUST filter to primary rows first (``is_primary(t)``) --
+    this helper is only valid for primary trials in file order and
+    will happily mislabel a verification row if one slips in.
+
+    Args:
+        t: Trial record whose phase label is needed.
+        index: Position of ``t`` within the primary-only subsequence.
+        n_sobol: The experiment's Sobol initialization budget.
+
+    Returns:
+        The stored ``phase`` when present; otherwise ``"sobol"`` for
+        indices below ``n_sobol`` and ``"bayesian"`` above.
+    """
+    if t.phase is not None:
+        return t.phase
+    return "sobol" if index < n_sobol else "bayesian"
+
+
 class TrialResult(BaseModel):
     """Aggregated result for one set of sysctls across iterations."""
 
@@ -269,6 +308,8 @@ class TrialResult(BaseModel):
     results: list[BenchmarkResult] = Field(default_factory=list)
     latency_results: list[LatencyResult] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    phase: Literal["sobol", "bayesian", "verification"] | None = None
+    parent_trial_id: str | None = None
 
     def model_post_init(self, _context: Any, /) -> None:  # noqa: ANN401
         """Populate derived fields (``sysctl_hash`` and ``topology``)."""
@@ -506,14 +547,20 @@ class ResumeMetadata(BaseModel):
     and consulted by :func:`kube_autotuner.runs.run_optimize` to decide
     whether the prior trials are compatible with the incoming
     experiment. ``objectives``, ``param_space``, ``benchmark`` are the
-    compatibility keys; ``n_sobol`` is only populated by ``optimize``
-    mode (baseline / trial leave it ``None``).
+    compatibility keys; ``n_sobol``, ``verification_trials``, and
+    ``verification_top_k`` are only populated by ``optimize`` mode
+    (baseline / trial leave them ``None``). ``verification_*`` fields
+    default to ``None`` for sidecars written by pre-feature binaries;
+    the compatibility check treats that shape as tolerant rather than
+    drift.
     """
 
     objectives: ObjectivesSection
     param_space: ParamSpace
     benchmark: BenchmarkConfig
     n_sobol: int | None = None
+    verification_trials: int | None = None
+    verification_top_k: int | None = None
 
 
 _resume_metadata_built = False
