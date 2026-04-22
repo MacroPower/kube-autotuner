@@ -36,7 +36,6 @@ from kube_autotuner.optimizer import (
     _encode_param_name,  # noqa: PLC2701
     build_ax_objective,
     build_ax_params,
-    filter_objectives_for_observability,
 )
 from kube_autotuner.sysctl.params import PARAM_SPACE
 
@@ -154,7 +153,7 @@ class TestOptimizationLoop:
 
     @pytest.fixture
     def config(self):
-        return BenchmarkConfig(duration=10, iterations=3, modes=["tcp"])
+        return BenchmarkConfig(duration=10, iterations=3)
 
     @patch("kube_autotuner.optimizer.NodeLease")
     @patch("kube_autotuner.optimizer.BenchmarkRunner")
@@ -500,8 +499,8 @@ class TestBuildAxObjective:
     def test_default_section(self) -> None:
         objective, constraints = build_ax_objective(ObjectivesSection())
         assert objective == (
-            "throughput, -cpu, -retransmit_rate, -node_memory, -cni_memory, "
-            "rps, -latency_p50, -latency_p90, -latency_p99"
+            "throughput, -cpu, -retransmit_rate, -jitter, -node_memory, "
+            "-cni_memory, rps, -latency_p50, -latency_p90, -latency_p99"
         )
         assert constraints == [
             "throughput >= 1e6",
@@ -535,6 +534,55 @@ class TestComputeMetricsMemory:
         assert "memory" not in metrics
         assert metrics["node_memory"][0] == pytest.approx(100_000_000)
         assert metrics["cni_memory"][0] == pytest.approx(10_000_000)
+
+
+class TestComputeMetricsJitter:
+    def test_jitter_averaged_across_udp_records(self) -> None:
+        results = [
+            BenchmarkResult(
+                timestamp=datetime.now(UTC),
+                mode="tcp",
+                bits_per_second=1e9,
+                retransmits=0,
+                bytes_sent=1_000_000_000,
+                cpu_utilization_percent=10.0,
+                iteration=0,
+            ),
+            BenchmarkResult(
+                timestamp=datetime.now(UTC),
+                mode="udp",
+                bits_per_second=1e9,
+                cpu_utilization_percent=99.0,
+                jitter_ms=0.2,
+                iteration=0,
+            ),
+            BenchmarkResult(
+                timestamp=datetime.now(UTC),
+                mode="udp",
+                bits_per_second=1e9,
+                cpu_utilization_percent=99.0,
+                jitter_ms=0.4,
+                iteration=1,
+            ),
+        ]
+        metrics = _compute_metrics(_trial_from(results))
+        # Iter 0 jitter mean 0.2, iter 1 jitter mean 0.4 -> 0.3.
+        assert metrics["jitter"][0] == pytest.approx(0.3)
+
+    def test_jitter_nan_when_no_udp_records(self) -> None:
+        results = [
+            BenchmarkResult(
+                timestamp=datetime.now(UTC),
+                mode="tcp",
+                bits_per_second=1e9,
+                retransmits=0,
+                bytes_sent=1_000_000_000,
+                cpu_utilization_percent=10.0,
+                iteration=0,
+            ),
+        ]
+        metrics = _compute_metrics(_trial_from(results))
+        assert math.isnan(metrics["jitter"][0])
 
 
 class TestComputeMetricsRate:
@@ -629,7 +677,7 @@ class TestSeedPriorTrials:
 
     @pytest.fixture
     def config(self) -> BenchmarkConfig:
-        return BenchmarkConfig(duration=10, iterations=3, modes=["tcp"])
+        return BenchmarkConfig(duration=10, iterations=3)
 
     def _prior(
         self,
@@ -884,33 +932,92 @@ class TestSeedPriorTrials:
         ]
 
 
-class TestFilterObjectivesForObservability:
-    def test_noop_when_unobservable_empty(self) -> None:
-        section = ObjectivesSection()
-        assert filter_objectives_for_observability(section, set()) is section
+class TestComputeMetricsTcpFilter:
+    """_compute_metrics must aggregate throughput / cpu over TCP only."""
 
-    def test_drops_matching_pareto_weights_constraints(self) -> None:
-        section = ObjectivesSection()
-        filtered = filter_objectives_for_observability(
-            section,
-            {"retransmit_rate"},
-        )
-        assert all(obj.metric != "retransmit_rate" for obj in filtered.pareto)
-        assert "retransmit_rate" not in filtered.recommendation_weights
-        # Insurance against the default weights shrinking to a single
-        # key again: with the latency defaults in place, filtering
-        # retransmit_rate must leave the two latency weights alone.
-        assert "latency_p90" in filtered.recommendation_weights
-        assert "latency_p99" in filtered.recommendation_weights
-        assert all("retransmit_rate" not in c for c in filtered.constraints)
+    def test_mixed_mode_trial_aggregates_tcp_records(self) -> None:
+        tcp_results = [
+            BenchmarkResult(
+                timestamp=datetime.now(UTC),
+                mode="tcp",
+                bits_per_second=1e9,
+                retransmits=0,
+                bytes_sent=1_000_000_000,
+                cpu_utilization_percent=10.0,
+                iteration=0,
+            ),
+            BenchmarkResult(
+                timestamp=datetime.now(UTC),
+                mode="tcp",
+                bits_per_second=3e9,
+                retransmits=0,
+                bytes_sent=1_000_000_000,
+                cpu_utilization_percent=20.0,
+                iteration=1,
+            ),
+        ]
+        udp_results = [
+            BenchmarkResult(
+                timestamp=datetime.now(UTC),
+                mode="udp",
+                bits_per_second=9e9,
+                cpu_utilization_percent=99.0,
+                jitter_ms=0.1,
+                iteration=0,
+            ),
+            BenchmarkResult(
+                timestamp=datetime.now(UTC),
+                mode="udp",
+                bits_per_second=9e9,
+                cpu_utilization_percent=99.0,
+                jitter_ms=0.2,
+                iteration=1,
+            ),
+        ]
+        metrics = _compute_metrics(_trial_from([*tcp_results, *udp_results]))
+        # Throughput: TCP-only mean of 1e9 and 3e9.
+        assert metrics["throughput"][0] == pytest.approx(2e9)
+        # CPU: TCP-only mean of 10 and 20.
+        assert metrics["cpu"][0] == pytest.approx(15.0)
 
-    def test_raises_when_pareto_becomes_empty(self) -> None:
-        section = ObjectivesSection(
-            pareto=[
-                ParetoObjective(metric="retransmit_rate", direction="minimize"),
-            ],
-            constraints=[],
-            recommendation_weights={"retransmit_rate": 0.3},
-        )
-        with pytest.raises(ValueError, match="unobservable"):
-            filter_objectives_for_observability(section, {"retransmit_rate"})
+    def test_single_iteration_multi_tcp_client_uses_tcp_sem(self) -> None:
+        """SEM fallback must base both the gate and the sample on TCP records."""
+        tcp_results = [
+            BenchmarkResult(
+                timestamp=datetime.now(UTC),
+                mode="tcp",
+                bits_per_second=4e9,
+                retransmits=0,
+                bytes_sent=1_000_000_000,
+                cpu_utilization_percent=10.0,
+                client_node="c1",
+                iteration=0,
+            ),
+            BenchmarkResult(
+                timestamp=datetime.now(UTC),
+                mode="tcp",
+                bits_per_second=6e9,
+                retransmits=0,
+                bytes_sent=1_000_000_000,
+                cpu_utilization_percent=20.0,
+                client_node="c2",
+                iteration=0,
+            ),
+        ]
+        udp_results = [
+            BenchmarkResult(
+                timestamp=datetime.now(UTC),
+                mode="udp",
+                bits_per_second=9e9,
+                cpu_utilization_percent=99.0,
+                jitter_ms=0.1,
+                client_node="c1",
+                iteration=0,
+            ),
+        ]
+        metrics = _compute_metrics(_trial_from([*tcp_results, *udp_results]))
+        # TCP-summed: 4e9 + 6e9 = 10e9.
+        assert metrics["throughput"][0] == pytest.approx(1e10)
+        # With 2 TCP samples (single iteration), SEM must be non-zero
+        # and computed over TCP samples only (not mixed with UDP).
+        assert metrics["throughput"][1] > 0.0

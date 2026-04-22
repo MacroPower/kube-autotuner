@@ -174,7 +174,7 @@ def _aggregate_by_iteration(
     record), and ``reducer`` collapses each iteration's values into one
     float. Iterations with no surviving values are dropped entirely.
 
-    The output is therefore one float *per iteration* — not one value
+    The output is therefore one float *per iteration* -- not one value
     across all iterations, and not one value per record.
 
     Args:
@@ -284,14 +284,23 @@ def _compute_metrics(  # noqa: PLR0914
     value per iteration, then :func:`_mean_sem` computes the mean and
     SEM across iterations. The ``iterations=1`` multi-client corner
     case collapses to a single iteration with zero SEM; the fallback
-    replaces it with a per-client SEM (best-effort — the samples share
+    replaces it with a per-client SEM (best-effort -- the samples share
     server state and are correlated).
+
+    ``throughput`` and ``cpu`` filter to ``mode == "tcp"`` records
+    before aggregating, preserving the optimizer's historical
+    TCP-only semantics for those objectives.
 
     ``retransmit_rate`` is the per-iteration ratio
     ``sum(retransmits) / sum(bytes_sent)`` averaged across iterations.
     When no iteration produced both a ``retransmits`` reading and a
-    non-zero ``bytes_sent`` total (UDP-only trials, failed TCP runs),
-    the mean is ``NaN`` and callers are expected to drop the key
+    non-zero ``bytes_sent`` total (i.e. every ``bw-tcp`` stage
+    failed), the mean is ``NaN`` and callers are expected to drop the
+    key before handing results to Ax.
+
+    ``jitter`` is the mean of the per-iteration cross-client mean of
+    ``jitter_ms`` (only UDP records carry it). When every ``bw-udp``
+    stage failed, the mean is ``NaN`` and callers drop the key
     before handing results to Ax.
 
     ``rps`` is sourced from the fortio saturation sub-stage only (it
@@ -299,7 +308,7 @@ def _compute_metrics(  # noqa: PLR0914
     sourced from the fortio fixed-QPS sub-stage only (they are
     meaningless under saturation). When the corresponding sub-stage
     produced no records, the mean is ``NaN`` and callers drop the
-    key before handing results to Ax — exactly as they do for
+    key before handing results to Ax -- exactly as they do for
     ``retransmit_rate``.
 
     Args:
@@ -313,13 +322,19 @@ def _compute_metrics(  # noqa: PLR0914
         :meth:`ax.api.client.Client.complete_trial`.
     """
     results = trial.results
+    tcp_results = [r for r in results if r.mode == "tcp"]
     throughput_vals = _aggregate_by_iteration(
-        results,
+        tcp_results,
         lambda r: r.bits_per_second,
         sum,
     )
-    cpu_vals = _aggregate_by_iteration(results, _cpu_value, statistics.mean)
+    cpu_vals = _aggregate_by_iteration(tcp_results, _cpu_value, statistics.mean)
     rate_vals = retransmit_rate_by_iteration(results)
+    jitter_vals = _aggregate_by_iteration(
+        results,
+        lambda r: r.jitter_ms,
+        statistics.mean,
+    )
 
     throughput_mean, throughput_sem = _mean_sem(throughput_vals)
     cpu_mean, cpu_sem = _mean_sem(cpu_vals)
@@ -327,9 +342,13 @@ def _compute_metrics(  # noqa: PLR0914
         rate_mean, rate_sem = _mean_sem(rate_vals)
     else:
         rate_mean, rate_sem = float("nan"), 0.0
+    if jitter_vals:
+        jitter_mean, jitter_sem = _mean_sem(jitter_vals)
+    else:
+        jitter_mean, jitter_sem = float("nan"), 0.0
 
-    if len(throughput_vals) == 1 and len(results) > 1:
-        raw = [r.bits_per_second for r in results]
+    if len(throughput_vals) == 1 and len(tcp_results) > 1:
+        raw = [r.bits_per_second for r in tcp_results]
         throughput_sem = statistics.stdev(raw) / math.sqrt(len(raw))
         logger.info(
             "iterations=1 with multiple clients: using per-client SEM "
@@ -361,6 +380,7 @@ def _compute_metrics(  # noqa: PLR0914
         "throughput": (throughput_mean, throughput_sem),
         "cpu": (cpu_mean, cpu_sem),
         "retransmit_rate": (rate_mean, rate_sem),
+        "jitter": (jitter_mean, jitter_sem),
         "node_memory": _memory_mean_sem(results, lambda r: r.node_memory_used_bytes),
         "cni_memory": _memory_mean_sem(results, lambda r: r.cni_memory_used_bytes),
         "rps": (rps_mean, rps_sem),
@@ -407,59 +427,6 @@ def _constraint_metric(constraint: str) -> str | None:
 
     match = _CONSTRAINT_RE.match(constraint)
     return match.group("metric") if match else None
-
-
-def filter_objectives_for_observability(
-    section: ObjectivesSection,
-    unobservable: set[str],
-) -> ObjectivesSection:
-    """Drop ``unobservable`` metrics from every part of ``section``.
-
-    Removes matching entries from ``pareto``,
-    ``recommendation_weights``, and any outcome constraint that
-    references one of the unobservable metrics. Used when the
-    configured benchmark cannot produce a metric (e.g. UDP-only
-    runs cannot observe ``retransmit_rate``). The fortio-sourced
-    metrics (``rps``, ``latency_p50/p90/p99``) are always observable
-    as long as the fortio sub-stages run, so they never feed this
-    set; their NaN-on-empty handling lives in :func:`_compute_metrics`
-    instead.
-
-    Args:
-        section: The objectives block loaded from user config.
-        unobservable: Metric names that will never have observations.
-
-    Returns:
-        A new :class:`ObjectivesSection` with the unobservable
-        metrics removed. The input is left unchanged.
-
-    Raises:
-        ValueError: Every Pareto objective referenced an unobservable
-            metric, leaving no objective to optimize against.
-    """
-    if not unobservable:
-        return section
-    filtered_pareto = [obj for obj in section.pareto if obj.metric not in unobservable]
-    if not filtered_pareto:
-        msg = (
-            f"every Pareto objective references an unobservable "
-            f"metric {sorted(unobservable)}; add at least one "
-            "observable objective to experiment.yaml"
-        )
-        raise ValueError(msg)
-    filtered_weights = {
-        k: v for k, v in section.recommendation_weights.items() if k not in unobservable
-    }
-    filtered_constraints = [
-        c for c in section.constraints if _constraint_metric(c) not in unobservable
-    ]
-    return section.model_copy(
-        update={
-            "pareto": filtered_pareto,
-            "recommendation_weights": filtered_weights,
-            "constraints": filtered_constraints,
-        },
-    )
 
 
 class OptimizationLoop:
@@ -541,23 +508,6 @@ class OptimizationLoop:
         self.cni: CniSection | None = cni
         self.observer: ProgressObserver = observer or NullObserver()
 
-        unobservable: set[str] = set()
-        if "tcp" not in config.modes:
-            unobservable.add("retransmit_rate")
-        references_unobservable = unobservable and (
-            any(obj.metric in unobservable for obj in objectives.pareto)
-            or any(
-                _constraint_metric(c) in unobservable for c in objectives.constraints
-            )
-        )
-        if references_unobservable:
-            logger.warning(
-                "benchmark modes=%s cannot observe %s; stripping from "
-                "objectives / constraints",
-                list(config.modes),
-                sorted(unobservable),
-            )
-        objectives = filter_objectives_for_observability(objectives, unobservable)
         self.objectives: ObjectivesSection = objectives
         self._ax_metric_names: set[str] = {obj.metric for obj in objectives.pareto} | {
             metric

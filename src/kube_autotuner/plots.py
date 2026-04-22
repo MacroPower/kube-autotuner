@@ -53,11 +53,11 @@ def plot_pareto_scatter_matrix(
 
     Returns:
         A :class:`plotly.graph_objects.Figure` rendering the subset of
-        the five objective columns (throughput, CPU, node memory, CNI
-        memory, retransmit_rate) that have at least one non-null
-        value in ``df``. Columns with no data (e.g. ``mean_cni_memory``
-        when ``cni.enabled=false``) are skipped so the matrix does not
-        show a dead axis.
+        the six objective columns (throughput, CPU, node memory, CNI
+        memory, retransmit_rate, jitter) that have at least one
+        non-null value in ``df``. Columns with no data (e.g.
+        ``mean_cni_memory`` when ``cni.enabled=false``) are skipped
+        so the matrix does not show a dead axis.
     """
     px, _ = _require_plotly()
     candidate_cols = [
@@ -66,6 +66,7 @@ def plot_pareto_scatter_matrix(
         "mean_node_memory",
         "mean_cni_memory",
         "retransmit_rate",
+        "mean_jitter_ms",
     ]
     cols = [c for c in candidate_cols if c in df.columns and df[c].notna().any()]
     plot_df = df[[*cols, "trial_id"]].copy()

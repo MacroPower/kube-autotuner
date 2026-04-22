@@ -2,12 +2,14 @@
 
 :class:`BenchmarkRunner` launches one iperf3 server Deployment and one
 fortio server Deployment on the target node, then drives each iteration
-as three sub-stages executed sequentially:
+as four sub-stages executed sequentially:
 
-1. **bandwidth** (iperf3 fan-out).
-2. **fortio-saturation** (fortio ``-qps 0`` fan-out; sole source of
+1. **bw-tcp** (iperf3 TCP fan-out).
+2. **bw-udp** (iperf3 UDP fan-out; sole source of ``jitter_ms`` and
+   the residual pressure that exercises the UDP-tuning dimensions).
+3. **fortio-saturation** (fortio ``-qps 0`` fan-out; sole source of
    the ``rps`` metric).
-3. **fortio-fixed-qps** (fortio at the configured ``fixed_qps``; sole
+4. **fortio-fixed-qps** (fortio at the configured ``fixed_qps``; sole
    source of the latency percentiles).
 
 Sub-stages run sequentially so fortio never contends with iperf3 for
@@ -109,7 +111,7 @@ class BenchmarkRunner:
 
         Args:
             node_pair: Source/target nodes and namespace for this run.
-            config: :class:`BenchmarkConfig` (duration, iterations, modes,
+            config: :class:`BenchmarkConfig` (duration, iterations,
                 parallel streams, TCP window).
             client: Injected :class:`K8sClient`. Defaults to a freshly
                 constructed real client.
@@ -553,101 +555,103 @@ class BenchmarkRunner:
                 sink.put(sample)
             stop.wait(SAMPLE_INTERVAL_S)
 
-    def run(self) -> IterationResults:  # noqa: C901, PLR0912, PLR0915
-        """Run all configured benchmark iterations and modes.
+    def run(self) -> IterationResults:  # noqa: PLR0912, PLR0915
+        """Run every configured benchmark iteration.
 
-        Each iteration expands into three sub-stages (bandwidth,
-        fortio saturation, fortio fixed-qps) executed sequentially so
-        fortio never contends with iperf3 for NIC, CPU, or CNI state.
-        The resource sampler straddles the whole iteration so peak
-        node and CNI memory reflect all three sub-stages rather than
-        any one phase.
+        Each iteration expands into four sub-stages executed
+        sequentially so fortio never contends with iperf3 for NIC,
+        CPU, or CNI state: ``bw-tcp`` -> ``bw-udp`` -> ``fortio-sat``
+        -> ``fortio-fixed``. The resource sampler straddles the whole
+        iteration so peak node and CNI memory reflect every sub-stage
+        rather than any one phase.
 
         Fires :meth:`ProgressObserver.on_benchmark_start` once up
         front with the trial-wide iteration budget
-        (``len(modes) * iterations``) so observers can size a
-        trial-scoped progress bar before the per-mode callbacks start.
+        (``config.iterations``) so observers can size a trial-scoped
+        progress bar before the per-iteration callbacks start.
 
         Returns:
             An :class:`IterationResults` holding every
             :class:`BenchmarkResult` and :class:`LatencyResult`
-            produced across iterations and modes, tagged with the
-            peak node and CNI memory observed during each iteration
-            when sampling produced any data.
+            produced across iterations, tagged with the peak node and
+            CNI memory observed during each iteration when sampling
+            produced any data.
         """
-        self.observer.on_benchmark_start(
-            len(self.config.modes) * self.config.iterations,
-        )
+        self.observer.on_benchmark_start(self.config.iterations)
         all_bench: list[BenchmarkResult] = []
         all_latency: list[LatencyResult] = []
-        for mode in self.config.modes:
-            self.observer.on_mode_start(mode, self.config.iterations)
-            for i in range(self.config.iterations):
-                logger.info(
-                    "Running %s iteration %d/%d: %s -> %s",
-                    mode,
-                    i + 1,
-                    self.config.iterations,
-                    self._clients,
-                    self.node_pair.target,
-                )
-                self.observer.on_iteration_start(mode, i)
-                stop = threading.Event()
-                sink: queue.Queue[dict[str, int]] = queue.Queue()
-                sampler = threading.Thread(
-                    target=self._sample_resources_loop,
-                    args=(stop, sink),
-                    name=f"mem-sampler-{mode}-{i}",
-                    daemon=True,
-                )
-                sampler.start()
-                bench: list[BenchmarkResult] = []
-                sat: list[LatencyResult] = []
-                fixed: list[LatencyResult] = []
+        for i in range(self.config.iterations):
+            logger.info(
+                "Running iteration %d/%d: %s -> %s",
+                i + 1,
+                self.config.iterations,
+                self._clients,
+                self.node_pair.target,
+            )
+            self.observer.on_iteration_start(i)
+            stop = threading.Event()
+            sink: queue.Queue[dict[str, int]] = queue.Queue()
+            sampler = threading.Thread(
+                target=self._sample_resources_loop,
+                args=(stop, sink),
+                name=f"mem-sampler-{i}",
+                daemon=True,
+            )
+            sampler.start()
+            bench_tcp: list[BenchmarkResult] = []
+            bench_udp: list[BenchmarkResult] = []
+            sat: list[LatencyResult] = []
+            fixed: list[LatencyResult] = []
+            try:
+                self.observer.on_stage_start("bw-tcp", i)
                 try:
-                    self.observer.on_stage_start("bw", mode, i)
-                    try:
-                        bench = self._run_bandwidth_stage(mode, i)
-                    finally:
-                        self.observer.on_stage_end("bw", mode, i)
-                    self.observer.on_stage_start("fortio-sat", mode, i)
-                    try:
-                        sat = self._run_latency_stage(i, workload="saturation")
-                    finally:
-                        self.observer.on_stage_end("fortio-sat", mode, i)
-                    self.observer.on_stage_start("fortio-fixed", mode, i)
-                    try:
-                        fixed = self._run_latency_stage(i, workload="fixed_qps")
-                    finally:
-                        self.observer.on_stage_end("fortio-fixed", mode, i)
+                    bench_tcp = self._run_bandwidth_stage("tcp", i)
                 finally:
-                    stop.set()
-                    sampler.join(timeout=SAMPLE_INTERVAL_S * 2)
-                    self.observer.on_iteration_end(mode, i)
-                samples: list[dict[str, int]] = []
-                while True:
-                    try:
-                        samples.append(sink.get_nowait())
-                    except queue.Empty:
-                        break
-                peaks: dict[str, int] = {}
-                for sample in samples:
-                    for k, v in sample.items():
-                        cur = peaks.get(k)
-                        peaks[k] = v if cur is None else max(cur, v)
-                for r in bench:
-                    if "node" in peaks:
-                        r.node_memory_used_bytes = peaks["node"]
-                    if "cni" in peaks:
-                        r.cni_memory_used_bytes = peaks["cni"]
-                latency_records = [*sat, *fixed]
-                for lr in latency_records:
-                    if "node" in peaks:
-                        lr.node_memory_used_bytes = peaks["node"]
-                    if "cni" in peaks:
-                        lr.cni_memory_used_bytes = peaks["cni"]
-                all_bench.extend(bench)
-                all_latency.extend(latency_records)
+                    self.observer.on_stage_end("bw-tcp", i)
+                self.observer.on_stage_start("bw-udp", i)
+                try:
+                    bench_udp = self._run_bandwidth_stage("udp", i)
+                finally:
+                    self.observer.on_stage_end("bw-udp", i)
+                self.observer.on_stage_start("fortio-sat", i)
+                try:
+                    sat = self._run_latency_stage(i, workload="saturation")
+                finally:
+                    self.observer.on_stage_end("fortio-sat", i)
+                self.observer.on_stage_start("fortio-fixed", i)
+                try:
+                    fixed = self._run_latency_stage(i, workload="fixed_qps")
+                finally:
+                    self.observer.on_stage_end("fortio-fixed", i)
+            finally:
+                stop.set()
+                sampler.join(timeout=SAMPLE_INTERVAL_S * 2)
+                self.observer.on_iteration_end(i)
+            samples: list[dict[str, int]] = []
+            while True:
+                try:
+                    samples.append(sink.get_nowait())
+                except queue.Empty:
+                    break
+            peaks: dict[str, int] = {}
+            for sample in samples:
+                for k, v in sample.items():
+                    cur = peaks.get(k)
+                    peaks[k] = v if cur is None else max(cur, v)
+            bench = [*bench_tcp, *bench_udp]
+            for r in bench:
+                if "node" in peaks:
+                    r.node_memory_used_bytes = peaks["node"]
+                if "cni" in peaks:
+                    r.cni_memory_used_bytes = peaks["cni"]
+            latency_records = [*sat, *fixed]
+            for lr in latency_records:
+                if "node" in peaks:
+                    lr.node_memory_used_bytes = peaks["node"]
+                if "cni" in peaks:
+                    lr.cni_memory_used_bytes = peaks["cni"]
+            all_bench.extend(bench)
+            all_latency.extend(latency_records)
         return IterationResults(bench=all_bench, latency=all_latency)
 
     def _run_bandwidth_stage(
@@ -656,6 +660,10 @@ class BenchmarkRunner:
         iteration: int,
     ) -> list[BenchmarkResult]:
         """Launch one iperf3 client Job per client concurrently.
+
+        Called twice per iteration from :meth:`run` -- once with
+        ``mode="tcp"`` (the ``bw-tcp`` sub-stage), once with
+        ``mode="udp"`` (the ``bw-udp`` sub-stage).
 
         Returns:
             The list of :class:`BenchmarkResult`, one per client, for

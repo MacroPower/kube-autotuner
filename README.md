@@ -11,19 +11,22 @@ for request/response latency and achieved RPS. An Ax-platform
 multi-objective Bayesian optimizer proposes the next configuration,
 the tool applies it, and the benchmark runs again. The loop converges
 on a Pareto-optimal set of trade-offs between throughput, TCP
-retransmit rate, CPU, target-node memory, CNI data-plane memory, RPS
-under saturation, and p50/p90/p99 latency under a fixed offered load.
+retransmit rate, UDP jitter, CPU, target-node memory, CNI data-plane
+memory, RPS under saturation, and p50/p90/p99 latency under a fixed
+offered load.
 
 ## Why this is hard
 
-- **Expensive trials.** A single iteration expands into three
-  sequential sub-stages: an iperf3 bandwidth fan-out
-  (`duration=30s` + `omit=5s` warmup), a fortio saturation run
-  (`-qps 0`, `fortio.duration=30s`), and a fortio fixed-QPS run at
-  `fortio.fixedQps`. The sequence repeats `iterations` times for each
-  mode in `benchmark.modes` (TCP and/or UDP), before setup and
-  teardown. A 50-trial run takes hours. Grid search over the default
-  space is infeasible by orders of magnitude.
+- **Expensive trials.** A single iteration expands into four
+  sequential sub-stages: an iperf3 TCP bandwidth fan-out
+  (`duration=30s` + `omit=5s` warmup), an iperf3 UDP bandwidth
+  fan-out (same budget, sole source of `jitter_ms` and the residual
+  pressure that exercises the UDP-tuning dimensions), a fortio
+  saturation run (`-qps 0`, `fortio.duration=30s`), and a fortio
+  fixed-QPS run at `fortio.fixedQps`. The sequence repeats
+  `iterations` times before setup and teardown. A 50-trial run
+  takes hours. Grid search over the default space is infeasible by
+  orders of magnitude.
 - **Noisy measurements.** iperf3 throughput has real run-to-run
   variance. The optimizer collapses each metric into a `(mean, SEM)`
   pair and accounts for the fact that samples are correlated when
@@ -116,12 +119,13 @@ Either way, exhaustive search is not an option.
 | UDP                | 2     | `net.ipv4.udp_rmem_min`, `net.ipv4.udp_mem`                                            |
 | Conntrack          | 3     | `net.netfilter.nf_conntrack_max`, `net.netfilter.nf_conntrack_tcp_timeout_established` |
 
-UDP-category params are only searched when `benchmark.modes` includes
-`udp`; on a TCP-only run (the default) they are stripped from the
-canonical default. A user-supplied `optimize.paramSpace` bypasses the
-mode gate. Conntrack tuning assumes the `nf_conntrack` kernel module is
-loaded on the target node; on nodes without `/proc/sys/net/netfilter`
-these writes will fail at apply time.
+UDP-category params are always part of the default search space: every
+iteration runs both a TCP and a UDP iperf3 bandwidth stage, so UDP
+metrics (`jitter_ms`) and the residual kernel pressure that these
+knobs control are always observable. Conntrack tuning assumes the
+`nf_conntrack` kernel module is loaded on the target node; on nodes
+without `/proc/sys/net/netfilter` these writes will fail at apply
+time.
 
 Two shapes of customisation:
 
@@ -142,7 +146,7 @@ pip install "git+https://github.com/<owner>/kube-autotuner.git"
 uv pip install -e .
 ```
 
-Python ≥ 3.14 is required. For a managed uv + Nix dev environment, see
+Python >= 3.14 is required. For a managed uv + Nix dev environment, see
 [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## Quick start
@@ -169,7 +173,6 @@ benchmark:
   iterations: 3
   parallel: 16                   # iperf3 -P streams per client
   window: null                   # iperf3 -w hint; e.g. "256K" to pin it
-  modes: [tcp]                   # any of: tcp, udp
 
 # Required when mode: optimize. Ax Bayesian loop knobs plus the search
 # space. Omit paramSpace to use the built-in canonical sysctl set.
@@ -253,6 +256,7 @@ objectives:
     - { metric: throughput, direction: maximize }
     - { metric: cpu, direction: minimize }
     - { metric: retransmit_rate, direction: minimize }
+    - { metric: jitter, direction: minimize }
     - { metric: node_memory, direction: minimize }
     - { metric: cni_memory, direction: minimize }
     - { metric: rps, direction: maximize }
@@ -262,7 +266,7 @@ objectives:
   constraints:
     - "throughput >= 1e6"
     - "cpu <= 200"
-    - "retransmit_rate <= 1e-6"   # retransmits per byte sent; 1e-6 ≈ 1 retx/MB
+    - "retransmit_rate <= 1e-6"   # retransmits per byte sent; 1e-6 ~ 1 retx/MB
     - "node_memory <= 1e10"
     - "rps >= 100"                # requests/sec; only the saturation sub-stage feeds rps,
                                   # so this floor only fails on fortio server crash.
@@ -270,6 +274,8 @@ objectives:
   recommendationWeights:
     cpu: 0.15
     retransmit_rate: 0.3
+    jitter: 0.1                   # UDP jitter ms; modest weight -- a stability signal,
+                                  # not a primary optimization target.
     node_memory: 0.15
     latency_p90: 0.1              # tail-latency weights keep the live Best-so-far panel
     latency_p99: 0.15             # and the post-hoc recommendation from over-indexing on
@@ -286,19 +292,21 @@ A few rules govern how the `objectives:` block is interpreted:
   the default list wholesale rather than extending it.
 - Weights are only valid on minimize-direction metrics and must
   reference a metric present in `pareto`.
-- UDP-only benchmarks cannot observe `retransmit_rate`; the optimizer
-  strips it from the objective and any referencing constraints with a
-  logged warning when `benchmark.modes` does not include `tcp`. Both
-  fortio sub-stages run every iteration regardless of mode, so the
-  fortio-sourced metrics below are always observable.
+- Every iteration runs both iperf3 bandwidth stages (TCP then UDP)
+  and both fortio sub-stages, so every metric below is always
+  observable. Sidecar metadata files (`<results.jsonl>.meta.json`)
+  from earlier versions that set `benchmark.modes: [tcp]` still
+  load: the `modes:` key is silently dropped at parse time, so a
+  resume will rerun against the new always-both semantics.
 
 Valid metric names and their sources:
 
 | Metric            | Direction | Source sub-stage         | Notes                                                                                                  |
 |-------------------|-----------|--------------------------|--------------------------------------------------------------------------------------------------------|
-| `throughput`      | maximize  | iperf3 bandwidth         | Bits per second; summed across source clients per iteration, averaged across iterations.              |
-| `cpu`             | minimize  | iperf3 bandwidth         | Percent; server-side CPU when every record reports it, per-client host CPU otherwise.                 |
-| `retransmit_rate` | minimize  | iperf3 bandwidth         | Retransmits per byte sent; scale-invariant, so high-throughput/high-loss does not win on raw count.   |
+| `throughput`      | maximize  | iperf3 bw-tcp            | Bits per second; TCP-only. Summed across source clients per iteration, averaged across iterations.    |
+| `cpu`             | minimize  | iperf3 bw-tcp            | Percent; TCP-only. Server-side CPU when every record reports it, per-client host CPU otherwise.       |
+| `retransmit_rate` | minimize  | iperf3 bw-tcp            | Retransmits per byte sent; scale-invariant, so high-throughput/high-loss does not win on raw count.   |
+| `jitter`          | minimize  | iperf3 bw-udp            | Milliseconds. Mean UDP inter-arrival jitter; tail-stability signal that TCP-only runs cannot observe. |
 | `node_memory`     | minimize  | iperf3 (peak over iter.) | Whole-node memory on the iperf target, from `metrics.k8s.io/v1beta1 nodes/<name>`.                    |
 | `cni_memory`      | minimize  | iperf3 (peak over iter.) | Memory summed across the CNI pods selected by `cni:`; what most sysctl tweaks actually move.          |
 | `rps`             | maximize  | fortio saturation        | Achieved QPS under `-qps 0`. Fixed-QPS RPS would clamp to the offered load, so it is not a source.    |

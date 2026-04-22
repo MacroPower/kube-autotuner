@@ -30,9 +30,7 @@ def _make_runner(
         namespace=namespace,
         ip_family_policy="SingleStack",
     )
-    config = BenchmarkConfig(
-        duration=5, omit=0, iterations=1, parallel=1, modes=["tcp"]
-    )
+    config = BenchmarkConfig(duration=5, omit=0, iterations=1, parallel=1)
     return BenchmarkRunner(node_pair, config, client=k8s_client)
 
 
@@ -106,9 +104,24 @@ def test_full_run_records_results(
     assert len(loaded) >= 1
 
     t = loaded[-1]
-    assert len(t.results) >= 1
-    assert t.results[0].bits_per_second > 0
+    # Each iteration runs both bw-tcp and bw-udp; with iterations=1,
+    # parallel=1, that's exactly two bench records.
+    assert len(t.results) == 2
+    assert {r.mode for r in t.results} == {"tcp", "udp"}
+    # bw-tcp runs before bw-udp, so the first record is the TCP one.
     assert t.results[0].mode == "tcp"
+    assert t.results[0].bits_per_second > 0
+    assert t.results[0].bytes_sent is not None  # TCP records carry bytes_sent
+    # The UDP record carries jitter_ms (only UDP does) and not retransmits.
+    udp = next(r for r in t.results if r.mode == "udp")
+    assert udp.jitter_ms is not None
+    assert udp.jitter_ms >= 0.0
+    assert udp.bytes_sent is None
+    # Aggregates reflect the new always-both semantics.
+    assert t.mean_jitter_ms() > 0.0
+    # retransmit_rate may be 0 on a clean intra-cluster path, but it
+    # must be a finite number (not None) now that bw-tcp always runs.
+    assert t.retransmit_rate() is not None
     assert t.node_pair.source == node_names["source"]
     assert t.node_pair.target == node_names["target"]
     # Both fortio sub-stages fire per iteration.

@@ -92,11 +92,6 @@ class NodePair(BaseModel):
         return self.extra_source_zones.get(client, "")
 
 
-def _default_modes() -> list[Literal["tcp", "udp"]]:
-    """Return the default benchmark modes list (TCP only)."""
-    return ["tcp"]
-
-
 class BenchmarkConfig(BaseModel):
     """Configuration for a single benchmark session."""
 
@@ -105,7 +100,6 @@ class BenchmarkConfig(BaseModel):
     iterations: int = 3
     parallel: int = 16
     window: str | None = None
-    modes: list[Literal["tcp", "udp"]] = Field(default_factory=_default_modes)
 
 
 class BenchmarkResult(BaseModel):
@@ -203,10 +197,11 @@ def retransmit_rate_by_iteration(results: list[BenchmarkResult]) -> list[float]:
     """Return one retransmit rate (retx per byte) per iteration.
 
     Each iteration's rate is ``sum(retransmits) / sum(bytes_sent)``
-    over its records. Iterations where no record reported
-    ``retransmits``, or whose ``bytes_sent`` total is zero, are
-    omitted so a UDP-only or failed iteration does not fabricate a
-    perfect-rate zero.
+    over its records. Every iteration now runs both TCP and UDP
+    bandwidth stages, so the filter's job is to skip iterations where
+    no TCP record reported ``retransmits`` / ``bytes_sent`` (e.g. a
+    failed ``bw-tcp`` stage). UDP records are dropped naturally
+    because they never report ``bytes_sent``.
 
     Args:
         results: Raw benchmark records for a single trial.
@@ -283,37 +278,46 @@ class TrialResult(BaseModel):
             self.topology = self.node_pair.topology
 
     def mean_throughput(self) -> float:
-        """Return the mean total throughput in bits per second.
+        """Return the mean total TCP throughput in bits per second.
 
-        Throughput is summed across clients within each iteration, then
-        averaged across iterations.
+        Filters to ``mode == "tcp"`` records before aggregating -- every
+        iteration now runs both TCP and UDP bandwidth stages, and the
+        ``throughput`` objective has always meant TCP. Throughput is
+        summed across clients within each iteration, then averaged
+        across iterations.
 
         Returns:
-            The averaged throughput, or ``0.0`` when there are no results.
+            The averaged TCP throughput, or ``0.0`` when there are no
+            TCP results.
         """
-        if not self.results:
+        tcp_results = [r for r in self.results if r.mode == "tcp"]
+        if not tcp_results:
             return 0.0
         per_iter_sums = [
             sum(r.bits_per_second for r in group)
-            for group in _group_by_iteration(self.results).values()
+            for group in _group_by_iteration(tcp_results).values()
         ]
         return sum(per_iter_sums) / len(per_iter_sums)
 
     def mean_cpu(self) -> float:
-        """Return the mean CPU utilization percent across iterations.
+        """Return the mean CPU utilization percent across TCP iterations.
 
-        Uses the server-side CPU when every record reports it (since all
-        clients share the same server); otherwise falls back to the
-        per-client host CPU.
+        Filters to ``mode == "tcp"`` records before aggregating -- the
+        ``cpu`` objective has always meant CPU observed during the TCP
+        bandwidth stage. Uses the server-side CPU when every TCP
+        record reports it (since all clients share the same server);
+        otherwise falls back to the per-client host CPU.
 
         Returns:
-            The averaged CPU percent, or ``0.0`` when there are no results.
+            The averaged CPU percent, or ``0.0`` when there are no TCP
+            results.
         """
-        if not self.results:
+        tcp_results = [r for r in self.results if r.mode == "tcp"]
+        if not tcp_results:
             return 0.0
-        use_server = all(r.cpu_server_percent is not None for r in self.results)
+        use_server = all(r.cpu_server_percent is not None for r in tcp_results)
         per_iter_means: list[float] = []
-        for group in _group_by_iteration(self.results).values():
+        for group in _group_by_iteration(tcp_results).values():
             if use_server:
                 values = [cast("float", r.cpu_server_percent) for r in group]
             else:
@@ -337,16 +341,17 @@ class TrialResult(BaseModel):
         iterations -- matching how :meth:`mean_throughput` folds
         clients within an iteration and averages across iterations.
         Iterations where no record reported ``bytes_sent`` (or the
-        per-iteration byte total was zero), or where every record
-        lacks a ``retransmits`` value (mixed TCP/UDP trials), are
-        dropped from the mean rather than treated as perfect-rate
-        zero.
+        per-iteration byte total was zero) are dropped from the mean
+        rather than treated as perfect-rate zero. UDP records never
+        carry ``bytes_sent``, so they are filtered out by this same
+        check.
 
         Returns:
             Retransmits per byte sent as a ``float`` (e.g. ``1e-6``
-            ≈ 1 retransmit per MB), or ``None`` when no iteration
-            contributed a usable ratio (UDP-only trials or runs
-            without ``bytes_sent``).
+            is approximately 1 retransmit per MB) -- the default
+            case, since every iteration now runs a TCP bandwidth
+            stage. Returns ``None`` only when every ``bw-tcp`` stage
+            failed.
         """
         rate_vals = retransmit_rate_by_iteration(self.results)
         if not rate_vals:

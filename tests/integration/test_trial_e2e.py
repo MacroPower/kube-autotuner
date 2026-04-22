@@ -67,7 +67,12 @@ def test_trial_snapshots_applies_benchmarks_restores(
 
     trial = TrialResult.model_validate_json(lines[0])
     assert trial.sysctl_values == {"net.core.rmem_max": "16777216"}
+    # Each iteration now runs both bw-tcp and bw-udp.
+    assert {r.mode for r in trial.results} == {"tcp", "udp"}
+    assert trial.results[0].mode == "tcp"  # bw-tcp runs first
     assert trial.results[0].bits_per_second > 0
+    # UDP jitter is the signal that the new bw-udp stage actually ran.
+    assert trial.mean_jitter_ms() > 0.0
 
     # Fake-state witness: after restore, the state file holds the pre-trial
     # default that snapshot captured (not the trial's 16777216), proving

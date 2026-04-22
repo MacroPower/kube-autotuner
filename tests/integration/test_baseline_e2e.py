@@ -57,6 +57,11 @@ def test_baseline_produces_results(
     assert len(lines) == 1
 
     trial = json.loads(lines[0])
-    assert trial["results"]
+    # Each iteration runs both bw-tcp and bw-udp (no `modes:` dimension).
+    assert len(trial["results"]) == 2
+    assert {r["mode"] for r in trial["results"]} == {"tcp", "udp"}
+    assert trial["results"][0]["mode"] == "tcp"  # bw-tcp runs first
     assert trial["results"][0]["bits_per_second"] > 0
+    udp = next(r for r in trial["results"] if r["mode"] == "udp")
+    assert udp["jitter_ms"] is not None
     assert trial["sysctl_values"]

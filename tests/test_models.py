@@ -120,8 +120,19 @@ def test_benchmark_config_defaults():
     assert config.omit == 5
     assert config.iterations == 3
     assert config.parallel == 16
-    assert config.modes == ["tcp"]
     assert config.window is None
+
+
+def test_benchmark_config_silently_drops_legacy_modes_key():
+    # Pre-change YAML embedded `modes: [tcp]`; Pydantic's default
+    # extra="ignore" must drop the stale key so resume-sidecar
+    # comparisons still succeed.
+    config = BenchmarkConfig.model_validate(
+        {"duration": 10, "iterations": 1, "modes": ["tcp"]},
+    )
+    assert config.duration == 10
+    assert config.iterations == 1
+    assert not hasattr(config, "modes")
 
 
 def test_node_pair_defaults():
@@ -407,6 +418,122 @@ def test_retransmit_rate_drops_iterations_missing_retx_record():
     )
     # Only iter 0 contributes (bytes present AND retx recorded).
     assert trial.retransmit_rate() == pytest.approx(1e-8)
+
+
+def test_mean_throughput_and_cpu_filter_to_tcp_records():
+    """Mixed TCP+UDP result list: UDP records must not poison TCP aggregates."""
+    results = [
+        BenchmarkResult(
+            timestamp=datetime.now(UTC),
+            mode="tcp",
+            bits_per_second=1e9,
+            cpu_utilization_percent=10.0,
+            client_node="n",
+            iteration=0,
+        ),
+        BenchmarkResult(
+            timestamp=datetime.now(UTC),
+            mode="udp",
+            bits_per_second=4e9,
+            cpu_utilization_percent=99.0,
+            client_node="n",
+            iteration=0,
+        ),
+        BenchmarkResult(
+            timestamp=datetime.now(UTC),
+            mode="tcp",
+            bits_per_second=3e9,
+            cpu_utilization_percent=20.0,
+            client_node="n",
+            iteration=1,
+        ),
+        BenchmarkResult(
+            timestamp=datetime.now(UTC),
+            mode="udp",
+            bits_per_second=5e9,
+            cpu_utilization_percent=99.0,
+            client_node="n",
+            iteration=1,
+        ),
+    ]
+    trial = TrialResult(
+        node_pair=NodePair(source="n", target="t", hardware_class="10g"),
+        sysctl_values={},
+        config=BenchmarkConfig(),
+        results=results,
+    )
+    # TCP-only: iter0=1e9, iter1=3e9 -> mean 2e9. UDP records dropped.
+    assert trial.mean_throughput() == pytest.approx(2e9)
+    # TCP-only CPU: iter0=10, iter1=20 -> mean 15. UDP records dropped.
+    assert trial.mean_cpu() == pytest.approx(15.0)
+
+
+def test_mean_throughput_and_cpu_return_zero_when_no_tcp_records():
+    """All-UDP result list must produce 0.0 for TCP-only aggregates."""
+    results = [
+        BenchmarkResult(
+            timestamp=datetime.now(UTC),
+            mode="udp",
+            bits_per_second=5e9,
+            cpu_utilization_percent=70.0,
+            client_node="n",
+            iteration=0,
+        ),
+    ]
+    trial = TrialResult(
+        node_pair=NodePair(source="n", target="t", hardware_class="10g"),
+        sysctl_values={},
+        config=BenchmarkConfig(),
+        results=results,
+    )
+    assert trial.mean_throughput() == pytest.approx(0.0)
+    assert trial.mean_cpu() == pytest.approx(0.0)
+
+
+def test_mean_jitter_ms_with_mixed_tcp_udp_records():
+    """UDP is always observable now: jitter filter honours jitter_ms is not None."""
+    results = [
+        BenchmarkResult(
+            timestamp=datetime.now(UTC),
+            mode="tcp",
+            bits_per_second=1e9,
+            jitter_ms=None,
+            client_node="n",
+            iteration=0,
+        ),
+        BenchmarkResult(
+            timestamp=datetime.now(UTC),
+            mode="udp",
+            bits_per_second=1e9,
+            jitter_ms=0.2,
+            client_node="n",
+            iteration=0,
+        ),
+        BenchmarkResult(
+            timestamp=datetime.now(UTC),
+            mode="tcp",
+            bits_per_second=1e9,
+            jitter_ms=None,
+            client_node="n",
+            iteration=1,
+        ),
+        BenchmarkResult(
+            timestamp=datetime.now(UTC),
+            mode="udp",
+            bits_per_second=1e9,
+            jitter_ms=0.4,
+            client_node="n",
+            iteration=1,
+        ),
+    ]
+    trial = TrialResult(
+        node_pair=NodePair(source="n", target="t", hardware_class="10g"),
+        sysctl_values={},
+        config=BenchmarkConfig(),
+        results=results,
+    )
+    # Iter 0 jitter=0.2, iter 1 jitter=0.4 -> mean 0.3; TCP's None jitter dropped.
+    assert trial.mean_jitter_ms() == pytest.approx(0.3)
 
 
 def test_trial_result_multi_client_falls_back_to_host_cpu():

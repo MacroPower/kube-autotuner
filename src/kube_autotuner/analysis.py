@@ -41,6 +41,7 @@ DEFAULT_OBJECTIVES: list[tuple[str, str]] = [
     (METRIC_TO_DF_COLUMN["throughput"], "maximize"),
     (METRIC_TO_DF_COLUMN["cpu"], "minimize"),
     (METRIC_TO_DF_COLUMN["retransmit_rate"], "minimize"),
+    (METRIC_TO_DF_COLUMN["jitter"], "minimize"),
     (METRIC_TO_DF_COLUMN["node_memory"], "minimize"),
     (METRIC_TO_DF_COLUMN["cni_memory"], "minimize"),
     (METRIC_TO_DF_COLUMN["rps"], "maximize"),
@@ -60,6 +61,7 @@ _FRAME_BASE_COLUMNS: list[str] = [
     "mean_node_memory",
     "mean_cni_memory",
     "retransmit_rate",
+    "mean_jitter_ms",
     "mean_rps",
     "mean_latency_p50_ms",
     "mean_latency_p90_ms",
@@ -208,6 +210,7 @@ def trials_to_dataframe(
             "mean_node_memory": t.mean_node_memory(),
             "mean_cni_memory": t.mean_cni_memory(),
             "retransmit_rate": t.retransmit_rate(),
+            "mean_jitter_ms": t.mean_jitter_ms(),
             "mean_rps": t.mean_rps(),
             "mean_latency_p50_ms": t.mean_latency_p50_ms(),
             "mean_latency_p90_ms": t.mean_latency_p90_ms(),
@@ -312,7 +315,7 @@ def pareto_front(
     dropped first (see :func:`_objectives_with_data`) so a
     disabled-metric column does not reduce the frontier to the empty
     set. Rows with a NaN value on any surviving objective column are
-    then dropped before the dominance scan — numpy comparisons against
+    then dropped before the dominance scan -- numpy comparisons against
     NaN are always ``False``, so a NaN-bearing row is neither
     dominated nor dominates, and would otherwise survive the frontier
     and poison downstream normalization.
@@ -532,10 +535,10 @@ def recommend_configs(
 
     Returns:
         A list of recommendation dicts. Each dict always contains the
-        same keys (``rank``, ``trial_id``, ``sysctl_values``, the nine
+        same keys (``rank``, ``trial_id``, ``sysctl_values``, the ten
         base metric names -- ``mean_throughput``, ``mean_cpu``,
         ``mean_node_memory``, ``mean_cni_memory``,
-        ``retransmit_rate``, ``mean_rps``,
+        ``retransmit_rate``, ``mean_jitter_ms``, ``mean_rps``,
         ``mean_latency_p50_ms``, ``mean_latency_p90_ms``,
         ``mean_latency_p99_ms`` -- and a ``score``). A metric value
         is ``None`` when the trial produced no reading for it (e.g.
@@ -599,6 +602,7 @@ def recommend_configs(
                 "mean_node_memory": _maybe(row, "mean_node_memory"),
                 "mean_cni_memory": _maybe(row, "mean_cni_memory"),
                 "retransmit_rate": _maybe(row, "retransmit_rate"),
+                "mean_jitter_ms": _maybe(row, "mean_jitter_ms"),
                 "mean_rps": _maybe(row, "mean_rps"),
                 "mean_latency_p50_ms": _maybe(row, "mean_latency_p50_ms"),
                 "mean_latency_p90_ms": _maybe(row, "mean_latency_p90_ms"),

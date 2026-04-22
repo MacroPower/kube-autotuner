@@ -231,7 +231,6 @@ def _apply_overrides(
     output: str,
     duration: int,
     iterations: int,
-    udp: bool,
     sysctls: dict[str, str] | None = None,
     optimize: dict[str, Any] | None = None,
 ) -> ExperimentConfig:
@@ -246,8 +245,9 @@ def _apply_overrides(
         ip_family_policy: Service ``ipFamilyPolicy``.
         output: JSONL destination path.
         duration: iperf3 test duration in seconds.
-        iterations: Iterations per benchmark mode.
-        udp: ``True`` to append UDP alongside TCP.
+        iterations: Iterations per benchmark (each iteration runs
+            both TCP and UDP bandwidth stages plus both fortio
+            sub-stages).
         sysctls: Fixed sysctl map for ``mode="trial"``.
         optimize: ``optimize:`` section for ``mode="optimize"``.
 
@@ -260,7 +260,6 @@ def _apply_overrides(
     if not sources:
         typer.echo("At least one --source is required.", err=True)
         raise typer.Exit(code=1)
-    modes: list[str] = ["tcp", "udp"] if udp else ["tcp"]
     data: dict[str, Any] = {
         "mode": mode,
         "nodes": {
@@ -273,7 +272,6 @@ def _apply_overrides(
         "benchmark": {
             "duration": duration,
             "iterations": iterations,
-            "modes": modes,
         },
         "output": output,
     }
@@ -412,9 +410,8 @@ def baseline(
     ] = 30,
     iterations: Annotated[
         int,
-        typer.Option("--iterations", help="Iterations per benchmark mode."),
+        typer.Option("--iterations", help="Iterations per benchmark."),
     ] = 3,
-    udp: Annotated[bool, typer.Option("--udp", help="Include UDP benchmarks.")] = False,
     backend: Annotated[
         str | None,
         typer.Option(
@@ -441,7 +438,6 @@ def baseline(
         output=output,
         duration=duration,
         iterations=iterations,
-        udp=udp,
     )
     observer = _app_state(ctx).make_observer(objectives=exp.objectives)
     run_ctx = _build_context(
@@ -495,9 +491,8 @@ def trial(
     ] = 30,
     iterations: Annotated[
         int,
-        typer.Option("--iterations", help="Iterations per benchmark mode."),
+        typer.Option("--iterations", help="Iterations per benchmark."),
     ] = 3,
-    udp: Annotated[bool, typer.Option("--udp", help="Include UDP benchmarks.")] = False,
     backend: Annotated[
         str | None,
         typer.Option(
@@ -525,7 +520,6 @@ def trial(
         output=output,
         duration=duration,
         iterations=iterations,
-        udp=udp,
         sysctls=params,
     )
     observer = _app_state(ctx).make_observer(objectives=exp.objectives)
@@ -572,9 +566,8 @@ def optimize(
     ] = 30,
     iterations: Annotated[
         int,
-        typer.Option("--iterations", help="Iterations per benchmark mode."),
+        typer.Option("--iterations", help="Iterations per benchmark."),
     ] = 3,
-    udp: Annotated[bool, typer.Option("--udp", help="Include UDP benchmarks.")] = False,
     n_trials: Annotated[
         int,
         typer.Option("--n-trials", help="Total optimization trials."),
@@ -623,7 +616,6 @@ def optimize(
         output=output,
         duration=duration,
         iterations=iterations,
-        udp=udp,
         optimize={
             "n_trials": n_trials,
             "n_sobol": n_sobol,
@@ -933,6 +925,9 @@ def _format_top_recommendation(r: dict[str, Any]) -> str:
     if cmem is not None:
         parts.append(f"cni {cmem / 1024 / 1024:.0f} MiB")
     parts.append(f"{format_retransmit_rate(r['retransmit_rate'])} retx/MB")
+    jit = r.get("mean_jitter_ms")
+    if jit is not None:
+        parts.append(f"{jit:.3f} ms jitter")
     rps = r.get("mean_rps")
     if rps is not None:
         parts.append(f"{rps:,.1f} rps")
@@ -1112,9 +1107,11 @@ def _write_figures(
         ("mean_throughput", "mean_node_memory"),
         ("mean_throughput", "mean_cni_memory"),
         ("mean_throughput", "retransmit_rate"),
+        ("mean_throughput", "mean_jitter_ms"),
         ("mean_cpu", "mean_node_memory"),
         ("mean_cpu", "mean_cni_memory"),
         ("mean_cpu", "retransmit_rate"),
+        ("mean_cpu", "mean_jitter_ms"),
     ]
     for x, y in pair_candidates:
         if not (_has_data(x) and _has_data(y)):

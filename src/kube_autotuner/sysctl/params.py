@@ -251,7 +251,6 @@ _UDP_PARAMS: list[SysctlParam] = [
     ),
     # Global UDP memory pressure thresholds (pages). Too small and
     # the kernel prunes under load; too large and node_memory climbs.
-    # Only active when benchmark.modes includes udp.
     SysctlParam(
         name="net.ipv4.udp_mem",
         values=["393216 524288 786432", "786432 1048576 1572864"],

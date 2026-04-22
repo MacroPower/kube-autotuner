@@ -74,15 +74,12 @@ class ProgressObserver(Protocol):
     """Progress callbacks emitted by the optimize / benchmark loops.
 
     Every method is fire-and-forget: implementations must not raise
-    and must tolerate out-of-order or missing calls (for example,
-    ``on_mode_start`` is not guaranteed before ``on_iteration_start``
-    for callers that do not know the mode structure up front).
+    and must tolerate out-of-order or missing calls.
 
     One ordering invariant is guaranteed: inside a single benchmark
-    run, ``on_benchmark_start`` fires once before any ``on_mode_start``
-    or ``on_iteration_start`` from that run. This lets implementations
-    size a trial-wide iteration progress bar up front instead of
-    inferring the total per-mode.
+    run, ``on_benchmark_start`` fires once before any
+    ``on_iteration_start`` from that run. This lets implementations
+    size a trial-wide iteration progress bar up front.
 
     Implementations must also be usable as context managers; the CLI
     wraps the entire run in ``with observer:`` so live displays have a
@@ -168,69 +165,56 @@ class ProgressObserver(Protocol):
         """Report that a benchmark run is starting.
 
         Fires once per :meth:`BenchmarkRunner.run` call, before any
-        ``on_mode_start``. Defines the trial-wide iteration budget so
-        implementations can size their iteration progress bar across
-        all modes rather than per-mode. Implementations must preserve
-        any cumulative iteration history (mean-duration samples used
-        to compute ETA) across this call -- only the current
-        benchmark's progress-bar state should be reset.
+        ``on_iteration_start``. Defines the trial-wide iteration
+        budget so implementations can size their iteration progress
+        bar up front. Implementations must preserve any cumulative
+        iteration history (mean-duration samples used to compute ETA)
+        across this call -- only the current benchmark's
+        progress-bar state should be reset.
 
         Args:
             total_iterations: Total iterations planned for the
-                benchmark run, i.e.
-                ``len(config.modes) * config.iterations``.
+                benchmark run, i.e. ``config.iterations``.
         """
         ...
 
-    def on_mode_start(self, mode: str, total_iterations: int) -> None:
-        """Report that the benchmark is starting a new iperf3 mode.
-
-        Args:
-            mode: ``"tcp"`` or ``"udp"``.
-            total_iterations: Iterations configured for this mode.
-        """
-        ...
-
-    def on_iteration_start(self, mode: str, iteration: int) -> None:
+    def on_iteration_start(self, iteration: int) -> None:
         """Report that a single benchmark iteration is starting.
 
         Args:
-            mode: ``"tcp"`` or ``"udp"``.
-            iteration: Zero-based iteration index within ``mode``.
+            iteration: Zero-based iteration index.
         """
         ...
 
-    def on_iteration_end(self, mode: str, iteration: int) -> None:
+    def on_iteration_end(self, iteration: int) -> None:
         """Report that a single benchmark iteration has finished.
 
         Args:
-            mode: ``"tcp"`` or ``"udp"``.
-            iteration: Zero-based iteration index within ``mode``.
+            iteration: Zero-based iteration index.
         """
         ...
 
-    def on_stage_start(self, stage: str, mode: str, iteration: int) -> None:
+    def on_stage_start(self, stage: str, iteration: int) -> None:
         """Report that a sub-stage within an iteration is starting.
 
-        Each iteration expands into three sub-stages: ``"bw"`` (iperf3),
-        ``"fortio-sat"`` (fortio ``-qps 0``), and ``"fortio-fixed"``
-        (fortio at the configured fixed QPS). Observers can use the
-        label to show which sub-stage is live.
+        Each iteration expands into four sub-stages: ``"bw-tcp"``
+        (iperf3 TCP), ``"bw-udp"`` (iperf3 UDP), ``"fortio-sat"``
+        (fortio ``-qps 0``), and ``"fortio-fixed"`` (fortio at the
+        configured fixed QPS). Observers can use the label to show
+        which sub-stage is live.
 
         Args:
             stage: Sub-stage label.
-            mode: ``"tcp"`` or ``"udp"``.
-            iteration: Zero-based iteration index within ``mode``.
+            iteration: Zero-based iteration index.
         """
         ...
 
-    def on_stage_end(self, stage: str, mode: str, iteration: int) -> None:
+    def on_stage_end(self, stage: str, iteration: int) -> None:
         """Report that a sub-stage within an iteration has finished.
 
         Args:
             stage: Sub-stage label.
-            mode: ``"tcp"`` or ``"udp"``.
-            iteration: Zero-based iteration index within ``mode``.
+            iteration: Zero-based iteration index.
         """
         ...
 
@@ -281,19 +265,16 @@ class NullObserver:
     def on_benchmark_start(self, total_iterations: int) -> None:
         """No-op."""
 
-    def on_mode_start(self, mode: str, total_iterations: int) -> None:
+    def on_iteration_start(self, iteration: int) -> None:
         """No-op."""
 
-    def on_iteration_start(self, mode: str, iteration: int) -> None:
+    def on_iteration_end(self, iteration: int) -> None:
         """No-op."""
 
-    def on_iteration_end(self, mode: str, iteration: int) -> None:
+    def on_stage_start(self, stage: str, iteration: int) -> None:
         """No-op."""
 
-    def on_stage_start(self, stage: str, mode: str, iteration: int) -> None:
-        """No-op."""
-
-    def on_stage_end(self, stage: str, mode: str, iteration: int) -> None:
+    def on_stage_end(self, stage: str, iteration: int) -> None:
         """No-op."""
 
 
@@ -313,7 +294,7 @@ class _HistoryEtaColumn(ProgressColumn):
        samples to produce a value (independent of pruning). With only
        one ``advance=1`` call posted after the first completion, the
        column would render ``-:--:--`` until the second trial finished
-       — roughly 19 minutes into a 9.5-min-per-trial run.
+       -- roughly 19 minutes into a 9.5-min-per-trial run.
 
     Both bars supply a ``(count, total_seconds)`` snapshot through a
     caller-provided callable, letting the ETA be available after the
@@ -371,6 +352,7 @@ class _TrialRow:
     __slots__ = (
         "cpu",
         "index",
+        "jitter_ms",
         "metrics",
         "node_memory_mib",
         "p99_ms",
@@ -388,6 +370,7 @@ class _TrialRow:
         throughput_mbps: float,
         cpu: float,
         retx_per_mb: float,
+        jitter_ms: float,
         rps: float,
         node_memory_mib: float,
         p99_ms: float,
@@ -401,10 +384,14 @@ class _TrialRow:
             throughput_mbps: Mean throughput in megabits-per-second.
             cpu: Mean target-node CPU utilization, 0-100.
             retx_per_mb: Retransmits per megabyte; ``NaN`` when the
-                mode cannot observe it (e.g. pure UDP).
+                trial produced no TCP bytes (every ``bw-tcp`` stage
+                failed).
+            jitter_ms: Mean UDP jitter in milliseconds from the
+                ``bw-udp`` stage; ``NaN`` when no UDP record
+                reported jitter.
             rps: Mean requests-per-second from the fortio saturation
-                sub-stage; ``NaN`` when the mode cannot observe it
-                (e.g. pure iperf3 TCP/UDP).
+                sub-stage; ``NaN`` when the trial produced no
+                saturation records.
             node_memory_mib: Mean target-node memory usage in MiB;
                 ``NaN`` when the trial produced no memory samples.
             p99_ms: Fixed-QPS p99 latency in milliseconds; ``NaN``
@@ -423,13 +410,14 @@ class _TrialRow:
         self.throughput_mbps = throughput_mbps
         self.cpu = cpu
         self.retx_per_mb = retx_per_mb
+        self.jitter_ms = jitter_ms
         self.rps = rps
         self.node_memory_mib = node_memory_mib
         self.p99_ms = p99_ms
         self.metrics = metrics
 
 
-def _build_trial_row(
+def _build_trial_row(  # noqa: PLR0914 one-pass projection over the full metric bundle
     index: int,
     phase: str,
     metrics: Mapping[str, tuple[float, float]],
@@ -462,6 +450,7 @@ def _build_trial_row(
     tp_pair = metrics.get("throughput")
     cpu_pair = metrics.get("cpu")
     rate_pair = metrics.get("retransmit_rate")
+    jitter_pair = metrics.get("jitter")
     rps_pair = metrics.get("rps")
     nmem_pair = metrics.get("node_memory")
     p99_pair = metrics.get("latency_p99")
@@ -469,6 +458,7 @@ def _build_trial_row(
     cpu = cpu_pair[0] if cpu_pair is not None else 0.0
     rate = rate_pair[0] if rate_pair is not None else math.nan
     retx_per_mb = math.nan if math.isnan(rate) else rate * 1e6
+    jitter = jitter_pair[0] if jitter_pair is not None else math.nan
     rps = rps_pair[0] if rps_pair is not None else math.nan
     nmem_bytes = nmem_pair[0] if nmem_pair is not None else math.nan
     node_memory_mib = math.nan if math.isnan(nmem_bytes) else nmem_bytes / (1024 * 1024)
@@ -479,6 +469,7 @@ def _build_trial_row(
             ("throughput", tp_pair),
             ("cpu", cpu_pair),
             ("retransmit_rate", rate_pair),
+            ("jitter", jitter_pair),
             ("node_memory", nmem_pair),
             ("cni_memory", metrics.get("cni_memory")),
             ("rps", rps_pair),
@@ -493,6 +484,7 @@ def _build_trial_row(
         throughput_mbps=tp,
         cpu=cpu,
         retx_per_mb=retx_per_mb,
+        jitter_ms=jitter,
         rps=rps,
         node_memory_mib=node_memory_mib,
         p99_ms=p99,
@@ -611,7 +603,6 @@ class RichProgressObserver:
         self._all_rows: list[_TrialRow] = []
         self._top: list[_TrialRow] = []
         self._phase: str = "sobol"
-        self._current_mode: str = ""
         self._current_stage: str = ""
         self._live: Live | None = None
         self._echo: _TtyEchoSuppressor | None = None
@@ -708,11 +699,13 @@ class RichProgressObserver:
         table.add_column("Throughput", justify="right")
         table.add_column("CPU", justify="right")
         table.add_column("retx/MB", justify="right")
+        table.add_column("jitter ms", justify="right")
         table.add_column("RPS", justify="right")
         table.add_column("node mem", justify="right")
         table.add_column("p99 ms", justify="right")
         for row in self._top:
             retx = "n/a" if math.isnan(row.retx_per_mb) else f"{row.retx_per_mb:.2f}"
+            jitter = "n/a" if math.isnan(row.jitter_ms) else f"{row.jitter_ms:.3f}"
             rps = "n/a" if math.isnan(row.rps) else f"{row.rps:,.1f}"
             nmem = (
                 "n/a"
@@ -726,6 +719,7 @@ class RichProgressObserver:
                 f"{row.throughput_mbps:,.1f} Mbps",
                 f"{row.cpu:.1f}%",
                 retx,
+                jitter,
                 rps,
                 nmem,
                 p99,
@@ -760,7 +754,7 @@ class RichProgressObserver:
         except BaseException:
             # BaseException (not Exception) so KeyboardInterrupt /
             # SystemExit during Live construction still unwinds echo
-            # suppression — leaving the terminal in noecho mode would
+            # suppression -- leaving the terminal in noecho mode would
             # strand the user.
             echo.__exit__(None, None, None)
             raise
@@ -909,9 +903,9 @@ class RichProgressObserver:
         """Size the iteration bar for the trial's full iteration budget.
 
         Fired once per :meth:`BenchmarkRunner.run` call. The iteration
-        bar spans every mode in the trial, so its ``total`` is set to
-        ``len(modes) * iterations`` and its ``completed`` starts at
-        zero. The cumulative iteration history (``_iter_count`` /
+        bar spans every iteration in the trial, so its ``total`` is
+        set to ``iterations`` and its ``completed`` starts at zero.
+        The cumulative iteration history (``_iter_count`` /
         ``_iter_total_seconds``) is deliberately preserved so the
         custom :class:`_IterEtaColumn` can keep producing a real ETA
         across trial boundaries. Only the transient
@@ -935,45 +929,20 @@ class RichProgressObserver:
             )
         self._refresh()
 
-    def on_mode_start(
-        self,
-        mode: str,
-        total_iterations: int,  # noqa: ARG002 kept on protocol for non-Rich observers
-    ) -> None:
-        """Repaint the iteration-bar description for the new mode.
-
-        The iteration bar itself is sized by :meth:`on_benchmark_start`
-        and spans the whole trial, so no ``reset`` happens here. The
-        transient start-of-iteration timestamp is still cleared in
-        case a prior iteration was aborted before
-        :meth:`on_iteration_end` fired.
-        """
-        self._iter_start = None
-        self._current_mode = mode
-        if self._iter_task_id is not None:
-            self._iters.update(
-                self._iter_task_id,
-                description=f"Current [{mode}]",
-            )
-        self._refresh()
-
     def on_iteration_start(
         self,
-        mode: str,
-        iteration: int,  # noqa: ARG002 start is just a label change
+        iteration: int,  # noqa: ARG002 start timestamp is the signal
     ) -> None:
-        """Refresh the iteration-bar description to reflect ``mode``."""
+        """Record the iteration start timestamp for ETA tracking.
+
+        The iteration-bar description is repainted by the immediately
+        following :meth:`on_stage_start`, so no description update
+        happens here.
+        """
         self._iter_start = time.monotonic()
-        if self._iter_task_id is not None:
-            self._iters.update(
-                self._iter_task_id,
-                description=f"Current [{mode}]",
-            )
-        self._refresh()
 
     def on_iteration_end(
         self,
-        mode: str,  # noqa: ARG002 mode already on the task description
         iteration: int,  # noqa: ARG002 advance is the signal
     ) -> None:
         """Advance the iteration bar by one completed iteration."""
@@ -989,22 +958,20 @@ class RichProgressObserver:
     def on_stage_start(
         self,
         stage: str,
-        mode: str,
-        iteration: int,  # noqa: ARG002 stage/mode carry the signal
+        iteration: int,  # noqa: ARG002 stage carries the signal
     ) -> None:
         """Update the iteration-bar description to reflect the active sub-stage."""
         self._current_stage = stage
         if self._iter_task_id is not None:
             self._iters.update(
                 self._iter_task_id,
-                description=f"Current [{mode} / {stage}]",
+                description=f"Current [{stage}]",
             )
         self._refresh()
 
     def on_stage_end(
         self,
-        stage: str,  # noqa: ARG002 description rolls back to mode-only
-        mode: str,  # noqa: ARG002
+        stage: str,  # noqa: ARG002 description rolls back on next start
         iteration: int,  # noqa: ARG002
     ) -> None:
         """Clear the sub-stage label; kept as a hook for future extensions."""

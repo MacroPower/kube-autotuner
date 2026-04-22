@@ -32,7 +32,7 @@ import yaml
 
 from kube_autotuner.models import BenchmarkConfig, NodePair, ParamSpace, SysctlParam
 from kube_autotuner.subproc import run_tool
-from kube_autotuner.sysctl.params import PARAM_CATEGORIES, PARAM_SPACE
+from kube_autotuner.sysctl.params import PARAM_SPACE
 
 if TYPE_CHECKING:
     from kube_autotuner.k8s.client import K8sClient
@@ -335,6 +335,7 @@ Metric = Literal[
     "throughput",
     "cpu",
     "retransmit_rate",
+    "jitter",
     "node_memory",
     "cni_memory",
     "rps",
@@ -366,6 +367,7 @@ _DEFAULT_WEIGHTS: dict[str, float] = {
     "cpu": 0.15,
     "node_memory": 0.15,
     "retransmit_rate": 0.3,
+    "jitter": 0.1,
     "latency_p90": 0.1,
     "latency_p99": 0.15,
 }
@@ -388,14 +390,15 @@ def _default_pareto() -> list[ParetoObjective]:
     """Return the default Pareto objective list.
 
     Returns:
-        Nine objectives: throughput (max), cpu (min),
-        retransmit_rate (min), node_memory (min), cni_memory (min),
-        rps (max), latency_p50/p90/p99 (min).
+        Ten objectives: throughput (max), cpu (min),
+        retransmit_rate (min), jitter (min), node_memory (min),
+        cni_memory (min), rps (max), latency_p50/p90/p99 (min).
     """
     return [
         ParetoObjective(metric="throughput", direction="maximize"),
         ParetoObjective(metric="cpu", direction="minimize"),
         ParetoObjective(metric="retransmit_rate", direction="minimize"),
+        ParetoObjective(metric="jitter", direction="minimize"),
         ParetoObjective(metric="node_memory", direction="minimize"),
         ParetoObjective(metric="cni_memory", direction="minimize"),
         ParetoObjective(metric="rps", direction="maximize"),
@@ -423,9 +426,11 @@ class ObjectivesSection(BaseModel):
 
     The default weights are
     ``{cpu: 0.15, node_memory: 0.15, retransmit_rate: 0.3,
-    latency_p90: 0.1, latency_p99: 0.15}``; ``latency_p50`` is left
-    unweighted so the mean-latency axis enters the Pareto set without
-    dominating the recommendation score.
+    jitter: 0.1, latency_p90: 0.1, latency_p99: 0.15}``;
+    ``latency_p50`` is left unweighted so the mean-latency axis
+    enters the Pareto set without dominating the recommendation
+    score. ``jitter`` (UDP-only) is weighted lightly: it's a
+    tail-stability signal rather than a primary optimization target.
     """
 
     model_config = ConfigDict(
@@ -480,6 +485,7 @@ class ObjectivesSection(BaseModel):
             "throughput",
             "cpu",
             "retransmit_rate",
+            "jitter",
             "node_memory",
             "cni_memory",
             "rps",
@@ -600,20 +606,12 @@ class ExperimentConfig(BaseModel):
         """Return the active search space for the experiment.
 
         Returns:
-            ``optimize.param_space`` when the config supplies one. For
-            the canonical default, UDP-category params are stripped when
-            ``benchmark.modes`` does not include ``"udp"``, since the
-            clients never generate UDP traffic and those dimensions are
-            noise. A user-supplied override bypasses the mode gate.
+            ``optimize.param_space`` when the config supplies one,
+            otherwise the canonical :data:`PARAM_SPACE`.
         """
         if self.optimize and self.optimize.param_space:
             return ParamSpace(params=self.optimize.param_space)
-        if "udp" in self.benchmark.modes:
-            return PARAM_SPACE
-        udp_names = set(PARAM_CATEGORIES.get("udp", []))
-        return ParamSpace(
-            params=[p for p in PARAM_SPACE.params if p.name not in udp_names],
-        )
+        return PARAM_SPACE
 
     def preflight(self, client: K8sClient) -> list[PreflightResult]:
         """Run every preflight check and return the results.

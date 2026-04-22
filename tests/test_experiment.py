@@ -76,7 +76,6 @@ nodes:
 benchmark:
   duration: 30
   iterations: 3
-  modes: [tcp]
 optimize:
   nTrials: 50
   nSobol: 15
@@ -316,37 +315,20 @@ optimize:
 # --- projections ---------------------------------------------------------
 
 
-def test_effective_param_space_default_tcp_only_strips_udp():
-    """TCP-only default runs strip UDP-category params from the canonical space."""
-    from kube_autotuner.sysctl.params import PARAM_CATEGORIES  # noqa: PLC0415
-
+def test_effective_param_space_default_returns_full_param_space():
+    """With no optimize override, the canonical full PARAM_SPACE is returned."""
     exp = ExperimentConfig.model_validate({
         "mode": "baseline",
         "nodes": {"sources": ["a"], "target": "b"},
-    })
-    ps = exp.effective_param_space()
-    udp_names = set(PARAM_CATEGORIES["udp"])
-    names = set(ps.param_names())
-    assert not (names & udp_names), "UDP params must be absent under modes=[tcp]"
-    assert len(ps.params) == len(PARAM_SPACE.params) - len(udp_names)
-
-
-def test_effective_param_space_default_tcp_and_udp_keeps_udp():
-    """Including udp in modes returns the canonical PARAM_SPACE intact."""
-    exp = ExperimentConfig.model_validate({
-        "mode": "baseline",
-        "nodes": {"sources": ["a"], "target": "b"},
-        "benchmark": {"modes": ["tcp", "udp"]},
     })
     assert exp.effective_param_space() is PARAM_SPACE
 
 
-def test_effective_param_space_user_override_bypasses_mode_gate():
-    """A user-supplied param_space is returned verbatim, even on a tcp-only run."""
+def test_effective_param_space_user_override_replaces_default():
+    """A user-supplied param_space is returned verbatim."""
     exp = ExperimentConfig.model_validate({
         "mode": "optimize",
         "nodes": {"sources": ["a"], "target": "b"},
-        "benchmark": {"modes": ["tcp"]},
         "optimize": {
             "nTrials": 2,
             "nSobol": 1,
@@ -361,6 +343,27 @@ def test_effective_param_space_user_override_bypasses_mode_gate():
     })
     ps = exp.effective_param_space()
     assert ps.param_names() == ["net.ipv4.udp_mem"]
+
+
+def test_legacy_benchmark_modes_key_silently_dropped(tmp_path: Path):
+    """Pre-change YAML embedded `modes: [tcp]`; the loader must accept and drop it."""
+    path = _write(
+        tmp_path,
+        """\
+mode: baseline
+nodes:
+  sources: [a]
+  target: b
+benchmark:
+  duration: 10
+  iterations: 1
+  modes: [tcp]
+""",
+    )
+    exp = ExperimentConfig.from_yaml(path)
+    assert exp.benchmark.duration == 10
+    assert exp.benchmark.iterations == 1
+    assert not hasattr(exp.benchmark, "modes")
 
 
 def test_effective_param_space_override():
@@ -910,6 +913,7 @@ class TestObjectivesSection:
             ("throughput", "maximize"),
             ("cpu", "minimize"),
             ("retransmit_rate", "minimize"),
+            ("jitter", "minimize"),
             ("node_memory", "minimize"),
             ("cni_memory", "minimize"),
             ("rps", "maximize"),
@@ -960,7 +964,7 @@ class TestObjectivesSection:
 
     def test_unknown_constraint_metric_rejected(self) -> None:
         with pytest.raises(ValueError, match="unknown metric"):
-            ObjectivesSection(constraints=["jitter <= 50"])
+            ObjectivesSection(constraints=["latency_p42 <= 50"])
 
     def test_empty_pareto_rejected(self) -> None:
         with pytest.raises(ValueError, match="at least 1"):

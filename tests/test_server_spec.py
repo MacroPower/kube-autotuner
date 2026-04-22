@@ -24,15 +24,19 @@ def test_build_single_port():
     assert containers[0]["name"] == "iperf3-server-5201"
     assert containers[0]["image"].startswith("nicolaka/netshoot")
     assert containers[0]["args"] == ["-s", "-p", "5201"]
-    assert containers[0]["ports"][0]["containerPort"] == 5201
+    # Each port exposes both TCP and UDP so the bw-udp stage can reach it.
+    assert [p["protocol"] for p in containers[0]["ports"]] == ["TCP", "UDP"]
+    assert all(p["containerPort"] == 5201 for p in containers[0]["ports"])
 
     svc = docs[1]
     assert svc["kind"] == "Service"
     assert svc["spec"]["ipFamilyPolicy"] == "RequireDualStack"
     ports = svc["spec"]["ports"]
-    assert len(ports) == 1
-    assert ports[0]["name"] == "iperf-5201"
-    assert ports[0]["port"] == 5201
+    # One TCP entry and one UDP entry per declared port.
+    assert len(ports) == 2
+    assert [p["name"] for p in ports] == ["iperf-5201-tcp", "iperf-5201-udp"]
+    assert all(p["port"] == 5201 for p in ports)
+    assert [p["protocol"] for p in ports] == ["TCP", "UDP"]
 
 
 def test_build_multi_port():
@@ -51,9 +55,16 @@ def test_build_multi_port():
     svc = docs[1]
     assert svc["spec"]["ipFamilyPolicy"] == "SingleStack"
     ports = svc["spec"]["ports"]
-    assert len(ports) == 2
-    assert [p["name"] for p in ports] == ["iperf-5201", "iperf-5202"]
-    assert [p["port"] for p in ports] == [5201, 5202]
+    # Each declared port contributes a TCP and a UDP Service entry.
+    assert len(ports) == 4
+    assert [p["name"] for p in ports] == [
+        "iperf-5201-tcp",
+        "iperf-5201-udp",
+        "iperf-5202-tcp",
+        "iperf-5202-udp",
+    ]
+    assert [p["port"] for p in ports] == [5201, 5201, 5202, 5202]
+    assert [p["protocol"] for p in ports] == ["TCP", "UDP", "TCP", "UDP"]
 
 
 def test_build_requires_ports():

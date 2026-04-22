@@ -321,10 +321,11 @@ class TestParetoFront:
         assert pareto_front(df).empty
 
     def test_default_objectives_shape(self) -> None:
-        assert len(DEFAULT_OBJECTIVES) == 9
+        assert len(DEFAULT_OBJECTIVES) == 10
         names = [n for n, _ in DEFAULT_OBJECTIVES]
         assert "mean_node_memory" in names
         assert "mean_cni_memory" in names
+        assert "mean_jitter_ms" in names
         assert "mean_rps" in names
         assert "mean_latency_p99_ms" in names
 
@@ -501,25 +502,29 @@ class TestRecommendConfigs:
         ``cni_memory`` is all-NaN (never set on these trials) so
         :func:`_objectives_with_data` excludes it -- score-neutral
         because the default weights do not include ``cni_memory``.
-        For the surviving ``throughput`` and ``node_memory`` axes,
-        trial A (higher throughput, higher memory) normalizes to
-        ``(1.0, 1.0)`` and trial B (lower throughput, lower memory)
-        to ``(0.0, 0.0)``. Latency percentiles are all-NaN across
-        both rows, so ``_norm`` resolves each of ``latency_p50``,
-        ``latency_p90``, ``latency_p99`` to ``0.5`` via the
-        "no finite values" branch. Under the default weights
+        ``jitter_ms`` is ``0.0`` for both TCP-only trials (no UDP
+        records in the fixture); the column survives
+        :func:`_objectives_with_data` with finite values but
+        collapses to ``0.5`` in :func:`_normalize_column` because
+        ``min == max``. For the surviving ``throughput`` and
+        ``node_memory`` axes, trial A (higher throughput, higher
+        memory) normalizes to ``(1.0, 1.0)`` and trial B (lower
+        throughput, lower memory) to ``(0.0, 0.0)``. Latency
+        percentiles are all-NaN across both rows, so ``_norm``
+        resolves each of ``latency_p50``, ``latency_p90``,
+        ``latency_p99`` to ``0.5`` via the "no finite values"
+        branch. Under the default weights
         ``{cpu: 0.15, node_memory: 0.15, retransmit_rate: 0.3,
-        latency_p90: 0.1, latency_p99: 0.15}`` and the ``rps``
-        maximize objective (unweighted ``+0.5`` for both):
+        jitter: 0.1, latency_p90: 0.1, latency_p99: 0.15}`` and the
+        ``rps`` maximize objective (unweighted ``+0.5`` for both):
 
         - score_A = 1.0 + 0.5 - 0.15 * 0.5 - 0.15 * 1.0 - 0.3 * 0.5
-          - 0.1 * 0.5 - 0.15 * 0.5 = 1.000
+          - 0.1 * 0.5 (jitter) - 0.1 * 0.5 - 0.15 * 0.5 = 0.950
         - score_B = 0.0 + 0.5 - 0.15 * 0.5 - 0.15 * 0.0 - 0.3 * 0.5
-          - 0.1 * 0.5 - 0.15 * 0.5 = 0.150
+          - 0.1 * 0.5 (jitter) - 0.1 * 0.5 - 0.15 * 0.5 = 0.100
 
-        Both rows drop by ``0.1 * 0.5 + 0.15 * 0.5 = 0.125`` relative
-        to the pre-latency-weights defaults (``1.125`` / ``0.275``),
-        so the relative ordering is preserved.
+        Both rows drop by the same ``0.05`` jitter term, preserving
+        the relative ordering.
         """
 
         def _mk(
@@ -548,8 +553,8 @@ class TestRecommendConfigs:
         trials = [_mk(10.0, 100, "a"), _mk(5.0, 50, "b")]
         recs = recommend_configs(trials, "10g", n=2)
         assert [r["trial_id"] for r in recs] == ["a", "b"]
-        assert recs[0]["score"] == pytest.approx(1.000)
-        assert recs[1]["score"] == pytest.approx(0.150)
+        assert recs[0]["score"] == pytest.approx(0.950)
+        assert recs[1]["score"] == pytest.approx(0.100)
 
     def test_rate_metric_reranks_over_absolute_count(self) -> None:
         """Per-byte rate reorders candidates vs. absolute retransmit count.
@@ -605,6 +610,7 @@ class TestRecommendConfigs:
                 "node_memory",
                 "cni_memory",
                 "retransmit_rate",
+                "jitter",
                 "rps",
                 "latency_p50",
                 "latency_p90",

@@ -34,6 +34,7 @@ METRIC_TO_DF_COLUMN: dict[str, str] = {
     "node_memory": "mean_node_memory",
     "cni_memory": "mean_cni_memory",
     "retransmit_rate": "retransmit_rate",
+    "jitter": "mean_jitter_ms",
     "rps": "mean_rps",
     "latency_p50": "mean_latency_p50_ms",
     "latency_p90": "mean_latency_p90_ms",
