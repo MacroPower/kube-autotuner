@@ -28,7 +28,7 @@ if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
     from kube_autotuner.experiment import ParetoObjective
-    from kube_autotuner.models import TrialResult
+    from kube_autotuner.models import MemoryCost, ParamSpace, TrialResult
 
 
 METRIC_TO_DF_COLUMN: dict[str, str] = {
@@ -102,13 +102,16 @@ def score_rows(
     rows: Sequence[Mapping[str, object]],
     objectives: Sequence[ParetoObjective],
     weights: Mapping[str, float],
+    memory_costs: Sequence[float] | None = None,
+    memory_cost_weight: float = 0.0,
 ) -> list[float]:
     """Return per-row weighted scores using the shared recommendation formula.
 
     Score formula:
 
         ``sum(+weights.get(m, 1.0) * norm(m) for m in maximize-direction) -
-         sum(weights.get(m, 0.0) * norm(m) for m in minimize-direction)``
+         sum(weights.get(m, 0.0) * norm(m) for m in minimize-direction)
+         - memory_cost_weight * norm(memory_cost)``
 
     Each ``norm`` is a min-max normalization across the supplied
     ``rows``. ``weights`` applies to both directions, with
@@ -117,6 +120,16 @@ def score_rows(
     contribution), while an omitted minimize-metric weight falls back
     to ``0.0`` (the metric participates in frontier selection upstream
     but does not bias the score).
+
+    The optional ``memory_costs`` / ``memory_cost_weight`` pair adds a
+    synthetic minimize term for static kernel/CNI memory footprint; see
+    :func:`config_memory_cost`. When both are supplied, the cost column
+    is min-max normalized across ``rows`` and
+    ``memory_cost_weight * norm`` is subtracted from each row's score
+    mirroring the minimize branch above. Single-row inputs collapse to
+    ``norm = 0.5`` (uniform offset, no rank change); ``memory_costs``
+    omitted or ``memory_cost_weight = 0.0`` preserves the three-arg
+    legacy behaviour.
 
     Both call sites pass their own idiomatic row shape and the helper
     is tolerant of both:
@@ -152,6 +165,13 @@ def score_rows(
             ``"tcp_retransmit_rate"``, ...). Missing maximize-metric
             keys default to ``1.0``; missing minimize-metric keys
             default to ``0.0``.
+        memory_costs: Optional per-row static memory footprint in
+            bytes aligned with ``rows``. Callers precompute this via
+            :func:`config_memory_cost` so the helper stays
+            stdlib-only.
+        memory_cost_weight: Non-negative multiplier applied to the
+            normalized memory-cost column. ``0.0`` (or ``None`` costs)
+            disables the term entirely.
 
     Returns:
         A list of raw float scores in ``rows`` order. Rounding and
@@ -174,7 +194,80 @@ def score_rows(
             weight = weights.get(obj.metric, 0.0)
             for i, value in enumerate(norm):
                 scores[i] -= weight * value
+
+    if memory_costs is not None and memory_cost_weight > 0.0:
+        cost_norm = _normalize_column([_to_float_or_nan(c) for c in memory_costs])
+        for i, value in enumerate(cost_norm):
+            scores[i] -= memory_cost_weight * value
     return scores
+
+
+def _apply_memory_cost_rule(rule: MemoryCost, value: int | str) -> int:
+    """Evaluate a :class:`MemoryCost` rule against a selected rung.
+
+    Args:
+        rule: Derivation kind attached to the sysctl.
+        value: The rung the trial selected. Mandatory argument kinds:
+            ``identity``, ``kib``, and ``per_entry`` require a numeric
+            value; ``triple_max`` and ``triple_max_pages`` require a
+            space-separated triple whose last field parses as an int.
+
+    Returns:
+        The estimated bytes consumed by this rung. ``0`` when the
+        value cannot be coerced under the chosen rule, so a bad
+        annotation degrades to "no cost" rather than crashing the
+        scorer mid-run.
+    """
+    kind = rule.kind
+    try:
+        if kind == "identity":
+            return int(value)
+        if kind == "kib":
+            return int(value) * 1024
+        if kind == "per_entry":
+            return int(value) * rule.per_entry_bytes
+        if kind in {"triple_max", "triple_max_pages"}:
+            max_field = int(str(value).split()[-1])
+            return max_field * 4096 if kind == "triple_max_pages" else max_field
+    except TypeError, ValueError:
+        return 0
+    return 0
+
+
+def config_memory_cost(
+    sysctl_values: Mapping[str, int | str],
+    param_space: ParamSpace,
+) -> float:
+    """Return the static kernel/CNI memory cost for a sysctl configuration.
+
+    Evaluates each annotated :class:`~kube_autotuner.models.SysctlParam`'s
+    :class:`~kube_autotuner.models.MemoryCost` rule against the selected
+    rung and sums the result. Unannotated params contribute ``0``, as
+    do rungs whose shape does not match the rule (see
+    :func:`_apply_memory_cost_rule`).
+
+    Pure-stdlib so :mod:`kube_autotuner.progress` can call it without
+    breaking the live-panel import ceiling.
+
+    Args:
+        sysctl_values: Mapping from sysctl name to the selected rung
+            value (``TrialResult.sysctl_values`` shape).
+        param_space: The search space the values were drawn from.
+
+    Returns:
+        Total estimated bytes across all costed sysctls. ``0.0`` when
+        nothing in the configuration touches a costed knob.
+    """
+    rules = {
+        p.name: p.memory_cost for p in param_space.params if p.memory_cost is not None
+    }
+    total = 0
+    for name, value in sysctl_values.items():
+        rule = rules.get(name)
+        if rule is None:
+            continue
+        total += _apply_memory_cost_rule(rule, value)
+    return float(total)
 
 
 def _per_trial_metric_means(t: TrialResult) -> dict[str, float]:

@@ -810,3 +810,46 @@ class TestCLIAnalyze:
             ],
         )
         assert result.exit_code != 0
+
+
+# --- memory cost recommendation preference -------------------------------
+
+
+def test_pareto_recommendation_rows_flips_tied_configs_by_memory_cost() -> None:
+    """Two trials tied on performance; lower-memory rmem_max wins at 0.1."""
+    from kube_autotuner.analysis import pareto_recommendation_rows  # noqa: PLC0415
+
+    big = _trial(
+        hw="10g",
+        bps=1.0e9,
+        retransmits=0,
+        rmem_max=67108864,  # 64 MiB
+        trial_id="big",
+    )
+    small = _trial(
+        hw="10g",
+        bps=1.0e9,
+        retransmits=0,
+        rmem_max=212992,  # 208 KiB
+        trial_id="small",
+    )
+
+    # weight=0.0 disables the memory-cost term; lexicographic tiebreak
+    # on trial_id puts "big" ahead of "small" (ascending).
+    rows_disabled = pareto_recommendation_rows(
+        [big, small],
+        "10g",
+        memory_cost_weight=0.0,
+    )
+    assert [r["trial_id"] for r in rows_disabled] == ["big", "small"]
+
+    # weight=0.1 makes the cheaper config win despite trial_id order.
+    rows_enabled = pareto_recommendation_rows(
+        [big, small],
+        "10g",
+        memory_cost_weight=0.1,
+    )
+    assert [r["trial_id"] for r in rows_enabled] == ["small", "big"]
+    # Every row carries a ``memory_cost`` field for downstream consumers.
+    assert rows_enabled[0]["memory_cost"] == pytest.approx(212992)
+    assert rows_enabled[1]["memory_cost"] == pytest.approx(67108864)

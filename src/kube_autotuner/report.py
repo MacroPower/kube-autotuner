@@ -424,6 +424,7 @@ def _section_payload(section: dict[str, Any]) -> dict[str, Any]:
         "topN": section.get("top_n", 3),
         "objectives": section["objectives"],
         "defaultWeights": section["default_weights"],
+        "memoryCostWeight": section["memory_cost_weight"],
         "paretoRows": section["pareto_rows"],
         "figureDivIds": [_figure_div_id(hw_slug, label) for label in figure_labels],
     }
@@ -592,7 +593,7 @@ function normalizeColumn(values) {
 
 // Port of kube_autotuner.scoring.score_rows with per-metric contribution
 // bookkeeping for the decomposition panel.
-function scoreRows(rows, objectives, weights) {
+function scoreRows(rows, objectives, weights, memoryCostWeight) {
   const n = rows.length;
   const scores = new Array(n).fill(0);
   const contributions = Array.from({length: n}, () => ({}));
@@ -619,6 +620,21 @@ function scoreRows(rows, objectives, weights) {
           norm: norm[i], contribution: c, direction: "minimize", weight: w,
         };
       }
+    }
+  }
+  // Memory-cost term: a separate top-level state field, not keyed in
+  // state.weights, so preset parity (activePresetKey / applyPreset)
+  // stays untouched. Matches kube_autotuner.scoring.score_rows.
+  const mw = memoryCostWeight ?? 0.0;
+  if (mw > 0) {
+    const raw = rows.map(r => toFloatOrNaN(r.memory_cost));
+    const norm = normalizeColumn(raw);
+    for (let i = 0; i < n; i++) {
+      const c = -mw * norm[i];
+      scores[i] += c;
+      contributions[i].memory_cost = {
+        norm: norm[i], contribution: c, direction: "minimize", weight: mw,
+      };
     }
   }
   return {scores, contributions};
@@ -991,6 +1007,9 @@ function renderSection(panel, section) {
     panel,
     visibleCols,
     weights: initialWeights,
+    // Kept outside state.weights so preset parity (activePresetKey /
+    // applyPreset) is untouched; memory cost is not a Pareto metric.
+    memoryCostWeight: section.memoryCostWeight ?? 0.0,
     topN: Math.max(1, Math.min(section.topN || 3, section.paretoRows.length)),
   };
   const presetsEl = panel.querySelector(".presets");
@@ -1006,7 +1025,10 @@ function renderSection(panel, section) {
 
   function rerank() {
     const {scores, contributions} = scoreRows(
-      section.paretoRows, section.objectives, state.weights);
+      section.paretoRows,
+      section.objectives,
+      state.weights,
+      state.memoryCostWeight);
     const ranked = section.paretoRows
       .map((row, i) => ({row, score: scores[i], contributions: contributions[i]}))
       .sort((a, b) => {

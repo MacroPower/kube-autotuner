@@ -14,7 +14,7 @@ response surface.
 
 from __future__ import annotations
 
-from kube_autotuner.models import ParamSpace, SysctlParam
+from kube_autotuner.models import MemoryCost, ParamSpace, SysctlParam
 
 # Full search space, organised by category.
 
@@ -22,24 +22,27 @@ _TCP_BUFFER_PARAMS: list[SysctlParam] = [
     # System-wide SO_RCVBUF ceiling. Low rungs cap the TCP receive
     # window on fat pipes and throttle throughput on long-BDP paths;
     # high rungs trade node memory headroom under many flows.
+    # Memory cost == rung value (per-socket SO_RCVBUF ceiling).
     SysctlParam(
         name="net.core.rmem_max",
         values=[212992, 4194304, 16777216, 67108864],
         param_type="int",
+        memory_cost=MemoryCost(kind="identity"),
     ),
     # System-wide SO_SNDBUF ceiling. Mirror of rmem_max on the send
     # path: low rungs cap the send window and throughput, high rungs
-    # raise memory pressure.
+    # raise memory pressure. Memory cost == rung value (per-socket).
     SysctlParam(
         name="net.core.wmem_max",
         values=[212992, 4194304, 16777216, 67108864],
         param_type="int",
+        memory_cost=MemoryCost(kind="identity"),
     ),
     # Autotuning triple (min default max) for TCP receive buffers.
     # Governs the peak receive window. Under-sized max caps iperf3
     # throughput on high-BDP links and can raise tcp_retransmit_rate
     # when the window collapses; over-sized max raises node memory
-    # under many concurrent flows.
+    # under many concurrent flows. Memory cost == max field of the triple.
     SysctlParam(
         name="net.ipv4.tcp_rmem",
         values=[
@@ -48,9 +51,11 @@ _TCP_BUFFER_PARAMS: list[SysctlParam] = [
             "4096 87380 33554432",
         ],
         param_type="choice",
+        memory_cost=MemoryCost(kind="triple_max"),
     ),
     # Autotuning triple for TCP send buffers. Same trade-off as
     # tcp_rmem on the send path: throughput vs. memory footprint.
+    # Memory cost == max field of the triple.
     SysctlParam(
         name="net.ipv4.tcp_wmem",
         values=[
@@ -59,15 +64,18 @@ _TCP_BUFFER_PARAMS: list[SysctlParam] = [
             "4096 65536 33554432",
         ],
         param_type="choice",
+        memory_cost=MemoryCost(kind="triple_max"),
     ),
     # Global TCP memory pressure thresholds in pages (min pressure max).
     # Too small and the kernel prunes/throttles under load (throughput
     # drops, tcp_retransmit_rate rises); too large and node memory climbs.
     # Represented as the canonical three-integer string form.
+    # Memory cost == max-field pages x 4096 bytes/page.
     SysctlParam(
         name="net.ipv4.tcp_mem",
         values=["393216 524288 786432", "786432 1048576 1572864"],
         param_type="choice",
+        memory_cost=MemoryCost(kind="triple_max_pages"),
     ),
 ]
 
@@ -158,11 +166,13 @@ _NAPI_PARAMS: list[SysctlParam] = [
     # Per-CPU input queue length before drops under RX bursts. Low
     # rungs cause packet drops on bursty workloads (visible as
     # tcp_retransmit_rate spikes); very high rungs add queuing latency
-    # once the system is already overloaded.
+    # once the system is already overloaded. Memory cost: entries x 256
+    # bytes (sk_buff head ~232 B on x86_64 plus per-slot pointer slack).
     SysctlParam(
         name="net.core.netdev_max_backlog",
         values=[1000, 5000, 30000, 250000],
         param_type="int",
+        memory_cost=MemoryCost(kind="per_entry", per_entry_bytes=256),
     ),
     # Max packets per NAPI poll cycle. Higher = better throughput on
     # bulk traffic (iperf3), potentially at the cost of softirq
@@ -187,30 +197,35 @@ _MEMORY_PARAMS: list[SysctlParam] = [
     # Floor on free pages the kernel keeps reserved. Too low and
     # allocations stall under pressure (packet drops, p99 spikes,
     # tcp_retransmit_rate); too high wastes headroom and inflates
-    # node memory.
+    # node memory. Memory cost == rung x 1024 bytes/KiB.
     SysctlParam(
         name="vm.min_free_kbytes",
         values=[65536, 131072, 262144],
         param_type="int",
+        memory_cost=MemoryCost(kind="kib"),
     ),
 ]
 
 _CONNECTION_PARAMS: list[SysctlParam] = [
     # listen() accept queue cap. Under-sized values drop SYNs during
     # fortio saturation, showing up as rps regressions and
-    # connection-establishment latency spikes.
+    # connection-establishment latency spikes. Memory cost: entries x
+    # 256 bytes (same sk_buff-head upper bound used by the backlog
+    # params; request_sock is slightly smaller but rounding up is safe).
     SysctlParam(
         name="net.core.somaxconn",
         values=[128, 4096, 16384, 65535],
         param_type="int",
+        memory_cost=MemoryCost(kind="per_entry", per_entry_bytes=256),
     ),
     # Per-listener SYN queue. Complements somaxconn earlier in the
     # handshake; under-sized values cause SYN drops under heavy
-    # new-connection load.
+    # new-connection load. Memory cost: entries x 256 bytes.
     SysctlParam(
         name="net.ipv4.tcp_max_syn_backlog",
         values=[1024, 4096, 65536],
         param_type="int",
+        memory_cost=MemoryCost(kind="per_entry", per_entry_bytes=256),
     ),
     # Allows outbound reuse of TIME_WAIT sockets. Mitigates ephemeral
     # port exhaustion under fortio connection churn; couples with
@@ -238,10 +253,12 @@ _CONNECTION_PARAMS: list[SysctlParam] = [
     # this dimension only bites if connection churn is scaled up
     # (e.g. envoy egress at 10k+ new connections/s). Benchmark-flat
     # at current shape / production-live on busy clusters: kept.
+    # Memory cost: entries x 144 bytes (tcp_timewait_sock size).
     SysctlParam(
         name="net.ipv4.tcp_max_tw_buckets",
         values=[65536, 262144, 1048576],
         param_type="int",
+        memory_cost=MemoryCost(kind="per_entry", per_entry_bytes=144),
     ),
     # Cap on unsent bytes in the TCP send queue. The kernel default
     # is UINT_MAX (4294967295), i.e. effectively unlimited; the
@@ -277,10 +294,12 @@ _UDP_PARAMS: list[SysctlParam] = [
     ),
     # Global UDP memory pressure thresholds (pages). Too small and
     # the kernel prunes under load; too large and node memory climbs.
+    # Memory cost == max-field pages x 4096 bytes/page.
     SysctlParam(
         name="net.ipv4.udp_mem",
         values=["393216 524288 786432", "786432 1048576 1572864"],
         param_type="choice",
+        memory_cost=MemoryCost(kind="triple_max_pages"),
     ),
 ]
 
@@ -301,10 +320,13 @@ _CONNTRACK_PARAMS: list[SysctlParam] = [
     # for service traffic, so this is a no-op for that subset; still
     # live for pod-to-external and pod-to-pod non-service flows.
     # Benchmark-flat / production-live: kept.
+    # Memory cost: entries x 320 bytes (nf_conn is ~304 bytes on
+    # modern kernels; round up for hash-table slot + overhead).
     SysctlParam(
         name="net.netfilter.nf_conntrack_max",
         values=[131072, 262144, 1048576],
         param_type="int",
+        memory_cost=MemoryCost(kind="per_entry", per_entry_bytes=320),
     ),
     # How long ESTABLISHED entries persist when idle (default 432000s
     # / 5 days). Shorter values reduce conntrack table pressure

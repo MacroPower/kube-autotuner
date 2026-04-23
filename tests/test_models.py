@@ -15,6 +15,7 @@ from kube_autotuner.models import (
     BenchmarkResult,
     IterationResults,
     LatencyResult,
+    MemoryCost,
     NodePair,
     ParamSpace,
     ResumeMetadata,
@@ -1056,3 +1057,39 @@ class TestTrialLogLoadTruncatedTail:
             f.write(self._make_trial(0).model_dump_json() + "\n")
         with pytest.raises((ValidationError, json.JSONDecodeError)):
             TrialLog.load(path)
+
+
+def test_sysctl_param_accepts_memory_cost_rule() -> None:
+    """``SysctlParam.memory_cost`` is optional and stores a :class:`MemoryCost`."""
+    plain = SysctlParam(name="a", values=[0, 1], param_type="choice")
+    assert plain.memory_cost is None
+
+    with_cost = SysctlParam(
+        name="net.core.rmem_max",
+        values=[212992, 67108864],
+        param_type="int",
+        memory_cost=MemoryCost(kind="identity"),
+    )
+    assert with_cost.memory_cost is not None
+    assert with_cost.memory_cost.kind == "identity"
+
+
+def test_memory_cost_round_trips_camel_case() -> None:
+    """``MemoryCost.per_entry_bytes`` serialises as ``perEntryBytes``."""
+    cost = MemoryCost(kind="per_entry", per_entry_bytes=320)
+    dumped = cost.model_dump(by_alias=True)
+    assert dumped == {"kind": "per_entry", "perEntryBytes": 320}
+    parsed = MemoryCost.model_validate({"kind": "per_entry", "perEntryBytes": 320})
+    assert parsed == cost
+
+
+def test_memory_cost_rejects_unknown_kind() -> None:
+    """Kinds outside the declared literal set are rejected."""
+    with pytest.raises(ValidationError):
+        MemoryCost.model_validate({"kind": "not_a_kind"})
+
+
+def test_memory_cost_rejects_non_positive_per_entry_bytes() -> None:
+    """``per_entry_bytes`` must be ``>= 1``."""
+    with pytest.raises(ValidationError):
+        MemoryCost(kind="per_entry", per_entry_bytes=0)

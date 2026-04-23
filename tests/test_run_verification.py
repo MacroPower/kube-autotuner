@@ -174,8 +174,9 @@ def test_run_verification_skips_done_work(
     # of the top-2 parents as already-done.
     from kube_autotuner.optimizer import _compute_metrics  # noqa: PLC0415, PLC2701
     from kube_autotuner.progress import _build_trial_row  # noqa: PLC0415, PLC2701
-    from kube_autotuner.scoring import score_rows  # noqa: PLC0415
+    from kube_autotuner.scoring import config_memory_cost, score_rows  # noqa: PLC0415
 
+    primaries = [tr for tr in loop._completed if is_primary(tr)]
     rows = [
         _build_trial_row(
             0,
@@ -183,14 +184,17 @@ def test_run_verification_skips_done_work(
             _compute_metrics(tr),
             trial_id=tr.trial_id,
             parent_trial_id=None,
+            memory_cost=config_memory_cost(tr.sysctl_values, PARAM_SPACE),
         )
-        for tr in loop._completed
-        if is_primary(tr)
+        for tr in primaries
     ]
+    objectives = ObjectivesSection()
     scores = score_rows(
         [r.metrics for r in rows],
-        ObjectivesSection().pareto,
-        ObjectivesSection().recommendation_weights,
+        objectives.pareto,
+        objectives.recommendation_weights,
+        memory_costs=[r.memory_cost for r in rows],
+        memory_cost_weight=objectives.memory_cost_weight,
     )
     ranked = sorted(
         range(len(rows)),

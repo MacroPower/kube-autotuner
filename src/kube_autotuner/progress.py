@@ -45,7 +45,12 @@ from rich.progress import (
 from rich.table import Column, Table
 from rich.text import Text
 
-from kube_autotuner.scoring import METRIC_TO_DF_COLUMN, score_rows
+from kube_autotuner.scoring import (
+    METRIC_TO_DF_COLUMN,
+    config_memory_cost,
+    score_rows,
+)
+from kube_autotuner.sysctl.params import PARAM_SPACE
 from kube_autotuner.units import format_coefficient, pick_duration_unit_for_series
 
 try:
@@ -385,6 +390,7 @@ class _TrialRow:
     __slots__ = (
         "index",
         "jitter_seconds",
+        "memory_cost",
         "metrics",
         "p99_seconds",
         "parent_trial_id",
@@ -408,6 +414,7 @@ class _TrialRow:
         rps: float,
         p99_seconds: float,
         metrics: dict[str, float],
+        memory_cost: float,
     ) -> None:
         """Store one trial's summary for display and scoring.
 
@@ -443,6 +450,12 @@ class _TrialRow:
                 live top-N ranking, which min-max normalizes across
                 every stored row on each refresh. Stores ``NaN`` for
                 metrics the trial did not observe.
+            memory_cost: Estimated kernel/CNI memory footprint in
+                bytes, precomputed via
+                :func:`kube_autotuner.scoring.config_memory_cost` off
+                ``TrialResult.sysctl_values``. Cached here so the
+                rerank hot path does not re-evaluate the per-param
+                cost rules on every refresh.
         """
         self.index = index
         self.phase = phase
@@ -454,6 +467,7 @@ class _TrialRow:
         self.rps = rps
         self.p99_seconds = p99_seconds
         self.metrics = metrics
+        self.memory_cost = memory_cost
 
 
 def _build_trial_row(
@@ -463,6 +477,7 @@ def _build_trial_row(
     *,
     trial_id: str,
     parent_trial_id: str | None,
+    memory_cost: float,
 ) -> _TrialRow:
     """Project a completed-trial metric bundle into a :class:`_TrialRow`.
 
@@ -482,6 +497,8 @@ def _build_trial_row(
         trial_id: The trial's stable ``TrialResult.trial_id``.
         parent_trial_id: The primary trial's ``trial_id`` when
             ``phase == "verification"``; ``None`` otherwise.
+        memory_cost: Cached static memory footprint in bytes (see
+            :func:`kube_autotuner.scoring.config_memory_cost`).
 
     Returns:
         A :class:`_TrialRow` ready to append to ``_all_rows``.
@@ -522,6 +539,7 @@ def _build_trial_row(
         rps=rps,
         p99_seconds=p99_seconds,
         metrics=raw_metrics,
+        memory_cost=memory_cost,
     )
 
 
@@ -875,6 +893,7 @@ class RichProgressObserver:
             metrics,
             trial_id=trial.trial_id,
             parent_trial_id=trial.parent_trial_id,
+            memory_cost=config_memory_cost(trial.sysctl_values, PARAM_SPACE),
         )
         self._all_rows.append(row)
         self._rerank()
@@ -938,6 +957,7 @@ class RichProgressObserver:
                     metrics,
                     trial_id=tr.trial_id,
                     parent_trial_id=tr.parent_trial_id,
+                    memory_cost=config_memory_cost(tr.sysctl_values, PARAM_SPACE),
                 ),
             )
         self._rerank()
@@ -979,6 +999,8 @@ class RichProgressObserver:
             [r.metrics for r in self._all_rows],
             self._objectives.pareto,
             self._objectives.recommendation_weights,
+            memory_costs=[r.memory_cost for r in self._all_rows],
+            memory_cost_weight=self._objectives.memory_cost_weight,
         )
         # Rank by score desc, break ties by trial_id ascending to
         # match recommend_configs (analysis.py) and
@@ -1029,11 +1051,6 @@ class RichProgressObserver:
                 agg[col] = math.nan if not values else sum(values) / len(values)
             aggregated.append(agg)
 
-        scores = score_rows(
-            aggregated,
-            self._objectives.pareto,
-            self._objectives.recommendation_weights,
-        )
         # Pick each group's "primary row" for display: prefer a
         # non-verification sample (the original primary); fall back to
         # whatever sample is first in the group (orphaned verification
@@ -1046,6 +1063,19 @@ class RichProgressObserver:
                 samples[0],
             )
             display_rows.append(primary)
+
+        # Parent and verification repeats share sysctl_values and
+        # therefore share memory_cost; pull it off the display (primary)
+        # row.
+        memory_costs = [r.memory_cost for r in display_rows]
+
+        scores = score_rows(
+            aggregated,
+            self._objectives.pareto,
+            self._objectives.recommendation_weights,
+            memory_costs=memory_costs,
+            memory_cost_weight=self._objectives.memory_cost_weight,
+        )
 
         order = sorted(
             range(len(group_order)),

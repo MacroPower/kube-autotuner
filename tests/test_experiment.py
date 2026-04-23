@@ -1099,3 +1099,34 @@ def test_experiment_config_default_objectives() -> None:
         "nodes": {"sources": ["kmain07"], "target": "kmain08"},
     })
     assert config.objectives == ObjectivesSection()
+
+
+def test_objectives_memory_cost_weight_default() -> None:
+    """``memory_cost_weight`` ships at 0.1 (on, gentle)."""
+    section = ObjectivesSection()
+    assert section.memory_cost_weight == pytest.approx(0.1)
+
+
+def test_objectives_memory_cost_weight_camel_case_alias() -> None:
+    """YAML users spell the field ``memoryCostWeight``."""
+    section = ObjectivesSection.model_validate({"memoryCostWeight": 0.25})
+    assert section.memory_cost_weight == pytest.approx(0.25)
+    dumped = section.model_dump(by_alias=True)
+    assert dumped["memoryCostWeight"] == pytest.approx(0.25)
+
+
+def test_objectives_memory_cost_weight_rejects_negative() -> None:
+    """Negative weights are rejected by the ``ge=0.0`` Field constraint."""
+    with pytest.raises(ValueError, match="greater than or equal"):
+        ObjectivesSection(memory_cost_weight=-0.1)
+
+
+def test_objectives_legacy_yaml_without_memory_cost_weight() -> None:
+    """A sidecar written before the field existed still loads cleanly."""
+    legacy = {
+        "pareto": [{"metric": "tcp_throughput", "direction": "maximize"}],
+        "constraints": [],
+        "recommendationWeights": {},
+    }
+    section = ObjectivesSection.model_validate(legacy)
+    assert section.memory_cost_weight == pytest.approx(0.1)

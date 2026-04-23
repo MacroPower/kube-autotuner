@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any
 from kube_autotuner.scoring import (
     METRIC_TO_DF_COLUMN,
     aggregate_verification,
+    config_memory_cost,
     score_rows,
 )
 from kube_autotuner.sysctl.params import PARAM_SPACE, PARAM_TO_CATEGORY
@@ -508,13 +509,14 @@ def _rf_importance_scores(
     return dict(zip(sysctl_cols, rf.feature_importances_, strict=True))
 
 
-def pareto_recommendation_rows(
+def pareto_recommendation_rows(  # noqa: PLR0914 - one-pass build over many intermediate frames
     trials: list[TrialResult],
     hardware_class: str,
     topology: str | None = None,
     *,
     objectives: list[ParetoObjective] | None = None,
     weights: dict[str, float] | None = None,
+    memory_cost_weight: float | None = None,
 ) -> list[dict[str, Any]]:
     """Return every Pareto-frontier row for a class, scored and sorted.
 
@@ -541,6 +543,11 @@ def pareto_recommendation_rows(
             maximize and minimize objectives. Missing maximize-metric
             keys default to ``1.0`` (full +norm contribution); missing
             minimize-metric keys default to ``0.0``.
+        memory_cost_weight: Non-negative multiplier on the static
+            memory-footprint term fed into
+            :func:`kube_autotuner.scoring.score_rows`. ``None`` picks
+            up the :class:`ObjectivesSection` default (``0.1``); set
+            ``0.0`` to disable.
 
     Lazy-imports ``pandas`` and raises :exc:`RuntimeError` with the
     ``uv sync --group analysis`` hint when the group is missing.
@@ -549,7 +556,8 @@ def pareto_recommendation_rows(
         One dict per Pareto-frontier row in rank order. Each dict
         contains ``trial_id``, ``sysctl_values``, every key in
         :data:`~kube_autotuner.scoring.METRIC_TO_DF_COLUMN` (value
-        ``None`` for unmeasured metrics), and an *unrounded* ``score``
+        ``None`` for unmeasured metrics), a ``memory_cost`` float
+        estimating total kernel/CNI bytes, and an *unrounded* ``score``
         float. Callers that need a fixed-precision score round at the
         surface; rounding in the helper would erase the mergesort
         tiebreak stability that :mod:`kube_autotuner.progress` relies
@@ -573,6 +581,8 @@ def pareto_recommendation_rows(
         objectives = defaults.pareto
     if weights is None:
         weights = defaults.recommendation_weights
+    if memory_cost_weight is None:
+        memory_cost_weight = defaults.memory_cost_weight
 
     agg_rows = aggregate_verification(filtered)
     if not agg_rows:
@@ -593,10 +603,23 @@ def pareto_recommendation_rows(
     if front.empty:
         return []
 
-    metric_columns = list(METRIC_TO_DF_COLUMN.values())
-    records = front[metric_columns].to_dict(orient="records")
-    raw_scores = score_rows(records, objectives, weights)
-    front = front.assign(score=raw_scores)
+    # Memory cost: computed once per primary trial off the filtered list
+    # (aggregate_verification drops sysctl_values, so we keep a parent-
+    # keyed lookup aligned with the aggregation key
+    # ``parent_trial_id or trial_id``).
+    cost_by_trial: dict[str, float] = {
+        t.trial_id: config_memory_cost(t.sysctl_values, PARAM_SPACE) for t in filtered
+    }
+    memory_costs = [cost_by_trial.get(tid, 0.0) for tid in front["trial_id"].tolist()]
+    records = front[list(METRIC_TO_DF_COLUMN.values())].to_dict(orient="records")
+    raw_scores = score_rows(
+        records,
+        objectives,
+        weights,
+        memory_costs=memory_costs,
+        memory_cost_weight=memory_cost_weight,
+    )
+    front = front.assign(score=raw_scores, memory_cost=memory_costs)
     front = front.sort_values(
         by=["score", "trial_id"],
         ascending=[False, True],
@@ -626,6 +649,7 @@ def pareto_recommendation_rows(
                 "mean_latency_p50": _maybe(row, "mean_latency_p50"),
                 "mean_latency_p90": _maybe(row, "mean_latency_p90"),
                 "mean_latency_p99": _maybe(row, "mean_latency_p99"),
+                "memory_cost": float(row["memory_cost"]),
                 "score": float(row["score"]),
             },
         )
@@ -640,6 +664,7 @@ def recommend_configs(
     *,
     objectives: list[ParetoObjective] | None = None,
     weights: dict[str, float] | None = None,
+    memory_cost_weight: float | None = None,
 ) -> list[dict[str, Any]]:
     """Return the top ``n`` recommended sysctl configurations for a class.
 
@@ -668,6 +693,10 @@ def recommend_configs(
             maximize and minimize objectives. Missing maximize-metric
             keys default to ``1.0``; missing minimize-metric keys
             default to ``0.0`` (i.e. they do not influence the score).
+        memory_cost_weight: Non-negative multiplier on the static
+            memory-footprint term. ``None`` picks up the
+            :class:`ObjectivesSection` default (``0.1``); set
+            ``0.0`` to disable.
 
     Lazy-imports ``pandas`` (via :func:`trials_to_dataframe`) and
     raises :exc:`RuntimeError` with the ``uv sync --group analysis``
@@ -690,6 +719,7 @@ def recommend_configs(
         topology,
         objectives=objectives,
         weights=weights,
+        memory_cost_weight=memory_cost_weight,
     )
     results: list[dict[str, Any]] = []
     for rank, row in enumerate(rows[:n], start=1):
@@ -707,6 +737,7 @@ def recommend_configs(
                 "mean_latency_p50": row["mean_latency_p50"],
                 "mean_latency_p90": row["mean_latency_p90"],
                 "mean_latency_p99": row["mean_latency_p99"],
+                "memory_cost": row["memory_cost"],
                 "score": round(row["score"], 4),
             },
         )

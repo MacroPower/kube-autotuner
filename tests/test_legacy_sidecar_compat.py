@@ -109,3 +109,35 @@ def test_legacy_sidecar_enables_verification_with_info_log(
     assert refreshed is not None
     assert refreshed.verification_trials == 2
     assert refreshed.verification_top_k == 1
+
+
+def test_legacy_sidecar_without_memory_cost_weight_round_trips() -> None:
+    """A sidecar dump dropping ``memoryCostWeight`` rehydrates at the default.
+
+    Pre-feature binaries wrote ``ResumeMetadata`` JSON without the new
+    ``memoryCostWeight`` key on ``objectives``. Pydantic fills the
+    default (0.1) on reload, so ``_check_compatibility``'s
+    ``model_dump()`` equality check still passes against a fresh
+    experiment dump.
+    """
+    from kube_autotuner import runs  # noqa: PLC0415
+
+    exp = ExperimentConfig.model_validate({
+        "mode": "baseline",
+        "nodes": {"sources": ["a"], "target": "b"},
+    })
+    meta = ResumeMetadata(
+        objectives=exp.objectives,
+        param_space=exp.effective_param_space(),
+        benchmark=exp.benchmark,
+        n_sobol=None,
+    )
+    # Build a sidecar dict and drop the new key to mimic old metadata.
+    dumped = meta.model_dump(by_alias=True)
+    dumped["objectives"].pop("memoryCostWeight", None)
+    rehydrated = ResumeMetadata.model_validate(dumped)
+    import pytest  # noqa: PLC0415
+
+    assert rehydrated.objectives.memory_cost_weight == pytest.approx(0.1)
+    # _check_compatibility is tolerant: dumps match after defaulting.
+    runs._check_compatibility(rehydrated, exp)

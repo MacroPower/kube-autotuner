@@ -476,6 +476,15 @@ class ObjectivesSection(BaseModel):
     retransmit rate does. Maximize metrics are not listed in the
     default map and therefore fall through to the ``1.0`` default in
     ``score_rows``.
+
+    ``memory_cost_weight`` (YAML key ``memoryCostWeight``) is a singular
+    scalar -- distinct from the plural ``recommendationWeights`` dict --
+    that gently penalises configs with a large static kernel/CNI memory
+    footprint. Default ``0.1`` sits at the same scale as ``latency_p90``
+    and ``udp_jitter``, nudging the ranker toward smaller-buffer peers
+    when performance is near-tied. Set to ``0.0`` to disable. The term
+    is applied only at recommendation-ranking time; Ax exploration
+    remains untouched.
     """
 
     model_config = ConfigDict(
@@ -492,6 +501,7 @@ class ObjectivesSection(BaseModel):
     recommendation_weights: dict[str, float] = Field(
         default_factory=lambda: dict(_DEFAULT_WEIGHTS),
     )
+    memory_cost_weight: float = Field(default=0.1, ge=0.0)
 
     @model_validator(mode="after")
     def _validate_objectives(self) -> ObjectivesSection:

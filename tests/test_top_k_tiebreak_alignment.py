@@ -75,6 +75,7 @@ def test_live_panel_rerank_ties_break_on_trial_id() -> None:
             },
             trial_id=b.trial_id,
             parent_trial_id=None,
+            memory_cost=0.0,
         ),
         _build_trial_row(
             1,
@@ -84,6 +85,7 @@ def test_live_panel_rerank_ties_break_on_trial_id() -> None:
             },
             trial_id=a.trial_id,
             parent_trial_id=None,
+            memory_cost=0.0,
         ),
     ])
     observer._rerank()
@@ -121,6 +123,7 @@ def test_build_trial_row_populates_udp_keys() -> None:
         },
         trial_id="t-1",
         parent_trial_id=None,
+        memory_cost=0.0,
     )
     assert row.metrics[METRIC_TO_DF_COLUMN["udp_throughput"]] == pytest.approx(1e9)
     assert row.metrics[METRIC_TO_DF_COLUMN["udp_loss_rate"]] == pytest.approx(0.02)
@@ -139,6 +142,7 @@ def test_run_verification_top_k_selector_agrees_on_trial_id_tiebreak() -> None:
             },
             trial_id=t.trial_id,
             parent_trial_id=None,
+            memory_cost=0.0,
         )
         for t in (b, a)
     ]

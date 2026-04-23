@@ -67,6 +67,7 @@ from kube_autotuner.report import format_retransmit_rate
 from kube_autotuner.scoring import (
     METRIC_TO_DF_COLUMN,
     aggregate_verification,
+    config_memory_cost,
     score_rows,
 )
 from kube_autotuner.sysctl.params import PARAM_SPACE
@@ -756,15 +757,33 @@ def _log_verification_summary(  # noqa: PLR0914 - unit picking adds three locals
     combined_rows = aggregate_verification(all_trials)
     primary_rows = aggregate_verification(primary_only)
 
+    # aggregate_verification does not carry sysctl_values, so we build a
+    # parent-keyed cost map off the primary list and look up by each
+    # aggregated row's trial_id (which is ``parent_trial_id or trial_id``).
+    memory_cost_by_trial: dict[str, float] = {
+        t.trial_id: config_memory_cost(t.sysctl_values, PARAM_SPACE)
+        for t in primary_only
+    }
+    combined_costs = [
+        memory_cost_by_trial.get(str(r["trial_id"]), 0.0) for r in combined_rows
+    ]
+    primary_costs = [
+        memory_cost_by_trial.get(str(r["trial_id"]), 0.0) for r in primary_rows
+    ]
+
     combined_scores = score_rows(
         combined_rows,
         objectives.pareto,
         objectives.recommendation_weights,
+        memory_costs=combined_costs,
+        memory_cost_weight=objectives.memory_cost_weight,
     )
     primary_scores = score_rows(
         primary_rows,
         objectives.pareto,
         objectives.recommendation_weights,
+        memory_costs=primary_costs,
+        memory_cost_weight=objectives.memory_cost_weight,
     )
     primary_score_by_id = {
         str(r["trial_id"]): s for r, s in zip(primary_rows, primary_scores, strict=True)

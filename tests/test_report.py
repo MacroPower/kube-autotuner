@@ -71,6 +71,7 @@ def _minimal_section(
             "mean_latency_p50_ms": 1.0,
             "mean_latency_p90_ms": 2.0,
             "mean_latency_p99_ms": 3.0 + i,
+            "memory_cost": float((i + 1) * 1_000_000),
             "score": 1.0 - 0.1 * i,
         }
         for i in range(n_pareto_rows)
@@ -104,6 +105,7 @@ def _minimal_section(
         "pareto_rows": pareto_rows,
         "objectives": objectives,
         "default_weights": dict(_DEFAULT_WEIGHTS),
+        "memory_cost_weight": 0.1,
         "importance": importance_df,
         "figures": figures,
     }
@@ -207,10 +209,19 @@ def test_write_index_html_embeds_pareto_rows(tmp_path: Path) -> None:
         assert payload["trialCount"] == section["trial_count"]
         assert payload["paretoCount"] == section["pareto_count"]
         assert payload["defaultWeights"] == section["default_weights"]
+        # memoryCostWeight is a top-level state field, NOT folded into
+        # defaultWeights -- doing so would break preset parity in the
+        # browser-side slider panel.
+        assert payload["memoryCostWeight"] == section["memory_cost_weight"]
+        assert "memoryCostWeight" not in payload["defaultWeights"]
         assert len(payload["paretoRows"]) == len(section["pareto_rows"])
         expected_ids = [r["trial_id"] for r in section["pareto_rows"]]
         actual_ids = [r["trial_id"] for r in payload["paretoRows"]]
         assert actual_ids == expected_ids
+        # Every pareto row carries a ``memory_cost`` so the JS
+        # ``scoreRows`` port can read it off the row dict directly.
+        for row in payload["paretoRows"]:
+            assert "memory_cost" in row
         expected_scores = [r["score"] for r in section["pareto_rows"]]
         actual_scores = [r["score"] for r in payload["paretoRows"]]
         assert actual_scores == expected_scores
@@ -463,3 +474,79 @@ def test_write_index_html_emits_decomposition_wrapper(
     html_text = path.read_text()
     assert "decomposition-wrapper" in html_text
     assert "decomposition-table" in html_text
+
+
+def test_js_score_rows_port_matches_python(tmp_path: Path) -> None:  # noqa: PLR0914 - parity replay needs both JS and Python bookkeeping
+    """Replay the JS ``scoreRows`` arithmetic and check it matches Python.
+
+    The browser-side decomposition panel has a standalone port of
+    :func:`kube_autotuner.scoring.score_rows` (``report.py:scoreRows``)
+    that must match the Python scorer for the same embedded payload.
+    We recompute the JS formula here against the embedded JSON and
+    assert the ranking agrees with Python's ``score_rows``.
+    """
+    from kube_autotuner.experiment import ParetoObjective as Obj  # noqa: PLC0415
+    from kube_autotuner.scoring import METRIC_TO_DF_COLUMN, score_rows  # noqa: PLC0415
+
+    section = _minimal_section("10g", n_figures=1, n_pareto_rows=5)
+    # Give rows distinct-enough metric spreads that the ranking is not
+    # determined by a single axis.
+    for i, row in enumerate(section["pareto_rows"]):
+        row["mean_tcp_throughput"] = 1.0e10 + 1e8 * i
+        row["tcp_retransmit_rate"] = 1e-6 * (5 - i)
+        row["memory_cost"] = float((i + 1) * 1_000_000_000)
+    section["memory_cost_weight"] = 0.1
+
+    path = report.write_index_html(tmp_path, [section])
+    payload = _section_payload_from_html(path.read_text(), "10g")
+
+    rows = payload["paretoRows"]
+    objectives = payload["objectives"]
+    weights = payload["defaultWeights"]
+    mw = payload["memoryCostWeight"]
+
+    def _normalize(values: list[float]) -> list[float]:
+        finite = [v for v in values if v is not None]
+        if not finite:
+            return [0.5] * len(values)
+        lo, hi = min(finite), max(finite)
+        if lo == hi:
+            return [0.5] * len(values)
+        span = hi - lo
+        return [0.5 if v is None else (v - lo) / span for v in values]
+
+    # JS port arithmetic, stdlib-only. Mirrors the post-fa45690
+    # direction-sensitive weight defaults (maximize -> 1.0, minimize -> 0.0).
+    n = len(rows)
+    js_scores = [0.0] * n
+    for obj in objectives:
+        col = METRIC_TO_DF_COLUMN[obj["metric"]]
+        raw = [r.get(col) for r in rows]
+        norm = _normalize(raw)
+        if obj["direction"] == "maximize":
+            w = weights.get(obj["metric"], 1.0)
+            for i, v in enumerate(norm):
+                js_scores[i] += w * v
+        else:
+            w = weights.get(obj["metric"], 0.0)
+            for i, v in enumerate(norm):
+                js_scores[i] -= w * v
+    cost_norm = _normalize([r.get("memory_cost") for r in rows])
+    for i, v in enumerate(cost_norm):
+        js_scores[i] -= mw * v
+
+    # Python scorer over the same payload.
+    py_objectives = [Obj.model_validate(o) for o in objectives]
+    py_scores = score_rows(
+        rows,
+        py_objectives,
+        weights,
+        memory_costs=[r["memory_cost"] for r in rows],
+        memory_cost_weight=mw,
+    )
+    # Rankings must match even if absolute scores differ by rounding.
+    js_order = sorted(range(n), key=lambda i: (-js_scores[i], i))
+    py_order = sorted(range(n), key=lambda i: (-py_scores[i], i))
+    assert js_order == py_order
+    for a, b in zip(js_scores, py_scores, strict=True):
+        assert a == pytest.approx(b)

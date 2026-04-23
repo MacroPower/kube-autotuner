@@ -1073,6 +1073,7 @@ def _analyze_one_class(
         topology,
         objectives=objectives.pareto,
         weights=objectives.recommendation_weights,
+        memory_cost_weight=objectives.memory_cost_weight,
     )
     recs: list[dict[str, Any]] = [
         {
@@ -1117,6 +1118,7 @@ def _analyze_one_class(
         "pareto_rows": pareto_rows,
         "objectives": [obj.model_dump(mode="json") for obj in objectives.pareto],
         "default_weights": dict(objectives.recommendation_weights),
+        "memory_cost_weight": objectives.memory_cost_weight,
         "top_n": top_n,
         "importance": importance,
         "importance_by_target": importance_by_target,

@@ -33,14 +33,67 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class MemoryCost(BaseModel):
+    """Rule for deriving a sysctl's kernel/CNI memory cost from its rung.
+
+    Picks a closed-form derivation from the selected rung value so
+    adding or tuning rungs does not require maintaining a parallel
+    per-rung bytes dict. Supported kinds:
+
+    * ``"identity"`` -- cost in bytes equals the rung value. Used for
+      per-socket buffer ceilings (``net.core.rmem_max``,
+      ``net.core.wmem_max``).
+    * ``"triple_max"`` -- cost equals the max (third) field of the
+      space-separated triple rung string. Used for ``net.ipv4.tcp_rmem``
+      and ``net.ipv4.tcp_wmem``.
+    * ``"triple_max_pages"`` -- same as ``triple_max`` but multiplied
+      by 4096 bytes/page. Used for ``net.ipv4.tcp_mem`` and
+      ``net.ipv4.udp_mem``, whose triples carry pages rather than bytes.
+    * ``"kib"`` -- rung in KiB; cost is ``value * 1024``. Used for
+      ``vm.min_free_kbytes``.
+    * ``"per_entry"`` -- entry-count cap; cost is
+      ``value * per_entry_bytes``. Used for ``nf_conntrack_max``
+      (~320 B/entry), ``tcp_max_tw_buckets`` (~144 B/entry), and the
+      backlog knobs (~256 B/entry covering the sk_buff head plus slot
+      overhead).
+
+    ``per_entry_bytes`` is only consulted when ``kind == "per_entry"``;
+    other kinds leave it at the default and ignore it.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+        alias_generator=to_camel,
+        populate_by_name=True,
+    )
+
+    kind: Literal[
+        "identity",
+        "triple_max",
+        "triple_max_pages",
+        "kib",
+        "per_entry",
+    ]
+    per_entry_bytes: int = Field(default=1, ge=1)
+
+
 class SysctlParam(BaseModel):
-    """A single sysctl knob with its discrete search space."""
+    """A single sysctl knob with its discrete search space.
+
+    ``memory_cost`` annotates how the recommendation scorer derives a
+    static kernel/CNI memory footprint from the selected rung. Leaving
+    it ``None`` opts a param out of the cost term. See :class:`MemoryCost`
+    for the rule set; a rule applies uniformly to every rung in
+    ``values``, so adding or retuning a rung needs no parallel bytes
+    dict.
+    """
 
     model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
 
     name: str
     values: list[int | str]
     param_type: Literal["int", "choice"]
+    memory_cost: MemoryCost | None = None
 
 
 class ParamSpace(BaseModel):

@@ -1196,16 +1196,22 @@ class OptimizationLoop:
         # import _build_trial_row inside the function to avoid a
         # runtime cycle between optimizer and progress.
         from kube_autotuner.progress import _build_trial_row  # noqa: PLC0415
-        from kube_autotuner.scoring import score_rows  # noqa: PLC0415
+        from kube_autotuner.scoring import (  # noqa: PLC0415
+            config_memory_cost,
+            score_rows,
+        )
+        from kube_autotuner.sysctl.params import PARAM_SPACE  # noqa: PLC0415
 
         primary_rows = []
         for tr in primary:
+            cost = config_memory_cost(tr.sysctl_values, PARAM_SPACE)
             row = _build_trial_row(
                 0,
                 tr.phase or "bayesian",
                 _compute_metrics(tr),
                 trial_id=tr.trial_id,
                 parent_trial_id=None,
+                memory_cost=cost,
             )
             primary_rows.append((tr, row))
 
@@ -1213,6 +1219,8 @@ class OptimizationLoop:
             [row.metrics for _tr, row in primary_rows],
             self.objectives.pareto,
             self.objectives.recommendation_weights,
+            memory_costs=[row.memory_cost for _tr, row in primary_rows],
+            memory_cost_weight=self.objectives.memory_cost_weight,
         )
         ranking = sorted(
             range(len(primary_rows)),

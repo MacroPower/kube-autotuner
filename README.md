@@ -274,6 +274,13 @@ objectives:
                                      # raw throughput; latency_p50 stays unweighted so the
                                      # mean-latency axis enters the Pareto set without
                                      # dominating the score.
+  memoryCostWeight: 0.1              # gently penalises configs that burn kernel/CNI memory
+                                     # on over-sized buffers, conntrack entries, and
+                                     # backlog queues. Derived statically from the selected
+                                     # rungs, summed across sysctls, min-max normalised
+                                     # alongside the other minimize terms. Set to 0.0 to
+                                     # disable. Applies only at recommendation-ranking
+                                     # time; Ax exploration stays untouched.
 
 output: out/results.jsonl
 ```
@@ -297,6 +304,15 @@ A few rules govern how the `objectives:` block is interpreted:
   not bias the recommendation score). Raising a maximize weight
   above `1.0` biases the recommendation toward that metric; setting
   any weight to `0.0` disables the metric's contribution entirely.
+- `memoryCostWeight` is a singular scalar, not a per-metric dict. It
+  weights a static per-trial memory footprint (bytes) derived from the
+  sysctl values -- buffer ceilings, conntrack table size,
+  `vm.min_free_kbytes`, and the backlog queues all contribute; flags,
+  timeouts, and congestion-control choices do not. The cost derivation
+  lives on each `SysctlParam` as a `memoryCost` rule (`identity`,
+  `triple_max`, `triple_max_pages`, `kib`, `per_entry`), so adding a
+  rung to an existing costed sysctl does not require hand-maintaining a
+  parallel bytes table.
 - Every iteration runs both iperf3 bandwidth stages (TCP then UDP)
   and both fortio sub-stages, so every metric below is always
   observable. Sidecar metadata files (`<results.jsonl>.meta.json`)
