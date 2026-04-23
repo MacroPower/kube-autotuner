@@ -40,10 +40,15 @@ import concurrent.futures
 import json
 import logging
 import threading
-from typing import TYPE_CHECKING, Literal, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast
 
 from kube_autotuner.benchmark.client_spec import build_client_yaml
-from kube_autotuner.benchmark.errors import JobAttemptError, ResultValidationError
+from kube_autotuner.benchmark.errors import (
+    BenchmarkFailure,
+    ClientJobFailed,
+    JobAttemptError,
+    ResultValidationError,
+)
 from kube_autotuner.benchmark.fortio_client_spec import (
     build_fortio_client_yaml,
     fortio_client_job_name,
@@ -70,6 +75,7 @@ if TYPE_CHECKING:
 
     from kube_autotuner.benchmark.fortio_client_spec import Workload
     from kube_autotuner.experiment import Patch
+    from kube_autotuner.k8s.client import JobFailureDiagnostics
     from kube_autotuner.models import (
         BenchmarkConfig,
         BenchmarkResult,
@@ -81,6 +87,69 @@ if TYPE_CHECKING:
 _T = TypeVar("_T")
 
 logger = logging.getLogger(__name__)
+
+
+def _diagnostics_from(exc: BaseException) -> list[JobFailureDiagnostics]:
+    """Extract per-attempt diagnostics from a :class:`ClientJobFailed`.
+
+    Returns ``[]`` for any other exception type so the stage method
+    can unconditionally call this on ``first_exc``.
+
+    Args:
+        exc: The first exception raised by a stage's per-client
+            future.
+
+    Returns:
+        The per-attempt diagnostics list, or ``[]`` when ``exc`` is
+        not a :class:`ClientJobFailed` (e.g. a cleanup
+        :class:`RuntimeError` surfaced from the retry loop's
+        ``finally`` block).
+    """
+    if isinstance(exc, ClientJobFailed):
+        return list(exc.diagnostics)
+    return []
+
+
+def _server_container_status_rows(pod: Any) -> list[dict[str, Any]]:  # noqa: ANN401
+    """Flatten a server pod's ``containerStatuses`` to plain dicts.
+
+    Captures the fields the plan calls out for the stage snapshot:
+    container name, ``ready``, ``restartCount``, and the
+    ``lastState.terminated`` reason/exit code so a recently crashed
+    iperf3 server is visible as a non-zero ``restartCount`` plus a
+    ``last_terminated`` payload.
+
+    Args:
+        pod: Typed pod object from the CoreV1 API.
+
+    Returns:
+        A list of dicts, one per container. Empty list when the pod
+        has no container statuses yet.
+    """
+    rows: list[dict[str, Any]] = []
+    statuses = getattr(getattr(pod, "status", None), "container_statuses", None) or []
+    for cs in statuses:
+        last_state = getattr(cs, "last_state", None)
+        term = getattr(last_state, "terminated", None) if last_state else None
+        last_terminated: dict[str, Any] = {}
+        if term is not None:
+            last_terminated = {
+                "reason": str(getattr(term, "reason", "") or ""),
+                "exit_code": (
+                    int(getattr(term, "exit_code", 0) or 0)
+                    if getattr(term, "exit_code", None) is not None
+                    else None
+                ),
+                "message": str(getattr(term, "message", "") or ""),
+            }
+        rows.append({
+            "name": str(getattr(cs, "name", "") or ""),
+            "ready": bool(getattr(cs, "ready", False)),
+            "restart_count": int(getattr(cs, "restart_count", 0) or 0),
+            "last_terminated": last_terminated,
+        })
+    return rows
+
 
 CLIENT_LABEL = "app.kubernetes.io/name=iperf3-client"
 SERVER_LABEL = "app.kubernetes.io/name=iperf3-server"
@@ -231,6 +300,8 @@ class BenchmarkRunner:
             parse=parse,
             kind="iperf3",
             abort=abort,
+            stage_label=f"bw-{mode}",
+            iteration=iteration,
         )
 
     def _run_one_fortio_client(
@@ -292,9 +363,11 @@ class BenchmarkRunner:
             parse=parse,
             kind="fortio",
             abort=abort,
+            stage_label=f"fortio-{workload}",
+            iteration=iteration,
         )
 
-    def _run_client_job_with_retries(  # noqa: PLR0915 - one cohesive retry loop with three interleaved signals
+    def _run_client_job_with_retries(  # noqa: PLR0913, PLR0915 - one cohesive retry loop with three interleaved signals
         self,
         *,
         job_name: str,
@@ -303,6 +376,8 @@ class BenchmarkRunner:
         parse: Callable[[str], _T],
         kind: str,
         abort: threading.Event | None,
+        stage_label: str,
+        iteration: int,
     ) -> _T:
         """Run one client Job with the three-signal detection + retry loop.
 
@@ -346,19 +421,30 @@ class BenchmarkRunner:
             kind: Short label (``"iperf3"`` / ``"fortio"``) used in log
                 messages.
             abort: Optional stage-level early-abort signal.
+            stage_label: Sub-stage label threaded into every warning
+                (``"bw-tcp"`` / ``"bw-udp"`` / ``"fortio-saturation"``
+                / ``"fortio-fixed_qps"``).
+            iteration: Zero-based iteration index threaded into every
+                warning.
 
         Returns:
             The value produced by ``parse`` on the first successful
             attempt.
 
         Raises:
-            RuntimeError: ``max_attempts`` were exhausted, or the
-                per-attempt ``delete`` failed.
+            ClientJobFailed: ``max_attempts`` were exhausted; carries
+                the accumulated per-attempt
+                :class:`JobFailureDiagnostics` list for the stage
+                method to fold into :class:`BenchmarkFailure`.
+            RuntimeError: The per-attempt ``delete`` failed, or the
+                retry loop exited without recording any error (should
+                not happen; signals a logic bug).
             JobAttemptError: Stage-level ``abort`` fired before the
                 first attempt completed successfully.
         """
         ns = self.node_pair.namespace
         last_error: Exception | None = None
+        diagnostics: list[JobFailureDiagnostics] = []
         for attempt in range(1, max_attempts + 1):
             if abort is not None and abort.is_set():
                 break
@@ -387,7 +473,16 @@ class BenchmarkRunner:
                     return result
                 finally:
                     if not attempt_ok:
-                        self._log_job_diagnostics(job_name, ns, kind, attempt)
+                        diag = self._log_job_diagnostics(
+                            job_name,
+                            ns,
+                            kind,
+                            attempt,
+                            stage_label=stage_label,
+                            iteration=iteration,
+                        )
+                        if diag is not None:
+                            diagnostics.append(diag)
                     try:
                         self.client.delete("job", job_name, ns, ignore_not_found=True)
                     except K8sApiError as cleanup_err:
@@ -407,9 +502,11 @@ class BenchmarkRunner:
             ) as exc:
                 last_error = exc
                 logger.warning(
-                    "%s client Job %s attempt %d/%d failed: %s",
+                    "%s client Job %s [stage=%s iter=%d] attempt %d/%d failed: %s",
                     kind,
                     job_name,
+                    stage_label,
+                    iteration,
                     attempt,
                     max_attempts,
                     exc,
@@ -428,8 +525,11 @@ class BenchmarkRunner:
                 f" recorded (max_attempts={max_attempts})"
             )
             raise RuntimeError(msg)
-        msg = f"{kind} client Job {job_name} failed after {max_attempts} attempts"
-        raise RuntimeError(msg) from last_error
+        msg = (
+            f"{kind} client Job {job_name} [stage={stage_label} iter={iteration}] "
+            f"failed after {max_attempts} attempts"
+        )
+        raise ClientJobFailed(msg, diagnostics=diagnostics) from last_error
 
     def _log_job_diagnostics(
         self,
@@ -437,7 +537,10 @@ class BenchmarkRunner:
         namespace: str,
         kind: str,
         attempt: int,
-    ) -> None:
+        *,
+        stage_label: str,
+        iteration: int,
+    ) -> JobFailureDiagnostics | None:
         """Emit a single warning line describing a failed Job attempt.
 
         Pulls :meth:`K8sClient.describe_job_failure` and renders the
@@ -456,25 +559,39 @@ class BenchmarkRunner:
             namespace: Target namespace.
             kind: Short label for log grouping (``"iperf3"``, ``"fortio"``).
             attempt: 1-based attempt index.
+            stage_label: Sub-stage label (``"bw-tcp"`` / ``"bw-udp"`` /
+                ``"fortio-saturation"`` / ``"fortio-fixed_qps"``).
+            iteration: Zero-based iteration index.
+
+        Returns:
+            The :class:`JobFailureDiagnostics` payload on success, or
+            ``None`` if the describe call itself failed. The retry loop
+            accumulates non-``None`` returns into the envelope carried
+            by :class:`ClientJobFailed`.
         """
         try:
             diag = self.client.describe_job_failure(job_name, namespace)
         except Exception:
             logger.warning(
-                "Could not describe %s client job %s (attempt %d)",
+                "Could not describe %s client job %s [stage=%s iter=%d] (attempt %d)",
                 kind,
                 job_name,
+                stage_label,
+                iteration,
                 attempt,
                 exc_info=True,
             )
-            return
+            return None
         logger.warning(
-            "%s client Job %s attempt %d diagnostics: %s",
+            "%s client Job %s [stage=%s iter=%d] attempt %d diagnostics: %s",
             kind,
             job_name,
+            stage_label,
+            iteration,
             attempt,
             diag,
         )
+        return diag
 
     def run(self) -> IterationResults:
         """Run every configured benchmark iteration.
@@ -550,9 +667,18 @@ class BenchmarkRunner:
 
         Returns:
             The list of :class:`BenchmarkResult`, one per client, for
-            this iteration. On any client failure the first failure is
-            re-raised and no partial results are returned.
+            this iteration. On any client failure a
+            :class:`BenchmarkFailure` envelope is raised (carrying the
+            per-attempt client diagnostics plus a server-side snapshot)
+            and no partial results are returned.
+
+        Raises:
+            BenchmarkFailure: A client Job's future raised. The
+                envelope chains the original exception via ``from`` and
+                exposes per-attempt diagnostics plus the server-side
+                snapshot for the optimizer to persist.
         """
+        stage_label = f"bw-{mode}"
         abort = threading.Event()
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=len(self._clients),
@@ -581,6 +707,7 @@ class BenchmarkRunner:
                     break
 
             if first_exc is not None:
+                server_snapshots = self._collect_server_snapshot(label=SERVER_LABEL)
                 self._cleanup_after_failure(
                     cast(
                         "set[concurrent.futures.Future[BenchmarkResult | LatencyResult]]",  # noqa: E501
@@ -589,7 +716,13 @@ class BenchmarkRunner:
                     first_exc,
                     CLIENT_LABEL,
                 )
-                raise first_exc
+                raise BenchmarkFailure(
+                    cause=first_exc,
+                    attempt_diagnostics=_diagnostics_from(first_exc),
+                    server_snapshots=server_snapshots,
+                    stage=stage_label,
+                    iteration=iteration,
+                ) from first_exc
 
             return [f.result() for f in done]
 
@@ -603,10 +736,19 @@ class BenchmarkRunner:
 
         Returns:
             The list of :class:`LatencyResult`, one per client, for
-            this iteration and sub-stage. On any client failure the
-            first failure is re-raised and no partial results are
-            returned.
+            this iteration and sub-stage. On any client failure a
+            :class:`BenchmarkFailure` envelope is raised (carrying the
+            per-attempt client diagnostics plus a fortio-server-side
+            snapshot) and no partial results are returned.
+
+        Raises:
+            BenchmarkFailure: A fortio client Job's future raised.
+                The envelope chains the original exception via
+                ``from`` and exposes per-attempt diagnostics plus the
+                fortio-server-side snapshot for the optimizer to
+                persist.
         """
+        stage_label = f"fortio-{workload}"
         abort = threading.Event()
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=len(self._clients),
@@ -634,6 +776,9 @@ class BenchmarkRunner:
                     break
 
             if first_exc is not None:
+                server_snapshots = self._collect_server_snapshot(
+                    label=FORTIO_SERVER_LABEL,
+                )
                 self._cleanup_after_failure(
                     cast(
                         "set[concurrent.futures.Future[BenchmarkResult | LatencyResult]]",  # noqa: E501
@@ -642,9 +787,84 @@ class BenchmarkRunner:
                     first_exc,
                     FORTIO_CLIENT_LABEL,
                 )
-                raise first_exc
+                raise BenchmarkFailure(
+                    cause=first_exc,
+                    attempt_diagnostics=_diagnostics_from(first_exc),
+                    server_snapshots=server_snapshots,
+                    stage=stage_label,
+                    iteration=iteration,
+                ) from first_exc
 
             return [f.result() for f in done]
+
+    def _collect_server_snapshot(self, *, label: str) -> list[dict[str, Any]]:
+        """Snapshot server pods matching ``label``; log a warning, return rows.
+
+        Fires once per failed stage from the stage method's
+        ``first_exc is not None`` branch -- no cross-thread
+        coordination because both :meth:`_run_bandwidth_stage` and
+        :meth:`_run_latency_stage` execute on the calling thread after
+        the executor's ``wait(...)`` returns.
+
+        Best-effort: every downstream call is wrapped so a missing
+        server, vanished pod, events-listing failure, or log-read
+        failure degrades to an empty row (or empty return) rather than
+        raising. Diagnostics must never mask the primary failure they
+        describe.
+
+        Args:
+            label: Label selector for the server pods, e.g.
+                ``SERVER_LABEL`` or ``FORTIO_SERVER_LABEL``.
+
+        Returns:
+            One dict per server pod with ``name``, ``phase``,
+            ``container_statuses`` (name, ready, restart_count,
+            last_terminated.reason/exit_code), ``events``, and
+            ``log_tail`` fields. Empty list when listing failed or no
+            pods matched.
+        """
+        ns = self.node_pair.namespace
+        try:
+            pods = self.client.list_pods_by_label(label, ns)
+        except Exception:
+            logger.warning(
+                "server snapshot [label=%s] list_pods_by_label failed",
+                label,
+                exc_info=True,
+            )
+            return []
+        rows: list[dict[str, Any]] = []
+        for pod in pods:
+            name = str(getattr(getattr(pod, "metadata", None), "name", "") or "")
+            phase = str(getattr(getattr(pod, "status", None), "phase", "") or "")
+            container_statuses = _server_container_status_rows(pod)
+            events: list[Any] = []
+            log_tail = ""
+            if name:
+                try:
+                    events = list(
+                        self.client._recent_pod_events(name, ns, 10),  # noqa: SLF001
+                    )
+                except Exception:  # noqa: BLE001 - best-effort diagnostic, swallow silently
+                    events = []
+                try:
+                    log_tail = self.client._read_pod_log_tail(name, ns, 100)  # noqa: SLF001
+                except Exception:  # noqa: BLE001 - best-effort diagnostic, swallow silently
+                    log_tail = ""
+            rows.append({
+                "name": name,
+                "phase": phase,
+                "container_statuses": container_statuses,
+                "events": events,
+                "log_tail": log_tail,
+            })
+        logger.warning(
+            "server snapshot [label=%s] pods=%d rows=%s",
+            label,
+            len(rows),
+            rows,
+        )
+        return rows
 
     def _cleanup_after_failure(
         self,

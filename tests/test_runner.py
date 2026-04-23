@@ -12,7 +12,11 @@ from unittest.mock import MagicMock
 import pytest
 import yaml
 
-from kube_autotuner.benchmark.errors import ResultValidationError
+from kube_autotuner.benchmark.errors import (
+    BenchmarkFailure,
+    ClientJobFailed,
+    ResultValidationError,
+)
 from kube_autotuner.benchmark.parser import parse_iperf_json
 from kube_autotuner.benchmark.runner import (
     CLIENT_LABEL,
@@ -463,14 +467,21 @@ def test_retry_succeeds_after_first_attempt_fails(caplog):
 
 
 def test_retry_exhaustion_raises_runtime_error_with_cause():
-    """(b) All attempts fail; final RuntimeError chains the last cause."""
+    """(b) All attempts fail; BenchmarkFailure wraps ClientJobFailed → cause."""
     runner, _ = _retry_runner(
         iperf_logs=[json.dumps({"error": "x"}) for _ in range(3)],
     )
     with pytest.raises(RuntimeError, match="after 3 attempts") as exc_info:
         runner.run()
-    assert exc_info.value.__cause__ is not None
-    assert isinstance(exc_info.value.__cause__, ResultValidationError)
+    # Outer: BenchmarkFailure envelope carrying stage/iteration metadata.
+    assert isinstance(exc_info.value, BenchmarkFailure)
+    assert exc_info.value.stage == "bw-tcp"
+    assert exc_info.value.iteration == 0
+    # Middle: ClientJobFailed carrying the per-attempt diagnostics list.
+    inner = exc_info.value.__cause__
+    assert isinstance(inner, ClientJobFailed)
+    # Innermost: the ResultValidationError raised by parse().
+    assert isinstance(inner.__cause__, ResultValidationError)
 
 
 def test_retry_when_no_succeeded_pod(caplog):

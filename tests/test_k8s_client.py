@@ -537,3 +537,85 @@ def test_api_exception_not_found_translates_to_reason():
         c.get_node_zone("n-missing")
     assert excinfo.value.reason == "NotFound"
     assert excinfo.value.status == 404
+
+
+# ---- describe_job_failure ---------------------------------------------
+
+
+def test_describe_job_failure_captures_log_tail():
+    """Populates ``log_tail`` per pod via server-side ``tail_lines``."""
+    c = _client_with_mocks()
+    c.batch_v1.read_namespaced_job.return_value = SimpleNamespace(
+        status=SimpleNamespace(
+            succeeded=0,
+            failed=1,
+            conditions=[
+                SimpleNamespace(
+                    type="Failed",
+                    status="True",
+                    reason="BackoffLimitExceeded",
+                    message="Job has reached the specified backoff limit",
+                ),
+            ],
+        ),
+    )
+    failed_pod = SimpleNamespace(
+        metadata=SimpleNamespace(name="client-pod-1"),
+        status=SimpleNamespace(
+            phase="Failed",
+            container_statuses=[
+                SimpleNamespace(
+                    name="iperf3-client",
+                    state=SimpleNamespace(
+                        terminated=SimpleNamespace(
+                            exit_code=1,
+                            reason="Error",
+                            message="control socket has closed unexpectedly",
+                        ),
+                        waiting=None,
+                    ),
+                ),
+            ],
+        ),
+    )
+    c.core_v1.list_namespaced_pod.return_value = SimpleNamespace(items=[failed_pod])
+    c.core_v1.list_namespaced_event.return_value = SimpleNamespace(items=[])
+
+    tail_body = b"iperf3: error - control socket has closed unexpectedly\n"
+    c.core_v1.read_namespaced_pod_log.return_value = _log_response(tail_body)
+
+    diag = c.describe_job_failure("j", "ns", log_tail_lines=50)
+
+    assert diag["job_name"] == "j"
+    assert diag["failed"] == 1
+    assert len(diag["pods"]) == 1
+    pod = diag["pods"][0]
+    assert pod["name"] == "client-pod-1"
+    assert pod["phase"] == "Failed"
+    assert pod["log_tail"] == tail_body.decode()
+
+    # Server-side truncation must flow through.
+    c.core_v1.read_namespaced_pod_log.assert_called_once_with(
+        "client-pod-1",
+        "ns",
+        _preload_content=False,
+        tail_lines=50,
+    )
+
+
+def test_describe_job_failure_log_tail_best_effort_on_api_error():
+    """A log-read failure degrades ``log_tail`` to ``""`` instead of raising."""
+    c = _client_with_mocks()
+    c.batch_v1.read_namespaced_job.return_value = SimpleNamespace(
+        status=SimpleNamespace(succeeded=0, failed=1, conditions=[]),
+    )
+    pod = SimpleNamespace(
+        metadata=SimpleNamespace(name="p"),
+        status=SimpleNamespace(phase="Failed", container_statuses=[]),
+    )
+    c.core_v1.list_namespaced_pod.return_value = SimpleNamespace(items=[pod])
+    c.core_v1.list_namespaced_event.return_value = SimpleNamespace(items=[])
+    c.core_v1.read_namespaced_pod_log.side_effect = _api_exception(500, "ServerError")
+
+    diag = c.describe_job_failure("j", "ns")
+    assert diag["pods"][0]["log_tail"] == ""

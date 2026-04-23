@@ -165,6 +165,7 @@ class PodFailureDiagnostics(TypedDict):
     terminations: list[ContainerTerminationRow]
     waiting: list[ContainerTerminationRow]
     events: list[PodEventRow]
+    log_tail: str
 
 
 class JobFailureDiagnostics(TypedDict):
@@ -724,6 +725,42 @@ class K8sClient:
         finally:
             resp.release_conn()
 
+    def _read_pod_log_tail(self, pod_name: str, namespace: str, lines: int) -> str:
+        """Return the last ``lines`` of ``pod_name``'s log, server-side tailed.
+
+        Mirrors :meth:`_read_pod_log` but adds ``tail_lines=lines`` so
+        the kubelet truncates the response before it hits the wire --
+        important for iperf3 ``-P 16 -u -b 0`` pods that can emit
+        multi-MB JSON bodies. Decodes with ``errors="replace"`` so
+        non-UTF-8 runtime tracebacks never raise ``UnicodeDecodeError``
+        (which is not an :class:`ApiException` and would bypass
+        best-effort guards in diagnostic callers).
+
+        Args:
+            pod_name: Pod name.
+            namespace: Target namespace.
+            lines: Max lines to return from the end of the log.
+
+        Returns:
+            The decoded UTF-8 log tail body.
+
+        Raises:
+            ApiException: Forwarded from the initial request or the
+                lazy body read. Callers must wrap in best-effort
+                ``try/except Exception`` so diagnostic failures do not
+                mask the primary failure.
+        """
+        resp = self.core_v1.read_namespaced_pod_log(
+            pod_name,
+            namespace,
+            _preload_content=False,
+            tail_lines=lines,
+        )
+        try:
+            return resp.read().decode("utf-8", errors="replace")
+        finally:
+            resp.release_conn()
+
     def _list_job_pods(self, job_name: str, namespace: str) -> list[Any]:
         """Return pods matching ``job_name``.
 
@@ -830,6 +867,7 @@ class K8sClient:
         namespace: str,
         *,
         event_limit: int = 5,
+        log_tail_lines: int = 100,
     ) -> JobFailureDiagnostics:
         """Return a structured snapshot of a failing Job for logging.
 
@@ -839,14 +877,18 @@ class K8sClient:
         before ``delete``.
 
         Best-effort: every downstream API call is wrapped so a missing
-        Job, vanished pod, or events-listing failure degrades to empty
-        fields rather than raising. Diagnostics must never mask the
-        primary failure they describe.
+        Job, vanished pod, events-listing failure, or log-read failure
+        degrades to empty fields rather than raising. Diagnostics must
+        never mask the primary failure they describe.
 
         Args:
             job_name: Job name.
             namespace: Target namespace.
             event_limit: Max number of recent pod events per pod.
+            log_tail_lines: Max log lines to pull per pod via
+                kubelet-side ``tail_lines`` truncation. Kept tight
+                because a failed iperf3 ``-P 16 -u -b 0`` pod can
+                still emit multi-MB JSON before crashing.
 
         Returns:
             A :class:`JobFailureDiagnostics` payload with Job counters,
@@ -883,6 +925,14 @@ class K8sClient:
             phase = str(getattr(getattr(pod, "status", None), "phase", "") or "")
             terminations, waiting = _container_status_rows(pod)
             events = self._recent_pod_events(pod_name, namespace, event_limit)
+            log_tail = ""
+            if pod_name:
+                try:
+                    log_tail = self._read_pod_log_tail(
+                        pod_name, namespace, log_tail_lines
+                    )
+                except Exception:  # noqa: BLE001 - best-effort diagnostic, swallow silently
+                    log_tail = ""
             pods.append(
                 PodFailureDiagnostics(
                     name=pod_name,
@@ -890,6 +940,7 @@ class K8sClient:
                     terminations=terminations,
                     waiting=waiting,
                     events=events,
+                    log_tail=log_tail,
                 )
             )
         return JobFailureDiagnostics(
@@ -967,6 +1018,31 @@ class K8sClient:
         if not listing.items:
             return ""
         return str(listing.items[0].metadata.name)
+
+    def list_pods_by_label(self, label: str, namespace: str) -> list[Any]:
+        """Return every pod matching ``label`` as typed objects.
+
+        Diagnostic callers use this to snapshot server-side pods at
+        stage-failure time; the raw typed objects are passed straight
+        to :func:`_container_status_rows` and
+        :meth:`_recent_pod_events`.
+
+        Args:
+            label: Label selector (``"k=v"``).
+            namespace: Target namespace.
+
+        Returns:
+            Pod objects, or an empty list when the selector matches
+            nothing. Never raises on empty lists.
+
+        Raises:
+            K8sApiError: The list call itself failed.
+        """
+        try:
+            listing = self.core_v1.list_namespaced_pod(namespace, label_selector=label)
+        except ApiException as e:
+            _raise(f"list pods -l {label}", e)
+        return list(listing.items or [])
 
     def get_node_zone(self, node: str) -> str:
         """Return the ``topology.kubernetes.io/zone`` label for ``node``.

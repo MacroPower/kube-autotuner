@@ -26,12 +26,14 @@ from __future__ import annotations
 
 from collections import defaultdict
 import contextlib
+import json
 import logging
 import math
 import statistics
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 import warnings
 
+from kube_autotuner.benchmark.errors import BenchmarkFailure
 from kube_autotuner.benchmark.runner import BenchmarkRunner
 from kube_autotuner.k8s.client import K8sClient
 from kube_autotuner.k8s.lease import NodeLease
@@ -816,6 +818,64 @@ class OptimizationLoop:
 
         return trial_result, _compute_metrics(trial_result)
 
+    def _dump_failure(
+        self,
+        *,
+        trial_index: int,
+        phase: str,
+        parameterization: dict[str, str],
+        exc: BaseException,
+    ) -> None:
+        """Persist a per-trial failure dump next to :attr:`output`.
+
+        Best-effort: wraps the write in ``try/except Exception`` so a
+        disk failure never masks the primary trial failure the dump is
+        describing.
+
+        ``self.output`` is the JSONL trial-log path; its ``parent``
+        (even when bare, ``Path(".")``) is used as the base so a
+        bare-filename ``output`` lands the dump under
+        ``./failures/trial-<idx>.json``.
+
+        Args:
+            trial_index: Zero-based trial index as logged by the
+                observer (``prior_count + i``).
+            phase: Ax phase label for the trial (``"sobol"`` /
+                ``"bayesian"`` / ``"verification"``).
+            parameterization: The Ax-encoded parameter dict proposed
+                for this trial.
+            exc: The exception that marked the trial failed.
+        """
+        try:
+            payload: dict[str, Any] = {
+                "trial_index": trial_index,
+                "phase": phase,
+                "parameterization": parameterization,
+                "exception": {
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                    "repr": repr(exc),
+                },
+                "attempt_diagnostics": [],
+                "server_snapshots": [],
+            }
+            if isinstance(exc, BenchmarkFailure):
+                payload["stage"] = exc.stage
+                payload["iteration"] = exc.iteration
+                payload["attempt_diagnostics"] = exc.attempt_diagnostics
+                payload["server_snapshots"] = exc.server_snapshots
+            failures_dir = self.output.parent / "failures"
+            failures_dir.mkdir(parents=True, exist_ok=True)
+            (failures_dir / f"trial-{trial_index}.json").write_text(
+                json.dumps(payload, indent=2, default=repr),
+            )
+        except Exception:
+            logger.warning(
+                "Failed to write per-trial failure dump for trial %d",
+                trial_index,
+                exc_info=True,
+            )
+
     def _should_stop(self, completed_iterations: int) -> bool:
         """Return ``True`` when the main loop should terminate.
 
@@ -1040,6 +1100,17 @@ class OptimizationLoop:
                         self.prior_count + i + 1,
                         self.n_trials,
                         exc_info=True,
+                    )
+                    logger.warning(
+                        "Trial %d parameterization: %s",
+                        self.prior_count + i + 1,
+                        parameterization,
+                    )
+                    self._dump_failure(
+                        trial_index=self.prior_count + i,
+                        phase=phase,
+                        parameterization=parameterization,
+                        exc=e,
                     )
                     self.client.mark_trial_failed(trial_index=trial_index)
                     self.observer.on_trial_failed(self.prior_count + i, e)
