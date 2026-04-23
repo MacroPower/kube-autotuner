@@ -43,6 +43,7 @@ from kube_autotuner.models import (
     udp_loss_rate_by_iteration,
 )
 from kube_autotuner.progress import NullObserver
+from kube_autotuner.sysctl.params import RECOMMENDED_DEFAULTS
 from kube_autotuner.sysctl.setter import make_sysctl_setter_from_env
 from kube_autotuner.units import format_duration
 
@@ -594,6 +595,11 @@ class OptimizationLoop:
         self._first_bayesian_generate: bool = True
         self._collapse_warned: set[str] = set()
         self._seed_prior_trials(prior_trials or [])
+        # Resumes skip the seed: the prior run already had its shot at
+        # anchoring the surrogate, and re-attaching RECOMMENDED_DEFAULTS
+        # here would consume budget a resuming user did not ask for.
+        self._seed_attempts_remaining: int = 2 if self.prior_count == 0 else 0
+        self._seed_trial_index: int | None = None
 
     def _seed_prior_trials(self, prior: list[TrialResult]) -> None:
         """Replay ``prior`` into the Ax client and the completion list.
@@ -620,12 +626,15 @@ class OptimizationLoop:
         Args:
             prior: Prior trial records in file order.
         """
+        space_names = set(self.param_space.param_names())
         for tr in prior:
             if not is_primary(tr):
                 self._completed.append(tr)
                 continue
             params = {
-                _encode_param_name(k): str(v) for k, v in tr.sysctl_values.items()
+                _encode_param_name(k): str(v)
+                for k, v in tr.sysctl_values.items()
+                if k in space_names
             }
             trial_index = self.client.attach_trial(parameters=params)
             metrics = _compute_metrics(tr)
@@ -641,9 +650,70 @@ class OptimizationLoop:
             )
             self._completed.append(tr)
 
+    def _attach_recommended_defaults(self) -> tuple[int, dict[str, str]] | None:
+        """Attach ``RECOMMENDED_DEFAULTS`` as the next Sobol trial.
+
+        The search space contains several benchmark-flat /
+        production-live knobs (``tcp_mtu_probing``, ``tcp_ecn``,
+        ``tcp_max_tw_buckets``, ``nf_conntrack_max``,
+        ``nf_conntrack_tcp_timeout_established``,
+        ``tcp_slow_start_after_idle``, ``tcp_autocorking``) whose
+        response is ~flat under the default fortio shape. Without
+        an anchor the Sobol phase picks random values on those axes and
+        the GP regresses noise; attaching the production-reasonable
+        point once gives the surrogate a known-good observation.
+
+        Called lazily from :meth:`_suggest` so a failed seed trial can
+        be re-attached on the next iteration with a fresh trial_index.
+        Returns ``None`` when the configured :attr:`param_space` is an
+        override that does not line up with
+        :data:`RECOMMENDED_DEFAULTS`, or when Ax itself rejects the
+        parameterization (e.g. the override changed a knob's rungs).
+        Either failure mode is non-fatal: the run proceeds without the
+        anchor.
+
+        Returns:
+            ``(trial_index, parameterization)`` to return from
+            :meth:`_suggest`, or ``None`` to skip seeding.
+        """
+        space_names = set(self.param_space.param_names())
+        seed: dict[str, str] = {
+            _encode_param_name(k): str(v)
+            for k, v in RECOMMENDED_DEFAULTS.items()
+            if k in space_names
+        }
+        if len(seed) != len(space_names):
+            logger.debug(
+                "RECOMMENDED_DEFAULTS does not cover the configured "
+                "search space; skipping seeded prior",
+            )
+            return None
+        try:
+            trial_index = self.client.attach_trial(parameters=seed)
+        except (ValueError, KeyError, TypeError) as e:
+            logger.warning(
+                "Ax rejected the RECOMMENDED_DEFAULTS seed "
+                "(likely a param_space override with mismatched rungs); "
+                "continuing without anchor: %s",
+                e,
+            )
+            return None
+        return trial_index, seed
+
     def _snapshot_params(self) -> list[str]:
-        """Return the sysctl keys to snapshot before each trial."""
-        return [*self.param_space.param_names(), "kernel.osrelease"]
+        """Return the sysctl keys to snapshot before each trial.
+
+        Includes ``net.ipv4.tcp_no_metrics_save`` even though the knob
+        is not part of the search space, because the per-trial loop
+        pins it to 1 for methodology (trial independence) and the
+        snapshot/restore path is what returns the node to its
+        pre-experiment state.
+        """
+        return [
+            *self.param_space.param_names(),
+            "net.ipv4.tcp_no_metrics_save",
+            "kernel.osrelease",
+        ]
 
     @contextlib.contextmanager
     def _node_leases(self) -> Iterator[None]:
@@ -712,10 +782,19 @@ class OptimizationLoop:
                 snap.pop("kernel.osrelease", None)
                 original_clients[name] = snap
 
+            trial_sysctls: dict[str, str | int] = {
+                **sysctl_params,
+                "net.ipv4.tcp_no_metrics_save": 1,
+            }
             try:
-                self.target_setter.apply(sysctl_params)
+                # Apply first so ``tcp_no_metrics_save=1`` is in effect
+                # before the flush; otherwise the kernel could cache
+                # fresh entries between the flush and the pin landing.
+                self.target_setter.apply(trial_sysctls)
+                self.target_setter.flush_tcp_metrics()
                 for setter in self.client_setters.values():
-                    setter.apply(sysctl_params)
+                    setter.apply(trial_sysctls)
+                    setter.flush_tcp_metrics()
                 iteration_results = self.runner.run()
             finally:
                 self.target_setter.restore(original_target)
@@ -775,6 +854,15 @@ class OptimizationLoop:
             schema and the downstream sysctl writer's signature.
         """
         phase = "sobol" if self.prior_count + i < self.n_sobol else "bayesian"
+        if self._seed_attempts_remaining > 0:
+            self._seed_attempts_remaining -= 1
+            seed = self._attach_recommended_defaults()
+            if seed is not None:
+                self._seed_trial_index, parameterization = seed
+                return self._seed_trial_index, parameterization, phase
+            # _attach_recommended_defaults logged the reason; fall through
+            # to a normal Sobol / Bayesian suggestion for this iteration.
+            self._seed_attempts_remaining = 0
         trials = self.client.get_next_trials(max_trials=1)
         trial_index, parameterization = next(iter(trials.items()))
         return trial_index, {k: str(v) for k, v in parameterization.items()}, phase
@@ -941,6 +1029,9 @@ class OptimizationLoop:
                         parent_trial_id=None,
                     )
                     self._record(i, phase, trial_index, trial_result, metrics)
+                    if trial_index == self._seed_trial_index:
+                        self._seed_attempts_remaining = 0
+                        self._seed_trial_index = None
                 except KeyboardInterrupt:
                     raise
                 except Exception as e:
@@ -952,6 +1043,11 @@ class OptimizationLoop:
                     )
                     self.client.mark_trial_failed(trial_index=trial_index)
                     self.observer.on_trial_failed(self.prior_count + i, e)
+                    # If the failed trial was the seed, the next
+                    # _suggest iteration will re-attach automatically
+                    # while ``_seed_attempts_remaining`` is still > 0.
+                    if trial_index == self._seed_trial_index:
+                        self._seed_trial_index = None
                 i += 1
         except KeyboardInterrupt:
             live = len(self._completed) - self.prior_count

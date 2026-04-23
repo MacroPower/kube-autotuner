@@ -18,6 +18,8 @@ from kube_autotuner.sysctl.fake import FakeSysctlBackend
 from kube_autotuner.sysctl.params import (
     PARAM_CATEGORIES,
     PARAM_SPACE,
+    RECOMMENDED_DEFAULTS,
+    _validate_recommended_defaults,  # noqa: PLC2701
     build_param_space,
 )
 from kube_autotuner.sysctl.setter import (
@@ -95,14 +97,14 @@ def test_build_param_space_canonical_validates():
     assert ps is not PARAM_SPACE  # builder returns a fresh instance each call
 
 
-# Drift guard: the README "Parameter space" section advertises a 27-sysctl
+# Drift guard: the README "Parameter space" section advertises a 28-sysctl
 # default broken down into seven categories. If these counts change,
 # update the README table in the same commit.
 def test_param_space_counts_match_readme():
-    assert len(PARAM_SPACE.params) == 27
+    assert len(PARAM_SPACE.params) == 28
     expected_counts = {
         "tcp_buffer": 5,
-        "congestion": 6,
+        "congestion": 7,
         "napi": 3,
         "memory": 1,
         "connection": 7,
@@ -113,13 +115,54 @@ def test_param_space_counts_match_readme():
     assert actual_counts == expected_counts
 
 
-def test_param_categories_includes_conntrack_excludes_busy_poll():
-    # Dropped in the sysctl parameter-space review: busy_poll / busy_read
-    # require application SO_BUSY_POLL opt-in that neither iperf3 nor
-    # fortio provide, and the conntrack family is the single biggest gap
-    # for a Kubernetes-focused tuner.
+def test_param_categories_includes_conntrack_excludes_dropped():
+    # Knobs dropped in the sysctl parameter-space review:
+    # - busy_poll / busy_read: require app SO_BUSY_POLL opt-in.
+    # - tcp_no_metrics_save: methodology, not tuning -- pinned to 1 per
+    #   trial in the optimizer bootstrap instead of searched.
+    # conntrack is the single biggest gap for a K8s-focused tuner.
+    param_names = set(PARAM_SPACE.param_names())
     assert "conntrack" in PARAM_CATEGORIES
     assert "busy_poll" not in PARAM_CATEGORIES
+    assert "net.ipv4.tcp_no_metrics_save" not in param_names
+
+
+def test_recommended_defaults_cover_space_and_hit_rungs():
+    # Seeded into Ax at optimizer construction; Ax rejects parameterizations
+    # whose values fall outside the declared choice set, and silently drops
+    # missing knobs. ``_validate_recommended_defaults`` catches both at
+    # import time so a developer who adds a knob without updating the
+    # defaults hits an ImportError instead of a silent seed gap.
+    space_names = {p.name for p in PARAM_SPACE.params}
+    assert space_names == RECOMMENDED_DEFAULTS.keys()
+    for p in PARAM_SPACE.params:
+        assert RECOMMENDED_DEFAULTS[p.name] in p.values
+
+
+def test_recommended_defaults_drift_guard_raises_on_missing_knob(monkeypatch):
+    bad = dict(RECOMMENDED_DEFAULTS)
+    missing_key = next(iter(bad))
+    del bad[missing_key]
+    monkeypatch.setattr(
+        "kube_autotuner.sysctl.params.RECOMMENDED_DEFAULTS",
+        bad,
+    )
+    with pytest.raises(ValueError, match="missing"):
+        _validate_recommended_defaults()
+
+
+def test_recommended_defaults_drift_guard_raises_on_off_rung_value(monkeypatch):
+    bad = dict(RECOMMENDED_DEFAULTS)
+    # Pick any int-typed param and set an obviously-off-rung value.
+    int_param = next(p for p in PARAM_SPACE.params if p.param_type == "int")
+    off_rung = max(int(v) for v in int_param.values if isinstance(v, int)) * 100
+    bad[int_param.name] = off_rung
+    monkeypatch.setattr(
+        "kube_autotuner.sysctl.params.RECOMMENDED_DEFAULTS",
+        bad,
+    )
+    with pytest.raises(ValueError, match="not in the declared rung set"):
+        _validate_recommended_defaults()
 
 
 def test_conntrack_keys_pass_both_sysctl_regexes():

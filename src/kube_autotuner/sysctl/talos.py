@@ -273,6 +273,21 @@ class TalosSysctlBackend:
         """Re-apply a previously captured snapshot."""
         self.apply(original)
 
+    def flush_tcp_metrics(self) -> None:
+        """No-op on Talos: ``talosctl`` offers no arbitrary-exec path.
+
+        The Talos backend routes sysctl writes through
+        ``talosctl patch mc``; there is no equivalent for running
+        ``ip tcp_metrics flush all`` as a one-shot command inside the
+        machine. Operators running on Talos and wanting strict trial
+        independence should reboot the node between trials or switch
+        to the privileged-pod (``real``) backend.
+        """
+        logger.debug(
+            "tcp_metrics flush skipped on %s (Talos backend has no exec path)",
+            self.node,
+        )
+
     def lock(self) -> NodeLease:
         """Return a :class:`NodeLease` guarding exclusive node access."""
         return NodeLease(self.node, namespace=self.namespace, client=self.client)

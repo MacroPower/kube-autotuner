@@ -75,6 +75,19 @@ class SysctlBackend(Protocol):
         """Re-apply a previously captured snapshot."""
         ...
 
+    def flush_tcp_metrics(self) -> None:
+        """Clear the kernel's cached per-peer TCP metrics.
+
+        Per-trial methodology hook: ``net.ipv4.tcp_no_metrics_save=1``
+        stops new entries from being cached but does not evict rows
+        already in ``/proc/net/tcp_metrics``, so trial N's cached
+        ssthresh / RTT bleeds into trial N+1 without this flush.
+        Implementations should log-and-continue on failure (SELinux
+        denial, missing iproute2, conntrack module not loaded) rather
+        than fail the trial.
+        """
+        ...
+
     def lock(self) -> AbstractContextManager[object]:
         """Return a context manager serialising access to the node."""
         ...

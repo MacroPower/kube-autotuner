@@ -90,19 +90,15 @@ _CONGESTION_PARAMS: list[SysctlParam] = [
         values=["pfifo_fast", "fq", "fq_codel"],
         param_type="choice",
     ),
-    # When 0 (default), the kernel caches per-peer RTT/ssthresh in
-    # tcp_metrics; repeated trials against the same src/dst peer
-    # inherit warm state, which biases early-trial results and can
-    # mask the real effect of other knobs. Setting 1 forces cold
-    # starts (trial independence) at the cost of slower ramp-up.
-    SysctlParam(
-        name="net.ipv4.tcp_no_metrics_save",
-        values=[0, 1],
-        param_type="choice",
-    ),
-    # Path-MTU probing. Only helps when the path has a PMTUD blackhole
-    # (rare intra-cluster). When it matters, it cuts tcp_retransmit_rate
-    # and latency spikes caused by fragmentation-induced loss.
+    # Path-MTU probing. Flat under Talos Docker (shared bridge,
+    # uniform MTU). Live on production clusters running VXLAN
+    # (Flannel, Calico-VXLAN), GENEVE (Antrea, OVN), or WireGuard
+    # overlay CNIs across nodes with mismatched MTUs or firewalls
+    # that drop ICMP Frag Needed. When it matters, it cuts
+    # tcp_retransmit_rate and latency spikes from fragmentation loss.
+    # Benchmark-flat / production-live: kept despite flat response
+    # so the production default (1) is anchored via the seeded prior
+    # and the dimension stays available for cluster-specific tuning.
     SysctlParam(
         name="net.ipv4.tcp_mtu_probing",
         values=[0, 1],
@@ -113,10 +109,37 @@ _CONGESTION_PARAMS: list[SysctlParam] = [
     # negotiate ECN on outbound connections). Rung 2 (responder-only)
     # is omitted because the clients initiate every flow in this
     # harness, making it equivalent to 0. On fabrics that honour ECN
-    # marks, 1 substitutes marks for drops and lowers tcp_retransmit_rate
-    # without hurting throughput; on fabrics that don't, it's a no-op.
+    # marks (DCTCP, BBRv2+, most modern DC switches), 1 substitutes
+    # marks for drops and lowers tcp_retransmit_rate without hurting
+    # throughput; on fabrics that don't (Talos Docker, most
+    # internet-facing paths), it's a no-op. Benchmark-flat under the
+    # default backend / production-live for DC deployments: kept.
     SysctlParam(
         name="net.ipv4.tcp_ecn",
+        values=[0, 1],
+        param_type="choice",
+    ),
+    # Disable the idle-to-slow-start reset. When 0 (kernel default),
+    # a connection that has been idle longer than one RTO gets its
+    # cwnd clamped back to the initial window on the next send,
+    # spiking p99 latency on the post-idle request. Flat at the
+    # default fortio shape (1000 QPS -> ~1 ms gaps, well below any
+    # RTO), live on low-QPS 1G clusters running sparse API traffic
+    # where inter-request gaps exceed the RTO. Benchmark-flat /
+    # production-live: kept for 1G deployment coverage.
+    SysctlParam(
+        name="net.ipv4.tcp_slow_start_after_idle",
+        values=[0, 1],
+        param_type="choice",
+    ),
+    # Kernel-side coalescing of small write()/send() calls. Default
+    # 1. Flat for apps that issue full-response writes (Go net/http,
+    # fortio, iperf3); live for apps doing many small writes per
+    # response (Python WSGI stacks, legacy C servers) where 0 can
+    # cut p99 at the cost of PPS efficiency. Benchmark-flat /
+    # production-live for a subset of apps: kept.
+    SysctlParam(
+        name="net.ipv4.tcp_autocorking",
         values=[0, 1],
         param_type="choice",
     ),
@@ -212,7 +235,9 @@ _CONNECTION_PARAMS: list[SysctlParam] = [
     # churn pushes the table into eviction and the residual pressure
     # carries into the following fixed_qps stage. At fortio.connections=4
     # and the current default shape the lowest rung is not reachable;
-    # this dimension only bites if connection churn is scaled up.
+    # this dimension only bites if connection churn is scaled up
+    # (e.g. envoy egress at 10k+ new connections/s). Benchmark-flat
+    # at current shape / production-live on busy clusters: kept.
     SysctlParam(
         name="net.ipv4.tcp_max_tw_buckets",
         values=[65536, 262144, 1048576],
@@ -270,7 +295,12 @@ _CONNTRACK_PARAMS: list[SysctlParam] = [
     # (typically ~max/4) and avoid max values that would blow the
     # chain-depth ratio past ~8x. At the default fortio shape this
     # dimension mostly matters for production guidance rather than
-    # moving trial metrics.
+    # moving trial metrics -- overloaded conntrack is one of the most
+    # common real-world K8s networking incidents. Note: Cilium in
+    # kube-proxy-replacement (eBPF) mode bypasses netfilter conntrack
+    # for service traffic, so this is a no-op for that subset; still
+    # live for pod-to-external and pod-to-pod non-service flows.
+    # Benchmark-flat / production-live: kept.
     SysctlParam(
         name="net.netfilter.nf_conntrack_max",
         values=[131072, 262144, 1048576],
@@ -279,7 +309,11 @@ _CONNTRACK_PARAMS: list[SysctlParam] = [
     # How long ESTABLISHED entries persist when idle (default 432000s
     # / 5 days). Shorter values reduce conntrack table pressure
     # (helps nf_conntrack_max headroom) at the cost of reaping
-    # idle-but-alive flows sooner.
+    # idle-but-alive flows sooner. Benchmark cannot observe the
+    # timeout firing (6-min trial vs 5-day default); live on
+    # long-uptime production clusters where dead entries accumulate
+    # from short-lived HTTP connections, cronjobs, probe traffic.
+    # Benchmark-flat / production-live: kept.
     SysctlParam(
         name="net.netfilter.nf_conntrack_tcp_timeout_established",
         values=[600, 3600, 86400, 432000],
@@ -375,12 +409,87 @@ PARAM_TO_CATEGORY: dict[str, str] = {
     param: cat for cat, params in PARAM_CATEGORIES.items() for param in params
 }
 
-# Current production sysctl values for 10G nodes.
-# Excludes vm.nr_hugepages which is not in the tuning space.
-DEFAULT_SYSCTLS_10G: dict[str, str | int] = {
+# Production-reasonable defaults covering every knob in the search
+# space. Seeded into the optimizer via ``_seed_prior_trials`` so the
+# GP has a concrete known-good anchor on benchmark-flat dimensions
+# (tcp_mtu_probing, tcp_ecn, nf_conntrack_*, tcp_max_tw_buckets,
+# tcp_slow_start_after_idle, tcp_autocorking). Without this anchor
+# the optimizer recommends Sobol-random values on flat axes.
+#
+# Every value here must match one of the rungs declared above --
+# Ax rejects seeded points outside the choice set.
+#
+# Targeted at 10G intra-DC as the "most common" deployment; 1G edge
+# nodes survive these values, 100G long-BDP clusters will want a
+# follow-up expert profile once the search space extends past 64 MB
+# buffer ceilings.
+RECOMMENDED_DEFAULTS: dict[str, str | int] = {
+    # tcp_buffer
     "net.core.rmem_max": 67108864,
     "net.core.wmem_max": 67108864,
-    "net.ipv4.tcp_mtu_probing": 1,
     "net.ipv4.tcp_rmem": "4096 87380 33554432",
     "net.ipv4.tcp_wmem": "4096 65536 33554432",
+    "net.ipv4.tcp_mem": "786432 1048576 1572864",
+    # congestion
+    "net.ipv4.tcp_congestion_control": "bbr",
+    "net.core.default_qdisc": "fq",
+    "net.ipv4.tcp_mtu_probing": 1,
+    "net.ipv4.tcp_ecn": 1,
+    "net.ipv4.tcp_slow_start_after_idle": 0,
+    "net.ipv4.tcp_autocorking": 1,
+    "net.ipv4.tcp_limit_output_bytes": 262144,
+    # napi
+    "net.core.netdev_max_backlog": 5000,
+    "net.core.netdev_budget": 600,
+    "net.core.gro_normal_batch": 8,
+    # memory
+    "vm.min_free_kbytes": 131072,
+    # connection
+    "net.core.somaxconn": 4096,
+    "net.ipv4.tcp_max_syn_backlog": 4096,
+    "net.ipv4.tcp_tw_reuse": 1,
+    "net.ipv4.tcp_fin_timeout": 60,
+    "net.ipv4.tcp_max_tw_buckets": 262144,
+    "net.ipv4.tcp_notsent_lowat": 4294967295,
+    "net.ipv4.ip_local_port_range": "15000 65535",
+    # udp
+    "net.ipv4.udp_rmem_min": 65536,
+    "net.ipv4.udp_mem": "786432 1048576 1572864",
+    # conntrack
+    "net.netfilter.nf_conntrack_max": 262144,
+    "net.netfilter.nf_conntrack_tcp_timeout_established": 86400,
+    "net.netfilter.nf_conntrack_tcp_timeout_time_wait": 120,
 }
+
+
+def _validate_recommended_defaults() -> None:
+    """Check :data:`RECOMMENDED_DEFAULTS` covers the space and hits rungs.
+
+    The dict is seeded into Ax as a prior trial; Ax rejects a seeded
+    point whose value is not in the param's choice set, and silently
+    omits a knob missing from the seed. This catches both at import.
+
+    Raises:
+        ValueError: If any knob is missing from ``RECOMMENDED_DEFAULTS``
+            or carries a value not among its declared rungs.
+    """
+    names = {p.name for p in PARAM_SPACE.params}
+    missing = names - RECOMMENDED_DEFAULTS.keys()
+    extra = RECOMMENDED_DEFAULTS.keys() - names
+    if missing or extra:
+        msg = (
+            f"RECOMMENDED_DEFAULTS must cover every PARAM_SPACE knob: "
+            f"missing={sorted(missing)}, extra={sorted(extra)}"
+        )
+        raise ValueError(msg)
+    for p in PARAM_SPACE.params:
+        value = RECOMMENDED_DEFAULTS[p.name]
+        if value not in p.values:
+            msg = (
+                f"RECOMMENDED_DEFAULTS[{p.name!r}] = {value!r} is not in "
+                f"the declared rung set {p.values!r}"
+            )
+            raise ValueError(msg)
+
+
+_validate_recommended_defaults()

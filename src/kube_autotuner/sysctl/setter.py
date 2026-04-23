@@ -252,6 +252,26 @@ class SysctlSetter:
         logger.info("Restoring sysctls on %s", self.node)
         self.apply(original)
 
+    def flush_tcp_metrics(self) -> None:
+        """Clear cached per-peer TCP metrics on the target node.
+
+        Runs ``ip tcp_metrics flush all`` inside the same privileged
+        hostNetwork pod pattern used for sysctl writes. Failures
+        (SELinux denial on RHEL/OpenShift, image missing iproute2,
+        `tcp_metrics` netlink not compiled in) are logged and
+        swallowed so the per-trial methodology hook cannot stall the
+        whole optimizer.
+        """
+        pod_name = f"tcp-metrics-flush-{self.node}"
+        try:
+            self._run_pod(pod_name, "ip tcp_metrics flush all")
+        except (PodExecutionError, K8sApiError) as e:
+            logger.warning(
+                "tcp_metrics flush failed on %s (continuing): %s",
+                self.node,
+                e,
+            )
+
     def lock(self) -> NodeLease:
         """Return a :class:`NodeLease` guarding exclusive node access."""
         return NodeLease(self.node, namespace=self.namespace, client=self.client)

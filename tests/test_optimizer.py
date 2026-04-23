@@ -37,7 +37,7 @@ from kube_autotuner.optimizer import (
     build_ax_objective,
     build_ax_params,
 )
-from kube_autotuner.sysctl.params import PARAM_SPACE
+from kube_autotuner.sysctl.params import PARAM_SPACE, RECOMMENDED_DEFAULTS
 
 
 def _make_results(n: int = 3) -> list[BenchmarkResult]:
@@ -197,7 +197,11 @@ class TestOptimizationLoop:
 
         snap_args = mock_setter.snapshot.call_args_list[0][0][0]
         assert "kernel.osrelease" in snap_args
-        assert len(snap_args) == len(PARAM_SPACE.params) + 1
+        # tcp_no_metrics_save is pinned to 1 per-trial (methodology) but
+        # not part of the search space, so the snapshot keys cover the
+        # space plus ``tcp_no_metrics_save`` plus ``kernel.osrelease``.
+        assert "net.ipv4.tcp_no_metrics_save" in snap_args
+        assert len(snap_args) == len(PARAM_SPACE.params) + 2
 
         assert mock_lease_cls.call_count == 6
 
@@ -1266,3 +1270,201 @@ class TestUpstreamNoiseFilters:
         ]
         for entry in expected:
             assert entry in canonical, (entry, canonical)
+
+
+class TestSeededPriorAndPin:
+    """Seeded prior + per-trial methodology pin behaviour."""
+
+    @pytest.fixture
+    def node_pair(self) -> NodePair:
+        return NodePair(source="kmain07", target="kmain08", hardware_class="10g")
+
+    @pytest.fixture
+    def config(self) -> BenchmarkConfig:
+        return BenchmarkConfig()
+
+    @patch("kube_autotuner.optimizer.NodeLease")
+    @patch("kube_autotuner.optimizer.BenchmarkRunner")
+    @patch("kube_autotuner.optimizer.make_sysctl_setter_from_env")
+    def test_first_trial_applies_recommended_defaults(
+        self,
+        mock_setter_cls,
+        mock_runner_cls,
+        mock_lease_cls,  # noqa: ARG002
+        node_pair,
+        config,
+        tmp_path,
+    ):
+        """First trial on a fresh run must evaluate RECOMMENDED_DEFAULTS."""
+        mock_setter = MagicMock()
+        mock_setter.snapshot.side_effect = _mock_snapshot
+        mock_setter_cls.return_value = mock_setter
+
+        mock_runner = MagicMock()
+        mock_runner.run.return_value = IterationResults(
+            bench=_make_results(),
+            latency=_make_latency_results(),
+        )
+        mock_runner_cls.return_value = mock_runner
+
+        loop = OptimizationLoop(
+            node_pair=node_pair,
+            config=config,
+            param_space=PARAM_SPACE,
+            output=tmp_path / "results.jsonl",
+            n_trials=1,
+            n_sobol=1,
+            objectives=ObjectivesSection(),
+        )
+        trials = loop.run()
+
+        assert len(trials) == 1
+        # Every declared knob appears in the recorded parameterization
+        # at its RECOMMENDED_DEFAULTS value.
+        recorded = trials[0].sysctl_values
+        for name, value in RECOMMENDED_DEFAULTS.items():
+            if name in PARAM_SPACE.param_names():
+                assert str(recorded[name]) == str(value), name
+
+    @patch("kube_autotuner.optimizer.NodeLease")
+    @patch("kube_autotuner.optimizer.BenchmarkRunner")
+    @patch("kube_autotuner.optimizer.make_sysctl_setter_from_env")
+    def test_apply_pins_tcp_no_metrics_save_and_flushes(
+        self,
+        mock_setter_cls,
+        mock_runner_cls,
+        mock_lease_cls,  # noqa: ARG002
+        node_pair,
+        config,
+        tmp_path,
+    ):
+        """Every apply() call carries ``tcp_no_metrics_save=1`` and flush fires."""
+        mock_setter = MagicMock()
+        mock_setter.snapshot.side_effect = _mock_snapshot
+        mock_setter_cls.return_value = mock_setter
+
+        mock_runner = MagicMock()
+        mock_runner.run.return_value = IterationResults(
+            bench=_make_results(),
+            latency=_make_latency_results(),
+        )
+        mock_runner_cls.return_value = mock_runner
+
+        loop = OptimizationLoop(
+            node_pair=node_pair,
+            config=config,
+            param_space=PARAM_SPACE,
+            output=tmp_path / "results.jsonl",
+            n_trials=2,
+            n_sobol=2,
+            objectives=ObjectivesSection(),
+        )
+        loop.run()
+
+        # Each of the 2 trials calls apply() once on the target.
+        assert mock_setter.apply.call_count == 2
+        for call in mock_setter.apply.call_args_list:
+            applied = call[0][0]
+            assert applied["net.ipv4.tcp_no_metrics_save"] == 1
+
+        # flush_tcp_metrics fires once per trial on the target setter.
+        assert mock_setter.flush_tcp_metrics.call_count == 2
+
+    @patch("kube_autotuner.optimizer.NodeLease")
+    @patch("kube_autotuner.optimizer.BenchmarkRunner")
+    @patch("kube_autotuner.optimizer.make_sysctl_setter_from_env")
+    def test_seed_retries_on_failed_first_trial(
+        self,
+        mock_setter_cls,
+        mock_runner_cls,
+        mock_lease_cls,  # noqa: ARG002
+        node_pair,
+        config,
+        tmp_path,
+    ):
+        """A failed seed trial gets re-attached on the next iteration."""
+        mock_setter = MagicMock()
+        mock_setter.snapshot.side_effect = _mock_snapshot
+        mock_setter_cls.return_value = mock_setter
+
+        mock_runner = MagicMock()
+        call_count = 0
+
+        def run_side_effect():
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise RuntimeError("seed trial crashed")  # noqa: TRY003
+            return IterationResults(
+                bench=_make_results(),
+                latency=_make_latency_results(),
+            )
+
+        mock_runner.run.side_effect = run_side_effect
+        mock_runner_cls.return_value = mock_runner
+
+        loop = OptimizationLoop(
+            node_pair=node_pair,
+            config=config,
+            param_space=PARAM_SPACE,
+            output=tmp_path / "results.jsonl",
+            n_trials=2,
+            n_sobol=2,
+            objectives=ObjectivesSection(),
+        )
+        trials = loop.run()
+
+        # One failure + one success => one recorded trial whose
+        # parameterization must still be RECOMMENDED_DEFAULTS (the
+        # second attempt re-attached the seed).
+        assert len(trials) == 1
+        recorded = trials[0].sysctl_values
+        for name, value in RECOMMENDED_DEFAULTS.items():
+            if name in PARAM_SPACE.param_names():
+                assert str(recorded[name]) == str(value), name
+
+
+def test_seed_prior_trials_filters_stale_keys(
+    tmp_path,
+):
+    """Historical JSONL containing a now-removed knob must still attach."""
+    node_pair = NodePair(source="a", target="b", hardware_class="10g")
+    stale_sysctls: dict[str, str | int] = {
+        p.name: p.values[0] for p in PARAM_SPACE.params
+    }
+    # Simulate a JSONL row written before ``tcp_no_metrics_save`` was
+    # removed from the space.
+    stale_sysctls["net.ipv4.tcp_no_metrics_save"] = 0
+    prior = TrialResult(
+        node_pair=node_pair,
+        sysctl_values=stale_sysctls,
+        config=BenchmarkConfig(),
+        results=[
+            BenchmarkResult(
+                timestamp=datetime.now(UTC),
+                mode="tcp",
+                bits_per_second=9e9,
+                retransmits=5,
+                bytes_sent=10**9,
+            ),
+        ],
+        phase="sobol",
+    )
+
+    with (
+        patch("kube_autotuner.optimizer.NodeLease"),
+        patch("kube_autotuner.optimizer.BenchmarkRunner"),
+        patch("kube_autotuner.optimizer.make_sysctl_setter_from_env"),
+    ):
+        # Constructor invokes ``_seed_prior_trials``; if the stale key
+        # is passed through to Ax, ``attach_trial`` raises.
+        OptimizationLoop(
+            node_pair=node_pair,
+            config=BenchmarkConfig(),
+            param_space=PARAM_SPACE,
+            output=tmp_path / "out.jsonl",
+            n_trials=2,
+            n_sobol=1,
+            objectives=ObjectivesSection(),
+            prior_trials=[prior],
+        )

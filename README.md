@@ -32,7 +32,7 @@ latency under a fixed offered load.
   multiple clients share one server. The surrogate is fitting a noisy
   response, not a deterministic function; iteration counts exist partly
   to buy it confidence.
-- **High-dimensional, discrete search.** The default space has 27
+- **High-dimensional, discrete search.** The default space has 28
   parameters (see the next section) with well over 10^10 combinations
   under the rung convention. It is discrete and categorical, so the
   optimizer treats it as a mixed integer/categorical problem.
@@ -94,7 +94,7 @@ percentiles in one pass.
 ## Parameter space
 
 When `optimize.paramSpace` is omitted, the tool searches a canonical
-default: 27 sysctls across seven categories. Two parameter types are
+default: 28 sysctls across seven categories. Two parameter types are
 accepted: `int` (a numeric range) and `choice` (an explicit value list
 of strings or ints). The canonical default quantises every integer
 parameter to a handful of representative rungs rather than covering the
@@ -106,15 +106,15 @@ parameters as full ranges (as the YAML doc comment
 `values = [min, max]` implies for custom params) makes it larger still.
 Either way, exhaustive search is not an option.
 
-| Category           | Count | Examples                                                                               |
-|--------------------|-------|----------------------------------------------------------------------------------------|
-| TCP buffers        | 5     | `net.core.rmem_max`, `net.ipv4.tcp_rmem`, `net.ipv4.tcp_mem`                           |
-| Congestion control | 6     | `net.ipv4.tcp_congestion_control`, `net.core.default_qdisc`                            |
-| NAPI / softirq     | 3     | `net.core.netdev_budget`, `net.core.netdev_max_backlog`                                |
-| VM / memory        | 1     | `vm.min_free_kbytes`                                                                   |
-| Connection         | 7     | `net.core.somaxconn`, `net.ipv4.tcp_max_tw_buckets`, `net.ipv4.ip_local_port_range`    |
-| UDP                | 2     | `net.ipv4.udp_rmem_min`, `net.ipv4.udp_mem`                                            |
-| Conntrack          | 3     | `net.netfilter.nf_conntrack_max`, `net.netfilter.nf_conntrack_tcp_timeout_established` |
+| Category           | Count | Examples                                                                                |
+|--------------------|-------|-----------------------------------------------------------------------------------------|
+| TCP buffers        | 5     | `net.core.rmem_max`, `net.ipv4.tcp_rmem`, `net.ipv4.tcp_mem`                            |
+| Congestion control | 7     | `net.ipv4.tcp_congestion_control`, `net.core.default_qdisc`, `net.ipv4.tcp_autocorking` |
+| NAPI / softirq     | 3     | `net.core.netdev_budget`, `net.core.netdev_max_backlog`                                 |
+| VM / memory        | 1     | `vm.min_free_kbytes`                                                                    |
+| Connection         | 7     | `net.core.somaxconn`, `net.ipv4.tcp_max_tw_buckets`, `net.ipv4.ip_local_port_range`     |
+| UDP                | 2     | `net.ipv4.udp_rmem_min`, `net.ipv4.udp_mem`                                             |
+| Conntrack          | 3     | `net.netfilter.nf_conntrack_max`, `net.netfilter.nf_conntrack_tcp_timeout_established`  |
 
 UDP-category params are always part of the default search space: every
 iteration runs both a TCP and a UDP iperf3 bandwidth stage, so
