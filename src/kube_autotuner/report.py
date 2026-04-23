@@ -50,42 +50,75 @@ def format_retransmit_rate(rate: float | None) -> str:
 
 
 _STYLE = """
-body { font-family: -apple-system, system-ui, Segoe UI, Roboto, sans-serif;
-       margin: 0; color: #222; background: #fafafa; }
-header { padding: 1rem 2rem; background: #fff; border-bottom: 1px solid #ddd; }
-header h1 { margin: 0; font-size: 1.4rem; }
-nav.top { position: sticky; top: 0; z-index: 10; background: #fff;
-          border-bottom: 1px solid #ddd; padding: 0.5rem 2rem; }
-nav.top a { margin-right: 1rem; text-decoration: none; color: #06c; }
-main { padding: 1rem 2rem 4rem; max-width: 1200px; margin: 0 auto; }
-section.hw { margin-top: 2rem; padding-top: 1rem; border-top: 2px solid #ccc; }
-section.fig { margin: 1.5rem 0; }
+:root {
+  color-scheme: dark;
+  --bg: #21252b;
+  --panel: #282c34;
+  --panel-2: #2c313a;
+  --border: #3e4451;
+  --divider: #3e4451;
+  --fg: #abb2bf;
+  --fg-muted: #828997;
+  --fg-dim: #5c6370;
+  --accent: #61afef;
+  --accent-fg: #282c34;
+  --pos: #98c379;
+  --neg: #e06c75;
+  --pos-bar: rgba(152, 195, 121, 0.28);
+  --neg-bar: rgba(224, 108, 117, 0.28);
+  --imp-bar: rgba(97, 175, 239, 0.32);
+  --top-rank: rgba(229, 192, 123, 0.16);
+}
+body { font-family: Inter, -apple-system, system-ui, "Segoe UI", Roboto, sans-serif;
+       margin: 0; color: var(--fg); background: var(--bg); }
+header { padding: 1rem 2rem; background: var(--panel);
+         border-bottom: 1px solid var(--border); }
+header h1 { margin: 0; font-size: 1.4rem; color: var(--fg); }
+nav.top { position: sticky; top: 0; z-index: 10;
+          background: color-mix(in srgb, var(--panel) 75%, transparent);
+          backdrop-filter: blur(8px);
+          border-bottom: 1px solid var(--border); padding: 0.5rem 2rem; }
+nav.top a { margin-right: 1rem; text-decoration: none; color: var(--accent); }
+main { padding: 1rem 2rem 4rem; max-width: 1280px; margin: 0 auto; }
+section.hw { margin-top: 2rem; padding-top: 1rem;
+             border-top: 2px solid var(--divider); }
+section.fig { margin: 1.5rem 0; background: var(--panel);
+              border: 1px solid var(--border); border-radius: 8px;
+              padding: 0.75rem 1rem;
+              box-shadow: 0 1px 2px rgba(0,0,0,0.4); }
 h2 { font-size: 1.2rem; }
-h3 { font-size: 1rem; color: #444; }
+h3 { font-size: 1rem; color: var(--fg-muted); }
 table.report-table { border-collapse: collapse; margin: 0.5rem 0 1rem;
-                     font-size: 0.9rem; background: #fff; width: 100%; }
+                     font-size: 0.9rem; background: var(--panel); width: 100%; }
 table.report-table th, table.report-table td {
-    border: 1px solid #ddd; padding: 4px 8px; text-align: left;
+    border: 1px solid var(--border); padding: 4px 8px; text-align: left;
     white-space: nowrap; }
-table.report-table th { background: #f0f0f0; }
+table.report-table th { background: var(--panel-2); }
 table.report-table td.numeric { text-align: right; font-variant-numeric: tabular-nums; }
-tr.top-rank { background: #fff7e6; }
+table.report-table tbody tr:hover {
+    background: color-mix(in srgb, var(--panel) 92%, var(--accent)); }
+tr.top-rank { background: var(--top-rank); }
 details { margin: 0.25rem 0 0.75rem; }
-summary { cursor: pointer; color: #06c; }
-pre { background: #f4f4f4; padding: 0.5rem; overflow-x: auto;
-      font-size: 0.85rem; }
-.meta { color: #666; font-size: 0.9rem; }
-.panel { background: #fff; border: 1px solid #ddd; border-radius: 4px;
-         padding: 0.75rem 1rem; margin: 0.75rem 0 1.25rem; }
+summary { cursor: pointer; color: var(--accent); }
+pre { background: var(--panel-2); padding: 0.5rem; overflow-x: auto;
+      font-size: 0.85rem; border-radius: 6px; color: var(--fg); }
+.meta { color: var(--fg-dim); font-size: 0.9rem; }
+.panel { background: var(--panel); border: 1px solid var(--border);
+         border-radius: 8px; padding: 0.75rem 1rem; margin: 0.75rem 0 1.25rem;
+         box-shadow: 0 1px 2px rgba(0,0,0,0.4); }
 .panel .presets { margin-bottom: 0.5rem; }
 .panel .presets button {
     margin-right: 0.35rem; margin-bottom: 0.25rem;
     padding: 0.25rem 0.6rem; font-size: 0.85rem;
-    border: 1px solid #bbb; background: #f5f5f5; border-radius: 3px;
-    cursor: pointer; }
-.panel .presets button:hover { background: #e8e8e8; }
+    border: 1px solid var(--border); background: var(--panel-2);
+    border-radius: 6px; color: var(--fg);
+    cursor: pointer; transition: background 120ms ease; }
+.panel .presets button:hover {
+    background: color-mix(in srgb, var(--panel-2) 80%, white); }
+.panel .presets button:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 1px; }
 .panel .presets button.active {
-    background: #06c; color: #fff; border-color: #06c; }
+    background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
 .panel .sliders {
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
@@ -94,9 +127,9 @@ pre { background: #f4f4f4; padding: 0.5rem; overflow-x: auto;
 .panel .slider-row {
     display: grid; grid-template-columns: 1fr auto; align-items: center;
     gap: 0.25rem; font-size: 0.85rem; }
-.panel .slider-row label { color: #444; }
+.panel .slider-row label { color: var(--fg-muted); }
 .panel .slider-row .weight-value {
-    font-variant-numeric: tabular-nums; color: #06c; font-weight: 600; }
+    font-variant-numeric: tabular-nums; color: var(--accent); font-weight: 600; }
 .panel .slider-row input[type=range] { grid-column: 1 / -1; width: 100%; }
 .panel .topn-row { margin-top: 0.5rem; font-size: 0.85rem; }
 .panel .topn-row input { width: 4em; }
@@ -107,24 +140,28 @@ pre { background: #f4f4f4; padding: 0.5rem; overflow-x: auto;
 .target-buttons button {
     margin-right: 0.25rem; margin-bottom: 0.25rem;
     padding: 0.2rem 0.55rem; font-size: 0.8rem;
-    border: 1px solid #bbb; background: #f5f5f5; border-radius: 3px;
-    cursor: pointer; color: #222; }
-.target-buttons button:hover { background: #e8e8e8; }
+    border: 1px solid var(--border); background: var(--panel-2);
+    border-radius: 6px; cursor: pointer; color: var(--fg);
+    transition: background 120ms ease; }
+.target-buttons button:hover {
+    background: color-mix(in srgb, var(--panel-2) 80%, white); }
+.target-buttons button:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 1px; }
 .target-buttons button.active {
-    background: #06c; color: #fff; border-color: #06c; }
+    background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
 table.importance-table { table-layout: fixed; width: 100%; }
 table.importance-table td.param-col { font-family: ui-monospace, SFMono-Regular,
     Menlo, Consolas, monospace; font-size: 0.82rem; white-space: normal;
     word-break: break-all; }
-table.importance-table td.category-col { color: #555; }
+table.importance-table td.category-col { color: var(--fg-muted); }
 table.importance-table td.bar-cell { position: relative; padding: 4px 8px;
     text-align: right; font-variant-numeric: tabular-nums; }
 table.importance-table col.param-w { width: 42%; }
 table.importance-table col.category-w { width: 18%; }
 table.importance-table col.corr-w { width: 20%; }
 table.importance-table col.imp-w { width: 20%; }
-.num-pos { color: #2b8a3e; }
-.num-neg { color: #c92a2a; }
+.num-pos { color: var(--pos); }
+.num-neg { color: var(--neg); }
 """
 
 
@@ -182,9 +219,9 @@ def _corr_bar_background(r: float) -> str:
     """
     magnitude = max(0.0, min(1.0, abs(r))) * 50.0
     if r >= 0:
-        start, end, color = 50.0, 50.0 + magnitude, "#c6f6c0"
+        start, end, color = 50.0, 50.0 + magnitude, "var(--pos-bar)"
     else:
-        start, end, color = 50.0 - magnitude, 50.0, "#f8c3c3"
+        start, end, color = 50.0 - magnitude, 50.0, "var(--neg-bar)"
     return (
         f"linear-gradient(to right, transparent {start:.2f}%, "
         f"{color} {start:.2f}%, {color} {end:.2f}%, "
@@ -195,7 +232,9 @@ def _corr_bar_background(r: float) -> str:
 def _imp_bar_background(imp: float) -> str:
     """Return a CSS linear-gradient for a 0-anchored importance bar."""
     pct = max(0.0, min(1.0, imp)) * 100.0
-    return f"linear-gradient(to right, #cfe2ff {pct:.2f}%, transparent {pct:.2f}%)"
+    return (
+        f"linear-gradient(to right, var(--imp-bar) {pct:.2f}%, transparent {pct:.2f}%)"
+    )
 
 
 def _render_importance(df: pd.DataFrame, top_n: int = _TOP_IMPORTANCE_ROWS) -> str:
@@ -848,7 +887,7 @@ function renderDecomposition(divEl, entry) {
   const metrics = Object.keys(contribs);
   const values = metrics.map(m => contribs[m].contribution);
   const colors = metrics.map(m =>
-    contribs[m].direction === "maximize" ? "#2b8a3e" : "#c92a2a"
+    contribs[m].direction === "maximize" ? "#98c379" : "#e06c75"
   );
   const hover = metrics.map(m => {
     const c = contribs[m];
@@ -870,7 +909,8 @@ function renderDecomposition(divEl, entry) {
   const layout = {
     margin: {l: 140, r: 20, t: 10, b: 30},
     height: 22 * metrics.length + 60,
-    xaxis: {title: "signed score contribution", zeroline: true, zerolinecolor: "#888"},
+    xaxis: {title: "signed score contribution", zeroline: true,
+            zerolinecolor: "#5c6370"},
     yaxis: {automargin: true},
     showlegend: false,
     bargap: 0.25,
@@ -1042,6 +1082,8 @@ def write_index_html(output_dir: Path, sections: list[dict[str, Any]]) -> Path:
     doc = (
         "<!doctype html>\n<html lang='en'>\n<head>\n"
         "<meta charset='utf-8'>\n"
+        '<meta name="color-scheme" content="dark">\n'
+        '<meta name="theme-color" content="#21252b">\n'
         "<title>kube-autotuner analysis report</title>\n"
         f"<style>{_STYLE}</style>\n"
         f'<script src="{_PLOTLY_CDN}"></script>\n'

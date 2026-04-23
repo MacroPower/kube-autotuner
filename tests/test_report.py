@@ -301,3 +301,23 @@ def test_presets_labels_cover_every_preset() -> None:
     presets = _extract_js_object_literal(report._JS_MODULE, "PRESETS")
     labels = _extract_js_object_literal(report._JS_MODULE, "PRESET_LABELS")
     assert set(presets.keys()) == set(labels.keys())
+
+
+def test_write_index_html_is_dark_themed(tmp_path: Path) -> None:
+    path = report.write_index_html(tmp_path, [_minimal_section("10g")])
+    html_text = path.read_text()
+    assert "color-scheme: dark" in html_text
+    for forbidden in (
+        "#fafafa",
+        "#fff7e6",
+        "#f4f4f4",
+        "#c6f6c0",
+        "#f8c3c3",
+        "#cfe2ff",
+        "#2b8a3e",
+        "#c92a2a",
+        "#06c",
+    ):
+        assert forbidden not in html_text, (
+            f"light-palette literal {forbidden} leaked into report"
+        )

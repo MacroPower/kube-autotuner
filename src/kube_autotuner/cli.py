@@ -1156,7 +1156,7 @@ def _write_figures(
         :func:`kube_autotuner.report.write_index_html`.
     """
     scatter_fig = plots.plot_pareto_scatter_matrix(df, pareto_mask)
-    scatter_fig.write_html(str(hw_dir / "pareto_scatter_matrix.html"))
+    plots.write_standalone_html(scatter_fig, hw_dir / "pareto_scatter_matrix.html")
     figures: list[tuple[str, Any]] = [
         ("Objective space (scatter matrix)", scatter_fig),
     ]
@@ -1181,6 +1181,6 @@ def _write_figures(
         if not (_has_data(x) and _has_data(y)):
             continue
         fig = plots.plot_pareto_2d(df, front, x, y)
-        fig.write_html(str(hw_dir / f"pareto_{x}_vs_{y}.html"))
+        plots.write_standalone_html(fig, hw_dir / f"pareto_{x}_vs_{y}.html")
         figures.append((f"Pareto: {x} vs {y}", fig))
     return figures

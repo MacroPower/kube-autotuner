@@ -10,6 +10,7 @@ Runtime helpers raise :class:`RuntimeError` with the
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -17,6 +18,18 @@ if TYPE_CHECKING:
     import plotly.graph_objects as go
 
 _ANALYSIS_HINT = "install analysis group: uv sync --group analysis"
+
+_DARK_LAYOUT: dict[str, Any] = {
+    "template": "plotly_dark",
+    "paper_bgcolor": "rgba(0,0,0,0)",
+    "plot_bgcolor": "rgba(0,0,0,0)",
+    "font": {"color": "#abb2bf"},
+}
+
+_STANDALONE_STYLE = (
+    "<style>html,body{background:#21252b;color:#abb2bf;margin:0;"
+    "color-scheme:dark}</style>"
+)
 
 
 def _require_plotly() -> tuple[Any, Any]:
@@ -84,7 +97,7 @@ def plot_pareto_scatter_matrix(
         title="Objective Space (Pareto-optimal highlighted)",
     )
     fig.update_traces(diagonal_visible=False, marker={"size": 5})
-    fig.update_layout(width=900, height=900)
+    fig.update_layout(width=900, height=900, **_DARK_LAYOUT)
     return fig
 
 
@@ -150,5 +163,25 @@ def plot_pareto_2d(
         yaxis_title=y,
         width=800,
         height=600,
+        **_DARK_LAYOUT,
     )
     return fig
+
+
+def write_standalone_html(fig: go.Figure, path: str | Path) -> None:
+    """Write a dark-themed stand-alone figure HTML file.
+
+    Plotly's ``write_html`` emits a default ``<body>`` with a white UA
+    background; ``paper_bgcolor`` only fills the plot area, so the
+    page margins around the figure would stay white. This helper
+    injects a small ``<style>`` block into the ``<head>`` so the
+    margins are dark too and the figure blends into the surrounding
+    page.
+
+    Args:
+        fig: The Plotly figure to serialize.
+        path: Destination path for the HTML file.
+    """
+    html = fig.to_html(include_plotlyjs="cdn", full_html=True)
+    html = html.replace("</head>", _STANDALONE_STYLE + "</head>", 1)
+    Path(path).write_text(html, encoding="utf-8")
