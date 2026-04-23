@@ -314,3 +314,31 @@ def test_write_index_html_is_dark_themed(tmp_path: Path) -> None:
         assert forbidden not in html_text, (
             f"light-palette literal {forbidden} leaked into report"
         )
+
+
+def test_decomposition_uses_table_not_plotly() -> None:
+    js = report._JS_MODULE
+    assert "renderDecompositionTable(" in js
+    assert "decomposition-table" in js
+    # Match the function definition with a word boundary so the new
+    # name `renderDecompositionTable` does not satisfy the assertion.
+    assert not re.search(r"\bfunction\s+renderDecomposition\s*\(", js)
+    assert "Plotly.newPlot(divEl" not in js
+    assert "displayModeBar: false" not in js
+    assert "decomposition-chart" not in js
+
+
+def test_decomposition_table_is_styled() -> None:
+    css = report._STYLE
+    assert "decomposition-wrapper" in css
+    assert "table.decomposition-table" in css
+    assert ".decomposition-chart" not in css
+
+
+def test_write_index_html_emits_decomposition_wrapper(
+    tmp_path: Path,
+) -> None:
+    path = report.write_index_html(tmp_path, [_minimal_section("10g")])
+    html_text = path.read_text()
+    assert "decomposition-wrapper" in html_text
+    assert "decomposition-table" in html_text

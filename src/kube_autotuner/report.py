@@ -133,7 +133,15 @@ pre { background: var(--panel-2); padding: 0.5rem; overflow-x: auto;
 .panel .slider-row input[type=range] { grid-column: 1 / -1; width: 100%; }
 .panel .topn-row { margin-top: 0.5rem; font-size: 0.85rem; }
 .panel .topn-row input { width: 4em; }
-.decomposition-chart { width: 100%; min-height: 220px; }
+.decomposition-wrapper { padding: 0.5rem 0.75rem; }
+table.decomposition-table { table-layout: fixed; width: 100%; margin: 0; }
+table.decomposition-table col.metric-w { width: 38%; }
+table.decomposition-table col.norm-w { width: 18%; }
+table.decomposition-table col.weight-w { width: 14%; }
+table.decomposition-table col.contrib-w { width: 30%; }
+table.decomposition-table td.metric-col { font-family: ui-monospace,
+    SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.82rem;
+    white-space: normal; word-break: break-all; }
 .importance-controls { margin: 0.5rem 0 0.75rem; font-size: 0.85rem;
     display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; }
 .importance-controls .meta { margin: 0; }
@@ -154,7 +162,7 @@ table.importance-table td.param-col { font-family: ui-monospace, SFMono-Regular,
     Menlo, Consolas, monospace; font-size: 0.82rem; white-space: normal;
     word-break: break-all; }
 table.importance-table td.category-col { color: var(--fg-muted); }
-table.importance-table td.bar-cell { position: relative; padding: 4px 8px;
+table.report-table td.bar-cell { position: relative; padding: 4px 8px;
     text-align: right; font-variant-numeric: tabular-nums; }
 table.importance-table col.param-w { width: 42%; }
 table.importance-table col.category-w { width: 18%; }
@@ -800,10 +808,13 @@ function buildRankedTable(wrapper, state, visibleCols) {
     summary.textContent = "details for trial " + row.trial_id;
     details.appendChild(summary);
 
-    const chartDiv = document.createElement("div");
-    chartDiv.className = "decomposition-chart";
-    chartDiv.id = "decomp-" + state.section.hwSlug + "-" + i;
-    details.appendChild(chartDiv);
+    const wrapper = document.createElement("div");
+    wrapper.className = "decomposition-wrapper";
+    const table = document.createElement("table");
+    table.className = "report-table decomposition-table";
+    table.id = "decomp-" + state.section.hwSlug + "-" + i;
+    wrapper.appendChild(table);
+    details.appendChild(wrapper);
 
     const sysctlDetails = document.createElement("details");
     const sysctlSummary = document.createElement("summary");
@@ -819,7 +830,8 @@ function buildRankedTable(wrapper, state, visibleCols) {
     tbody.appendChild(tr);
     tbody.appendChild(detailsTr);
 
-    const ref = {tr, rankTd, scoreTd, detailsTr, details, chartDiv, entry: null};
+    const ref = {tr, rankTd, scoreTd, detailsTr, details,
+                 tableEl: table, entry: null};
     details.addEventListener("toggle", () => {
       if (details.open && ref.entry) ensureDecomposition(ref);
     });
@@ -855,59 +867,60 @@ function updateRankedTable(state, ranked) {
   }
 }
 
-// Render the decomposition for a row's current entry. Defers the very
-// first ``Plotly.newPlot`` call via ``queueMicrotask`` so the
-// ``<details>`` layout has settled when Plotly measures the div;
-// subsequent calls go through ``Plotly.react`` directly.
 function ensureDecomposition(ref) {
   if (!ref.entry) return;
-  if (!ref.chartDiv._fullLayout) {
-    queueMicrotask(() => {
-      if (ref.entry) renderDecomposition(ref.chartDiv, ref.entry);
-    });
-  } else {
-    renderDecomposition(ref.chartDiv, ref.entry);
-  }
+  renderDecompositionTable(ref.tableEl, ref.entry);
 }
 
-function renderDecomposition(divEl, entry) {
+function renderDecompositionTable(tableEl, entry) {
   const contribs = entry.contributions;
   const metrics = Object.keys(contribs);
-  const values = metrics.map(m => contribs[m].contribution);
-  const colors = metrics.map(m =>
-    contribs[m].direction === "maximize" ? "#98c379" : "#e06c75"
-  );
-  const hover = metrics.map(m => {
+  // Largest |contribution| sets the bar scale so the longest bar fills
+  // the cell. Recomputed on every rerank because slider changes shift
+  // contributions; the ~20-row max keeps this cheap.
+  let maxAbs = 0;
+  for (const m of metrics) {
+    const v = Math.abs(contribs[m].contribution);
+    if (v > maxAbs) maxAbs = v;
+  }
+  tableEl.innerHTML =
+    `<colgroup>`
+    + `<col class="metric-w"><col class="norm-w">`
+    + `<col class="weight-w"><col class="contrib-w">`
+    + `</colgroup>`
+    + `<thead><tr><th>metric</th>`
+    + `<th title="Normalized metric value, 0 to 1">norm</th>`
+    + `<th title="Slider weight (minimize metrics only)">weight</th>`
+    + `<th title="Signed score contribution = norm \u00d7 weight">`
+    + `contribution</th>`
+    + `</tr></thead><tbody></tbody>`;
+  const tbody = tableEl.querySelector("tbody");
+  for (const m of metrics) {
     const c = contribs[m];
-    if (c.direction === "maximize") {
-      return `${m}: +norm=${c.norm.toFixed(3)} (+${c.contribution.toFixed(3)})`;
-    }
-    return `${m}: norm=${c.norm.toFixed(3)} * weight=${c.weight.toFixed(2)} `
-      + `= ${c.contribution.toFixed(3)}`;
-  });
-  const data = [{
-    type: "bar",
-    orientation: "h",
-    x: values,
-    y: metrics,
-    marker: {color: colors},
-    text: hover,
-    hoverinfo: "text",
-  }];
-  const layout = {
-    margin: {l: 140, r: 20, t: 10, b: 30},
-    height: 22 * metrics.length + 60,
-    xaxis: {title: "signed score contribution", zeroline: true,
-            zerolinecolor: "#5c6370"},
-    yaxis: {automargin: true},
-    showlegend: false,
-    bargap: 0.25,
-  };
-  const config = {displayModeBar: false, responsive: true};
-  if (divEl._fullLayout) {
-    Plotly.react(divEl, data, layout, config);
-  } else {
-    Plotly.newPlot(divEl, data, layout, config);
+    const sign = c.contribution >= 0 ? "+" : "";
+    const numCls = c.contribution > 0 ? "num-pos"
+      : (c.contribution < 0 ? "num-neg" : "");
+    const barColor = c.direction === "maximize"
+      ? "var(--pos-bar)" : "var(--neg-bar)";
+    const pct = maxAbs > 0
+      ? Math.min(1, Math.abs(c.contribution) / maxAbs) * 100 : 0;
+    const weightCell = c.direction === "maximize"
+      ? "-" : c.weight.toFixed(2);
+    const tr = document.createElement("tr");
+    const metricTd = document.createElement("td");
+    metricTd.className = "metric-col";
+    // textContent avoids HTML injection from arbitrary metric keys.
+    metricTd.textContent = m;
+    tr.appendChild(metricTd);
+    tr.insertAdjacentHTML("beforeend",
+      `<td class="numeric">${c.norm.toFixed(3)}</td>`
+      + `<td class="numeric">${weightCell}</td>`
+      + `<td class="bar-cell" style="background: linear-gradient(`
+      + `to right, ${barColor} ${pct.toFixed(2)}%, transparent `
+      + `${pct.toFixed(2)}%)">`
+      + `<span class="${numCls}">${sign}`
+      + `${c.contribution.toFixed(3)}</span></td>`);
+    tbody.appendChild(tr);
   }
 }
 
