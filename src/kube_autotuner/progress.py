@@ -42,7 +42,7 @@ from rich.progress import (
     TextColumn,
     TimeElapsedColumn,
 )
-from rich.table import Table
+from rich.table import Column, Table
 from rich.text import Text
 
 from kube_autotuner.scoring import METRIC_TO_DF_COLUMN, score_rows
@@ -631,7 +631,7 @@ class RichProgressObserver:
         self._progress: Progress = Progress(
             TextColumn("[bold]{task.description}[/bold]"),
             BarColumn(bar_width=None),
-            MofNCompleteColumn(),
+            MofNCompleteColumn(table_column=Column(justify="right", no_wrap=True)),
             TextColumn("[dim]elapsed[/dim]"),
             TimeElapsedColumn(),
             TextColumn("[dim]eta[/dim]"),
