@@ -732,6 +732,41 @@ class TestRecommendConfigs:
             assert r["mean_cni_memory"] is None
             assert r["mean_node_memory"] is not None
 
+    def test_matches_pareto_recommendation_rows_wrapper(
+        self,
+        mixed_trials: list[TrialResult],
+    ) -> None:
+        """``recommend_configs`` is a top-N slice of ``pareto_recommendation_rows``."""
+        from kube_autotuner.analysis import (  # noqa: PLC0415
+            pareto_recommendation_rows,
+        )
+
+        rows = pareto_recommendation_rows(mixed_trials, "10g")
+        recs = recommend_configs(mixed_trials, "10g", n=3)
+        assert len(recs) == min(3, len(rows))
+
+        # trial ordering identical
+        assert [r["trial_id"] for r in recs] == [r["trial_id"] for r in rows[:3]]
+
+        # unrounded helper scores round to the wrapper's 4-decimal output
+        for i, (rec, row) in enumerate(zip(recs, rows[:3], strict=True)):
+            assert rec["score"] == round(row["score"], 4)
+            assert rec["rank"] == i + 1
+            # every metric key carries through unchanged
+            for key in (
+                "mean_throughput",
+                "mean_cpu",
+                "mean_node_memory",
+                "mean_cni_memory",
+                "retransmit_rate",
+                "mean_jitter_ms",
+                "mean_rps",
+                "mean_latency_p50_ms",
+                "mean_latency_p90_ms",
+                "mean_latency_p99_ms",
+            ):
+                assert rec[key] == row[key]
+
 
 # --- plots ---------------------------------------------------------------
 
@@ -739,8 +774,6 @@ class TestRecommendConfigs:
 pytest.importorskip("plotly")
 
 from kube_autotuner.plots import (  # noqa: E402
-    plot_importance,
-    plot_param_heatmap,
     plot_pareto_2d,
     plot_pareto_scatter_matrix,
 )
@@ -764,19 +797,6 @@ class TestPlots:
         df, _ = trials_to_dataframe(mixed_trials, hardware_class="10g")
         front = pareto_front(df)
         fig = plot_pareto_2d(df, front, "mean_throughput", "mean_node_memory")
-        assert fig is not None
-
-    def test_importance(self, mixed_trials: list[TrialResult]) -> None:
-        df, _ = trials_to_dataframe(mixed_trials, hardware_class="10g")
-        imp = parameter_importance(df)
-        fig = plot_importance(imp)
-        assert fig is not None
-
-    def test_heatmap(self, mixed_trials: list[TrialResult]) -> None:
-        df, _ = trials_to_dataframe(mixed_trials, hardware_class="10g")
-        front = pareto_front(df)
-        imp = parameter_importance(df)
-        fig = plot_param_heatmap(df, front, imp)
         assert fig is not None
 
 

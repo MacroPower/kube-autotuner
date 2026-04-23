@@ -1,4 +1,11 @@
-"""Consolidated HTML report combining per-hardware-class analysis output.
+"""Interactive HTML report combining per-hardware-class analysis output.
+
+Each hardware-class section embeds its Pareto-frontier rows as JSON and
+a vanilla-JS module renders a slider panel, a re-ranked top-N table,
+and lazy score-decomposition charts. Weights are applied in the
+browser via a direct port of
+:func:`kube_autotuner.scoring.score_rows`; the Pareto frontier itself
+is weight-invariant so no Python round-trip is needed.
 
 ``pandas`` and ``plotly`` live in the optional ``analysis`` dependency
 group. All runtime uses are lazy-imported inside function bodies so
@@ -22,6 +29,8 @@ if TYPE_CHECKING:
 _ANALYSIS_HINT = "install analysis group: uv sync --group analysis"
 
 _TOP_IMPORTANCE_ROWS = 20
+
+_PLOTLY_CDN = "https://cdn.plot.ly/plotly-2.35.2.min.js"
 
 
 def format_retransmit_rate(rate: float | None) -> str:
@@ -54,15 +63,68 @@ section.fig { margin: 1.5rem 0; }
 h2 { font-size: 1.2rem; }
 h3 { font-size: 1rem; color: #444; }
 table.report-table { border-collapse: collapse; margin: 0.5rem 0 1rem;
-                     font-size: 0.9rem; background: #fff; }
+                     font-size: 0.9rem; background: #fff; width: 100%; }
 table.report-table th, table.report-table td {
-    border: 1px solid #ddd; padding: 4px 8px; text-align: left; }
+    border: 1px solid #ddd; padding: 4px 8px; text-align: left;
+    white-space: nowrap; }
 table.report-table th { background: #f0f0f0; }
+table.report-table td.numeric { text-align: right; font-variant-numeric: tabular-nums; }
+tr.top-rank { background: #fff7e6; }
 details { margin: 0.25rem 0 0.75rem; }
 summary { cursor: pointer; color: #06c; }
 pre { background: #f4f4f4; padding: 0.5rem; overflow-x: auto;
       font-size: 0.85rem; }
 .meta { color: #666; font-size: 0.9rem; }
+.panel { background: #fff; border: 1px solid #ddd; border-radius: 4px;
+         padding: 0.75rem 1rem; margin: 0.75rem 0 1.25rem; }
+.panel .presets { margin-bottom: 0.5rem; }
+.panel .presets button {
+    margin-right: 0.35rem; margin-bottom: 0.25rem;
+    padding: 0.25rem 0.6rem; font-size: 0.85rem;
+    border: 1px solid #bbb; background: #f5f5f5; border-radius: 3px;
+    cursor: pointer; }
+.panel .presets button:hover { background: #e8e8e8; }
+.panel .presets button.active {
+    background: #06c; color: #fff; border-color: #06c; }
+.panel .sliders {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+    gap: 0.5rem 1rem;
+    margin: 0.5rem 0; }
+.panel .slider-row {
+    display: grid; grid-template-columns: 1fr auto; align-items: center;
+    gap: 0.25rem; font-size: 0.85rem; }
+.panel .slider-row label { color: #444; }
+.panel .slider-row .weight-value {
+    font-variant-numeric: tabular-nums; color: #06c; font-weight: 600; }
+.panel .slider-row input[type=range] { grid-column: 1 / -1; width: 100%; }
+.panel .topn-row { margin-top: 0.5rem; font-size: 0.85rem; }
+.panel .topn-row input { width: 4em; }
+.decomposition-chart { width: 100%; min-height: 220px; }
+.importance-controls { margin: 0.5rem 0 0.75rem; font-size: 0.85rem;
+    display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; }
+.importance-controls .meta { margin: 0; }
+.target-buttons button {
+    margin-right: 0.25rem; margin-bottom: 0.25rem;
+    padding: 0.2rem 0.55rem; font-size: 0.8rem;
+    border: 1px solid #bbb; background: #f5f5f5; border-radius: 3px;
+    cursor: pointer; color: #222; }
+.target-buttons button:hover { background: #e8e8e8; }
+.target-buttons button.active {
+    background: #06c; color: #fff; border-color: #06c; }
+table.importance-table { table-layout: fixed; width: 100%; }
+table.importance-table td.param-col { font-family: ui-monospace, SFMono-Regular,
+    Menlo, Consolas, monospace; font-size: 0.82rem; white-space: normal;
+    word-break: break-all; }
+table.importance-table td.category-col { color: #555; }
+table.importance-table td.bar-cell { position: relative; padding: 4px 8px;
+    text-align: right; font-variant-numeric: tabular-nums; }
+table.importance-table col.param-w { width: 42%; }
+table.importance-table col.category-w { width: 18%; }
+table.importance-table col.corr-w { width: 20%; }
+table.importance-table col.imp-w { width: 20%; }
+.num-pos { color: #2b8a3e; }
+.num-neg { color: #c92a2a; }
 """
 
 
@@ -95,68 +157,54 @@ def _slug(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")
 
 
-def _render_recommendations(recs: list[dict[str, Any]]) -> str:
-    """Render the recommendations table and per-trial sysctl details.
+_TARGET_METRIC_LABELS: dict[str, str] = {
+    "mean_throughput": "throughput",
+    "mean_cpu": "CPU",
+    "mean_node_memory": "node memory",
+    "mean_cni_memory": "CNI memory",
+    "retransmit_rate": "retransmit rate",
+    "mean_jitter_ms": "jitter",
+    "mean_rps": "RPS",
+    "mean_latency_p50_ms": "latency p50",
+    "mean_latency_p90_ms": "latency p90",
+    "mean_latency_p99_ms": "latency p99",
+}
 
-    Args:
-        recs: Recommendation dicts as produced by
-            :func:`kube_autotuner.analysis.recommend_configs`.
 
-    Lazy-imports ``pandas`` and raises :exc:`RuntimeError` with the
-    ``uv sync --group analysis`` hint when the group is missing.
+def _corr_bar_background(r: float) -> str:
+    """Return a CSS linear-gradient for a diverging correlation bar.
 
-    Returns:
-        An HTML fragment combining a summary table with one expandable
-        ``<details>`` block per recommendation. When ``recs`` is
-        empty, returns a short "No recommendations." note.
+    The bar is centered at 50%; positive ``r`` paints green to the
+    right, negative ``r`` paints red to the left. The magnitude of
+    ``|r|`` drives the filled width.
     """
-    if not recs:
-        return "<p class='meta'>No recommendations.</p>"
+    magnitude = max(0.0, min(1.0, abs(r))) * 50.0
+    if r >= 0:
+        start, end, color = 50.0, 50.0 + magnitude, "#c6f6c0"
+    else:
+        start, end, color = 50.0 - magnitude, 50.0, "#f8c3c3"
+    return (
+        f"linear-gradient(to right, transparent {start:.2f}%, "
+        f"{color} {start:.2f}%, {color} {end:.2f}%, "
+        f"transparent {end:.2f}%)"
+    )
 
-    pd = _require_pandas()
 
-    def _row(r: dict[str, Any]) -> dict[str, Any]:
-        row: dict[str, Any] = {
-            "rank": r["rank"],
-            "trial_id": r["trial_id"],
-            "throughput (Mbps)": round(r["mean_throughput"] / 1e6, 1),
-            "cpu": f"{r['mean_cpu']:.1f}%",
-        }
-        nmem = r["mean_node_memory"]
-        if nmem is not None:
-            row["node memory (MiB)"] = f"{nmem / 1024 / 1024:.0f}"
-        cmem = r["mean_cni_memory"]
-        if cmem is not None:
-            row["cni memory (MiB)"] = f"{cmem / 1024 / 1024:.0f}"
-        row["retx/MB"] = format_retransmit_rate(r["retransmit_rate"])
-        rps = r.get("mean_rps")
-        if rps is not None:
-            row["rps"] = f"{rps:,.1f}"
-        for key, label in (
-            ("mean_latency_p50_ms", "p50 (ms)"),
-            ("mean_latency_p90_ms", "p90 (ms)"),
-            ("mean_latency_p99_ms", "p99 (ms)"),
-        ):
-            v = r.get(key)
-            if v is not None:
-                row[label] = f"{v:.1f}"
-        row["score"] = r["score"]
-        return row
-
-    display = pd.DataFrame([_row(r) for r in recs]).dropna(axis=1, how="all")
-    parts = [display.to_html(index=False, classes="report-table", border=0)]
-    for r in recs:
-        sysctl_json = json.dumps(r["sysctl_values"], indent=2)
-        parts.append(
-            f"<details><summary>sysctl values (trial "
-            f"{html.escape(str(r['trial_id']))})"
-            f"</summary><pre>{html.escape(sysctl_json)}</pre></details>",
-        )
-    return "\n".join(parts)
+def _imp_bar_background(imp: float) -> str:
+    """Return a CSS linear-gradient for a 0-anchored importance bar."""
+    pct = max(0.0, min(1.0, imp)) * 100.0
+    return f"linear-gradient(to right, #cfe2ff {pct:.2f}%, transparent {pct:.2f}%)"
 
 
 def _render_importance(df: pd.DataFrame, top_n: int = _TOP_IMPORTANCE_ROWS) -> str:
-    """Render the parameter-importance table.
+    """Render a parameter-importance table with inline bar visualization.
+
+    The rendered table adds a diverging bar behind the Spearman-r cell
+    (green for positive, red for negative, width proportional to
+    ``|r|``) and a left-anchored bar behind the RF-importance cell
+    (width proportional to the normalized score). Numbers stay visible
+    on top, right-aligned with tabular numerics, so the reader can
+    both scan the ranking at a glance and read exact values.
 
     Args:
         df: Frame produced by
@@ -172,54 +220,222 @@ def _render_importance(df: pd.DataFrame, top_n: int = _TOP_IMPORTANCE_ROWS) -> s
             "<p class='meta'>Parameter importance unavailable "
             "(not enough variance).</p>"
         )
-    return df.head(top_n).to_html(index=False, classes="report-table", border=0)
+
+    rows_html: list[str] = []
+    for _, row in df.head(top_n).iterrows():
+        param = str(row["param"])
+        category = str(row["category"])
+        r = float(row["spearman_r"]) if row["spearman_r"] is not None else 0.0
+        imp = float(row["rf_importance"]) if row["rf_importance"] is not None else 0.0
+        r_cls = "num-pos" if r > 0 else ("num-neg" if r < 0 else "")
+        rows_html.append(
+            "<tr>"
+            f"<td class='param-col'>{html.escape(param)}</td>"
+            f"<td class='category-col'>{html.escape(category)}</td>"
+            f"<td class='bar-cell' style='background: {_corr_bar_background(r)}'>"
+            f"<span class='{r_cls}'>{r:+.2f}</span></td>"
+            f"<td class='bar-cell' style='background: {_imp_bar_background(imp)}'>"
+            f"{imp:.3f}</td>"
+            "</tr>"
+        )
+
+    return (
+        "<table class='report-table importance-table'>"
+        "<colgroup>"
+        "<col class='param-w'><col class='category-w'>"
+        "<col class='corr-w'><col class='imp-w'>"
+        "</colgroup>"
+        "<thead><tr>"
+        "<th>param</th><th>category</th>"
+        "<th title='Spearman rank correlation with the target metric'>"
+        "corr (r)</th>"
+        "<th title='Random Forest feature importance, 0 to 1'>"
+        "importance</th>"
+        "</tr></thead>"
+        f"<tbody>{''.join(rows_html)}</tbody>"
+        "</table>"
+    )
 
 
-def _render_figure(
+def _render_importance_block(
     hw_slug: str,
-    label: str,
-    fig: go.Figure,
-    *,
-    include_js: bool,
+    importance_by_target: dict[str, pd.DataFrame],
+    fallback: pd.DataFrame,
 ) -> str:
-    """Render a single Plotly figure inside a ``<section class='fig'>`` block.
+    """Render the importance block with a target-metric dropdown.
+
+    Renders one ``<div>`` per target, all but the default hidden via
+    the ``hidden`` attribute. A row of buttons above lets the user
+    swap the visible table; the JS module wires the click handler.
+    When ``importance_by_target`` is empty, falls back to a single
+    table rendered from ``fallback`` (which may itself be an empty
+    frame).
+
+    Args:
+        hw_slug: Slugified hardware-class label; used to namespace ids.
+        importance_by_target: Per-target importance frames. Keys are
+            DataFrame column names (e.g. ``"mean_throughput"``).
+        fallback: Legacy single-frame fallback used when the per-target
+            dict is empty.
+
+    Returns:
+        An HTML fragment covering the dropdown plus every table.
+    """
+    if not importance_by_target:
+        return _render_importance(fallback)
+
+    target_order = [col for col in _TARGET_METRIC_LABELS if col in importance_by_target]
+    # Any unknown targets (future metrics) append in insertion order.
+    target_order.extend(
+        col for col in importance_by_target if col not in _TARGET_METRIC_LABELS
+    )
+    default_target = (
+        "mean_throughput"
+        if "mean_throughput" in importance_by_target
+        else target_order[0]
+    )
+
+    buttons = "".join(
+        (
+            f'<button type="button" '
+            f'class="target-btn{" active" if col == default_target else ""}" '
+            f'data-hw-slug="{html.escape(hw_slug)}" '
+            f'data-target="{html.escape(col)}">'
+            f"{html.escape(_TARGET_METRIC_LABELS.get(col, col))}"
+            "</button>"
+        )
+        for col in target_order
+    )
+
+    tables: list[str] = []
+    for col in target_order:
+        hidden = "" if col == default_target else " hidden"
+        tables.append(
+            f'<div class="importance-panel" '
+            f'data-hw-slug="{html.escape(hw_slug)}" '
+            f'data-target="{html.escape(col)}"{hidden}>'
+            f"{_render_importance(importance_by_target[col])}</div>"
+        )
+
+    return (
+        f'<div class="importance-controls">'
+        f'<span class="meta">Target metric:</span>'
+        f'<div class="target-buttons">{buttons}</div>'
+        f"</div>" + "".join(tables)
+    )
+
+
+def _figure_div_id(hw_slug: str, label: str) -> str:
+    """Return the stable div id for a per-hardware-class figure."""
+    return f"fig-{hw_slug}-{_slug(label)}"
+
+
+def _render_figure(hw_slug: str, label: str, fig: go.Figure) -> str:
+    """Render a Plotly figure with a stable div id, no JS include.
+
+    The Plotly CDN script is emitted once at the top of the document
+    (see :func:`write_index_html`), so every figure uses
+    ``include_plotlyjs=False``.
 
     Args:
         hw_slug: Slugified hardware-class label.
         label: Human-readable chart label (rendered as ``<h3>``).
         fig: The Plotly figure.
-        include_js: When ``True``, emit the CDN ``<script>`` tag for
-            the plotly bundle; the caller is responsible for passing
-            ``True`` exactly once per document.
 
     Returns:
         An HTML fragment containing the chart.
     """
     div = fig.to_html(
-        include_plotlyjs=("cdn" if include_js else False),
+        include_plotlyjs=False,
         full_html=False,
-        div_id=f"fig-{hw_slug}-{_slug(label)}",
+        div_id=_figure_div_id(hw_slug, label),
     )
     return f"<section class='fig'><h3>{html.escape(label)}</h3>\n{div}\n</section>"
 
 
-def _render_section(
-    section: dict[str, Any],
-    *,
-    include_js: bool,
-) -> tuple[str, bool]:
-    """Render one per-hardware-class section of the report.
+def _section_payload(section: dict[str, Any]) -> dict[str, Any]:
+    """Return the JSON-serializable payload for one hardware-class section.
 
     Args:
-        section: Section payload with ``hardware_class``,
-            ``topology``, ``trial_count``, ``pareto_count``,
-            ``recommendations``, ``importance``, and ``figures``.
-        include_js: ``True`` when the plotly CDN tag has not yet been
-            emitted.
+        section: Section dict produced by ``_analyze_one_class``.
 
     Returns:
-        An ``(html_fragment, include_js_remaining)`` pair. The second
-        entry is ``False`` after this call consumes the CDN slot.
+        A dict safe to pass to :func:`json.dumps` with
+        ``allow_nan=False``: every unmeasured metric is ``None`` (from
+        :func:`kube_autotuner.analysis.pareto_recommendation_rows`) and
+        every Pydantic ``ParetoObjective`` has already been lowered to
+        a plain dict upstream.
+    """
+    hw = section["hardware_class"]
+    hw_slug = _slug(hw)
+    figure_labels = [label for label, _ in section.get("figures", [])]
+    return {
+        "hardwareClass": hw,
+        "hwSlug": hw_slug,
+        "topology": section.get("topology"),
+        "trialCount": section["trial_count"],
+        "paretoCount": section["pareto_count"],
+        "topN": section.get("top_n", 3),
+        "objectives": section["objectives"],
+        "defaultWeights": section["default_weights"],
+        "paretoRows": section["pareto_rows"],
+        "figureDivIds": [_figure_div_id(hw_slug, label) for label in figure_labels],
+    }
+
+
+def _embed_json(data: dict[str, Any], script_id: str) -> str:
+    """Embed a JSON payload inside a ``<script type="application/json">`` tag.
+
+    Emits with ``allow_nan=False`` so a stray ``float('nan')`` fails
+    fast in Python instead of producing JSON that ``JSON.parse``
+    rejects in the browser. The ``</`` sequence is escaped so the
+    payload cannot close the enclosing script tag.
+
+    Args:
+        data: The payload to serialize.
+        script_id: ``id`` attribute for the script tag.
+
+    Returns:
+        A ``<script>`` tag string.
+    """
+    payload = json.dumps(data, allow_nan=False, ensure_ascii=False)
+    payload = payload.replace("</", "<\\/")
+    return (
+        f'<script type="application/json" id="{html.escape(script_id)}">'
+        f"{payload}</script>"
+    )
+
+
+def _render_interactive_panel(hw_slug: str) -> str:
+    """Return the empty skeleton the JS module fills in on load."""
+    return (
+        f'<div class="panel" data-hw-slug="{html.escape(hw_slug)}">\n'
+        "<h3>Top recommendations</h3>\n"
+        '<div class="controls">\n'
+        '<div class="presets" role="group" aria-label="Weight presets"></div>\n'
+        '<div class="sliders"></div>\n'
+        '<div class="topn-row">'
+        "<label>Show top "
+        f'<input type="number" min="1" step="1" data-hw-slug="{html.escape(hw_slug)}" '
+        'class="topn-input"> rows</label>'
+        "</div>\n"
+        "</div>\n"
+        '<div class="ranked-table-wrapper"></div>\n'
+        "</div>"
+    )
+
+
+def _render_section(section: dict[str, Any]) -> str:
+    """Render one per-hardware-class section.
+
+    Args:
+        section: Section payload with ``hardware_class``, ``topology``,
+            ``trial_count``, ``pareto_count``, ``recommendations``,
+            ``pareto_rows``, ``objectives``, ``default_weights``,
+            ``top_n``, ``importance``, and ``figures``.
+
+    Returns:
+        An HTML fragment for the section.
     """
     hw = section["hardware_class"]
     hw_slug = _slug(hw)
@@ -230,28 +446,571 @@ def _render_section(
         f"{section['pareto_count']} Pareto-optimal{topology_suffix}</p>"
     )
 
-    fig_html: list[str] = []
-    js_remaining = include_js
-    for label, fig in section["figures"]:
-        fig_html.append(_render_figure(hw_slug, label, fig, include_js=js_remaining))
-        js_remaining = False
+    fig_html = "".join(
+        _render_figure(hw_slug, label, fig) for label, fig in section["figures"]
+    )
 
-    body = (
+    data_script = _embed_json(
+        _section_payload(section),
+        script_id=f"section-data-{hw_slug}",
+    )
+
+    importance_by_target = section.get("importance_by_target", {})
+    importance_block = _render_importance_block(
+        hw_slug,
+        importance_by_target,
+        section["importance"],
+    )
+
+    return (
         f"<section class='hw' id='hw-{hw_slug}'>\n"
         f"<h2>Hardware class: {html.escape(hw)}</h2>\n"
         f"{meta}\n"
-        f"<h3>Top recommendations</h3>\n"
-        f"{_render_recommendations(section['recommendations'])}\n"
+        f"{_render_interactive_panel(hw_slug)}\n"
+        f"{data_script}\n"
         f"<h3>Parameter importance (top {_TOP_IMPORTANCE_ROWS})</h3>\n"
-        f"{_render_importance(section['importance'])}\n"
-        f"<h3>Charts</h3>\n{''.join(fig_html)}\n"
+        f"{importance_block}\n"
+        f"<h3>Charts</h3>\n{fig_html}\n"
         f"</section>"
     )
-    return body, js_remaining
+
+
+# The JS module is a single constant so that a small regex test in
+# ``tests/test_report.py`` can pluck out the preset literals and
+# verify they stay aligned with ``_DEFAULT_WEIGHTS`` in experiment.py.
+_JS_MODULE = r"""
+const DEGENERATE = 0.5;
+
+const METRIC_TO_DF_COLUMN = {
+  throughput: "mean_throughput",
+  cpu: "mean_cpu",
+  node_memory: "mean_node_memory",
+  cni_memory: "mean_cni_memory",
+  retransmit_rate: "retransmit_rate",
+  jitter: "mean_jitter_ms",
+  rps: "mean_rps",
+  latency_p50: "mean_latency_p50_ms",
+  latency_p90: "mean_latency_p90_ms",
+  latency_p99: "mean_latency_p99_ms",
+};
+
+const PRESETS = {
+  "default": null,
+  "latency-sensitive": {latency_p99: 0.4, latency_p90: 0.2, retransmit_rate: 0.1},
+  "efficient": {cpu: 0.4, node_memory: 0.3, retransmit_rate: 0.1},
+  "throughput-only": {}
+};
+
+const PRESET_LABELS = {
+  "default": "Default",
+  "latency-sensitive": "Latency-sensitive",
+  "efficient": "Efficient",
+  "throughput-only": "Throughput-only"
+};
+
+const METRIC_DISPLAY = {
+  mean_throughput: {label: "Throughput", unit: "Mbps",
+                    format: v => (v / 1e6).toFixed(1)},
+  mean_cpu: {label: "CPU", unit: "%", format: v => v.toFixed(1)},
+  mean_node_memory: {label: "Node mem", unit: "MiB",
+                     format: v => (v / 1048576).toFixed(0)},
+  mean_cni_memory: {label: "CNI mem", unit: "MiB",
+                    format: v => (v / 1048576).toFixed(0)},
+  retransmit_rate: {label: "Retx", unit: "/MB",
+                    format: v => (v * 1e6).toFixed(2)},
+  mean_rps: {label: "RPS", unit: "",
+             format: v => v.toLocaleString("en-US", {maximumFractionDigits: 1})},
+  mean_jitter_ms: {label: "Jitter", unit: "ms", format: v => v.toFixed(3)},
+  mean_latency_p50_ms: {label: "p50", unit: "ms", format: v => v.toFixed(1)},
+  mean_latency_p90_ms: {label: "p90", unit: "ms", format: v => v.toFixed(1)},
+  mean_latency_p99_ms: {label: "p99", unit: "ms", format: v => v.toFixed(1)},
+};
+
+function toFloatOrNaN(v) {
+  if (v === null || v === undefined) return NaN;
+  const f = Number(v);
+  return Number.isFinite(f) ? f : NaN;
+}
+
+function normalizeColumn(values) {
+  const finite = values.filter(v => !Number.isNaN(v));
+  if (finite.length === 0) return values.map(() => DEGENERATE);
+  let lo = Infinity, hi = -Infinity;
+  for (const v of finite) {
+    if (v < lo) lo = v;
+    if (v > hi) hi = v;
+  }
+  if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi === lo) {
+    return values.map(() => DEGENERATE);
+  }
+  const span = hi - lo;
+  return values.map(v => Number.isNaN(v) ? DEGENERATE : (v - lo) / span);
+}
+
+// Port of kube_autotuner.scoring.score_rows with per-metric contribution
+// bookkeeping for the decomposition panel.
+function scoreRows(rows, objectives, weights) {
+  const n = rows.length;
+  const scores = new Array(n).fill(0);
+  const contributions = Array.from({length: n}, () => ({}));
+  if (n === 0) return {scores, contributions};
+  for (const obj of objectives) {
+    const col = METRIC_TO_DF_COLUMN[obj.metric];
+    const raw = rows.map(r => toFloatOrNaN(r[col]));
+    const norm = normalizeColumn(raw);
+    if (obj.direction === "maximize") {
+      for (let i = 0; i < n; i++) {
+        const c = norm[i];
+        scores[i] += c;
+        contributions[i][obj.metric] = {
+          norm: norm[i], contribution: c, direction: "maximize",
+        };
+      }
+    } else {
+      const w = weights[obj.metric] ?? 0.0;
+      for (let i = 0; i < n; i++) {
+        const c = -w * norm[i];
+        scores[i] += c;
+        contributions[i][obj.metric] = {
+          norm: norm[i], contribution: c, direction: "minimize", weight: w,
+        };
+      }
+    }
+  }
+  return {scores, contributions};
+}
+
+function formatMetric(col, value) {
+  if (value === null || value === undefined) return "-";
+  const fmt = METRIC_DISPLAY[col];
+  if (!fmt) return String(value);
+  return fmt.format(value) + (fmt.unit ? " " + fmt.unit : "");
+}
+
+// The keyset that drives sliders and presets: every minimize-direction
+// metric in the section's objectives. defaultWeights fills in initial
+// values; metrics without a default start at 0.0.
+function minimizeMetricKeys(section) {
+  return section.objectives
+    .filter(o => o.direction === "minimize")
+    .map(o => o.metric);
+}
+
+function activePresetKey(weights, section) {
+  const keys = minimizeMetricKeys(section);
+  for (const [key, overrides] of Object.entries(PRESETS)) {
+    let target;
+    if (overrides === null) {
+      target = {};
+      for (const k of keys) target[k] = section.defaultWeights[k] ?? 0.0;
+    } else {
+      target = {};
+      for (const k of keys) target[k] = 0.0;
+      for (const [k, v] of Object.entries(overrides)) {
+        if (k in target) target[k] = v;
+      }
+    }
+    let match = true;
+    for (const k of keys) {
+      if (Math.abs((weights[k] ?? 0) - (target[k] ?? 0)) > 1e-9) {
+        match = false;
+        break;
+      }
+    }
+    if (match) return key;
+  }
+  return null;
+}
+
+function applyPreset(key, section) {
+  const keys = minimizeMetricKeys(section);
+  const overrides = PRESETS[key];
+  const next = {};
+  if (overrides === null) {
+    for (const k of keys) next[k] = section.defaultWeights[k] ?? 0.0;
+    return next;
+  }
+  for (const k of keys) next[k] = 0.0;
+  for (const [k, v] of Object.entries(overrides)) {
+    if (k in next) next[k] = v;
+  }
+  return next;
+}
+
+function renderPresets(container, state, rerank) {
+  container.innerHTML = "";
+  for (const key of Object.keys(PRESETS)) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.textContent = PRESET_LABELS[key];
+    btn.dataset.preset = key;
+    btn.addEventListener("click", () => {
+      state.weights = applyPreset(key, state.section);
+      syncSliderValues(state);
+      rerank();
+    });
+    container.appendChild(btn);
+  }
+}
+
+function renderSliders(container, state, rerank) {
+  container.innerHTML = "";
+  const minimizeMetrics = minimizeMetricKeys(state.section);
+  const defaultValues = Object.values(state.section.defaultWeights);
+  const maxDefault = defaultValues.length ? Math.max(0, ...defaultValues) : 0;
+  const sliderMax = Math.max(1.0, 1.5 * maxDefault);
+  state.sliderMax = sliderMax;
+  for (const metric of minimizeMetrics) {
+    const row = document.createElement("div");
+    row.className = "slider-row";
+    const label = document.createElement("label");
+    label.textContent = metric + ": ";
+    const valueSpan = document.createElement("span");
+    valueSpan.className = "weight-value";
+    label.appendChild(valueSpan);
+    const input = document.createElement("input");
+    input.type = "range";
+    input.min = "0";
+    input.max = String(sliderMax);
+    input.step = "0.01";
+    input.dataset.metric = metric;
+    input.value = String(state.weights[metric] ?? 0);
+    valueSpan.textContent = Number(input.value).toFixed(2);
+    input.addEventListener("input", () => {
+      const v = Number(input.value);
+      state.weights[metric] = v;
+      valueSpan.textContent = v.toFixed(2);
+      rerank();
+    });
+    row.appendChild(label);
+    row.appendChild(input);
+    container.appendChild(row);
+  }
+}
+
+function syncSliderValues(state) {
+  const panel = state.panel;
+  for (const input of panel.querySelectorAll("input[type=range]")) {
+    const metric = input.dataset.metric;
+    const v = state.weights[metric] ?? 0;
+    input.value = String(v);
+    const valueSpan = input.parentElement.querySelector(".weight-value");
+    if (valueSpan) valueSpan.textContent = v.toFixed(2);
+  }
+}
+
+function updatePresetHighlight(state) {
+  const active = activePresetKey(state.weights, state.section);
+  for (const btn of state.panel.querySelectorAll(".presets button")) {
+    if (btn.dataset.preset === active) btn.classList.add("active");
+    else btn.classList.remove("active");
+  }
+}
+
+// Build the ranked-table skeleton once per section (stable DOM nodes
+// keyed by trial_id). Subsequent reranks only update cell text, reorder
+// existing <tr> pairs in tbody, and toggle row visibility -- the
+// <details> expansion state and any already-rendered Plotly chart are
+// preserved across slider drags.
+function buildRankedTable(wrapper, state, visibleCols) {
+  const table = document.createElement("table");
+  table.className = "report-table";
+  const thead = document.createElement("thead");
+  const headRow = document.createElement("tr");
+  for (const h of ["rank", "trial"]) {
+    const th = document.createElement("th");
+    th.textContent = h;
+    headRow.appendChild(th);
+  }
+  for (const col of visibleCols) {
+    const th = document.createElement("th");
+    th.textContent = METRIC_DISPLAY[col].label
+      + (METRIC_DISPLAY[col].unit ? " (" + METRIC_DISPLAY[col].unit + ")" : "");
+    headRow.appendChild(th);
+  }
+  const scoreTh = document.createElement("th");
+  scoreTh.textContent = "score";
+  headRow.appendChild(scoreTh);
+  thead.appendChild(headRow);
+  table.appendChild(thead);
+
+  const tbody = document.createElement("tbody");
+  const rowRefs = new Map();
+  for (let i = 0; i < state.section.paretoRows.length; i++) {
+    const row = state.section.paretoRows[i];
+    const tr = document.createElement("tr");
+    const rankTd = document.createElement("td");
+    tr.appendChild(rankTd);
+    const trialTd = document.createElement("td");
+    trialTd.textContent = row.trial_id;
+    tr.appendChild(trialTd);
+    const metricTds = {};
+    for (const col of visibleCols) {
+      const td = document.createElement("td");
+      td.className = "numeric";
+      td.textContent = formatMetric(col, row[col]);
+      metricTds[col] = td;
+      tr.appendChild(td);
+    }
+    const scoreTd = document.createElement("td");
+    scoreTd.className = "numeric";
+    tr.appendChild(scoreTd);
+
+    const detailsTr = document.createElement("tr");
+    const detailsTd = document.createElement("td");
+    detailsTd.colSpan = visibleCols.length + 3;
+    detailsTd.style.padding = "0";
+    const details = document.createElement("details");
+    const summary = document.createElement("summary");
+    summary.textContent = "details for trial " + row.trial_id;
+    details.appendChild(summary);
+
+    const chartDiv = document.createElement("div");
+    chartDiv.className = "decomposition-chart";
+    chartDiv.id = "decomp-" + state.section.hwSlug + "-" + i;
+    details.appendChild(chartDiv);
+
+    const sysctlDetails = document.createElement("details");
+    const sysctlSummary = document.createElement("summary");
+    sysctlSummary.textContent = "sysctl values";
+    sysctlDetails.appendChild(sysctlSummary);
+    const pre = document.createElement("pre");
+    pre.textContent = JSON.stringify(row.sysctl_values, null, 2);
+    sysctlDetails.appendChild(pre);
+    details.appendChild(sysctlDetails);
+
+    detailsTd.appendChild(details);
+    detailsTr.appendChild(detailsTd);
+    tbody.appendChild(tr);
+    tbody.appendChild(detailsTr);
+
+    const ref = {tr, rankTd, scoreTd, detailsTr, details, chartDiv, entry: null};
+    details.addEventListener("toggle", () => {
+      if (details.open && ref.entry) ensureDecomposition(ref);
+    });
+    rowRefs.set(row.trial_id, ref);
+  }
+  table.appendChild(tbody);
+  wrapper.innerHTML = "";
+  wrapper.appendChild(table);
+  return {tbody, rowRefs};
+}
+
+function updateRankedTable(state, ranked) {
+  const tbody = state.tbody;
+  const topN = state.topN;
+  for (let rank = 0; rank < ranked.length; rank++) {
+    const entry = ranked[rank];
+    const ref = state.rowRefs.get(entry.row.trial_id);
+    if (!ref) continue;
+    ref.entry = entry;
+    const visible = rank < topN;
+    ref.tr.hidden = !visible;
+    ref.detailsTr.hidden = !visible;
+    ref.tr.classList.toggle("top-rank", visible && rank === 0);
+    if (visible) {
+      ref.rankTd.textContent = String(rank + 1);
+      ref.scoreTd.textContent = entry.score.toFixed(4);
+      // Reorder: place this row pair next in tbody (stable even when
+      // appending an element that already lives in the tree).
+      tbody.appendChild(ref.tr);
+      tbody.appendChild(ref.detailsTr);
+      if (ref.details.open) ensureDecomposition(ref);
+    }
+  }
+}
+
+// Render the decomposition for a row's current entry. Defers the very
+// first ``Plotly.newPlot`` call via ``queueMicrotask`` so the
+// ``<details>`` layout has settled when Plotly measures the div;
+// subsequent calls go through ``Plotly.react`` directly.
+function ensureDecomposition(ref) {
+  if (!ref.entry) return;
+  if (!ref.chartDiv._fullLayout) {
+    queueMicrotask(() => {
+      if (ref.entry) renderDecomposition(ref.chartDiv, ref.entry);
+    });
+  } else {
+    renderDecomposition(ref.chartDiv, ref.entry);
+  }
+}
+
+function renderDecomposition(divEl, entry) {
+  const contribs = entry.contributions;
+  const metrics = Object.keys(contribs);
+  const values = metrics.map(m => contribs[m].contribution);
+  const colors = metrics.map(m =>
+    contribs[m].direction === "maximize" ? "#2b8a3e" : "#c92a2a"
+  );
+  const hover = metrics.map(m => {
+    const c = contribs[m];
+    if (c.direction === "maximize") {
+      return `${m}: +norm=${c.norm.toFixed(3)} (+${c.contribution.toFixed(3)})`;
+    }
+    return `${m}: norm=${c.norm.toFixed(3)} * weight=${c.weight.toFixed(2)} `
+      + `= ${c.contribution.toFixed(3)}`;
+  });
+  const data = [{
+    type: "bar",
+    orientation: "h",
+    x: values,
+    y: metrics,
+    marker: {color: colors},
+    text: hover,
+    hoverinfo: "text",
+  }];
+  const layout = {
+    margin: {l: 140, r: 20, t: 10, b: 30},
+    height: 22 * metrics.length + 60,
+    xaxis: {title: "signed score contribution", zeroline: true, zerolinecolor: "#888"},
+    yaxis: {automargin: true},
+    showlegend: false,
+    bargap: 0.25,
+  };
+  const config = {displayModeBar: false, responsive: true};
+  if (divEl._fullLayout) {
+    Plotly.react(divEl, data, layout, config);
+  } else {
+    Plotly.newPlot(divEl, data, layout, config);
+  }
+}
+
+function highlightInPlots(figureDivIds, topTrialIds) {
+  const topSet = new Set(topTrialIds.map(String));
+  for (const id of figureDivIds) {
+    const el = document.getElementById(id);
+    if (!el || !el.data) continue;
+    for (let t = 0; t < el.data.length; t++) {
+      const trace = el.data[t];
+      if (trace.name === "pareto front") continue;
+      const cd = trace.customdata;
+      if (!cd) continue;
+      // Plotly customdata can be a flat array or an array of arrays.
+      const size = [];
+      const opacity = [];
+      for (let i = 0; i < cd.length; i++) {
+        const raw = cd[i];
+        const tid = Array.isArray(raw) ? raw[0] : raw;
+        if (topSet.has(String(tid))) {
+          size.push(14);
+          opacity.push(1.0);
+        } else {
+          size.push(5);
+          opacity.push(0.35);
+        }
+      }
+      Plotly.restyle(el, {"marker.size": [size], "marker.opacity": [opacity]}, [t]);
+    }
+  }
+}
+
+function renderSection(panel, section) {
+  // Column visibility is computed once from the full frontier so the
+  // table's column set is stable under slider and top-N changes.
+  const visibleCols = Object.keys(METRIC_DISPLAY).filter(col =>
+    section.paretoRows.some(r => r[col] !== null && r[col] !== undefined)
+  );
+  // Every minimize-direction objective gets a slider; metrics without a
+  // default weight start at 0.0 but are still user-adjustable.
+  const initialWeights = {};
+  for (const metric of minimizeMetricKeys(section)) {
+    initialWeights[metric] = section.defaultWeights[metric] ?? 0.0;
+  }
+  const state = {
+    section,
+    panel,
+    visibleCols,
+    weights: initialWeights,
+    topN: Math.max(1, Math.min(section.topN || 3, section.paretoRows.length)),
+  };
+  const presetsEl = panel.querySelector(".presets");
+  const slidersEl = panel.querySelector(".sliders");
+  const tableWrapper = panel.querySelector(".ranked-table-wrapper");
+  const topNInput = panel.querySelector(".topn-input");
+  topNInput.value = String(state.topN);
+  topNInput.max = String(Math.max(1, section.paretoRows.length));
+
+  const {tbody, rowRefs} = buildRankedTable(tableWrapper, state, visibleCols);
+  state.tbody = tbody;
+  state.rowRefs = rowRefs;
+
+  function rerank() {
+    const {scores, contributions} = scoreRows(
+      section.paretoRows, section.objectives, state.weights);
+    const ranked = section.paretoRows
+      .map((row, i) => ({row, score: scores[i], contributions: contributions[i]}))
+      .sort((a, b) => {
+        if (b.score !== a.score) return b.score - a.score;
+        return String(a.row.trial_id).localeCompare(String(b.row.trial_id));
+      });
+    updateRankedTable(state, ranked);
+    updatePresetHighlight(state);
+    const topIds = ranked.slice(0, state.topN).map(r => r.row.trial_id);
+    highlightInPlots(section.figureDivIds, topIds);
+  }
+
+  renderPresets(presetsEl, state, rerank);
+  renderSliders(slidersEl, state, rerank);
+  topNInput.addEventListener("input", () => {
+    const v = Math.max(1, Math.min(
+      parseInt(topNInput.value, 10) || 1,
+      section.paretoRows.length));
+    state.topN = v;
+    rerank();
+  });
+  rerank();
+  // Open the rank-1 details after the first rerank so ``ref.entry`` is
+  // populated when the toggle listener fires -- avoids the first-load
+  // double-render the reviewer flagged.
+  const firstRef = rowRefs.get(section.paretoRows[0].trial_id);
+  if (firstRef) firstRef.details.open = true;
+}
+
+function wireImportanceSelectors() {
+  for (const btn of document.querySelectorAll(".target-btn")) {
+    btn.addEventListener("click", () => {
+      const hwSlug = btn.dataset.hwSlug;
+      const target = btn.dataset.target;
+      for (const sibling of document.querySelectorAll(
+          `.target-btn[data-hw-slug="${hwSlug}"]`)) {
+        sibling.classList.toggle("active", sibling === btn);
+      }
+      for (const panel of document.querySelectorAll(
+          `.importance-panel[data-hw-slug="${hwSlug}"]`)) {
+        panel.hidden = panel.dataset.target !== target;
+      }
+    });
+  }
+}
+
+function boot() {
+  const dataScripts = document.querySelectorAll(
+    'script[type="application/json"][id^="section-data-"]');
+  for (const dataEl of dataScripts) {
+    const section = JSON.parse(dataEl.textContent);
+    const panel = document.querySelector(
+      `.panel[data-hw-slug="${section.hwSlug}"]`);
+    if (!panel) continue;
+    if (!section.paretoRows || section.paretoRows.length === 0) {
+      panel.querySelector(".ranked-table-wrapper").innerHTML =
+        "<p class='meta'>No Pareto-frontier rows.</p>";
+      continue;
+    }
+    renderSection(panel, section);
+  }
+  wireImportanceSelectors();
+}
+
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", boot);
+} else {
+  boot();
+}
+"""
 
 
 def write_index_html(output_dir: Path, sections: list[dict[str, Any]]) -> Path:
-    """Write a consolidated HTML index combining all hardware-class sections.
+    """Write a consolidated interactive HTML index.
 
     Args:
         output_dir: Destination directory; created if necessary.
@@ -270,21 +1029,20 @@ def write_index_html(output_dir: Path, sections: list[dict[str, Any]]) -> Path:
         for s in sections
     )
 
-    include_js = True
-    section_html: list[str] = []
-    for s in sections:
-        rendered, include_js = _render_section(s, include_js=include_js)
-        section_html.append(rendered)
+    section_html = "\n".join(_render_section(s) for s in sections)
 
     doc = (
         "<!doctype html>\n<html lang='en'>\n<head>\n"
         "<meta charset='utf-8'>\n"
         "<title>kube-autotuner analysis report</title>\n"
         f"<style>{_STYLE}</style>\n"
+        f'<script src="{_PLOTLY_CDN}"></script>\n'
         "</head>\n<body>\n"
         "<header><h1>kube-autotuner analysis report</h1></header>\n"
         f"<nav class='top'>Jump to: {nav_links}</nav>\n"
-        "<main>\n" + "\n".join(section_html) + "\n</main>\n</body>\n</html>\n"
+        "<main>\n" + section_html + "\n</main>\n"
+        f"<script type='module'>{_JS_MODULE}</script>\n"
+        "</body>\n</html>\n"
     )
 
     path = output_dir / "index.html"

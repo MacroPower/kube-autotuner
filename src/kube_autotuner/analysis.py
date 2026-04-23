@@ -415,13 +415,28 @@ def parameter_importance(
     sysctl_cols = [c for c in _SYSCTL_COLUMNS if c in df.columns]
     sysctl_cols = [c for c in sysctl_cols if len(df[c].unique()) > 1]
 
+    empty = pd.DataFrame(
+        columns=["param", "category", "spearman_r", "rf_importance"],
+    )
     if not sysctl_cols:
-        return pd.DataFrame(
-            columns=["param", "category", "spearman_r", "rf_importance"],
-        )
+        return empty
 
-    spearman = _spearman_scores(df, sysctl_cols, target, pd)
-    rf_imp = _rf_importance_scores(df, sysctl_cols, target, rf_cls, pd)
+    # Target-column variance is required for both correlation and RF
+    # fitting to be meaningful; constant or all-NaN targets yield no
+    # information and would make the RF regressor fail.
+    if target not in df.columns:
+        return empty
+    target_series = pd.to_numeric(df[target], errors="coerce")
+    finite_mask = target_series.notna()
+    if int(finite_mask.sum()) < _MIN_SPEARMAN_SAMPLES:
+        return empty
+    fit_df = df.loc[finite_mask].copy()
+    fit_df[target] = target_series.loc[finite_mask]
+    if fit_df[target].nunique() < 2:  # noqa: PLR2004 - RF needs variance
+        return empty
+
+    spearman = _spearman_scores(fit_df, sysctl_cols, target, pd)
+    rf_imp = _rf_importance_scores(fit_df, sysctl_cols, target, rf_cls, pd)
 
     records = [
         {
@@ -497,6 +512,130 @@ def _rf_importance_scores(
     return dict(zip(sysctl_cols, rf.feature_importances_, strict=True))
 
 
+def pareto_recommendation_rows(
+    trials: list[TrialResult],
+    hardware_class: str,
+    topology: str | None = None,
+    *,
+    objectives: list[ParetoObjective] | None = None,
+    weights: dict[str, float] | None = None,
+) -> list[dict[str, Any]]:
+    """Return every Pareto-frontier row for a class, scored and sorted.
+
+    The full-frontier counterpart to :func:`recommend_configs`.
+    Aggregates verification samples back into their parents, computes
+    the Pareto frontier, scores each row via
+    :func:`kube_autotuner.scoring.score_rows`, and sorts by
+    ``(score desc, trial_id asc)`` with a stable mergesort.
+
+    Every unmeasured metric is returned as ``None`` rather than
+    ``float('nan')`` or a pandas sentinel, so the result is safe to
+    serialize with :func:`json.dumps` without needing
+    ``allow_nan=False``. The browser-side interactive report relies on
+    that: ``JSON.parse`` rejects the ``NaN`` / ``Infinity`` tokens that
+    Python emits by default.
+
+    Args:
+        trials: Input trial records (any number of hardware classes).
+        hardware_class: Hardware-class label to filter on.
+        topology: Optional topology filter.
+        objectives: Pareto objectives driving frontier selection and
+            scoring. Defaults to the nine built-in metrics.
+        weights: Per-metric negative coefficients for
+            minimize-direction metrics. Missing metrics default to
+            ``0.0``.
+
+    Lazy-imports ``pandas`` and raises :exc:`RuntimeError` with the
+    ``uv sync --group analysis`` hint when the group is missing.
+
+    Returns:
+        One dict per Pareto-frontier row in rank order. Each dict
+        contains ``trial_id``, ``sysctl_values``, every key in
+        :data:`~kube_autotuner.scoring.METRIC_TO_DF_COLUMN` (value
+        ``None`` for unmeasured metrics), and an *unrounded* ``score``
+        float. Callers that need a fixed-precision score round at the
+        surface; rounding in the helper would erase the mergesort
+        tiebreak stability that :mod:`kube_autotuner.progress` relies
+        on. Returns an empty list when no trials match or the frontier
+        is empty.
+    """
+    pd = _require_pandas()
+    from kube_autotuner.experiment import ObjectivesSection  # noqa: PLC0415
+
+    filtered = [
+        t
+        for t in trials
+        if t.node_pair.hardware_class == hardware_class
+        and (topology is None or t.topology == topology)
+    ]
+    if not filtered:
+        return []
+
+    defaults = ObjectivesSection()
+    if objectives is None:
+        objectives = defaults.pareto
+    if weights is None:
+        weights = defaults.recommendation_weights
+
+    agg_rows = aggregate_verification(filtered)
+    if not agg_rows:
+        return []
+
+    agg_df = pd.DataFrame(agg_rows)
+    for col in METRIC_TO_DF_COLUMN.values():
+        if col in agg_df.columns:
+            agg_df[col] = pd.to_numeric(agg_df[col], errors="coerce")
+
+    tuple_objectives: list[tuple[str, str]] = [
+        (METRIC_TO_DF_COLUMN[obj.metric], obj.direction) for obj in objectives
+    ]
+    # Suppress the log here so the CLI's direct pareto_front call is
+    # the single source of truth for "excluded" INFO lines.
+    tuple_objectives = _objectives_with_data(agg_df, tuple_objectives, log=False)
+    front = pareto_front(agg_df, objectives=tuple_objectives)
+    if front.empty:
+        return []
+
+    metric_columns = list(METRIC_TO_DF_COLUMN.values())
+    records = front[metric_columns].to_dict(orient="records")
+    raw_scores = score_rows(records, objectives, weights)
+    front = front.assign(score=raw_scores)
+    front = front.sort_values(
+        by=["score", "trial_id"],
+        ascending=[False, True],
+        kind="mergesort",
+    ).reset_index(drop=True)
+
+    def _maybe(row: pd.Series, col: str) -> float | None:
+        v = row[col]
+        return None if pd.isna(v) else float(v)
+
+    rows: list[dict[str, Any]] = []
+    for _, row in front.iterrows():
+        # row["trial_id"] is the aggregation key (``parent_trial_id
+        # or trial_id``) so it always resolves to the primary trial,
+        # not a verification repeat.
+        trial = next(t for t in filtered if t.trial_id == row["trial_id"])
+        rows.append(
+            {
+                "trial_id": row["trial_id"],
+                "sysctl_values": trial.sysctl_values,
+                "mean_throughput": _maybe(row, "mean_throughput"),
+                "mean_cpu": _maybe(row, "mean_cpu"),
+                "mean_node_memory": _maybe(row, "mean_node_memory"),
+                "mean_cni_memory": _maybe(row, "mean_cni_memory"),
+                "retransmit_rate": _maybe(row, "retransmit_rate"),
+                "mean_jitter_ms": _maybe(row, "mean_jitter_ms"),
+                "mean_rps": _maybe(row, "mean_rps"),
+                "mean_latency_p50_ms": _maybe(row, "mean_latency_p50_ms"),
+                "mean_latency_p90_ms": _maybe(row, "mean_latency_p90_ms"),
+                "mean_latency_p99_ms": _maybe(row, "mean_latency_p99_ms"),
+                "score": float(row["score"]),
+            },
+        )
+    return rows
+
+
 def recommend_configs(
     trials: list[TrialResult],
     hardware_class: str,
@@ -508,19 +647,19 @@ def recommend_configs(
 ) -> list[dict[str, Any]]:
     """Return the top ``n`` recommended sysctl configurations for a class.
 
-    The ranking picks from the Pareto frontier of the filtered trials
-    and scores each candidate through
-    :func:`kube_autotuner.scoring.score_rows`, which implements
-    ``sum(+norm(metric) for maximize metrics) -
-    sum(weights[metric] * norm(metric) for minimize metrics)``
-    with per-column min-max normalization across the Pareto set.
-    Maximize metrics always contribute ``+1.0 * norm`` and cannot be
-    re-weighted. Default weights come from
+    Thin wrapper over :func:`pareto_recommendation_rows`: slices the
+    first ``n`` rows, prepends a ``rank`` field, and rounds ``score``
+    to 4 decimals for display. The underlying sort uses the unrounded
+    score so near-ties that round to equal 4-decimal values still sort
+    by their true ordering before falling back to the ``trial_id asc``
+    secondary key.
+
+    Default weights come from
     :class:`~kube_autotuner.experiment.ObjectivesSection` --
     ``{cpu: 0.15, node_memory: 0.15, retransmit_rate: 0.3,
-    latency_p90: 0.1, latency_p99: 0.15}`` at the time of writing --
-    so the live ``Best so far`` panel and this recommendation output
-    rank trials identically.
+    jitter: 0.1, latency_p90: 0.1, latency_p99: 0.15}`` at the time of
+    writing -- so the live ``Best so far`` panel and this
+    recommendation output rank trials identically.
 
     Args:
         trials: Input trial records (any number of hardware classes).
@@ -549,90 +688,30 @@ def recommend_configs(
         ``mean_cni_memory`` when CNI was disabled). Returns an empty
         list when no trials match.
     """
-    pd = _require_pandas()
-    from kube_autotuner.experiment import ObjectivesSection  # noqa: PLC0415
-
-    # Per-trial frame (one row per :class:`TrialResult`, verification
-    # rows included) is kept for any downstream caller that wants the
-    # unaggregated view -- trajectory plots, for instance.
-    filtered = [
-        t
-        for t in trials
-        if t.node_pair.hardware_class == hardware_class
-        and (topology is None or t.topology == topology)
-    ]
-    if not filtered:
-        return []
-
-    defaults = ObjectivesSection()
-    if objectives is None:
-        objectives = defaults.pareto
-    if weights is None:
-        weights = defaults.recommendation_weights
-
-    # Aggregate verification samples back into their parents before
-    # running the Pareto / scoring pipeline, then wrap as a DataFrame
-    # so the existing _objectives_with_data / pareto_front helpers can
-    # operate on the combined-mean view. This keeps scoring.py pure
-    # stdlib (list[dict] in, list[float] out) while analysis.py stays
-    # DataFrame-native.
-    agg_rows = aggregate_verification(filtered)
-    if not agg_rows:
-        return []
-
-    agg_df = pd.DataFrame(agg_rows)
-    for col in METRIC_TO_DF_COLUMN.values():
-        if col in agg_df.columns:
-            agg_df[col] = pd.to_numeric(agg_df[col], errors="coerce")
-
-    tuple_objectives: list[tuple[str, str]] = [
-        (METRIC_TO_DF_COLUMN[obj.metric], obj.direction) for obj in objectives
-    ]
-    # Suppress the log here so the CLI's direct pareto_front call is
-    # the single source of truth for "excluded" INFO lines.
-    tuple_objectives = _objectives_with_data(agg_df, tuple_objectives, log=False)
-    front = pareto_front(agg_df, objectives=tuple_objectives)
-    if front.empty:
-        return []
-
-    metric_columns = list(METRIC_TO_DF_COLUMN.values())
-    records = front[metric_columns].to_dict(orient="records")
-    raw_scores = score_rows(records, objectives, weights)
-    front = front.assign(score=raw_scores)
-    # trial_id tiebreak + mergesort keeps tied rows order-stable, which
-    # matters when the live panel's top-5 is compared against this
-    # post-hoc ordering during eyeball checks.
-    front = front.sort_values(
-        by=["score", "trial_id"],
-        ascending=[False, True],
-        kind="mergesort",
-    ).reset_index(drop=True)
-
-    def _maybe(row: pd.Series, col: str) -> float | None:
-        v = row[col]
-        return None if pd.isna(v) else float(v)
-
+    rows = pareto_recommendation_rows(
+        trials,
+        hardware_class,
+        topology,
+        objectives=objectives,
+        weights=weights,
+    )
     results: list[dict[str, Any]] = []
-    for rank, (_, row) in enumerate(front.head(n).iterrows(), start=1):
-        # row["trial_id"] is the aggregation key (``parent_trial_id
-        # or trial_id``) so it always resolves to the primary trial,
-        # not a verification repeat.
-        trial = next(t for t in filtered if t.trial_id == row["trial_id"])
+    for rank, row in enumerate(rows[:n], start=1):
         results.append(
             {
                 "rank": rank,
                 "trial_id": row["trial_id"],
-                "sysctl_values": trial.sysctl_values,
-                "mean_throughput": _maybe(row, "mean_throughput"),
-                "mean_cpu": _maybe(row, "mean_cpu"),
-                "mean_node_memory": _maybe(row, "mean_node_memory"),
-                "mean_cni_memory": _maybe(row, "mean_cni_memory"),
-                "retransmit_rate": _maybe(row, "retransmit_rate"),
-                "mean_jitter_ms": _maybe(row, "mean_jitter_ms"),
-                "mean_rps": _maybe(row, "mean_rps"),
-                "mean_latency_p50_ms": _maybe(row, "mean_latency_p50_ms"),
-                "mean_latency_p90_ms": _maybe(row, "mean_latency_p90_ms"),
-                "mean_latency_p99_ms": _maybe(row, "mean_latency_p99_ms"),
+                "sysctl_values": row["sysctl_values"],
+                "mean_throughput": row["mean_throughput"],
+                "mean_cpu": row["mean_cpu"],
+                "mean_node_memory": row["mean_node_memory"],
+                "mean_cni_memory": row["mean_cni_memory"],
+                "retransmit_rate": row["retransmit_rate"],
+                "mean_jitter_ms": row["mean_jitter_ms"],
+                "mean_rps": row["mean_rps"],
+                "mean_latency_p50_ms": row["mean_latency_p50_ms"],
+                "mean_latency_p90_ms": row["mean_latency_p90_ms"],
+                "mean_latency_p99_ms": row["mean_latency_p99_ms"],
                 "score": round(row["score"], 4),
             },
         )

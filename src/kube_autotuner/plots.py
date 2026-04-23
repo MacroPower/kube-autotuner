@@ -77,6 +77,7 @@ def plot_pareto_scatter_matrix(
         color="pareto",
         color_discrete_map={"pareto": "#EF553B", "other": "#BABBBD"},
         hover_data=["trial_id"],
+        custom_data=["trial_id"],
         title="Objective Space (Pareto-optimal highlighted)",
     )
     fig.update_traces(diagonal_visible=False, marker={"size": 5})
@@ -110,7 +111,9 @@ def plot_pareto_2d(
     _, go = _require_plotly()
     fig = go.Figure()
 
-    hover_template = f"%{{text}}<br>{x}=%{{x:.3g}}<br>{y}=%{{y:.3g}}<extra></extra>"
+    hover_template = (
+        f"trial %{{customdata}}<br>{x}=%{{x:.3g}}<br>{y}=%{{y:.3g}}<extra></extra>"
+    )
 
     fig.add_trace(
         go.Scatter(
@@ -119,7 +122,7 @@ def plot_pareto_2d(
             mode="markers",
             marker={"color": "#BABBBD", "size": 6},
             name="all trials",
-            text=df["trial_id"],
+            customdata=df["trial_id"],
             hovertemplate=hover_template,
         ),
     )
@@ -133,7 +136,7 @@ def plot_pareto_2d(
             marker={"color": "#EF553B", "size": 9},
             line={"color": "#EF553B", "width": 2},
             name="pareto front",
-            text=frontier["trial_id"],
+            customdata=frontier["trial_id"],
             hovertemplate=hover_template,
         ),
     )
@@ -144,95 +147,5 @@ def plot_pareto_2d(
         yaxis_title=y,
         width=800,
         height=600,
-    )
-    return fig
-
-
-def plot_importance(importance_df: pd.DataFrame, top_n: int = 15) -> go.Figure:
-    """Horizontal bar chart of parameter importance, coloured by category.
-
-    Lazy-imports ``plotly`` and raises :exc:`RuntimeError` with the
-    ``uv sync --group analysis`` hint when the group is missing.
-
-    Args:
-        importance_df: Frame produced by
-            :func:`kube_autotuner.analysis.parameter_importance`.
-        top_n: Number of top-importance parameters to include.
-
-    Returns:
-        A :class:`plotly.graph_objects.Figure` rendering the bar chart.
-    """
-    px, _ = _require_plotly()
-    top = importance_df.head(top_n).iloc[::-1]
-    fig = px.bar(
-        top,
-        x="rf_importance",
-        y="param",
-        color="category",
-        orientation="h",
-        title=f"Parameter Importance (top {min(top_n, len(top))})",
-    )
-    fig.update_layout(
-        yaxis_title="",
-        xaxis_title="Random Forest Importance",
-        width=900,
-        height=max(400, 30 * len(top)),
-    )
-    return fig
-
-
-def plot_param_heatmap(
-    df: pd.DataFrame,  # noqa: ARG001 - kept for API symmetry with callers
-    pareto_df: pd.DataFrame,
-    importance_df: pd.DataFrame,
-    top_n: int = 10,
-) -> go.Figure:
-    """Heatmap of top-N params across Pareto trials (min-max normalized).
-
-    Args:
-        df: All-trial frame (unused; accepted for call-signature
-            parity with sibling plot helpers).
-        pareto_df: Frame produced by
-            :func:`kube_autotuner.analysis.pareto_front`.
-        importance_df: Frame produced by
-            :func:`kube_autotuner.analysis.parameter_importance`.
-        top_n: Number of top-importance parameters to include.
-
-    Lazy-imports ``plotly`` and raises :exc:`RuntimeError` with the
-    ``uv sync --group analysis`` hint when the group is missing.
-
-    Returns:
-        A :class:`plotly.graph_objects.Figure` rendering the
-        normalized heatmap, or an empty figure when no parameters are
-        available.
-    """
-    _, go = _require_plotly()
-    top_params = importance_df.head(top_n)["param"].tolist()
-    if not top_params:
-        return go.Figure()
-
-    subset = pareto_df[top_params].copy()
-    for col in subset.columns:
-        lo, hi = subset[col].min(), subset[col].max()
-        if hi != lo:
-            subset[col] = (subset[col] - lo) / (hi - lo)
-        else:
-            subset[col] = 0.5
-
-    fig = go.Figure(
-        data=go.Heatmap(
-            z=subset.T.values,
-            x=[f"trial {tid}" for tid in pareto_df["trial_id"]],
-            y=top_params,
-            colorscale="RdYlGn",
-            hovertemplate=(
-                "param=%{y}<br>trial=%{x}<br>normalized=%{z:.2f}<extra></extra>"
-            ),
-        ),
-    )
-    fig.update_layout(
-        title=f"Pareto Configurations: Top {top_n} Parameters (normalized)",
-        width=max(600, 80 * len(pareto_df)),
-        height=max(400, 35 * len(top_params)),
     )
     return fig

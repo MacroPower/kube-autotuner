@@ -1053,15 +1053,40 @@ def _analyze_one_class(
     ]
     front = analysis.pareto_front(df, objectives=tuple_objectives)
     pareto_mask = df["trial_id"].isin(front["trial_id"])
-    importance = analysis.parameter_importance(df)
-    recs = analysis.recommend_configs(
+    # Importance is computed per potential target metric so the browser
+    # can answer "which sysctls drive throughput vs p99 vs retx rate?".
+    # parameter_importance silently returns an empty frame for targets
+    # with too few finite samples or no variance, so this loop never
+    # needs a try/except.
+    importance_by_target: dict[str, Any] = {}
+    for col in analysis.METRIC_TO_DF_COLUMN.values():
+        if col not in df.columns or not df[col].notna().any():
+            continue
+        frame = analysis.parameter_importance(df, target=col)
+        if not frame.empty:
+            importance_by_target[col] = frame
+    importance = importance_by_target.get(
+        "mean_throughput",
+        analysis.parameter_importance(df),
+    )
+    # One Pareto+score computation per class: ``recommend_configs`` is
+    # a thin wrapper, so call ``pareto_recommendation_rows`` directly
+    # and slice top-N here instead of running the pipeline twice.
+    pareto_rows = analysis.pareto_recommendation_rows(
         trials,
         hardware_class,
-        n=top_n,
-        topology=topology,
+        topology,
         objectives=objectives.pareto,
         weights=objectives.recommendation_weights,
     )
+    recs: list[dict[str, Any]] = [
+        {
+            "rank": i + 1,
+            **{k: row[k] for k in row if k != "score"},
+            "score": round(row["score"], 4),
+        }
+        for i, row in enumerate(pareto_rows[:top_n])
+    ]
 
     hw_dir = output_dir / hardware_class
     hw_dir.mkdir(parents=True, exist_ok=True)
@@ -1070,7 +1095,6 @@ def _analyze_one_class(
         df=df,
         front=front,
         pareto_mask=pareto_mask,
-        importance=importance,
         hw_dir=hw_dir,
         plots=plots,
     )
@@ -1095,7 +1119,12 @@ def _analyze_one_class(
         "pareto_count": len(front),
         "topology": topology,
         "recommendations": recs,
+        "pareto_rows": pareto_rows,
+        "objectives": [obj.model_dump(mode="json") for obj in objectives.pareto],
+        "default_weights": dict(objectives.recommendation_weights),
+        "top_n": top_n,
         "importance": importance,
+        "importance_by_target": importance_by_target,
         "figures": figures,
     }
 
@@ -1105,7 +1134,6 @@ def _write_figures(
     df: Any,  # noqa: ANN401
     front: Any,  # noqa: ANN401
     pareto_mask: Any,  # noqa: ANN401
-    importance: Any,  # noqa: ANN401
     hw_dir: Path,
     plots: Any,  # noqa: ANN401
 ) -> list[tuple[str, Any]]:
@@ -1116,7 +1144,6 @@ def _write_figures(
         front: The Pareto frontier DataFrame.
         pareto_mask: Boolean mask marking Pareto-optimal rows of
             ``df``.
-        importance: The parameter-importance DataFrame.
         hw_dir: Per-hardware-class output directory.
         plots: The lazy-imported ``kube_autotuner.plots`` module.
 
@@ -1150,11 +1177,4 @@ def _write_figures(
         fig = plots.plot_pareto_2d(df, front, x, y)
         fig.write_html(str(hw_dir / f"pareto_{x}_vs_{y}.html"))
         figures.append((f"Pareto: {x} vs {y}", fig))
-    if not importance.empty:
-        imp_fig = plots.plot_importance(importance)
-        imp_fig.write_html(str(hw_dir / "importance_throughput.html"))
-        figures.append(("Parameter importance", imp_fig))
-        heat_fig = plots.plot_param_heatmap(df, front, importance)
-        heat_fig.write_html(str(hw_dir / "param_heatmap.html"))
-        figures.append(("Pareto config heatmap", heat_fig))
     return figures
