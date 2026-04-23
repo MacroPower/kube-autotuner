@@ -935,9 +935,24 @@ class TestObjectivesSection:
         section = ObjectivesSection()
         assert "tcp_retransmit_rate <= 1e-06" in section.constraints
 
-    def test_weight_on_maximize_metric_rejected(self) -> None:
-        with pytest.raises(ValueError, match="maximize-direction"):
+    def test_weight_on_maximize_metric_accepted(self) -> None:
+        section = ObjectivesSection(
+            recommendation_weights={"tcp_throughput": 2.0},
+        )
+        assert section.recommendation_weights["tcp_throughput"] == pytest.approx(2.0)
+
+    def test_zero_weight_on_maximize_metric_accepted(self) -> None:
+        section = ObjectivesSection(
+            recommendation_weights={"tcp_throughput": 0.0},
+        )
+        assert section.recommendation_weights["tcp_throughput"] == pytest.approx(0.0)
+
+    def test_weight_on_maximize_metric_not_in_pareto_rejected(self) -> None:
+        with pytest.raises(ValueError, match="not in pareto objectives"):
             ObjectivesSection(
+                pareto=[
+                    ParetoObjective(metric="udp_throughput", direction="maximize"),
+                ],
                 recommendation_weights={"tcp_throughput": 1.0},
             )
 
@@ -950,10 +965,11 @@ class TestObjectivesSection:
                 },
             )
 
-    def test_negative_weight_rejected(self) -> None:
+    @pytest.mark.parametrize("metric", ["tcp_retransmit_rate", "tcp_throughput"])
+    def test_negative_weight_rejected(self, metric: str) -> None:
         with pytest.raises(ValueError, match="non-negative"):
             ObjectivesSection(
-                recommendation_weights={"tcp_retransmit_rate": -0.1},
+                recommendation_weights={metric: -0.1},
             )
 
     def test_malformed_constraint_rejected(self) -> None:

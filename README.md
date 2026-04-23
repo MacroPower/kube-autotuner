@@ -288,8 +288,15 @@ A few rules govern how the `objectives:` block is interpreted:
   Values are normalized to bare floats at load time, so a config
   written as `"throughput >= 1Gi"` is stored and forwarded to Ax as
   `"throughput >= 1073741824"`.
-- Weights are only valid on minimize-direction metrics and must
-  reference a metric present in `pareto`.
+- Weights apply to every metric listed in `pareto` (both maximize
+  and minimize directions) and must reference a metric present in
+  `pareto`. Defaults depend on direction: an omitted
+  maximize-metric weight defaults to `1.0` (the metric contributes
+  its full +norm), and an omitted minimize-metric weight defaults
+  to `0.0` (the metric participates in frontier selection but does
+  not bias the recommendation score). Raising a maximize weight
+  above `1.0` biases the recommendation toward that metric; setting
+  any weight to `0.0` disables the metric's contribution entirely.
 - Every iteration runs both iperf3 bandwidth stages (TCP then UDP)
   and both fortio sub-stages, so every metric below is always
   observable. Sidecar metadata files (`<results.jsonl>.meta.json`)

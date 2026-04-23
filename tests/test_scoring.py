@@ -135,3 +135,80 @@ def test_score_rows_missing_metric_column_is_neutral() -> None:
     # throughput norms: 0.0 and 1.0; latency_p99 norms: 0.5 each.
     assert scores[0] == pytest.approx(0.0 - 0.075)
     assert scores[1] == pytest.approx(1.0 - 0.075)
+
+
+def test_score_rows_maximize_weight_scales_contribution() -> None:
+    """An explicit maximize weight multiplies the +norm contribution.
+
+    Throughput (maximize, weight 2.0) normalizes to (1.0, 0.5, 0.0);
+    jitter (minimize, weight 0.15) normalizes to (1.0, 0.5, 0.0).
+    Composed score per row is ``2.0 * norm_tp - 0.15 * norm_j``.
+    """
+    objectives = [
+        ParetoObjective(metric="tcp_throughput", direction="maximize"),
+        ParetoObjective(metric="udp_jitter", direction="minimize"),
+    ]
+    rows = [
+        {_col("tcp_throughput"): 2.0e9, _col("udp_jitter"): 8.0},
+        {_col("tcp_throughput"): 1.5e9, _col("udp_jitter"): 5.0},
+        {_col("tcp_throughput"): 1.0e9, _col("udp_jitter"): 2.0},
+    ]
+    scores = score_rows(
+        rows,
+        objectives,
+        {"tcp_throughput": 2.0, "udp_jitter": 0.15},
+    )
+    assert scores[0] == pytest.approx(2.0 * 1.0 - 0.15 * 1.0)
+    assert scores[1] == pytest.approx(2.0 * 0.5 - 0.15 * 0.5)
+    assert scores[2] == pytest.approx(2.0 * 0.0 - 0.15 * 0.0)
+
+
+def test_score_rows_missing_maximize_weight_defaults_to_one() -> None:
+    """Omitting a maximize weight reproduces the historical ``+norm``.
+
+    Regression guard for the behavior-preservation claim: callers
+    that never set a maximize weight keep the same per-row scores
+    they had before weights were extensible to maximize metrics.
+    """
+    objectives = [
+        ParetoObjective(metric="tcp_throughput", direction="maximize"),
+        ParetoObjective(metric="udp_jitter", direction="minimize"),
+    ]
+    rows = [
+        {_col("tcp_throughput"): 2.0e9, _col("udp_jitter"): 8.0},
+        {_col("tcp_throughput"): 1.0e9, _col("udp_jitter"): 2.0},
+    ]
+    implicit = score_rows(rows, objectives, {"udp_jitter": 0.15})
+    explicit = score_rows(
+        rows,
+        objectives,
+        {"tcp_throughput": 1.0, "udp_jitter": 0.15},
+    )
+    for a, b in zip(implicit, explicit, strict=True):
+        assert a == pytest.approx(b)
+
+
+def test_score_rows_zero_weight_on_maximize_disables_contribution() -> None:
+    """Weight ``0.0`` on a maximize metric zeroes its contribution.
+
+    With throughput disabled, the score reduces to just the
+    minimize-direction terms. All three rows then share the same
+    jitter-only ranking.
+    """
+    objectives = [
+        ParetoObjective(metric="tcp_throughput", direction="maximize"),
+        ParetoObjective(metric="udp_jitter", direction="minimize"),
+    ]
+    rows = [
+        {_col("tcp_throughput"): 2.0e9, _col("udp_jitter"): 8.0},
+        {_col("tcp_throughput"): 1.5e9, _col("udp_jitter"): 5.0},
+        {_col("tcp_throughput"): 1.0e9, _col("udp_jitter"): 2.0},
+    ]
+    scores = score_rows(
+        rows,
+        objectives,
+        {"tcp_throughput": 0.0, "udp_jitter": 0.15},
+    )
+    assert scores[0] == pytest.approx(-0.15 * 1.0)
+    assert scores[1] == pytest.approx(-0.15 * 0.5)
+    assert scores[2] == pytest.approx(-0.15 * 0.0)

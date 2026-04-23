@@ -4,6 +4,15 @@ The live panel (``RichProgressObserver._rerank``),
 ``recommend_configs``, and
 ``OptimizationLoop.run_verification``'s top-K selector all sort by
 ``(-score, trial_id)`` under score ties. This test holds the invariant.
+
+Load-bearing assumption: ``_DEFAULT_WEIGHTS`` in
+``kube_autotuner.experiment`` only seeds minimize-direction entries,
+so ``ObjectivesSection().recommendation_weights`` carries no keys for
+``tcp_throughput``/``udp_throughput``/``rps``. The maximize branch of
+``score_rows`` then defaults those to ``1.0``. If a future change
+adds maximize entries to ``_DEFAULT_WEIGHTS``, the scores here shift
+and the tiebreak ordering may silently change -- update the
+expectations here when that happens.
 """
 
 from __future__ import annotations

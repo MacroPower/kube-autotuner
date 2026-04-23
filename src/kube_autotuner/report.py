@@ -602,11 +602,12 @@ function scoreRows(rows, objectives, weights) {
     const raw = rows.map(r => toFloatOrNaN(r[col]));
     const norm = normalizeColumn(raw);
     if (obj.direction === "maximize") {
+      const w = weights[obj.metric] ?? 1.0;
       for (let i = 0; i < n; i++) {
-        const c = norm[i];
+        const c = w * norm[i];
         scores[i] += c;
         contributions[i][obj.metric] = {
-          norm: norm[i], contribution: c, direction: "maximize",
+          norm: norm[i], contribution: c, direction: "maximize", weight: w,
         };
       }
     } else {
@@ -630,32 +631,42 @@ function formatMetric(col, value) {
   return fmt.format(value) + (fmt.unit ? " " + fmt.unit : "");
 }
 
-// The keyset that drives sliders and presets: every minimize-direction
-// metric in the section's objectives. defaultWeights fills in initial
-// values; metrics without a default start at 0.0.
-function minimizeMetricKeys(section) {
-  return section.objectives
-    .filter(o => o.direction === "minimize")
-    .map(o => o.metric);
+// The keyset that drives sliders and presets: every pareto objective
+// in the section, regardless of direction. defaultWeights fills in
+// initial minimize-direction values; maximize objectives and metrics
+// without an explicit default fall back to the direction default
+// (1.0 for maximize, 0.0 for minimize).
+function weightedMetricKeys(section) {
+  return section.objectives.map(o => o.metric);
+}
+
+function directionDefault(section, metric) {
+  const obj = section.objectives.find(o => o.metric === metric);
+  return obj && obj.direction === "maximize" ? 1.0 : 0.0;
 }
 
 function activePresetKey(weights, section) {
-  const keys = minimizeMetricKeys(section);
+  const keys = weightedMetricKeys(section);
   for (const [key, overrides] of Object.entries(PRESETS)) {
     let target;
     if (overrides === null) {
       target = {};
-      for (const k of keys) target[k] = section.defaultWeights[k] ?? 0.0;
+      for (const k of keys) {
+        target[k] = section.defaultWeights[k] ?? directionDefault(section, k);
+      }
     } else {
       target = {};
-      for (const k of keys) target[k] = 0.0;
+      for (const k of keys) target[k] = directionDefault(section, k);
       for (const [k, v] of Object.entries(overrides)) {
         if (k in target) target[k] = v;
       }
     }
     let match = true;
     for (const k of keys) {
-      if (Math.abs((weights[k] ?? 0) - (target[k] ?? 0)) > 1e-9) {
+      const fallback = directionDefault(section, k);
+      const wv = weights[k] ?? fallback;
+      const tv = target[k] ?? fallback;
+      if (Math.abs(wv - tv) > 1e-9) {
         match = false;
         break;
       }
@@ -666,14 +677,16 @@ function activePresetKey(weights, section) {
 }
 
 function applyPreset(key, section) {
-  const keys = minimizeMetricKeys(section);
+  const keys = weightedMetricKeys(section);
   const overrides = PRESETS[key];
   const next = {};
   if (overrides === null) {
-    for (const k of keys) next[k] = section.defaultWeights[k] ?? 0.0;
+    for (const k of keys) {
+      next[k] = section.defaultWeights[k] ?? directionDefault(section, k);
+    }
     return next;
   }
-  for (const k of keys) next[k] = 0.0;
+  for (const k of keys) next[k] = directionDefault(section, k);
   for (const [k, v] of Object.entries(overrides)) {
     if (k in next) next[k] = v;
   }
@@ -698,12 +711,17 @@ function renderPresets(container, state, rerank) {
 
 function renderSliders(container, state, rerank) {
   container.innerHTML = "";
-  const minimizeMetrics = minimizeMetricKeys(state.section);
-  const defaultValues = Object.values(state.section.defaultWeights);
-  const maxDefault = defaultValues.length ? Math.max(0, ...defaultValues) : 0;
-  const sliderMax = Math.max(1.0, 1.5 * maxDefault);
+  const metrics = weightedMetricKeys(state.section);
+  // Compute sliderMax from the initial weights map, which now
+  // includes 1.0 entries for maximize metrics; the 1.5x multiplier
+  // keeps maximize defaults with visible headroom above 1.0 so users
+  // can bias a maximize weight upward.
+  const initialValues = metrics.map(
+    m => state.weights[m] ?? directionDefault(state.section, m));
+  const maxInitial = initialValues.length ? Math.max(0, ...initialValues) : 0;
+  const sliderMax = Math.max(1.0, 1.5 * maxInitial);
   state.sliderMax = sliderMax;
-  for (const metric of minimizeMetrics) {
+  for (const metric of metrics) {
     const row = document.createElement("div");
     row.className = "slider-row";
     const label = document.createElement("label");
@@ -717,7 +735,8 @@ function renderSliders(container, state, rerank) {
     input.max = String(sliderMax);
     input.step = "0.01";
     input.dataset.metric = metric;
-    input.value = String(state.weights[metric] ?? 0);
+    input.value = String(
+      state.weights[metric] ?? directionDefault(state.section, metric));
     valueSpan.textContent = Number(input.value).toFixed(2);
     input.addEventListener("input", () => {
       const v = Number(input.value);
@@ -735,7 +754,7 @@ function syncSliderValues(state) {
   const panel = state.panel;
   for (const input of panel.querySelectorAll("input[type=range]")) {
     const metric = input.dataset.metric;
-    const v = state.weights[metric] ?? 0;
+    const v = state.weights[metric] ?? directionDefault(state.section, metric);
     input.value = String(v);
     const valueSpan = input.parentElement.querySelector(".weight-value");
     if (valueSpan) valueSpan.textContent = v.toFixed(2);
@@ -890,7 +909,7 @@ function renderDecompositionTable(tableEl, entry) {
     + `</colgroup>`
     + `<thead><tr><th>metric</th>`
     + `<th title="Normalized metric value, 0 to 1">norm</th>`
-    + `<th title="Slider weight (minimize metrics only)">weight</th>`
+    + `<th title="Slider weight">weight</th>`
     + `<th title="Signed score contribution = norm \u00d7 weight">`
     + `contribution</th>`
     + `</tr></thead><tbody></tbody>`;
@@ -904,8 +923,7 @@ function renderDecompositionTable(tableEl, entry) {
       ? "var(--pos-bar)" : "var(--neg-bar)";
     const pct = maxAbs > 0
       ? Math.min(1, Math.abs(c.contribution) / maxAbs) * 100 : 0;
-    const weightCell = c.direction === "maximize"
-      ? "-" : c.weight.toFixed(2);
+    const weightCell = c.weight.toFixed(2);
     const tr = document.createElement("tr");
     const metricTd = document.createElement("td");
     metricTd.className = "metric-col";
@@ -959,11 +977,14 @@ function renderSection(panel, section) {
   const visibleCols = Object.keys(METRIC_DISPLAY).filter(col =>
     section.paretoRows.some(r => r[col] !== null && r[col] !== undefined)
   );
-  // Every minimize-direction objective gets a slider; metrics without a
-  // default weight start at 0.0 but are still user-adjustable.
+  // Every pareto objective gets a slider. defaultWeights supplies
+  // the initial minimize-direction values; maximize objectives (and
+  // any metric without an explicit default) fall back to the
+  // direction default -- 1.0 for maximize, 0.0 for minimize.
   const initialWeights = {};
-  for (const metric of minimizeMetricKeys(section)) {
-    initialWeights[metric] = section.defaultWeights[metric] ?? 0.0;
+  for (const metric of weightedMetricKeys(section)) {
+    initialWeights[metric] =
+      section.defaultWeights[metric] ?? directionDefault(section, metric);
   }
   const state = {
     section,

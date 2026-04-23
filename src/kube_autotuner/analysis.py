@@ -537,9 +537,10 @@ def pareto_recommendation_rows(
         topology: Optional topology filter.
         objectives: Pareto objectives driving frontier selection and
             scoring. Defaults to the seven built-in metrics.
-        weights: Per-metric negative coefficients for
-            minimize-direction metrics. Missing metrics default to
-            ``0.0``.
+        weights: Per-metric non-negative multipliers applied to both
+            maximize and minimize objectives. Missing maximize-metric
+            keys default to ``1.0`` (full +norm contribution); missing
+            minimize-metric keys default to ``0.0``.
 
     Lazy-imports ``pandas`` and raises :exc:`RuntimeError` with the
     ``uv sync --group analysis`` hint when the group is missing.
@@ -663,9 +664,10 @@ def recommend_configs(
         topology: Optional topology filter.
         objectives: Pareto objectives driving both frontier selection
             and scoring. Defaults to the seven built-in metrics.
-        weights: Per-metric negative coefficients for
-            minimize-direction metrics. Missing metrics default to
-            ``0.0`` (i.e. they do not influence the score).
+        weights: Per-metric non-negative multipliers applied to both
+            maximize and minimize objectives. Missing maximize-metric
+            keys default to ``1.0``; missing minimize-metric keys
+            default to ``0.0`` (i.e. they do not influence the score).
 
     Lazy-imports ``pandas`` (via :func:`trials_to_dataframe`) and
     raises :exc:`RuntimeError` with the ``uv sync --group analysis``

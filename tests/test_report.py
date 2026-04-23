@@ -296,6 +296,127 @@ def test_presets_labels_cover_every_preset() -> None:
     assert set(presets.keys()) == set(labels.keys())
 
 
+def test_decomposition_table_weight_cell_is_always_numeric() -> None:
+    """The JS decomposition table no longer emits ``-`` for maximize rows.
+
+    Before weights applied to both directions, the decomposition
+    table rendered ``"-"`` in the weight column for maximize metrics.
+    After the change every row shows a numeric weight; guard against
+    a future regression that reintroduces the placeholder.
+    """
+    js = report._JS_MODULE
+    assert 'c.direction === "maximize"\n      ? "-"' not in js
+    assert '? "-" : c.weight.toFixed(2)' not in js
+
+
+def test_render_sliders_does_not_filter_by_direction() -> None:
+    """``renderSliders`` must iterate every pareto objective.
+
+    The historical ``minimizeMetricKeys`` helper restricted sliders
+    to minimize metrics. Confirm the rename landed and no stale
+    direction filter survives inside the renderer.
+    """
+    js = report._JS_MODULE
+    assert "minimizeMetricKeys" not in js
+    assert "weightedMetricKeys" in js
+    # renderSliders iterates every pareto objective; no direction
+    # filter should live inside the renderer.
+    render_start = js.index("function renderSliders(")
+    render_end = js.index("function syncSliderValues(")
+    render_src = js[render_start:render_end]
+    assert ".filter(" not in render_src
+
+
+# The three helpers below mirror the JS ``directionDefault``,
+# ``applyPreset``, and ``activePresetKey`` in ``report._JS_MODULE``.
+# The JS is the source of truth; these Python mirrors exist so the
+# preset round-trip can be asserted without an in-test JS runtime.
+# Update both sides in lockstep when the preset logic changes.
+def _direction_default(section: dict[str, Any], metric: str) -> float:
+    obj = next(o for o in section["objectives"] if o["metric"] == metric)
+    return 1.0 if obj["direction"] == "maximize" else 0.0
+
+
+def _apply_preset_py(
+    key: str,
+    section: dict[str, Any],
+    presets: dict[str, dict[str, float] | None],
+) -> dict[str, float]:
+    keys = [o["metric"] for o in section["objectives"]]
+    overrides = presets[key]
+    if overrides is None:
+        return {
+            k: section["default_weights"].get(k, _direction_default(section, k))
+            for k in keys
+        }
+    result = {k: _direction_default(section, k) for k in keys}
+    for k, v in overrides.items():
+        if k in result:
+            result[k] = v
+    return result
+
+
+def _active_preset_key_py(
+    weights: dict[str, float],
+    section: dict[str, Any],
+    presets: dict[str, dict[str, float] | None],
+) -> str | None:
+    keys = [o["metric"] for o in section["objectives"]]
+    for key in presets:
+        target = _apply_preset_py(key, section, presets)
+        match = True
+        for k in keys:
+            fallback = _direction_default(section, k)
+            wv = weights.get(k, fallback)
+            tv = target.get(k, fallback)
+            if abs(wv - tv) > 1e-9:
+                match = False
+                break
+        if match:
+            return key
+    return None
+
+
+def test_apply_preset_throughput_only_sets_maximize_to_one() -> None:
+    """``throughput-only`` zeros minimize weights and keeps maximize at 1.0."""
+    section = _minimal_section("10g", n_figures=0, n_pareto_rows=1)
+    presets = _extract_js_object_literal(report._JS_MODULE, "PRESETS")
+    weights = _apply_preset_py("throughput-only", section, presets)
+    for obj in section["objectives"]:
+        if obj["direction"] == "maximize":
+            assert weights[obj["metric"]] == pytest.approx(1.0)
+        else:
+            assert weights[obj["metric"]] == pytest.approx(0.0)
+
+
+def test_active_preset_key_round_trip_throughput_only() -> None:
+    """The weights produced by ``throughput-only`` round-trip back to it."""
+    section = _minimal_section("10g", n_figures=0, n_pareto_rows=1)
+    presets = _extract_js_object_literal(report._JS_MODULE, "PRESETS")
+    weights = _apply_preset_py("throughput-only", section, presets)
+    assert _active_preset_key_py(weights, section, presets) == "throughput-only"
+
+
+def test_apply_preset_latency_sensitive_keeps_maximize_at_one() -> None:
+    """``latency-sensitive`` zeros non-overridden minimize weights.
+
+    Maximize weights stay at their 1.0 default.
+    """
+    section = _minimal_section("10g", n_figures=0, n_pareto_rows=1)
+    presets = _extract_js_object_literal(report._JS_MODULE, "PRESETS")
+    overrides = presets["latency-sensitive"]
+    assert overrides is not None
+    weights = _apply_preset_py("latency-sensitive", section, presets)
+    for obj in section["objectives"]:
+        metric = obj["metric"]
+        if obj["direction"] == "maximize":
+            assert weights[metric] == pytest.approx(1.0)
+        elif metric in overrides:
+            assert weights[metric] == pytest.approx(overrides[metric])
+        else:
+            assert weights[metric] == pytest.approx(0.0)
+
+
 def test_write_index_html_is_dark_themed(tmp_path: Path) -> None:
     path = report.write_index_html(tmp_path, [_minimal_section("10g")])
     html_text = path.read_text()

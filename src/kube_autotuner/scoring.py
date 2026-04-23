@@ -105,16 +105,18 @@ def score_rows(
 ) -> list[float]:
     """Return per-row weighted scores using the shared recommendation formula.
 
-    Score formula, matching the derivation documented on
-    :func:`kube_autotuner.analysis.recommend_configs`:
+    Score formula:
 
-        ``sum(+norm(metric)     for objectives with direction="maximize") -
-         sum(weights[metric] * norm(metric) for objectives with direction="minimize")``
+        ``sum(+weights.get(m, 1.0) * norm(m) for m in maximize-direction) -
+         sum(weights.get(m, 0.0) * norm(m) for m in minimize-direction)``
 
     Each ``norm`` is a min-max normalization across the supplied
-    ``rows``. Maximize-direction objectives always contribute
-    ``+1.0 * norm``; ``weights`` are only consulted for
-    minimize-direction metrics (``weights.get(metric, 0.0)``).
+    ``rows``. ``weights`` applies to both directions, with
+    direction-sensitive defaults: an omitted maximize-metric weight
+    falls back to ``1.0`` (preserving that metric's full +norm
+    contribution), while an omitted minimize-metric weight falls back
+    to ``0.0`` (the metric participates in frontier selection upstream
+    but does not bias the score).
 
     Both call sites pass their own idiomatic row shape and the helper
     is tolerant of both:
@@ -145,10 +147,11 @@ def score_rows(
         rows: Per-trial metric bundles keyed by DataFrame column name
             (see :data:`METRIC_TO_DF_COLUMN`).
         objectives: Pareto objectives driving the scoring formula.
-        weights: Non-negative multipliers for minimize-direction
-            metrics, keyed by the short metric name
-            (``"tcp_retransmit_rate"``, ``"latency_p99"``, ...).
-            Missing keys default to ``0.0``.
+        weights: Non-negative per-metric multipliers keyed by the
+            short metric name (``"tcp_throughput"``,
+            ``"tcp_retransmit_rate"``, ...). Missing maximize-metric
+            keys default to ``1.0``; missing minimize-metric keys
+            default to ``0.0``.
 
     Returns:
         A list of raw float scores in ``rows`` order. Rounding and
@@ -164,8 +167,9 @@ def score_rows(
         raw = [_to_float_or_nan(row.get(col)) for row in rows]
         norm = _normalize_column(raw)
         if obj.direction == "maximize":
+            weight = weights.get(obj.metric, 1.0)
             for i, value in enumerate(norm):
-                scores[i] += value
+                scores[i] += weight * value
         else:
             weight = weights.get(obj.metric, 0.0)
             for i, value in enumerate(norm):

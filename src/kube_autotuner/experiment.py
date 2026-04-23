@@ -452,13 +452,18 @@ class ObjectivesSection(BaseModel):
     suffix set. Storage is normalized -- e.g. a user-written
     ``"throughput >= 1Gi"`` is stored as ``"throughput >= 1073741824"``.
     ``recommendation_weights`` (YAML key ``recommendationWeights``)
-    scales minimize-direction metrics in the shared scoring formula
+    scales every pareto metric in the shared scoring formula
     implemented by :func:`kube_autotuner.scoring.score_rows` -- the
     same formula drives both the live ``Best so far`` panel and the
     post-hoc :func:`kube_autotuner.analysis.recommend_configs`
-    ranking. Weights on maximize-direction metrics are rejected
-    because the gain term is always ``+1.0 * norm`` in the normalized
-    score.
+    ranking. Defaults are direction-sensitive: a maximize-metric
+    weight omitted from the map defaults to ``1.0`` (full +norm
+    contribution, reproducing historical behavior), while a
+    minimize-metric weight omitted from the map defaults to ``0.0``
+    (the metric participates in frontier selection but does not bias
+    the score). A maximize weight above ``1.0`` biases the
+    recommendation toward that metric; a weight of ``0.0`` on either
+    direction disables the metric's contribution entirely.
 
     The default weights are
     ``{tcp_retransmit_rate: 0.3, udp_loss_rate: 0.3, udp_jitter: 0.1,
@@ -468,7 +473,9 @@ class ObjectivesSection(BaseModel):
     seconds) is weighted lightly as a tail-stability signal;
     ``udp_loss_rate`` mirrors ``tcp_retransmit_rate``'s 0.3 weight so
     UDP packet loss pushes back on the score with the same force TCP
-    retransmit rate does.
+    retransmit rate does. Maximize metrics are not listed in the
+    default map and therefore fall through to the ``1.0`` default in
+    ``score_rows``.
     """
 
     model_config = ConfigDict(
@@ -494,29 +501,21 @@ class ObjectivesSection(BaseModel):
             ``self`` when every invariant holds.
 
         Raises:
-            ValueError: A weight targets an unknown metric, a
-                maximize-direction metric, or a negative value; or a
-                constraint does not parse as ``"<metric> <op> <quantity>"``
-                against the known metric set.
+            ValueError: A weight targets an unknown metric or has a
+                negative value; or a constraint does not parse as
+                ``"<metric> <op> <quantity>"`` against the known
+                metric set.
         """
-        directions: dict[str, str] = {obj.metric: obj.direction for obj in self.pareto}
+        pareto_metrics: set[str] = {obj.metric for obj in self.pareto}
         for metric, weight in self.recommendation_weights.items():
             if weight < 0:
                 msg = (
                     f"recommendation_weights[{metric!r}]={weight} must be non-negative"
                 )
                 raise ValueError(msg)
-            direction = directions.get(metric)
-            if direction is None:
+            if metric not in pareto_metrics:
                 msg = (
                     f"recommendation_weights key {metric!r} is not in pareto objectives"
-                )
-                raise ValueError(msg)
-            if direction != "minimize":
-                msg = (
-                    f"recommendation_weights[{metric!r}] targets a "
-                    "maximize-direction metric; weights are only valid "
-                    "on minimize-direction metrics"
                 )
                 raise ValueError(msg)
         known = {
