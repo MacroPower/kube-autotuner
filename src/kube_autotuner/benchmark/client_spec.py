@@ -28,7 +28,9 @@ def build_client_yaml(  # noqa: PLR0913, PLR0917 - iperf3 client flag surface
         duration: ``-t`` seconds to run.
         omit: ``-O`` seconds of warmup to omit from stats.
         parallel: ``-P`` number of parallel streams.
-        mode: ``"tcp"`` (default) or ``"udp"``; ``"udp"`` appends ``-u``.
+        mode: ``"tcp"`` (default) or ``"udp"``; ``"udp"`` appends
+            ``-u -b 0`` to lift iperf3's per-stream 1 Mbit/sec UDP
+            default. Callers can override ``-b`` via ``extra_args``.
         window: Optional ``-w`` TCP window size argument.
         extra_args: Additional iperf3 flags appended after the controlled
             arguments. Reserved-flag enforcement happens in the
@@ -53,7 +55,7 @@ def build_client_yaml(  # noqa: PLR0913, PLR0917 - iperf3 client flag surface
         "--json",
     ]
     if mode == "udp":
-        args.append("-u")
+        args.extend(["-u", "-b", "0"])
     if window:
         args.extend(["-w", window])
     if extra_args:

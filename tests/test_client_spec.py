@@ -41,6 +41,7 @@ def test_build_tcp_default_port():
     assert "--json" in args
     assert "--get-server-output" in args
     assert "-u" not in args
+    assert "-b" not in args
 
 
 def test_build_custom_port():
@@ -77,6 +78,8 @@ def test_build_udp_and_window():
     assert "-u" in args
     assert "-w" in args
     assert "256K" in args
+    assert args.index("-b") == args.index("-u") + 1
+    assert args[args.index("-b") + 1] == "0"
 
 
 def test_build_extra_args_appended_after_defaults():
@@ -116,3 +119,25 @@ def test_build_extra_args_preserved_with_udp():
     assert "-u" in args
     assert "-Z" in args
     assert args.index("-u") < args.index("-Z")
+    assert args.index("-b") < args.index("-Z")
+
+
+def test_build_udp_bitrate_override():
+    doc = _parse(
+        build_client_yaml(
+            node="kmain08",
+            target="kmain07",
+            port=5201,
+            duration=30,
+            omit=5,
+            parallel=16,
+            mode="udp",
+            extra_args=["-b", "500M"],
+        )
+    )
+    args = doc["spec"]["template"]["spec"]["containers"][0]["args"]
+    b_indices = [i for i, a in enumerate(args) if a == "-b"]
+    assert len(b_indices) == 2
+    assert args[b_indices[0] + 1] == "0"
+    assert args[b_indices[1] + 1] == "500M"
+    assert b_indices[0] < b_indices[1]
