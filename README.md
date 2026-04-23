@@ -11,9 +11,8 @@ for request/response latency and achieved RPS. An Ax-platform
 multi-objective Bayesian optimizer proposes the next configuration,
 the tool applies it, and the benchmark runs again. The loop converges
 on a Pareto-optimal set of trade-offs between throughput, TCP
-retransmit rate, UDP jitter, CPU, target-node memory, CNI data-plane
-memory, RPS under saturation, and p50/p90/p99 latency under a fixed
-offered load.
+retransmit rate, UDP jitter, RPS under saturation, and p50/p90/p99
+latency under a fixed offered load.
 
 ## Why this is hard
 
@@ -50,14 +49,14 @@ offered load.
   path. A setting that helps in isolation can regress in combination.
   That is the kind of structure a GP surrogate can pick up.
 - **Objectives conflict.** Throughput-maximising configurations often
-  raise CPU and retransmit rate; configurations that win on raw Gbps
-  frequently degrade tail latency under request/response workloads,
-  so bandwidth-only tuning hides regressions. The tool returns a
+  raise retransmit rate; configurations that win on raw Gbps frequently
+  degrade tail latency under request/response workloads, so
+  bandwidth-only tuning hides regressions. The tool returns a
   **Pareto front** rather than a single winner. Default outcome
-  constraints (a throughput floor, a CPU ceiling, a retransmit-rate
-  ceiling, a memory ceiling, an RPS floor, and a p99 latency ceiling)
-  are forwarded to Ax as hard constraints; the exact values live in
-  the `objectives` block shown under [Quick start](#quick-start).
+  constraints (a throughput floor, a retransmit-rate ceiling, an RPS
+  floor, jitter and latency ceilings) are forwarded to Ax as hard
+  constraints; the exact values live in the `objectives` block shown
+  under [Quick start](#quick-start).
 - **Results are hardware- and topology-dependent.** The tool stratifies
   results by `hardwareClass` (a free-form label you choose, e.g.
   `graviton4` or `epyc-9454p`) and topology (intra-AZ / inter-AZ).
@@ -68,7 +67,7 @@ offered load.
 Ax fits this shape: sample-efficient Bayesian optimization with native
 multi-objective support, Sobol warm-up (`optimize.nSobol`, default 15)
 to explore, then a GP surrogate that absorbs the remaining trials and
-trades off throughput, CPU, retransmit rate, memory, RPS, and latency
+trades off throughput, retransmit rate, jitter, RPS, and latency
 percentiles in one pass.
 
 ## How it works
@@ -77,15 +76,13 @@ percentiles in one pass.
 2. `kube-autotuner run` resolves the sysctl backend and runs preflight
    checks against the live cluster.
 3. An iperf3 server Deployment and a fortio server Deployment land on
-   the target node. Each iteration then drives three sub-stages
-   sequentially: an iperf3 client fan-out (bandwidth), a fortio
+   the target node. Each iteration then drives four sub-stages
+   sequentially: an iperf3 TCP bandwidth fan-out, an iperf3 UDP
+   bandwidth fan-out (sole source of `jitter_ms`), a fortio
    saturation fan-out (RPS), and a fortio fixed-QPS fan-out
    (latency percentiles). Sub-stages run one at a time so fortio
-   never contends with iperf3 for NIC, CPU, or CNI state; within each
-   sub-stage the source nodes still fan out in parallel. The
-   per-iteration resource sampler straddles all three sub-stages, so
-   peak node and CNI memory reflect the whole iteration rather than
-   any one phase.
+   never contends with iperf3 for NIC, CPU, or CNI state; within
+   each sub-stage the source nodes still fan out in parallel.
 4. In `optimize` mode the Ax loop proposes trials, applies sysctls,
    benchmarks, and appends one JSONL record per trial.
 5. Every run writes the resolved `objectives` block alongside the JSONL
@@ -219,15 +216,6 @@ fortio:
   server:
     extraArgs: []
 
-# Selector for the CNI pods on the target node whose memory is summed
-# into the cni_memory objective, sampled from metrics.k8s.io per tick
-# alongside whole-node memory. Set enabled: false to skip CNI sampling;
-# drop cni_memory from objectives / constraints to match.
-cni:
-  enabled: true
-  namespace: kube-system
-  labelSelector: k8s-app=cilium
-
 # Kustomize patches layered onto the generated client/server manifests.
 # `patch:` accepts a Strategic Merge Patch body (dict), a JSON6902 op
 # list, or a pre-rendered patch string. Do not set target.namespace or
@@ -257,12 +245,9 @@ objectives:
   pareto:
     - { metric: tcp_throughput, direction: maximize }
     - { metric: udp_throughput, direction: maximize }
-    - { metric: cpu, direction: minimize }
     - { metric: tcp_retransmit_rate, direction: minimize }
     - { metric: udp_loss_rate, direction: minimize }
     - { metric: udp_jitter, direction: minimize }
-    - { metric: node_memory, direction: minimize }
-    - { metric: cni_memory, direction: minimize }
     - { metric: rps, direction: maximize }
     - { metric: latency_p50, direction: minimize }
     - { metric: latency_p90, direction: minimize }
@@ -270,24 +255,20 @@ objectives:
   constraints:                       # k8s-style quantity suffixes accepted on the threshold
     - "tcp_throughput >= 1M"         # bits/sec; 1M (decimal mega) = 1e6
     - "udp_throughput >= 1M"
-    - "cpu <= 200"
     - "tcp_retransmit_rate <= 1u"    # retransmits per byte sent; 1u (micro) ~ 1 retx/MB
     - "udp_loss_rate <= 0.05"        # 5% UDP packet loss cap; UDP loss naturally runs
                                      # higher than TCP retransmit rate.
-    - "node_memory <= 10G"           # bytes; 10G (decimal giga) = 1e10
     - "rps >= 100"                   # requests/sec; only the saturation sub-stage feeds
                                      # rps, so this floor only fails on fortio server crash.
     - "latency_p99 <= 1000m"         # seconds; 1000m (milli) = 1.0s ceiling from the
                                      # fixed_qps sub-stage only.
   recommendationWeights:
-    cpu: 0.15
     tcp_retransmit_rate: 0.3
     udp_loss_rate: 0.3               # mirror tcp_retransmit_rate's weight; UDP loss pushes
                                      # back on the score with the same force TCP retransmit
                                      # rate does.
     udp_jitter: 0.1                  # UDP inter-arrival jitter (ms); modest weight -- a
                                      # stability signal, not a primary optimization target.
-    node_memory: 0.15
     latency_p90: 0.1                 # tail-latency weights keep the live Best-so-far panel
     latency_p99: 0.15                # and the post-hoc recommendation from over-indexing on
                                      # raw throughput; latency_p50 stays unweighted so the
@@ -324,12 +305,9 @@ Valid `pareto.metric` values and their sources:
 |-----------------------|-----------|--------------------------|--------------------------------------------------------------------------------------------------------|
 | `tcp_throughput`      | maximize  | iperf3 bw-tcp            | Bits per second. Summed across source clients per iteration, averaged across iterations.              |
 | `udp_throughput`      | maximize  | iperf3 bw-udp            | Bits per second. Same aggregation as `tcp_throughput`.                                                |
-| `cpu`                 | minimize  | iperf3 bw-tcp            | Percent; sampled during the TCP bandwidth stage. Server-side CPU when every record reports it, per-client host CPU otherwise. |
 | `tcp_retransmit_rate` | minimize  | iperf3 bw-tcp            | Retransmits per byte sent; scale-invariant, so high-throughput/high-loss does not win on raw count.   |
 | `udp_loss_rate`       | minimize  | iperf3 bw-udp            | Lost packets per packet sent; per-iteration ratio-of-sums then averaged. UDP analog of `tcp_retransmit_rate`. |
 | `udp_jitter`          | minimize  | iperf3 bw-udp            | Seconds (stored); displayed as milliseconds. Mean UDP inter-arrival jitter; tail-stability signal that TCP-only runs cannot observe. |
-| `node_memory`         | minimize  | iperf3 (peak over iter.) | Whole-node memory on the iperf target, from `metrics.k8s.io/v1beta1 nodes/<name>`.                    |
-| `cni_memory`          | minimize  | iperf3 (peak over iter.) | Memory summed across the CNI pods selected by `cni:`; what most sysctl tweaks actually move.          |
 | `rps`                 | maximize  | fortio saturation        | Achieved QPS under `-qps 0`. Fixed-QPS RPS would clamp to the offered load, so it is not a source.    |
 | `latency_p50`         | minimize  | fortio fixed-QPS         | Seconds (stored); displayed as milliseconds. Measured under the configured `fortio.fixedQps` offered load. |
 | `latency_p90`         | minimize  | fortio fixed-QPS         | Seconds (stored); displayed as milliseconds. See `latency_p50`.                                       |

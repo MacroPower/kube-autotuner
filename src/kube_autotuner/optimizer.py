@@ -4,8 +4,8 @@ This module wraps `ax-platform`'s multi-objective Bayesian optimizer
 around the :class:`~kube_autotuner.benchmark.runner.BenchmarkRunner`.
 Each trial proposes a sysctl parameterization, applies it to the target
 (and optionally every source) node, runs iperf3, and reports the
-resulting throughput / CPU / retransmit rate / node memory / CNI
-memory back to Ax.
+resulting throughput / retransmit rate / jitter / rps / latency
+percentiles back to Ax.
 
 ``ax-platform`` is a heavyweight optional dependency that lives in the
 ``optimize`` dependency group, not in ``dev``. Every Ax symbol is
@@ -54,7 +54,6 @@ if TYPE_CHECKING:
     from ax.api.configs import ChoiceParameterConfig
 
     from kube_autotuner.experiment import (
-        CniSection,
         FortioSection,
         IperfSection,
         ObjectivesSection,
@@ -267,36 +266,6 @@ def _mean_sem(vals: list[float]) -> tuple[float, float]:
     return mean, sem
 
 
-def _cpu_value(r: BenchmarkResult) -> float | None:
-    """Return the preferred CPU sample for ``r``.
-
-    Prefers the server-side CPU (shared across clients) and falls back
-    to the per-client host CPU.
-
-    Args:
-        r: Benchmark record.
-
-    Returns:
-        The CPU percentage, or ``None`` when neither field is set.
-    """
-    if r.cpu_server_percent is not None:
-        return r.cpu_server_percent
-    return r.cpu_utilization_percent
-
-
-def _memory_mean_sem(
-    results: list[BenchmarkResult],
-    field: Callable[[BenchmarkResult], int | None],
-) -> tuple[float, float]:
-    """Return ``(mean, SEM)`` for a per-record memory field across iterations."""
-    vals = _aggregate_by_iteration(
-        results,
-        lambda r: float(v) if (v := field(r)) else None,
-        statistics.mean,
-    )
-    return _mean_sem(vals)
-
-
 def _aggregate_latency_by_iteration(
     results: list[LatencyResult],
     value_fn: Callable[[LatencyResult], float | None],
@@ -328,7 +297,7 @@ def _aggregate_latency_by_iteration(
     return [reducer(vals) for vals in grouped.values() if vals]
 
 
-def _compute_metrics(  # noqa: PLR0914, PLR0915
+def _compute_metrics(  # noqa: PLR0914
     trial: TrialResult,
 ) -> dict[str, tuple[float, float]]:
     """Collapse raw trial results into per-metric ``(mean, SEM)`` pairs.
@@ -341,10 +310,10 @@ def _compute_metrics(  # noqa: PLR0914, PLR0915
     replaces it with a per-client SEM (best-effort -- the samples share
     server state and are correlated).
 
-    ``tcp_throughput`` and ``cpu`` filter to ``mode == "tcp"`` records
-    before aggregating, preserving the optimizer's historical
-    TCP-only semantics for those objectives. ``udp_throughput``
-    mirrors ``tcp_throughput`` but filters to ``mode == "udp"`` records.
+    ``tcp_throughput`` filters to ``mode == "tcp"`` records before
+    aggregating, preserving the optimizer's historical TCP-only
+    semantics. ``udp_throughput`` mirrors it but filters to
+    ``mode == "udp"`` records.
 
     ``tcp_retransmit_rate`` is the per-iteration ratio
     ``sum(retransmits) / sum(bytes_sent)`` averaged across iterations.
@@ -374,10 +343,10 @@ def _compute_metrics(  # noqa: PLR0914, PLR0915
 
     Returns:
         A dict keyed by ``"tcp_throughput"`` / ``"udp_throughput"`` /
-        ``"cpu"`` / ``"tcp_retransmit_rate"`` / ``"udp_loss_rate"`` /
-        ``"udp_jitter"`` / ``"node_memory"`` / ``"cni_memory"`` /
-        ``"rps"`` / ``"latency_p50"`` / ``"latency_p90"`` /
-        ``"latency_p99"`` with ``(mean, SEM)`` values ready for
+        ``"tcp_retransmit_rate"`` / ``"udp_loss_rate"`` /
+        ``"udp_jitter"`` / ``"rps"`` / ``"latency_p50"`` /
+        ``"latency_p90"`` / ``"latency_p99"`` with ``(mean, SEM)``
+        values ready for
         :meth:`ax.api.client.Client.complete_trial`.
     """
     results = trial.results
@@ -393,7 +362,6 @@ def _compute_metrics(  # noqa: PLR0914, PLR0915
         lambda r: r.bits_per_second,
         sum,
     )
-    cpu_vals = _aggregate_by_iteration(tcp_results, _cpu_value, statistics.mean)
     tcp_rate_vals = tcp_retransmit_rate_by_iteration(results)
     udp_loss_vals = udp_loss_rate_by_iteration(results)
     udp_jitter_vals = _aggregate_by_iteration(
@@ -404,7 +372,6 @@ def _compute_metrics(  # noqa: PLR0914, PLR0915
 
     tcp_throughput_mean, tcp_throughput_sem = _mean_sem(tcp_throughput_vals)
     udp_throughput_mean, udp_throughput_sem = _mean_sem(udp_throughput_vals)
-    cpu_mean, cpu_sem = _mean_sem(cpu_vals)
     if tcp_rate_vals:
         tcp_rate_mean, tcp_rate_sem = _mean_sem(tcp_rate_vals)
     else:
@@ -453,12 +420,9 @@ def _compute_metrics(  # noqa: PLR0914, PLR0915
     return {
         "tcp_throughput": (tcp_throughput_mean, tcp_throughput_sem),
         "udp_throughput": (udp_throughput_mean, udp_throughput_sem),
-        "cpu": (cpu_mean, cpu_sem),
         "tcp_retransmit_rate": (tcp_rate_mean, tcp_rate_sem),
         "udp_loss_rate": (udp_loss_mean, udp_loss_sem),
         "udp_jitter": (udp_jitter_mean, udp_jitter_sem),
-        "node_memory": _memory_mean_sem(results, lambda r: r.node_memory_used_bytes),
-        "cni_memory": _memory_mean_sem(results, lambda r: r.cni_memory_used_bytes),
         "rps": (rps_mean, rps_sem),
         "latency_p50": _pct_mean_sem(lambda r: r.latency_p50),
         "latency_p90": _pct_mean_sem(lambda r: r.latency_p90),
@@ -529,7 +493,6 @@ class OptimizationLoop:
         fortio_args: FortioSection | None = None,
         patches: list[Patch] | None = None,
         objectives: ObjectivesSection,
-        cni: CniSection | None = None,
         observer: ProgressObserver | None = None,
         prior_trials: list[TrialResult] | None = None,
     ) -> None:
@@ -556,8 +519,6 @@ class OptimizationLoop:
                 rendered benchmark manifests.
             objectives: Pareto objectives and outcome constraints
                 handed to Ax via :func:`build_ax_objective`.
-            cni: Selector for CNI pods tracked by the benchmark
-                runner's resource sampler on the target node.
             observer: Optional progress callback. Defaults to
                 :class:`~kube_autotuner.progress.NullObserver`. The
                 same instance is forwarded to the internal
@@ -581,7 +542,6 @@ class OptimizationLoop:
         self.iperf_args: IperfSection | None = iperf_args
         self.fortio_args: FortioSection | None = fortio_args
         self.patches: list[Patch] | None = patches
-        self.cni: CniSection | None = cni
         self.observer: ProgressObserver = observer or NullObserver()
 
         self.objectives: ObjectivesSection = objectives
@@ -626,7 +586,6 @@ class OptimizationLoop:
             client=self.k8s_client,
             iperf_args=iperf_args,
             patches=patches,
-            cni=cni,
             fortio_args=fortio_args,
             observer=self.observer,
         )
@@ -863,7 +822,6 @@ class OptimizationLoop:
         self.client.complete_trial(trial_index=trial_index, raw_data=raw_data)
 
         tp = metrics["tcp_throughput"][0]
-        cpu = metrics["cpu"][0]
         rate = metrics["tcp_retransmit_rate"][0]
         rate_str = "NaN" if math.isnan(rate) else f"{rate * 1e6:.2f}"
         rps = metrics.get("rps", (float("nan"), 0.0))[0]
@@ -871,13 +829,12 @@ class OptimizationLoop:
         p99 = metrics.get("latency_p99", (float("nan"), 0.0))[0]
         p99_str = "NaN" if math.isnan(p99) else format_duration(p99)
         logger.info(
-            "Trial %d/%d [%s] tcp_throughput=%.1f Mbps cpu=%.1f%% "
+            "Trial %d/%d [%s] tcp_throughput=%.1f Mbps "
             "tcp_retransmit_rate=%s retx/MB rps=%s p99=%s",
             self.prior_count + i + 1,
             self.n_trials,
             phase,
             tp / 1e6,
-            cpu,
             rate_str,
             rps_str,
             p99_str,
@@ -1151,12 +1108,10 @@ class OptimizationLoop:
                         ordinal += 1
                         continue
                     logger.info(
-                        "Verification [%s] parent=%s "
-                        "tcp_throughput=%.1f Mbps cpu=%.1f%%",
+                        "Verification [%s] parent=%s tcp_throughput=%.1f Mbps",
                         parent.trial_id,
                         parent.trial_id,
                         metrics["tcp_throughput"][0] / 1e6,
-                        metrics["cpu"][0],
                     )
                     self.observer.on_trial_complete(
                         obs_index,

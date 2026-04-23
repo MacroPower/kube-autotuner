@@ -45,8 +45,6 @@ def _trial(
                 bits_per_second=bps,
                 retransmits=5,
                 bytes_sent=int(bps),
-                cpu_utilization_percent=20.0,
-                cpu_server_percent=20.0,
                 iteration=0,
                 client_node="a",
             ),

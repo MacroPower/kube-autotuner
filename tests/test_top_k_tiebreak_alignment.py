@@ -40,8 +40,6 @@ def _trial(trial_id: str, bps: float) -> TrialResult:
                 bits_per_second=bps,
                 retransmits=1,
                 bytes_sent=int(bps),
-                cpu_utilization_percent=10.0,
-                cpu_server_percent=10.0,
                 iteration=0,
                 client_node="a",
             ),
@@ -65,7 +63,6 @@ def test_live_panel_rerank_ties_break_on_trial_id() -> None:
             "bayesian",
             {
                 "tcp_throughput": (b.mean_tcp_throughput(), 0.0),
-                "cpu": (b.mean_cpu(), 0.0),
             },
             trial_id=b.trial_id,
             parent_trial_id=None,
@@ -75,7 +72,6 @@ def test_live_panel_rerank_ties_break_on_trial_id() -> None:
             "bayesian",
             {
                 "tcp_throughput": (a.mean_tcp_throughput(), 0.0),
-                "cpu": (a.mean_cpu(), 0.0),
             },
             trial_id=a.trial_id,
             parent_trial_id=None,
@@ -110,7 +106,6 @@ def test_build_trial_row_populates_udp_keys() -> None:
         {
             "tcp_throughput": (5e9, 0.0),
             "udp_throughput": (1e9, 0.0),
-            "cpu": (15.0, 0.0),
             "tcp_retransmit_rate": (1e-8, 0.0),
             "udp_loss_rate": (0.02, 0.0),
             "udp_jitter": (0.5, 0.0),
@@ -132,7 +127,6 @@ def test_run_verification_top_k_selector_agrees_on_trial_id_tiebreak() -> None:
             "bayesian",
             {
                 "tcp_throughput": (t.mean_tcp_throughput(), 0.0),
-                "cpu": (t.mean_cpu(), 0.0),
             },
             trial_id=t.trial_id,
             parent_trial_id=None,

@@ -34,9 +34,6 @@ if TYPE_CHECKING:
 METRIC_TO_DF_COLUMN: dict[str, str] = {
     "tcp_throughput": "mean_tcp_throughput",
     "udp_throughput": "mean_udp_throughput",
-    "cpu": "mean_cpu",
-    "node_memory": "mean_node_memory",
-    "cni_memory": "mean_cni_memory",
     "tcp_retransmit_rate": "tcp_retransmit_rate",
     "udp_loss_rate": "udp_loss_rate",
     "udp_jitter": "mean_udp_jitter",
@@ -62,7 +59,7 @@ def _to_float_or_nan(v: object) -> float:
         that :func:`_normalize_column` treats identically:
 
         * ``None`` (``recommend_configs`` passes this for object-dtype
-          NaN, e.g. ``mean_cni_memory`` on a CNI-disabled trial).
+          NaN, e.g. ``mean_udp_jitter`` on a TCP-only trial).
         * ``float("nan")`` (both callers can pass this directly).
         * Any value that fails :func:`float` coercion. Defensive
           catch-all; no caller is known to trigger this path.
@@ -149,8 +146,9 @@ def score_rows(
             (see :data:`METRIC_TO_DF_COLUMN`).
         objectives: Pareto objectives driving the scoring formula.
         weights: Non-negative multipliers for minimize-direction
-            metrics, keyed by the short metric name (``"cpu"``,
-            ``"latency_p99"``, ...). Missing keys default to ``0.0``.
+            metrics, keyed by the short metric name
+            (``"tcp_retransmit_rate"``, ``"latency_p99"``, ...).
+            Missing keys default to ``0.0``.
 
     Returns:
         A list of raw float scores in ``rows`` order. Rounding and
@@ -190,15 +188,10 @@ def _per_trial_metric_means(t: TrialResult) -> dict[str, float]:
         :data:`METRIC_TO_DF_COLUMN`, with :data:`math.nan` in place of
         any unreported metric.
     """
-    nmem = t.mean_node_memory()
-    cmem = t.mean_cni_memory()
     rate = t.tcp_retransmit_rate()
     return {
         METRIC_TO_DF_COLUMN["tcp_throughput"]: t.mean_tcp_throughput(),
         METRIC_TO_DF_COLUMN["udp_throughput"]: t.mean_udp_throughput(),
-        METRIC_TO_DF_COLUMN["cpu"]: t.mean_cpu(),
-        METRIC_TO_DF_COLUMN["node_memory"]: (math.nan if nmem is None else nmem),
-        METRIC_TO_DF_COLUMN["cni_memory"]: (math.nan if cmem is None else cmem),
         METRIC_TO_DF_COLUMN["tcp_retransmit_rate"]: (
             math.nan if rate is None else rate
         ),
@@ -242,9 +235,9 @@ def aggregate_verification(
 
     * ``tcp_throughput`` / ``udp_throughput`` / ``rps``: mean of
       per-trial means.
-    * ``cpu`` / ``udp_jitter`` / ``node_memory`` / ``cni_memory`` /
-      ``latency_p50`` / ``latency_p90`` / ``latency_p99``: mean of
-      per-trial means; NaN (not measured) drops out of the mean.
+    * ``udp_jitter`` / ``latency_p50`` / ``latency_p90`` /
+      ``latency_p99``: mean of per-trial means; NaN (not measured)
+      drops out of the mean.
     * ``tcp_retransmit_rate`` / ``udp_loss_rate``: mean of per-trial
       rates; NaN drops out.
 

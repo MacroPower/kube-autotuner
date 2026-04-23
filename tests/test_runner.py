@@ -12,7 +12,6 @@ from unittest.mock import MagicMock
 import pytest
 import yaml
 
-from kube_autotuner.benchmark import runner as runner_module
 from kube_autotuner.benchmark.errors import ResultValidationError
 from kube_autotuner.benchmark.parser import parse_iperf_json
 from kube_autotuner.benchmark.runner import (
@@ -21,13 +20,11 @@ from kube_autotuner.benchmark.runner import (
     BenchmarkRunner,
 )
 from kube_autotuner.experiment import (
-    CniSection,
     IperfArgs,
     IperfSection,
     Patch,
     PatchTarget,
 )
-from kube_autotuner.k8s.client import K8sApiError
 from kube_autotuner.models import BenchmarkConfig, NodePair
 
 if TYPE_CHECKING:
@@ -36,17 +33,11 @@ if TYPE_CHECKING:
 
 def _fake_iperf_json(
     bps: float,
-    remote_total: float = 12.3,
     mode: str = "tcp",
 ) -> str:
     base: dict = {
         "start": {"timestamp": {"timesecs": 1700000000}},
-        "end": {
-            "cpu_utilization_percent": {
-                "host_total": 5.0,
-                "remote_total": remote_total,
-            },
-        },
+        "end": {},
     }
     if mode == "tcp":
         base["end"]["sum_sent"] = {
@@ -143,17 +134,10 @@ def _make_client(
 
     client.logs.side_effect = _logs
     client.describe_job_failure.return_value = {}
-    client.top_pod_containers.return_value = []
-    client.top_node.return_value = {}
-    client.list_pods_by_selector_on_node.return_value = []
     # Exposed so tests that override `client.logs.side_effect` can still
     # discriminate TCP vs UDP for the shared iperf3 client job names.
     client._last_mode_by_job = last_mode_by_job
     return client
-
-
-def _cni_disabled() -> CniSection:
-    return CniSection(enabled=False)
 
 
 def test_single_client_single_iteration():
@@ -175,7 +159,6 @@ def test_single_client_single_iteration():
     assert tcp.bits_per_second == pytest.approx(9e9)
     assert tcp.client_node == "kmain07"
     assert tcp.iteration == 0
-    assert tcp.cpu_server_percent == pytest.approx(12.3)
     # Fortio sub-stages fire twice per iteration (saturation + fixed_qps).
     assert len(iteration_results.latency) == 2
     workloads = sorted(lr.workload for lr in iteration_results.latency)
@@ -326,231 +309,6 @@ def test_patches_applied_to_server_yaml():
     docs = list(yaml.safe_load_all(server_yaml))
     dep = next(d for d in docs if d["kind"] == "Deployment")
     assert dep["spec"]["replicas"] == 3
-
-
-def _slow_logs(
-    delay_seconds: float,
-    logs_by_job: dict[str, str],
-    client: MagicMock,
-):
-    """Build a ``client.logs`` side_effect that waits before returning.
-
-    Gives the background memory sampler time to poll at least once
-    during the otherwise-instant mocked iteration. Unknown fortio
-    client job names fall back to a canned fortio JSON response so
-    sub-stages after the iperf3 stage can complete. The same iperf3
-    client job name is applied twice per iteration (TCP then UDP), so
-    the mock consults ``client._last_mode_by_job`` to serve the right
-    payload shape.
-
-    Returns:
-        A callable matching the ``client.logs`` signature.
-    """
-
-    def _impl(_kind, name, _ns):
-        time.sleep(delay_seconds)
-        if name.startswith("iperf3-client-"):
-            mode = client._last_mode_by_job.get(name, "tcp")
-            if mode == "udp":
-                return _fake_iperf_udp_json()
-            if name in logs_by_job:
-                return logs_by_job[name]
-            raise KeyError(name)
-        if name.startswith("fortio-client-"):
-            return _fake_fortio_json()
-        raise KeyError(name)
-
-    return _impl
-
-
-def test_node_memory_tagging_applied_to_all_client_results(monkeypatch):
-    monkeypatch.setattr(runner_module, "SAMPLE_INTERVAL_S", 0.001)
-
-    node_pair = NodePair(
-        source="kmain07",
-        target="kmain08",
-        hardware_class="10g",
-        extra_sources=["kmain09"],
-    )
-    config = BenchmarkConfig(duration=1, iterations=1)
-
-    logs = {
-        "iperf3-client-kmain07-p5201": _fake_iperf_json(4e9),
-        "iperf3-client-kmain09-p5202": _fake_iperf_json(5e9),
-    }
-    client = _make_client(logs)
-    client.logs.side_effect = _slow_logs(0.05, logs, client)
-    client.top_node.return_value = {"cpu": "500m", "memory": "8000000Ki"}
-
-    runner = BenchmarkRunner(node_pair, config, client=client, cni=_cni_disabled())
-    iteration_results = runner.run()
-
-    # 2 clients * 1 iteration * 2 modes (tcp + udp).
-    assert len(iteration_results.bench) == 4
-    for r in iteration_results.bench:
-        assert r.node_memory_used_bytes == 8_000_000 * 1024
-        assert r.cni_memory_used_bytes is None
-    # Latency records also see the iteration peak.
-    for lr in iteration_results.latency:
-        assert lr.node_memory_used_bytes == 8_000_000 * 1024
-        assert lr.cni_memory_used_bytes is None
-
-
-def test_node_memory_peak_not_last(monkeypatch):
-    monkeypatch.setattr(runner_module, "SAMPLE_INTERVAL_S", 0.001)
-
-    node_pair = NodePair(source="kmain07", target="kmain08", hardware_class="10g")
-    config = BenchmarkConfig(duration=1, iterations=1)
-
-    logs = {"iperf3-client-kmain07-p5201": _fake_iperf_json(1e9)}
-    client = _make_client(logs)
-    client.logs.side_effect = _slow_logs(0.1, logs, client)
-
-    series = iter([
-        {"cpu": "0", "memory": "50Mi"},
-        {"cpu": "0", "memory": "200Mi"},
-        {"cpu": "0", "memory": "100Mi"},
-    ])
-    tail = {"cpu": "0", "memory": "100Mi"}
-
-    def _top_node(_name):
-        return next(series, tail)
-
-    client.top_node.side_effect = _top_node
-
-    runner = BenchmarkRunner(node_pair, config, client=client, cni=_cni_disabled())
-    iteration_results = runner.run()
-
-    # bw-tcp + bw-udp per iteration.
-    assert len(iteration_results.bench) == 2
-    for r in iteration_results.bench:
-        assert r.node_memory_used_bytes == 200 * 1024 * 1024
-
-
-def test_node_memory_none_when_metrics_empty(monkeypatch):
-    monkeypatch.setattr(runner_module, "SAMPLE_INTERVAL_S", 0.001)
-
-    node_pair = NodePair(source="kmain07", target="kmain08", hardware_class="10g")
-    config = BenchmarkConfig(duration=1, iterations=1)
-
-    logs = {"iperf3-client-kmain07-p5201": _fake_iperf_json(1e9)}
-    client = _make_client(logs)
-    client.logs.side_effect = _slow_logs(0.05, logs, client)
-    client.top_node.return_value = {}
-
-    runner = BenchmarkRunner(node_pair, config, client=client, cni=_cni_disabled())
-    iteration_results = runner.run()
-
-    assert len(iteration_results.bench) == 2
-    for r in iteration_results.bench:
-        assert r.node_memory_used_bytes is None
-        assert r.cni_memory_used_bytes is None
-
-
-def test_memory_sampler_survives_api_error(monkeypatch):
-    monkeypatch.setattr(runner_module, "SAMPLE_INTERVAL_S", 0.001)
-
-    node_pair = NodePair(source="kmain07", target="kmain08", hardware_class="10g")
-    config = BenchmarkConfig(duration=1, iterations=1)
-
-    logs = {"iperf3-client-kmain07-p5201": _fake_iperf_json(1e9)}
-    client = _make_client(logs)
-    client.logs.side_effect = _slow_logs(0.1, logs, client)
-
-    calls = {"n": 0}
-
-    def _top_node(_name):
-        calls["n"] += 1
-        if calls["n"] == 1:
-            raise K8sApiError(
-                op="top node",
-                status=503,
-                reason="ServiceUnavailable",
-                message="metrics-server down",
-            )
-        return {"cpu": "100m", "memory": "75Mi"}
-
-    client.top_node.side_effect = _top_node
-
-    runner = BenchmarkRunner(node_pair, config, client=client, cni=_cni_disabled())
-    iteration_results = runner.run()
-
-    assert len(iteration_results.bench) == 2
-    for r in iteration_results.bench:
-        assert r.node_memory_used_bytes == 75 * 1024 * 1024
-    assert calls["n"] >= 2, "sampler thread did not survive initial API error"
-
-
-def test_memory_sampler_thread_is_cleaned_up(monkeypatch):
-    monkeypatch.setattr(runner_module, "SAMPLE_INTERVAL_S", 0.001)
-
-    node_pair = NodePair(source="kmain07", target="kmain08", hardware_class="10g")
-    config = BenchmarkConfig(duration=1, iterations=2)
-
-    logs = {"iperf3-client-kmain07-p5201": _fake_iperf_json(1e9)}
-    client = _make_client(logs)
-    client.top_node.return_value = {"cpu": "10m", "memory": "10Mi"}
-
-    runner = BenchmarkRunner(node_pair, config, client=client, cni=_cni_disabled())
-    runner.run()
-
-    lingering = [t for t in threading.enumerate() if t.name.startswith("mem-sampler-")]
-    assert lingering == []
-
-
-def test_cni_memory_populated_when_enabled(monkeypatch):
-    monkeypatch.setattr(runner_module, "SAMPLE_INTERVAL_S", 0.001)
-
-    node_pair = NodePair(source="kmain07", target="kmain08", hardware_class="10g")
-    config = BenchmarkConfig(duration=1, iterations=1)
-
-    logs = {"iperf3-client-kmain07-p5201": _fake_iperf_json(1e9)}
-    client = _make_client(logs)
-    client.logs.side_effect = _slow_logs(0.05, logs, client)
-    client.top_node.return_value = {"cpu": "1000m", "memory": "4194304Ki"}
-    client.list_pods_by_selector_on_node.return_value = ["cilium-abc"]
-    client.top_pod_containers.return_value = [
-        {"container": "cilium-agent", "cpu": "100m", "memory": "64Mi"},
-    ]
-
-    cni = CniSection(
-        enabled=True,
-        namespace="kube-system",
-        label_selector="k8s-app=cilium",
-    )
-    runner = BenchmarkRunner(node_pair, config, client=client, cni=cni)
-    iteration_results = runner.run()
-
-    assert len(iteration_results.bench) == 2
-    for r in iteration_results.bench:
-        assert r.node_memory_used_bytes == 4_194_304 * 1024
-        assert r.cni_memory_used_bytes == 64 * 1024 * 1024
-    client.list_pods_by_selector_on_node.assert_called()
-    args = client.list_pods_by_selector_on_node.call_args
-    assert args.args[0] == "k8s-app=cilium"
-    assert args.args[1] == "kube-system"
-    assert args.args[2] == "kmain08"
-
-
-def test_cni_memory_skipped_when_disabled(monkeypatch):
-    monkeypatch.setattr(runner_module, "SAMPLE_INTERVAL_S", 0.001)
-
-    node_pair = NodePair(source="kmain07", target="kmain08", hardware_class="10g")
-    config = BenchmarkConfig(duration=1, iterations=1)
-
-    logs = {"iperf3-client-kmain07-p5201": _fake_iperf_json(1e9)}
-    client = _make_client(logs)
-    client.logs.side_effect = _slow_logs(0.05, logs, client)
-    client.top_node.return_value = {"cpu": "1000m", "memory": "1048576Ki"}
-
-    runner = BenchmarkRunner(node_pair, config, client=client, cni=_cni_disabled())
-    iteration_results = runner.run()
-
-    assert len(iteration_results.bench) == 2
-    for r in iteration_results.bench:
-        assert r.node_memory_used_bytes == 1_048_576 * 1024
-        assert r.cni_memory_used_bytes is None
-    assert client.list_pods_by_selector_on_node.call_count == 0
 
 
 def test_substages_run_sequentially_in_order():

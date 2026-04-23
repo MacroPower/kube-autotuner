@@ -39,7 +39,6 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import logging
-import queue
 import threading
 from typing import TYPE_CHECKING, Literal, TypeVar, cast
 
@@ -54,10 +53,10 @@ from kube_autotuner.benchmark.fortio_parser import (
     parse_fortio_json,
 )
 from kube_autotuner.benchmark.fortio_server_spec import build_fortio_server_yaml
-from kube_autotuner.benchmark.parser import parse_iperf_json, parse_k8s_memory
+from kube_autotuner.benchmark.parser import parse_iperf_json
 from kube_autotuner.benchmark.patch import apply_patches
 from kube_autotuner.benchmark.server_spec import build_server_yaml
-from kube_autotuner.experiment import CniSection, FortioSection, IperfSection
+from kube_autotuner.experiment import FortioSection, IperfSection
 from kube_autotuner.k8s.client import (
     JobFailedConditionError,
     K8sApiError,
@@ -89,20 +88,18 @@ FORTIO_CLIENT_LABEL = "app.kubernetes.io/name=fortio-client"
 FORTIO_SERVER_LABEL = "app.kubernetes.io/name=fortio-server"
 _IPERF_BASE_PORT = 5201
 _CLIENT_WAIT_TIMEOUT_SECONDS = 180
-SAMPLE_INTERVAL_S = 5.0
 
 
 class BenchmarkRunner:
     """Orchestrates iperf3 server/client lifecycle via the Kubernetes API."""
 
-    def __init__(  # noqa: PLR0913
+    def __init__(
         self,
         node_pair: NodePair,
         config: BenchmarkConfig,
         client: K8sClient | None = None,
         iperf_args: IperfSection | None = None,
         patches: list[Patch] | None = None,
-        cni: CniSection | None = None,
         *,
         fortio_args: FortioSection | None = None,
         observer: ProgressObserver | None = None,
@@ -120,8 +117,6 @@ class BenchmarkRunner:
             patches: Optional kustomize patches applied to every rendered
                 manifest (server Deployment/Service and every client
                 Job) via :func:`kube_autotuner.benchmark.patch.apply_patches`.
-            cni: Selector for CNI pods to track on the target node. When
-                ``enabled`` is ``False``, CNI sampling is skipped.
             fortio_args: Optional fortio per-role ``extra_args`` plus
                 ``fixed_qps`` / ``connections`` / ``duration`` for the
                 latency sub-stages.
@@ -135,7 +130,6 @@ class BenchmarkRunner:
         self.iperf_args = iperf_args or IperfSection()
         self.fortio_args = fortio_args or FortioSection()
         self.patches = patches or []
-        self.cni = cni or CniSection()
         self.observer: ProgressObserver = observer or NullObserver()
         self._server_name = f"iperf3-server-{node_pair.target}"
         self._fortio_server_name = f"fortio-server-{node_pair.target}"
@@ -482,88 +476,13 @@ class BenchmarkRunner:
             diag,
         )
 
-    def _sum_cni_memory(self, target: str) -> int | None:
-        """Return summed CNI-pod memory on ``target``, or ``None`` when empty.
-
-        Args:
-            target: Node name whose CNI pods are totalled.
-
-        Returns:
-            Total memory in bytes across every container of every CNI
-            pod on ``target``, or ``None`` when no container produced a
-            reading.
-        """
-        pods = self.client.list_pods_by_selector_on_node(
-            self.cni.label_selector,
-            self.cni.namespace,
-            target,
-        )
-        total = 0
-        saw_any = False
-        for pod in pods:
-            for r in self.client.top_pod_containers(pod, self.cni.namespace):
-                m = r.get("memory")
-                if m:
-                    total += parse_k8s_memory(m)
-                    saw_any = True
-        return total if saw_any else None
-
-    def _sample_resources_loop(
-        self,
-        stop: threading.Event,
-        sink: queue.Queue[dict[str, int]],
-    ) -> None:
-        """Poll metrics-server for node and CNI memory until ``stop`` is set.
-
-        On every tick the loop polls:
-
-        * Whole-node memory on ``self.node_pair.target`` via
-          :meth:`K8sClient.top_node`.
-        * When ``self.cni.enabled``, memory summed across the CNI pods
-          on the target node matching ``self.cni.label_selector`` in
-          ``self.cni.namespace``.
-
-        Empty rows (no scrape yet) are silently skipped; poisoning the
-        peak with ``0`` would be wrong. The loop body catches
-        :class:`Exception` broadly and logs at ``warning``: this is a
-        daemon thread, and an uncaught exception would terminate it
-        silently and leave the operator with no sampling.
-
-        Args:
-            stop: Event signalling shutdown. The loop blocks on
-                ``stop.wait(SAMPLE_INTERVAL_S)`` so shutdown is prompt.
-            sink: Thread-safe queue receiving one dict per successful
-                poll. Keys are a subset of ``{"node", "cni"}``.
-        """
-        target = self.node_pair.target
-        while not stop.is_set():
-            sample: dict[str, int] = {}
-            try:
-                node_mem = self.client.top_node(target).get("memory")
-                if node_mem:
-                    sample["node"] = parse_k8s_memory(node_mem)
-                if self.cni.enabled:
-                    cni_total = self._sum_cni_memory(target)
-                    if cni_total is not None:
-                        sample["cni"] = cni_total
-            except Exception:
-                logger.warning(
-                    "Resource sampler poll failed; continuing",
-                    exc_info=True,
-                )
-            if sample:
-                sink.put(sample)
-            stop.wait(SAMPLE_INTERVAL_S)
-
-    def run(self) -> IterationResults:  # noqa: PLR0912, PLR0915
+    def run(self) -> IterationResults:
         """Run every configured benchmark iteration.
 
         Each iteration expands into four sub-stages executed
         sequentially so fortio never contends with iperf3 for NIC,
         CPU, or CNI state: ``bw-tcp`` -> ``bw-udp`` -> ``fortio-sat``
-        -> ``fortio-fixed``. The resource sampler straddles the whole
-        iteration so peak node and CNI memory reflect every sub-stage
-        rather than any one phase.
+        -> ``fortio-fixed``.
 
         Fires :meth:`ProgressObserver.on_benchmark_start` once up
         front with the trial-wide iteration budget
@@ -573,9 +492,7 @@ class BenchmarkRunner:
         Returns:
             An :class:`IterationResults` holding every
             :class:`BenchmarkResult` and :class:`LatencyResult`
-            produced across iterations, tagged with the peak node and
-            CNI memory observed during each iteration when sampling
-            produced any data.
+            produced across iterations.
         """
         self.observer.on_benchmark_start(self.config.iterations)
         all_bench: list[BenchmarkResult] = []
@@ -589,15 +506,6 @@ class BenchmarkRunner:
                 self.node_pair.target,
             )
             self.observer.on_iteration_start(i)
-            stop = threading.Event()
-            sink: queue.Queue[dict[str, int]] = queue.Queue()
-            sampler = threading.Thread(
-                target=self._sample_resources_loop,
-                args=(stop, sink),
-                name=f"mem-sampler-{i}",
-                daemon=True,
-            )
-            sampler.start()
             bench_tcp: list[BenchmarkResult] = []
             bench_udp: list[BenchmarkResult] = []
             sat: list[LatencyResult] = []
@@ -624,34 +532,9 @@ class BenchmarkRunner:
                 finally:
                     self.observer.on_stage_end("fortio-fixed", i)
             finally:
-                stop.set()
-                sampler.join(timeout=SAMPLE_INTERVAL_S * 2)
                 self.observer.on_iteration_end(i)
-            samples: list[dict[str, int]] = []
-            while True:
-                try:
-                    samples.append(sink.get_nowait())
-                except queue.Empty:
-                    break
-            peaks: dict[str, int] = {}
-            for sample in samples:
-                for k, v in sample.items():
-                    cur = peaks.get(k)
-                    peaks[k] = v if cur is None else max(cur, v)
-            bench = [*bench_tcp, *bench_udp]
-            for r in bench:
-                if "node" in peaks:
-                    r.node_memory_used_bytes = peaks["node"]
-                if "cni" in peaks:
-                    r.cni_memory_used_bytes = peaks["cni"]
-            latency_records = [*sat, *fixed]
-            for lr in latency_records:
-                if "node" in peaks:
-                    lr.node_memory_used_bytes = peaks["node"]
-                if "cni" in peaks:
-                    lr.cni_memory_used_bytes = peaks["cni"]
-            all_bench.extend(bench)
-            all_latency.extend(latency_records)
+            all_bench.extend([*bench_tcp, *bench_udp])
+            all_latency.extend([*sat, *fixed])
         return IterationResults(bench=all_bench, latency=all_latency)
 
     def _run_bandwidth_stage(

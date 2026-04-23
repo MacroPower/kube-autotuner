@@ -83,7 +83,7 @@ def test_null_observer_is_protocol_compliant() -> None:
         active.on_trial_complete(
             0,
             _stub_trial("sobol"),
-            {"tcp_throughput": (9_400_000_000.0, 1e6), "cpu": (42.0, 0.5)},
+            {"tcp_throughput": (9_400_000_000.0, 1e6), "udp_jitter": (0.05, 0.01)},
         )
         active.on_trial_failed(1, RuntimeError("boom"))
 
@@ -101,7 +101,6 @@ def test_rich_observer_renders_bars_and_table() -> None:
             _stub_trial("sobol"),
             {
                 "tcp_throughput": (9_412_000_000.0, 1e7),
-                "cpu": (42.1, 0.4),
                 "tcp_retransmit_rate": (1.2e-7, 1e-9),
                 "udp_jitter": (0.000128, 1e-5),
             },
@@ -111,7 +110,6 @@ def test_rich_observer_renders_bars_and_table() -> None:
             _stub_trial("bayesian"),
             {
                 "tcp_throughput": (9_188_000_000.0, 1e7),
-                "cpu": (38.4, 0.3),
                 "tcp_retransmit_rate": (float("nan"), float("nan")),
                 "udp_jitter": (float("nan"), float("nan")),
             },
@@ -173,7 +171,7 @@ def test_rich_observer_handles_missing_metrics() -> None:
     assert math.isnan(observer._top[0].retx_per_mb)
 
 
-def _prior_trial(bps: float, *, mem: int | None = 500_000_000) -> Any:
+def _prior_trial(bps: float) -> Any:
     from datetime import UTC, datetime  # noqa: PLC0415
 
     from kube_autotuner.models import (  # noqa: PLC0415
@@ -194,8 +192,6 @@ def _prior_trial(bps: float, *, mem: int | None = 500_000_000) -> Any:
                 bits_per_second=bps,
                 retransmits=5,
                 bytes_sent=1_000_000_000,
-                cpu_utilization_percent=10.0,
-                node_memory_used_bytes=mem,
                 iteration=0,
             ),
         ],
@@ -280,7 +276,6 @@ def test_rich_observer_tracks_top_n() -> None:
                 _stub_trial("bayesian"),
                 {
                     "tcp_throughput": (tp * 1e9, 0.0),
-                    "cpu": (10.0, 0.0),
                     "tcp_retransmit_rate": (0.0, 0.0),
                 },
             )
@@ -697,14 +692,12 @@ def _score_row_complete(  # noqa: PLR0913 - keyword-only metric bundle
     index: int,
     phase: str = "bayesian",
     throughput: float,
-    cpu: float = 50.0,
-    node_memory: float = 1e9,
     tcp_retransmit_rate: float = 1e-8,
+    udp_jitter: float = 0.1,
     rps: float = 1000.0,
     latency_p50: float = 1.0,
     latency_p90: float = 2.0,
     latency_p99: float = 4.0,
-    cni_memory: float = 1e8,
 ) -> None:
     """Drive ``observer.on_trial_complete`` with a full metric bundle."""
     observer.on_trial_complete(
@@ -712,10 +705,8 @@ def _score_row_complete(  # noqa: PLR0913 - keyword-only metric bundle
         _stub_trial(phase, trial_id=f"trial-{index:02d}"),
         {
             "tcp_throughput": (throughput, 0.0),
-            "cpu": (cpu, 0.0),
-            "node_memory": (node_memory, 0.0),
-            "cni_memory": (cni_memory, 0.0),
             "tcp_retransmit_rate": (tcp_retransmit_rate, 0.0),
+            "udp_jitter": (udp_jitter, 0.0),
             "rps": (rps, 0.0),
             "latency_p50": (latency_p50, 0.0),
             "latency_p90": (latency_p90, 0.0),
@@ -738,7 +729,6 @@ def test_top5_ranks_by_score_when_objectives_provided() -> None:
         observer,
         index=0,
         throughput=1.01e9,
-        cpu=50.0,
         rps=1000.0,
         latency_p90=5.0,
         latency_p99=10.0,
@@ -747,7 +737,6 @@ def test_top5_ranks_by_score_when_objectives_provided() -> None:
         observer,
         index=1,
         throughput=1.00e9,
-        cpu=50.0,
         rps=1050.0,
         latency_p90=2.0,
         latency_p99=4.0,
@@ -771,7 +760,6 @@ def test_top5_holds_every_completed_trial_for_rerank() -> None:
             observer,
             index=i,
             throughput=(1.0 + 0.01 * i) * 1e9,
-            cpu=50.0,
             latency_p99=10.0 - i,
         )
         assert len(observer._all_rows) == i + 1
@@ -826,8 +814,6 @@ def test_top5_handles_nan_metrics() -> None:
         _stub_trial("bayesian"),
         {
             "tcp_throughput": (2.0e9, 0.0),
-            "cpu": (50.0, 0.0),
-            "node_memory": (1e9, 0.0),
             "tcp_retransmit_rate": (math.nan, math.nan),
             "rps": (math.nan, math.nan),
             "latency_p50": (math.nan, math.nan),
@@ -852,7 +838,6 @@ def test_top5_fallback_sorts_by_throughput_when_objectives_none() -> None:
                 _stub_trial("bayesian"),
                 {
                     "tcp_throughput": (tp * 1e9, 0.0),
-                    "cpu": (10.0, 0.0),
                     "tcp_retransmit_rate": (0.0, 0.0),
                 },
             )

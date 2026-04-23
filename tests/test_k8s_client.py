@@ -41,53 +41,6 @@ def _api_exception(status: int, reason: str, message: str = "") -> ApiException:
     return exc
 
 
-# ---- top_pod_containers / top_pod -------------------------------------
-
-
-def test_top_pod_containers_returns_per_container_rows():
-    c = _client_with_mocks()
-    c.custom_objects.get_namespaced_custom_object.return_value = {
-        "containers": [
-            {"name": "srv-1", "usage": {"cpu": "10m", "memory": "50Mi"}},
-            {"name": "srv-2", "usage": {"cpu": "20m", "memory": "30Mi"}},
-        ],
-    }
-    rows = c.top_pod_containers("pod-x", "default")
-    assert rows == [
-        {"container": "srv-1", "cpu": "10m", "memory": "50Mi"},
-        {"container": "srv-2", "cpu": "20m", "memory": "30Mi"},
-    ]
-
-
-def test_top_pod_containers_empty_on_metrics_404():
-    c = _client_with_mocks()
-    c.custom_objects.get_namespaced_custom_object.side_effect = _api_exception(
-        404, "NotFound"
-    )
-    assert c.top_pod_containers("pod-x", "default") == []
-
-
-def test_top_pod_sums_across_containers_and_resuffixes():
-    c = _client_with_mocks()
-    c.custom_objects.get_namespaced_custom_object.return_value = {
-        "containers": [
-            {"name": "a", "usage": {"cpu": "100m", "memory": "1024Ki"}},
-            {"name": "b", "usage": {"cpu": "250m", "memory": "1Mi"}},
-        ],
-    }
-    result = c.top_pod("pod-x", "default")
-    # 100m + 250m = 350m; memory 1024Ki + 1Mi = 1024 + 1024 = 2048 Ki.
-    assert result == {"cpu": "350m", "memory": "2048Ki"}
-
-
-def test_top_pod_empty_on_404():
-    c = _client_with_mocks()
-    c.custom_objects.get_namespaced_custom_object.side_effect = _api_exception(
-        404, "NotFound"
-    )
-    assert c.top_pod("pod-x", "default") == {}
-
-
 # ---- get_pod_name / node lookups --------------------------------------
 
 

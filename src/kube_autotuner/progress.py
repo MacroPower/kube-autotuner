@@ -383,11 +383,9 @@ class _TrialRow:
     """One row of the live "best so far" table."""
 
     __slots__ = (
-        "cpu",
         "index",
         "jitter_seconds",
         "metrics",
-        "node_memory_mib",
         "p99_seconds",
         "parent_trial_id",
         "phase",
@@ -405,11 +403,9 @@ class _TrialRow:
         trial_id: str,
         parent_trial_id: str | None,
         throughput_mbps: float,
-        cpu: float,
         retx_per_mb: float,
         jitter_seconds: float,
         rps: float,
-        node_memory_mib: float,
         p99_seconds: float,
         metrics: dict[str, float],
     ) -> None:
@@ -425,7 +421,6 @@ class _TrialRow:
             parent_trial_id: The primary trial's ``trial_id`` when
                 ``phase == "verification"``; ``None`` otherwise.
             throughput_mbps: Mean throughput in megabits-per-second.
-            cpu: Mean target-node CPU utilization, 0-100.
             retx_per_mb: Retransmits per megabyte; ``NaN`` when the
                 trial produced no TCP bytes (every ``bw-tcp`` stage
                 failed).
@@ -436,8 +431,6 @@ class _TrialRow:
             rps: Mean requests-per-second from the fortio saturation
                 sub-stage; ``NaN`` when the trial produced no
                 saturation records.
-            node_memory_mib: Mean target-node memory usage in MiB;
-                ``NaN`` when the trial produced no memory samples.
             p99_seconds: Fixed-QPS p99 latency in seconds; ``NaN``
                 when the trial produced no fortio records. Stored
                 in native seconds so the live-table unit can be
@@ -445,7 +438,7 @@ class _TrialRow:
             metrics: Raw-domain per-metric means keyed by the
                 :data:`kube_autotuner.scoring.METRIC_TO_DF_COLUMN`
                 DataFrame column name (``mean_tcp_throughput``,
-                ``mean_cpu``, ...). Fed to
+                ``mean_udp_throughput``, ...). Fed to
                 :func:`kube_autotuner.scoring.score_rows` for the
                 live top-N ranking, which min-max normalizes across
                 every stored row on each refresh. Stores ``NaN`` for
@@ -456,16 +449,14 @@ class _TrialRow:
         self.trial_id = trial_id
         self.parent_trial_id = parent_trial_id
         self.throughput_mbps = throughput_mbps
-        self.cpu = cpu
         self.retx_per_mb = retx_per_mb
         self.jitter_seconds = jitter_seconds
         self.rps = rps
-        self.node_memory_mib = node_memory_mib
         self.p99_seconds = p99_seconds
         self.metrics = metrics
 
 
-def _build_trial_row(  # noqa: PLR0914 one-pass projection over the full metric bundle
+def _build_trial_row(
     index: int,
     phase: str,
     metrics: Mapping[str, tuple[float, float]],
@@ -477,18 +468,12 @@ def _build_trial_row(  # noqa: PLR0914 one-pass projection over the full metric 
 
     Handles two concerns in one pass:
 
-    * derives the display-domain floats (Mbps / MiB / retx/MB) for
-      the rendered table, and
+    * derives the display-domain floats (Mbps / retx/MB) for the
+      rendered table, and
     * captures the full raw-domain metric bundle keyed by
       :data:`kube_autotuner.scoring.METRIC_TO_DF_COLUMN` so
       :func:`kube_autotuner.scoring.score_rows` can min-max normalize
       across every metric the user's objectives reference.
-
-    Without the raw bundle, metrics not surfaced by the display
-    (``cni_memory``, ``rps``, ``latency_p50`` / ``p90`` / ``p99``)
-    would be NaN across every row and collapse to the
-    degenerate-column fallback, making the live ranking diverge
-    from :func:`kube_autotuner.analysis.recommend_configs`.
 
     Args:
         index: Zero-based trial index within this run.
@@ -502,32 +487,24 @@ def _build_trial_row(  # noqa: PLR0914 one-pass projection over the full metric 
         A :class:`_TrialRow` ready to append to ``_all_rows``.
     """
     tp_pair = metrics.get("tcp_throughput")
-    cpu_pair = metrics.get("cpu")
     rate_pair = metrics.get("tcp_retransmit_rate")
     jitter_pair = metrics.get("udp_jitter")
     rps_pair = metrics.get("rps")
-    nmem_pair = metrics.get("node_memory")
     p99_pair = metrics.get("latency_p99")
     tp = (tp_pair[0] if tp_pair is not None else 0.0) / 1e6
-    cpu = cpu_pair[0] if cpu_pair is not None else 0.0
     rate = rate_pair[0] if rate_pair is not None else math.nan
     retx_per_mb = math.nan if math.isnan(rate) else rate * 1e6
     jitter_seconds = jitter_pair[0] if jitter_pair is not None else math.nan
     rps = rps_pair[0] if rps_pair is not None else math.nan
-    nmem_bytes = nmem_pair[0] if nmem_pair is not None else math.nan
-    node_memory_mib = math.nan if math.isnan(nmem_bytes) else nmem_bytes / (1024 * 1024)
     p99_seconds = p99_pair[0] if p99_pair is not None else math.nan
     raw_metrics: dict[str, float] = {
         METRIC_TO_DF_COLUMN[key]: (pair[0] if pair is not None else math.nan)
         for key, pair in (
             ("tcp_throughput", tp_pair),
             ("udp_throughput", metrics.get("udp_throughput")),
-            ("cpu", cpu_pair),
             ("tcp_retransmit_rate", rate_pair),
             ("udp_loss_rate", metrics.get("udp_loss_rate")),
             ("udp_jitter", jitter_pair),
-            ("node_memory", nmem_pair),
-            ("cni_memory", metrics.get("cni_memory")),
             ("rps", rps_pair),
             ("latency_p50", metrics.get("latency_p50")),
             ("latency_p90", metrics.get("latency_p90")),
@@ -540,11 +517,9 @@ def _build_trial_row(  # noqa: PLR0914 one-pass projection over the full metric 
         trial_id=trial_id,
         parent_trial_id=parent_trial_id,
         throughput_mbps=tp,
-        cpu=cpu,
         retx_per_mb=retx_per_mb,
         jitter_seconds=jitter_seconds,
         rps=rps,
-        node_memory_mib=node_memory_mib,
         p99_seconds=p99_seconds,
         metrics=raw_metrics,
     )
@@ -771,11 +746,9 @@ class RichProgressObserver:
         table.add_column("#", justify="right", no_wrap=True)
         table.add_column("Phase", no_wrap=True)
         table.add_column("Throughput", justify="right")
-        table.add_column("CPU", justify="right")
         table.add_column("retx/MB", justify="right")
         table.add_column(f"jitter {jitter_suffix}", justify="right")
         table.add_column("RPS", justify="right")
-        table.add_column("node mem", justify="right")
         table.add_column(f"p99 {p99_suffix}", justify="right")
         for row in self._top:
             retx = "n/a" if math.isnan(row.retx_per_mb) else f"{row.retx_per_mb:.2f}"
@@ -785,11 +758,6 @@ class RichProgressObserver:
                 else format_coefficient(row.jitter_seconds / jitter_scale)
             )
             rps = "n/a" if math.isnan(row.rps) else f"{row.rps:,.1f}"
-            nmem = (
-                "n/a"
-                if math.isnan(row.node_memory_mib)
-                else f"{row.node_memory_mib:,.0f} MiB"
-            )
             p99 = (
                 "n/a"
                 if math.isnan(row.p99_seconds)
@@ -799,11 +767,9 @@ class RichProgressObserver:
                 str(row.index + 1),
                 row.phase,
                 f"{row.throughput_mbps:,.1f} Mbps",
-                f"{row.cpu:.1f}%",
                 retx,
                 jitter,
                 rps,
-                nmem,
                 p99,
             )
         return Group(self._progress, table)

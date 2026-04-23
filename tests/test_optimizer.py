@@ -48,9 +48,6 @@ def _make_results(n: int = 3) -> list[BenchmarkResult]:
             bits_per_second=9_000_000_000 + i * 100_000,
             retransmits=5 + i,
             bytes_sent=1_000_000_000,
-            cpu_utilization_percent=30.0 + i,
-            node_memory_used_bytes=100_000_000,
-            cni_memory_used_bytes=10_000_000,
             client_node="kmain07",
             iteration=i,
         )
@@ -429,7 +426,6 @@ class TestAggregateByIteration:
                 mode="tcp",
                 bits_per_second=1e9,
                 retransmits=1,
-                cpu_utilization_percent=10.0,
                 client_node="c1",
                 iteration=0,
             ),
@@ -438,7 +434,6 @@ class TestAggregateByIteration:
                 mode="tcp",
                 bits_per_second=2e9,
                 retransmits=2,
-                cpu_utilization_percent=20.0,
                 client_node="c1",
                 iteration=1,
             ),
@@ -457,7 +452,6 @@ class TestAggregateByIteration:
                 mode="tcp",
                 bits_per_second=bps,
                 retransmits=1,
-                cpu_utilization_percent=10.0,
                 client_node=client,
                 iteration=itr,
             )
@@ -484,7 +478,6 @@ class TestIterationsOneSEMFallback:
                 mode="tcp",
                 bits_per_second=bps,
                 retransmits=1,
-                cpu_utilization_percent=10.0,
                 client_node=client,
                 iteration=0,
             )
@@ -499,21 +492,18 @@ class TestBuildAxObjective:
     def test_default_section(self) -> None:
         objective, constraints = build_ax_objective(ObjectivesSection())
         assert objective == (
-            "tcp_throughput, udp_throughput, -cpu, -tcp_retransmit_rate, "
-            "-udp_loss_rate, -udp_jitter, -node_memory, -cni_memory, rps, "
+            "tcp_throughput, udp_throughput, -tcp_retransmit_rate, "
+            "-udp_loss_rate, -udp_jitter, rps, "
             "-latency_p50, -latency_p90, -latency_p99"
         )
         assert constraints == [
             "tcp_throughput >= 1000000",
             "udp_throughput >= 1000000",
-            "cpu <= 200",
             "tcp_retransmit_rate <= 1e-06",
             "udp_loss_rate <= 0.05",
-            "node_memory <= 10000000000",
             "rps >= 100",
             "latency_p99 <= 1",
             "udp_jitter <= 0.01",
-            "cni_memory <= 1000000000",
             "latency_p50 <= 0.1",
             "latency_p90 <= 0.5",
         ]
@@ -522,25 +512,14 @@ class TestBuildAxObjective:
         section = ObjectivesSection(
             pareto=[
                 ParetoObjective(metric="tcp_throughput", direction="maximize"),
-                ParetoObjective(metric="node_memory", direction="minimize"),
+                ParetoObjective(metric="udp_jitter", direction="minimize"),
             ],
             constraints=["tcp_throughput >= 1e6"],
-            recommendation_weights={"node_memory": 0.5},
+            recommendation_weights={"udp_jitter": 0.5},
         )
         objective, constraints = build_ax_objective(section)
-        assert objective == "tcp_throughput, -node_memory"
+        assert objective == "tcp_throughput, -udp_jitter"
         assert constraints == ["tcp_throughput >= 1000000"]
-
-
-class TestComputeMetricsMemory:
-    def test_node_and_cni_keys_present(self) -> None:
-        results = _make_results(2)
-        metrics = _compute_metrics(_trial_from(results))
-        assert "node_memory" in metrics
-        assert "cni_memory" in metrics
-        assert "memory" not in metrics
-        assert metrics["node_memory"][0] == pytest.approx(100_000_000)
-        assert metrics["cni_memory"][0] == pytest.approx(10_000_000)
 
 
 class TestComputeMetricsJitter:
@@ -552,14 +531,12 @@ class TestComputeMetricsJitter:
                 bits_per_second=1e9,
                 retransmits=0,
                 bytes_sent=1_000_000_000,
-                cpu_utilization_percent=10.0,
                 iteration=0,
             ),
             BenchmarkResult(
                 timestamp=datetime.now(UTC),
                 mode="udp",
                 bits_per_second=1e9,
-                cpu_utilization_percent=99.0,
                 jitter=0.0002,
                 iteration=0,
             ),
@@ -567,7 +544,6 @@ class TestComputeMetricsJitter:
                 timestamp=datetime.now(UTC),
                 mode="udp",
                 bits_per_second=1e9,
-                cpu_utilization_percent=99.0,
                 jitter=0.0004,
                 iteration=1,
             ),
@@ -584,7 +560,6 @@ class TestComputeMetricsJitter:
                 bits_per_second=1e9,
                 retransmits=0,
                 bytes_sent=1_000_000_000,
-                cpu_utilization_percent=10.0,
                 iteration=0,
             ),
         ]
@@ -601,7 +576,6 @@ class TestComputeMetricsRate:
                 bits_per_second=1e9,
                 retransmits=None,
                 bytes_sent=None,
-                cpu_utilization_percent=10.0,
                 iteration=0,
             ),
         ]
@@ -616,7 +590,6 @@ class TestComputeMetricsRate:
                 bits_per_second=1e9,
                 retransmits=0,
                 bytes_sent=1_000_000_000,
-                cpu_utilization_percent=10.0,
                 iteration=0,
             ),
         ]
@@ -636,7 +609,6 @@ class TestComputeMetricsUdp:
                 bits_per_second=1e9,
                 packets=packets,
                 lost_packets=100,  # iter 0: 1% loss
-                cpu_utilization_percent=15.0,
                 iteration=0,
             ),
             BenchmarkResult(
@@ -645,7 +617,6 @@ class TestComputeMetricsUdp:
                 bits_per_second=3e9,
                 packets=packets,
                 lost_packets=500,  # iter 1: 5% loss
-                cpu_utilization_percent=15.0,
                 iteration=1,
             ),
         ]
@@ -666,7 +637,6 @@ class TestComputeMetricsUdp:
                 bits_per_second=1e9,
                 retransmits=0,
                 bytes_sent=1_000_000_000,
-                cpu_utilization_percent=10.0,
                 iteration=0,
             ),
         ]
@@ -780,7 +750,6 @@ class TestSeedPriorTrials:
                     bits_per_second=bps,
                     retransmits=None if rate_nan else 5,
                     bytes_sent=None if rate_nan else 1_000_000_000,
-                    cpu_utilization_percent=10.0,
                     iteration=0,
                 ),
             ],
@@ -1017,7 +986,7 @@ class TestSeedPriorTrials:
 
 
 class TestComputeMetricsTcpFilter:
-    """_compute_metrics must aggregate throughput / cpu over TCP only."""
+    """_compute_metrics must aggregate throughput over TCP only."""
 
     def test_mixed_mode_trial_aggregates_tcp_records(self) -> None:
         tcp_results = [
@@ -1027,7 +996,6 @@ class TestComputeMetricsTcpFilter:
                 bits_per_second=1e9,
                 retransmits=0,
                 bytes_sent=1_000_000_000,
-                cpu_utilization_percent=10.0,
                 iteration=0,
             ),
             BenchmarkResult(
@@ -1036,7 +1004,6 @@ class TestComputeMetricsTcpFilter:
                 bits_per_second=3e9,
                 retransmits=0,
                 bytes_sent=1_000_000_000,
-                cpu_utilization_percent=20.0,
                 iteration=1,
             ),
         ]
@@ -1045,7 +1012,6 @@ class TestComputeMetricsTcpFilter:
                 timestamp=datetime.now(UTC),
                 mode="udp",
                 bits_per_second=9e9,
-                cpu_utilization_percent=99.0,
                 jitter=0.0001,
                 iteration=0,
             ),
@@ -1053,7 +1019,6 @@ class TestComputeMetricsTcpFilter:
                 timestamp=datetime.now(UTC),
                 mode="udp",
                 bits_per_second=9e9,
-                cpu_utilization_percent=99.0,
                 jitter=0.0002,
                 iteration=1,
             ),
@@ -1061,8 +1026,6 @@ class TestComputeMetricsTcpFilter:
         metrics = _compute_metrics(_trial_from([*tcp_results, *udp_results]))
         # Throughput: TCP-only mean of 1e9 and 3e9.
         assert metrics["tcp_throughput"][0] == pytest.approx(2e9)
-        # CPU: TCP-only mean of 10 and 20.
-        assert metrics["cpu"][0] == pytest.approx(15.0)
 
     def test_single_iteration_multi_tcp_client_uses_tcp_sem(self) -> None:
         """SEM fallback must base both the gate and the sample on TCP records."""
@@ -1073,7 +1036,6 @@ class TestComputeMetricsTcpFilter:
                 bits_per_second=4e9,
                 retransmits=0,
                 bytes_sent=1_000_000_000,
-                cpu_utilization_percent=10.0,
                 client_node="c1",
                 iteration=0,
             ),
@@ -1083,7 +1045,6 @@ class TestComputeMetricsTcpFilter:
                 bits_per_second=6e9,
                 retransmits=0,
                 bytes_sent=1_000_000_000,
-                cpu_utilization_percent=20.0,
                 client_node="c2",
                 iteration=0,
             ),
@@ -1093,7 +1054,6 @@ class TestComputeMetricsTcpFilter:
                 timestamp=datetime.now(UTC),
                 mode="udp",
                 bits_per_second=9e9,
-                cpu_utilization_percent=99.0,
                 jitter=0.0001,
                 client_node="c1",
                 iteration=0,
@@ -1136,7 +1096,6 @@ class TestWarnOnCollapsedObjectives:
                     bits_per_second=bps,
                     retransmits=retransmits,
                     bytes_sent=1_000_000_000,
-                    cpu_utilization_percent=10.0,
                     iteration=0,
                 ),
             ],

@@ -1,52 +1,15 @@
-"""Parsers for iperf3 JSON output and Kubernetes memory strings."""
+"""Parser for iperf3 JSON output."""
 
 from __future__ import annotations
 
 from datetime import UTC, datetime
-import re
 from typing import Any, Literal
 
 from kube_autotuner.benchmark.errors import ResultValidationError
 from kube_autotuner.models import BenchmarkResult
 
-_K8S_MEM_RE = re.compile(r"^(\d+)(Ki|Mi|Gi|Ti|k|M|G|T)?$")
-_K8S_MEM_MULTIPLIERS: dict[str | None, int] = {
-    None: 1,
-    "Ki": 1024,
-    "Mi": 1024**2,
-    "Gi": 1024**3,
-    "Ti": 1024**4,
-    "k": 1000,
-    "M": 1_000_000,
-    "G": 1_000_000_000,
-    "T": 1_000_000_000_000,
-}
 
-
-def parse_k8s_memory(mem_str: str) -> int:
-    """Parse a Kubernetes memory string (e.g. ``"45Mi"``) to bytes.
-
-    Args:
-        mem_str: Memory string with optional IEC (``Ki``/``Mi``/``Gi``/
-            ``Ti``) or SI (``k``/``M``/``G``/``T``) suffix. Bare integers
-            are returned as-is.
-
-    Returns:
-        The decoded byte count.
-
-    Raises:
-        ValueError: When the string does not match the expected format.
-    """
-    m = _K8S_MEM_RE.match(mem_str.strip())
-    if not m:
-        msg = f"Cannot parse memory string: {mem_str!r}"
-        raise ValueError(msg)
-    value = int(m.group(1))
-    suffix = m.group(2)
-    return value * _K8S_MEM_MULTIPLIERS[suffix]
-
-
-def parse_iperf_json(  # noqa: PLR0914, PLR0915 - linear sanity-check ladder, no branching
+def parse_iperf_json(  # noqa: PLR0915 - linear sanity-check ladder, no branching
     raw: dict[str, Any],
     mode: Literal["tcp", "udp"],
     client_node: str = "",
@@ -127,10 +90,6 @@ def parse_iperf_json(  # noqa: PLR0914, PLR0915 - linear sanity-check ladder, no
             msg = "iperf3 UDP produced zero packets and zero bits_per_second"
             raise ResultValidationError(msg)
 
-    cpu = end.get("cpu_utilization_percent", {})
-    cpu_pct = cpu.get("host_total", 0.0)
-    cpu_server = cpu.get("remote_total")
-
     ts_str = raw.get("start", {}).get("timestamp", {}).get("timesecs")
     if ts_str is not None:
         timestamp = datetime.fromtimestamp(ts_str, tz=UTC)
@@ -143,8 +102,6 @@ def parse_iperf_json(  # noqa: PLR0914, PLR0915 - linear sanity-check ladder, no
         bits_per_second=bits_per_second,
         retransmits=retransmits,
         bytes_sent=bytes_sent,
-        cpu_utilization_percent=cpu_pct,
-        cpu_server_percent=cpu_server,
         jitter=jitter,
         packets=packets,
         lost_packets=lost_packets,

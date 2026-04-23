@@ -279,20 +279,6 @@ class FortioSection(BaseModel):
     max_attempts: int = Field(default=3, ge=1)
 
 
-class CniSection(BaseModel):
-    """Selector for CNI pods to track on the target node."""
-
-    model_config = ConfigDict(
-        extra="forbid",
-        alias_generator=to_camel,
-        populate_by_name=True,
-    )
-
-    enabled: bool = True
-    namespace: str = "kube-system"
-    label_selector: str = "k8s-app=cilium"
-
-
 class NodesSection(BaseModel):
     """Source/target node topology for an experiment."""
 
@@ -337,12 +323,9 @@ class TrialSection(BaseModel):
 Metric = Literal[
     "tcp_throughput",
     "udp_throughput",
-    "cpu",
     "tcp_retransmit_rate",
     "udp_loss_rate",
     "udp_jitter",
-    "node_memory",
-    "cni_memory",
     "rps",
     "latency_p50",
     "latency_p90",
@@ -362,13 +345,11 @@ _CONSTRAINT_RE = re.compile(
 _DEFAULT_CONSTRAINTS: list[str] = [
     "tcp_throughput >= 1000000",
     "udp_throughput >= 1000000",
-    "cpu <= 200",
     "tcp_retransmit_rate <= 1e-06",
     # UDP loss rate; lost_packets / packets summed per iteration,
     # then averaged. UDP loss naturally runs higher than TCP retransmit
     # rate, so the cap is correspondingly looser.
     "udp_loss_rate <= 0.05",
-    "node_memory <= 10000000000",
     # requests/sec; only the saturation sub-stage feeds ``rps``, so
     # this floor only fails on fortio server crash (zero achieved
     # QPS). Not intended as a performance gate.
@@ -386,15 +367,12 @@ _DEFAULT_CONSTRAINTS: list[str] = [
     # ``score_rows`` min-max normalization, not Ax's hypervolume.
     # udp_jitter is in seconds; suffix form: ``"udp_jitter <= 10m"``.
     "udp_jitter <= 0.01",
-    "cni_memory <= 1000000000",
     # seconds; suffix forms: ``"latency_p50 <= 100m"``, ``"latency_p90 <= 500m"``.
     "latency_p50 <= 0.1",
     "latency_p90 <= 0.5",
 ]
 
 _DEFAULT_WEIGHTS: dict[str, float] = {
-    "cpu": 0.15,
-    "node_memory": 0.15,
     "tcp_retransmit_rate": 0.3,
     "udp_loss_rate": 0.3,
     "udp_jitter": 0.1,
@@ -444,20 +422,16 @@ def _default_pareto() -> list[ParetoObjective]:
     """Return the default Pareto objective list.
 
     Returns:
-        Twelve objectives: tcp_throughput (max), udp_throughput (max),
-        cpu (min), tcp_retransmit_rate (min), udp_loss_rate (min),
-        udp_jitter (min), node_memory (min), cni_memory (min),
+        Nine objectives: tcp_throughput (max), udp_throughput (max),
+        tcp_retransmit_rate (min), udp_loss_rate (min), udp_jitter (min),
         rps (max), latency_p50/p90/p99 (min).
     """
     return [
         ParetoObjective(metric="tcp_throughput", direction="maximize"),
         ParetoObjective(metric="udp_throughput", direction="maximize"),
-        ParetoObjective(metric="cpu", direction="minimize"),
         ParetoObjective(metric="tcp_retransmit_rate", direction="minimize"),
         ParetoObjective(metric="udp_loss_rate", direction="minimize"),
         ParetoObjective(metric="udp_jitter", direction="minimize"),
-        ParetoObjective(metric="node_memory", direction="minimize"),
-        ParetoObjective(metric="cni_memory", direction="minimize"),
         ParetoObjective(metric="rps", direction="maximize"),
         ParetoObjective(metric="latency_p50", direction="minimize"),
         ParetoObjective(metric="latency_p90", direction="minimize"),
@@ -487,15 +461,14 @@ class ObjectivesSection(BaseModel):
     score.
 
     The default weights are
-    ``{cpu: 0.15, node_memory: 0.15, tcp_retransmit_rate: 0.3,
-    udp_loss_rate: 0.3, udp_jitter: 0.1, latency_p90: 0.1,
-    latency_p99: 0.15}``; ``latency_p50`` is left unweighted so the
-    mean-latency axis enters the Pareto set without dominating the
-    recommendation score. ``udp_jitter`` (inter-arrival, seconds) is
-    weighted lightly as a tail-stability signal; ``udp_loss_rate``
-    mirrors ``tcp_retransmit_rate``'s 0.3 weight so UDP packet loss
-    pushes back on the score with the same force TCP retransmit rate
-    does.
+    ``{tcp_retransmit_rate: 0.3, udp_loss_rate: 0.3, udp_jitter: 0.1,
+    latency_p90: 0.1, latency_p99: 0.15}``; ``latency_p50`` is left
+    unweighted so the mean-latency axis enters the Pareto set without
+    dominating the recommendation score. ``udp_jitter`` (inter-arrival,
+    seconds) is weighted lightly as a tail-stability signal;
+    ``udp_loss_rate`` mirrors ``tcp_retransmit_rate``'s 0.3 weight so
+    UDP packet loss pushes back on the score with the same force TCP
+    retransmit rate does.
     """
 
     model_config = ConfigDict(
@@ -549,12 +522,9 @@ class ObjectivesSection(BaseModel):
         known = {
             "tcp_throughput",
             "udp_throughput",
-            "cpu",
             "tcp_retransmit_rate",
             "udp_loss_rate",
             "udp_jitter",
-            "node_memory",
-            "cni_memory",
             "rps",
             "latency_p50",
             "latency_p90",
@@ -593,7 +563,6 @@ class ExperimentConfig(BaseModel):
     trial: TrialSection | None = None
     iperf: IperfSection = Field(default_factory=IperfSection)
     fortio: FortioSection = Field(default_factory=FortioSection)
-    cni: CniSection = Field(default_factory=CniSection)
     patches: list[Patch] = Field(default_factory=list)
     objectives: ObjectivesSection = Field(default_factory=ObjectivesSection)
     output: str = "results.jsonl"

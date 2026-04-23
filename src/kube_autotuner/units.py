@@ -7,9 +7,6 @@ are exact up to ``2**53``, and fractional IEC coefficients are exact up
 to and including ``Ti``. Intentional divergences: no canonical
 re-emission (callers stringify for Ax, which accepts bare floats only),
 and permissive leading/trailing whitespace.
-
-See also :func:`kube_autotuner.benchmark.parser.parse_k8s_memory` for the
-int-bytes variant used by the benchmark runner for pod memory strings.
 """
 
 from __future__ import annotations

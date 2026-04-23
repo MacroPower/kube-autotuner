@@ -58,7 +58,6 @@ def _prior(
                 bits_per_second=9e9,
                 retransmits=5,
                 bytes_sent=10**9,
-                cpu_utilization_percent=20.0,
             ),
         ],
         phase=phase,  # ty: ignore[invalid-argument-type]

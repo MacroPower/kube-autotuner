@@ -27,7 +27,6 @@ from kubernetes import client as _k8s, config as _k8s_config, watch as _k8s_watc
 from kubernetes.client.exceptions import ApiException
 import yaml
 
-from kube_autotuner.benchmark.parser import parse_k8s_memory
 from kube_autotuner.units import format_duration
 
 if TYPE_CHECKING:
@@ -945,140 +944,6 @@ class K8sClient:
         rows.sort(key=operator.itemgetter("last_timestamp"), reverse=True)
         return rows[:limit]
 
-    # ---- metrics ------------------------------------------------------
-
-    def top_pod(self, name: str, namespace: str) -> dict[str, str]:
-        """Return summed CPU/memory across every container of a pod.
-
-        Args:
-            name: Pod name.
-            namespace: Target namespace.
-
-        Returns:
-            ``{"cpu": "<n>m", "memory": "<n>Ki"}`` aggregated across
-            containers, or ``{}`` when the metrics-server has no data
-            for the pod (404).
-        """
-        try:
-            resp = self.custom_objects.get_namespaced_custom_object(
-                "metrics.k8s.io",
-                "v1beta1",
-                namespace,
-                "pods",
-                name,
-            )
-        except ApiException as e:
-            if e.status == _HTTP_NOT_FOUND:
-                return {}
-            _raise(f"top pod/{name}", e)
-        containers = resp.get("containers", [])
-        if not containers:
-            return {}
-        cpu_total_milli = sum(_parse_cpu_milli(c["usage"]["cpu"]) for c in containers)
-        mem_total_bytes = sum(
-            parse_k8s_memory(c["usage"]["memory"]) for c in containers
-        )
-        return {
-            "cpu": f"{cpu_total_milli}m",
-            "memory": f"{mem_total_bytes // 1024}Ki",
-        }
-
-    def top_node(self, name: str) -> dict[str, str]:
-        """Return summed CPU/memory usage for a single node.
-
-        Args:
-            name: Node name.
-
-        Returns:
-            ``{"cpu": "<n>m", "memory": "<n>Ki"}`` sourced from
-            ``metrics.k8s.io/v1beta1 nodes/<name>``, or ``{}`` when the
-            metrics-server has no data for the node (404).
-        """
-        try:
-            resp = self.custom_objects.get_cluster_custom_object(
-                "metrics.k8s.io",
-                "v1beta1",
-                "nodes",
-                name,
-            )
-        except ApiException as e:
-            if e.status == _HTTP_NOT_FOUND:
-                return {}
-            _raise(f"top node/{name}", e)
-        usage = resp.get("usage", {})
-        cpu = usage.get("cpu")
-        mem = usage.get("memory")
-        if cpu is None or mem is None:
-            return {}
-        return {"cpu": str(cpu), "memory": str(mem)}
-
-    def list_pods_by_selector_on_node(
-        self,
-        label_selector: str,
-        namespace: str,
-        node_name: str,
-    ) -> list[str]:
-        """Return pod names matching ``label_selector`` on ``node_name``.
-
-        Merges the label and field selectors server-side so the result
-        is scoped to pods scheduled on the target node.
-
-        Args:
-            label_selector: Label selector (``"k=v"``).
-            namespace: Target namespace.
-            node_name: Node name to filter on via
-                ``spec.nodeName==<node_name>``.
-
-        Returns:
-            The pod names, in list-API order. Empty list when nothing
-            matches.
-
-        Raises:
-            K8sApiError: The list call itself failed.
-        """
-        try:
-            listing = self.core_v1.list_namespaced_pod(
-                namespace,
-                label_selector=label_selector,
-                field_selector=f"spec.nodeName={node_name}",
-            )
-        except ApiException as e:
-            _raise(f"list pods -l {label_selector} on {node_name}", e)
-        return [p.metadata.name for p in listing.items]
-
-    def top_pod_containers(self, name: str, namespace: str) -> list[dict[str, str]]:
-        """Return per-container CPU/memory usage for a pod.
-
-        Args:
-            name: Pod name.
-            namespace: Target namespace.
-
-        Returns:
-            ``[{"container": str, "cpu": str, "memory": str}]``, one row
-            per container. Values are the raw Kubernetes-suffixed strings
-            returned by metrics-server. Empty list on 404.
-        """
-        try:
-            resp = self.custom_objects.get_namespaced_custom_object(
-                "metrics.k8s.io",
-                "v1beta1",
-                namespace,
-                "pods",
-                name,
-            )
-        except ApiException as e:
-            if e.status == _HTTP_NOT_FOUND:
-                return []
-            _raise(f"top pod/{name}", e)
-        return [
-            {
-                "container": c["name"],
-                "cpu": c["usage"]["cpu"],
-                "memory": c["usage"]["memory"],
-            }
-            for c in resp.get("containers", [])
-        ]
-
     # ---- lookups ------------------------------------------------------
 
     def get_pod_name(self, label: str, namespace: str) -> str:
@@ -1386,28 +1251,3 @@ def _deployment_ready(obj: Any) -> bool:  # noqa: ANN401
         and ready == desired
         and unavailable == 0
     )
-
-
-def _parse_cpu_milli(cpu: str) -> int:
-    """Parse a Kubernetes CPU quantity into milli-CPU units.
-
-    Args:
-        cpu: Quantity string. Accepts the three forms metrics-server
-            emits: bare integer cores (``"2"``), fractional cores
-            (``"0.25"``), milli-CPU (``"250m"``), and nano-CPU
-            (``"500000000n"``).
-
-    Returns:
-        Integer milli-CPU.
-
-    Raises:
-        ValueError: The string does not match any known form.
-    """
-    s = cpu.strip()
-    if s.endswith("n"):
-        return int(s[:-1]) // 1_000_000
-    if s.endswith("u"):
-        return int(s[:-1]) // 1_000
-    if s.endswith("m"):
-        return int(s[:-1])
-    return round(float(s) * 1000)

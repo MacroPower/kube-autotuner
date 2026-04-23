@@ -52,13 +52,12 @@ def test_trial_result_auto_hash():
     assert trial.sysctl_hash == compute_sysctl_hash(trial.sysctl_values)
 
 
-def test_trial_result_mean_throughput():
+def test_trial_result_mean_tcp_throughput():
     results = [
         BenchmarkResult(
             timestamp=datetime.now(UTC),
             mode="tcp",
             bits_per_second=1_000_000_000,
-            cpu_utilization_percent=10.0,
             client_node="n1",
             iteration=0,
         ),
@@ -66,7 +65,6 @@ def test_trial_result_mean_throughput():
             timestamp=datetime.now(UTC),
             mode="tcp",
             bits_per_second=2_000_000_000,
-            cpu_utilization_percent=20.0,
             client_node="n1",
             iteration=1,
         ),
@@ -78,7 +76,6 @@ def test_trial_result_mean_throughput():
         results=results,
     )
     assert trial.mean_tcp_throughput() == pytest.approx(1_500_000_000)
-    assert trial.mean_cpu() == pytest.approx(15.0)
 
 
 def test_trial_log_round_trip(tmp_path: Path):
@@ -94,7 +91,6 @@ def test_trial_log_round_trip(tmp_path: Path):
                 mode="tcp",
                 bits_per_second=500_000_000,
                 retransmits=5,
-                cpu_utilization_percent=8.0,
             ),
         ],
     )
@@ -250,23 +246,6 @@ def test_trial_log_round_trip_with_zones(tmp_path: Path):
     assert loaded[0].topology == "inter-az"
 
 
-def test_benchmark_result_with_memory():
-    result = BenchmarkResult(
-        timestamp=datetime.now(UTC),
-        mode="tcp",
-        bits_per_second=9_000_000_000,
-        node_memory_used_bytes=47185920,
-        cni_memory_used_bytes=12582912,
-    )
-    assert result.node_memory_used_bytes == 47185920
-    assert result.cni_memory_used_bytes == 12582912
-    # Round-trip through JSON.
-    data = result.model_dump_json()
-    restored = BenchmarkResult.model_validate_json(data)
-    assert restored.node_memory_used_bytes == 47185920
-    assert restored.cni_memory_used_bytes == 12582912
-
-
 def test_node_pair_all_sources_and_zone_for():
     pair = NodePair(
         source="n1",
@@ -292,7 +271,6 @@ def test_trial_result_single_client_multiple_iterations():
             bits_per_second=1e9,
             retransmits=5,
             bytes_sent=1_000_000_000,
-            cpu_utilization_percent=10.0,
             client_node="n1",
             iteration=0,
         ),
@@ -302,7 +280,6 @@ def test_trial_result_single_client_multiple_iterations():
             bits_per_second=3e9,
             retransmits=2,
             bytes_sent=1_000_000_000,
-            cpu_utilization_percent=30.0,
             client_node="n1",
             iteration=1,
         ),
@@ -314,7 +291,6 @@ def test_trial_result_single_client_multiple_iterations():
         results=results,
     )
     assert trial.mean_tcp_throughput() == pytest.approx(2e9)
-    assert trial.mean_cpu() == pytest.approx(20.0)
     # rates: iter0=5/1e9, iter1=2/1e9; mean=3.5/1e9.
     assert trial.tcp_retransmit_rate() == pytest.approx(3.5e-9)
     assert trial.total_bytes_sent() == 2_000_000_000
@@ -323,24 +299,22 @@ def test_trial_result_single_client_multiple_iterations():
 def test_trial_result_multi_client_per_iteration_grouping():
     """Multi-client records sum throughput within iteration, then mean."""
 
-    def _r(bps, cpu, client, itr):
+    def _r(bps, client, itr):
         return BenchmarkResult(
             timestamp=datetime.now(UTC),
             mode="tcp",
             bits_per_second=bps,
             retransmits=1,
             bytes_sent=1_000_000_000,
-            cpu_utilization_percent=cpu,
-            cpu_server_percent=cpu,
             client_node=client,
             iteration=itr,
         )
 
     results = [
-        _r(4e9, 10.0, "c1", 0),
-        _r(5e9, 20.0, "c2", 0),
-        _r(3e9, 15.0, "c1", 1),
-        _r(6e9, 25.0, "c2", 1),
+        _r(4e9, "c1", 0),
+        _r(5e9, "c2", 0),
+        _r(3e9, "c1", 1),
+        _r(6e9, "c2", 1),
     ]
     trial = TrialResult(
         node_pair=NodePair(
@@ -353,10 +327,7 @@ def test_trial_result_multi_client_per_iteration_grouping():
         config=BenchmarkConfig(),
         results=results,
     )
-    # Iter 0 sum = 9e9, Iter 1 sum = 9e9 -> mean 9e9.
     assert trial.mean_tcp_throughput() == pytest.approx(9e9)
-    # CPU uses cpu_server_percent when all present: iter0=15, iter1=20 -> mean 17.5.
-    assert trial.mean_cpu() == pytest.approx(17.5)
     # Rate: each iteration has 2 retx over 2GB; per-iter rate = 1e-9.
     assert trial.tcp_retransmit_rate() == pytest.approx(1e-9)
     assert trial.total_bytes_sent() == 4_000_000_000
@@ -420,14 +391,13 @@ def test_retransmit_rate_drops_iterations_missing_retx_record():
     assert trial.tcp_retransmit_rate() == pytest.approx(1e-8)
 
 
-def test_mean_throughput_and_cpu_filter_to_tcp_records():
+def test_mean_throughput_filters_to_tcp_records():
     """Mixed TCP+UDP result list: UDP records must not poison TCP aggregates."""
     results = [
         BenchmarkResult(
             timestamp=datetime.now(UTC),
             mode="tcp",
             bits_per_second=1e9,
-            cpu_utilization_percent=10.0,
             client_node="n",
             iteration=0,
         ),
@@ -435,7 +405,6 @@ def test_mean_throughput_and_cpu_filter_to_tcp_records():
             timestamp=datetime.now(UTC),
             mode="udp",
             bits_per_second=4e9,
-            cpu_utilization_percent=99.0,
             client_node="n",
             iteration=0,
         ),
@@ -443,7 +412,6 @@ def test_mean_throughput_and_cpu_filter_to_tcp_records():
             timestamp=datetime.now(UTC),
             mode="tcp",
             bits_per_second=3e9,
-            cpu_utilization_percent=20.0,
             client_node="n",
             iteration=1,
         ),
@@ -451,7 +419,6 @@ def test_mean_throughput_and_cpu_filter_to_tcp_records():
             timestamp=datetime.now(UTC),
             mode="udp",
             bits_per_second=5e9,
-            cpu_utilization_percent=99.0,
             client_node="n",
             iteration=1,
         ),
@@ -464,18 +431,15 @@ def test_mean_throughput_and_cpu_filter_to_tcp_records():
     )
     # TCP-only: iter0=1e9, iter1=3e9 -> mean 2e9. UDP records dropped.
     assert trial.mean_tcp_throughput() == pytest.approx(2e9)
-    # TCP-only CPU: iter0=10, iter1=20 -> mean 15. UDP records dropped.
-    assert trial.mean_cpu() == pytest.approx(15.0)
 
 
-def test_mean_throughput_and_cpu_return_zero_when_no_tcp_records():
+def test_mean_throughput_returns_zero_when_no_tcp_records():
     """All-UDP result list must produce 0.0 for TCP-only aggregates."""
     results = [
         BenchmarkResult(
             timestamp=datetime.now(UTC),
             mode="udp",
             bits_per_second=5e9,
-            cpu_utilization_percent=70.0,
             client_node="n",
             iteration=0,
         ),
@@ -487,7 +451,6 @@ def test_mean_throughput_and_cpu_return_zero_when_no_tcp_records():
         results=results,
     )
     assert trial.mean_tcp_throughput() == pytest.approx(0.0)
-    assert trial.mean_cpu() == pytest.approx(0.0)
 
 
 def test_mean_udp_throughput_filters_to_udp_records():
@@ -679,41 +642,6 @@ def test_mean_jitter_with_mixed_tcp_udp_records():
     assert trial.mean_udp_jitter() == pytest.approx(0.0003)
 
 
-def test_trial_result_multi_client_falls_back_to_host_cpu():
-    """If any record lacks cpu_server_percent, fall back to host CPU."""
-    a = BenchmarkResult(
-        timestamp=datetime.now(UTC),
-        mode="tcp",
-        bits_per_second=1e9,
-        cpu_utilization_percent=10.0,
-        cpu_server_percent=40.0,
-        client_node="c1",
-        iteration=0,
-    )
-    b = BenchmarkResult(
-        timestamp=datetime.now(UTC),
-        mode="tcp",
-        bits_per_second=1e9,
-        cpu_utilization_percent=20.0,
-        cpu_server_percent=None,
-        client_node="c2",
-        iteration=0,
-    )
-    trial = TrialResult(
-        node_pair=NodePair(
-            source="c1",
-            target="t",
-            hardware_class="10g",
-            extra_sources=["c2"],
-        ),
-        sysctl_values={},
-        config=BenchmarkConfig(),
-        results=[a, b],
-    )
-    # Falls back to host CPU mean: (10+20)/2 = 15.
-    assert trial.mean_cpu() == pytest.approx(15.0)
-
-
 def test_trial_result_mean_jitter_single_client():
     results = [
         BenchmarkResult(
@@ -774,246 +702,16 @@ def test_trial_result_mean_jitter_multi_client():
     assert trial.mean_udp_jitter() == pytest.approx(0.00025)
 
 
-def test_trial_result_mean_node_memory_single_client():
-    results = [
-        BenchmarkResult(
-            timestamp=datetime.now(UTC),
-            mode="tcp",
-            bits_per_second=1e9,
-            node_memory_used_bytes=100_000_000,
-            client_node="n",
-            iteration=0,
-        ),
-        BenchmarkResult(
-            timestamp=datetime.now(UTC),
-            mode="tcp",
-            bits_per_second=1e9,
-            node_memory_used_bytes=200_000_000,
-            client_node="n",
-            iteration=1,
-        ),
-    ]
-    trial = TrialResult(
-        node_pair=NodePair(source="n", target="t", hardware_class="10g"),
-        sysctl_values={},
-        config=BenchmarkConfig(),
-        results=results,
-    )
-    assert trial.mean_node_memory() == pytest.approx(150_000_000)
-
-
-def test_trial_result_mean_node_memory_multi_client():
-    def _r(mem, client, itr):
-        return BenchmarkResult(
-            timestamp=datetime.now(UTC),
-            mode="tcp",
-            bits_per_second=1e9,
-            node_memory_used_bytes=mem,
-            client_node=client,
-            iteration=itr,
-        )
-
-    results = [
-        _r(100_000_000, "c1", 0),
-        _r(300_000_000, "c2", 0),
-        _r(200_000_000, "c1", 1),
-        _r(400_000_000, "c2", 1),
-    ]
-    trial = TrialResult(
-        node_pair=NodePair(
-            source="c1",
-            target="t",
-            hardware_class="10g",
-            extra_sources=["c2"],
-        ),
-        sysctl_values={},
-        config=BenchmarkConfig(),
-        results=results,
-    )
-    # Iter 0 mean = 2e8, Iter 1 mean = 3e8 -> overall 2.5e8.
-    assert trial.mean_node_memory() == pytest.approx(250_000_000)
-
-
-def test_trial_result_mean_node_memory_skips_none_per_group():
-    """Records with None node memory are skipped within each iteration."""
-    results = [
-        BenchmarkResult(
-            timestamp=datetime.now(UTC),
-            mode="tcp",
-            bits_per_second=1e9,
-            node_memory_used_bytes=None,
-            client_node="c1",
-            iteration=0,
-        ),
-        BenchmarkResult(
-            timestamp=datetime.now(UTC),
-            mode="tcp",
-            bits_per_second=1e9,
-            node_memory_used_bytes=500_000_000,
-            client_node="c2",
-            iteration=0,
-        ),
-    ]
-    trial = TrialResult(
-        node_pair=NodePair(
-            source="c1",
-            target="t",
-            hardware_class="10g",
-            extra_sources=["c2"],
-        ),
-        sysctl_values={},
-        config=BenchmarkConfig(),
-        results=results,
-    )
-    assert trial.mean_node_memory() == pytest.approx(500_000_000)
-
-
-def test_trial_result_mean_node_memory_all_none_returns_none():
-    results = [
-        BenchmarkResult(
-            timestamp=datetime.now(UTC),
-            mode="tcp",
-            bits_per_second=1e9,
-            node_memory_used_bytes=None,
-            client_node="n",
-            iteration=0,
-        ),
-    ]
-    trial = TrialResult(
-        node_pair=NodePair(source="n", target="t", hardware_class="10g"),
-        sysctl_values={},
-        config=BenchmarkConfig(),
-        results=results,
-    )
-    assert trial.mean_node_memory() is None
-
-
-def test_trial_result_mean_cni_memory_single_client():
-    results = [
-        BenchmarkResult(
-            timestamp=datetime.now(UTC),
-            mode="tcp",
-            bits_per_second=1e9,
-            cni_memory_used_bytes=10_000_000,
-            client_node="n",
-            iteration=0,
-        ),
-        BenchmarkResult(
-            timestamp=datetime.now(UTC),
-            mode="tcp",
-            bits_per_second=1e9,
-            cni_memory_used_bytes=30_000_000,
-            client_node="n",
-            iteration=1,
-        ),
-    ]
-    trial = TrialResult(
-        node_pair=NodePair(source="n", target="t", hardware_class="10g"),
-        sysctl_values={},
-        config=BenchmarkConfig(),
-        results=results,
-    )
-    assert trial.mean_cni_memory() == pytest.approx(20_000_000)
-
-
-def test_trial_result_mean_cni_memory_multi_client():
-    def _r(mem, client, itr):
-        return BenchmarkResult(
-            timestamp=datetime.now(UTC),
-            mode="tcp",
-            bits_per_second=1e9,
-            cni_memory_used_bytes=mem,
-            client_node=client,
-            iteration=itr,
-        )
-
-    results = [
-        _r(10_000_000, "c1", 0),
-        _r(30_000_000, "c2", 0),
-        _r(20_000_000, "c1", 1),
-        _r(40_000_000, "c2", 1),
-    ]
-    trial = TrialResult(
-        node_pair=NodePair(
-            source="c1",
-            target="t",
-            hardware_class="10g",
-            extra_sources=["c2"],
-        ),
-        sysctl_values={},
-        config=BenchmarkConfig(),
-        results=results,
-    )
-    # Iter 0 mean = 2e7, Iter 1 mean = 3e7 -> overall 2.5e7.
-    assert trial.mean_cni_memory() == pytest.approx(25_000_000)
-
-
-def test_trial_result_mean_cni_memory_skips_none_per_group():
-    """Records with None CNI memory are skipped within each iteration."""
-    results = [
-        BenchmarkResult(
-            timestamp=datetime.now(UTC),
-            mode="tcp",
-            bits_per_second=1e9,
-            cni_memory_used_bytes=None,
-            client_node="c1",
-            iteration=0,
-        ),
-        BenchmarkResult(
-            timestamp=datetime.now(UTC),
-            mode="tcp",
-            bits_per_second=1e9,
-            cni_memory_used_bytes=50_000_000,
-            client_node="c2",
-            iteration=0,
-        ),
-    ]
-    trial = TrialResult(
-        node_pair=NodePair(
-            source="c1",
-            target="t",
-            hardware_class="10g",
-            extra_sources=["c2"],
-        ),
-        sysctl_values={},
-        config=BenchmarkConfig(),
-        results=results,
-    )
-    assert trial.mean_cni_memory() == pytest.approx(50_000_000)
-
-
-def test_trial_result_mean_cni_memory_all_none_returns_none():
-    results = [
-        BenchmarkResult(
-            timestamp=datetime.now(UTC),
-            mode="tcp",
-            bits_per_second=1e9,
-            cni_memory_used_bytes=None,
-            client_node="n",
-            iteration=0,
-        ),
-    ]
-    trial = TrialResult(
-        node_pair=NodePair(source="n", target="t", hardware_class="10g"),
-        sysctl_values={},
-        config=BenchmarkConfig(),
-        results=results,
-    )
-    assert trial.mean_cni_memory() is None
-
-
 def test_benchmark_result_new_fields_round_trip():
     result = BenchmarkResult(
         timestamp=datetime.now(UTC),
         mode="tcp",
         bits_per_second=9e9,
-        cpu_server_percent=42.0,
         client_node="c7",
         iteration=2,
     )
     dumped = result.model_dump_json()
     restored = BenchmarkResult.model_validate_json(dumped)
-    assert restored.cpu_server_percent == pytest.approx(42.0)
     assert restored.client_node == "c7"
     assert restored.iteration == 2
 
@@ -1235,10 +933,10 @@ class TestResumeMetadata:
             objectives=ObjectivesSection(
                 pareto=[
                     ParetoObjective(metric="tcp_throughput", direction="maximize"),
-                    ParetoObjective(metric="node_memory", direction="minimize"),
+                    ParetoObjective(metric="udp_jitter", direction="minimize"),
                 ],
                 constraints=["tcp_throughput >= 1e6"],
-                recommendation_weights={"node_memory": 0.5},
+                recommendation_weights={"udp_jitter": 0.5},
             ),
             param_space=ParamSpace(
                 params=[

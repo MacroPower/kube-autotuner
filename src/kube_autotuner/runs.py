@@ -431,7 +431,6 @@ def run_baseline(ctx: RunContext) -> None:
             client=ctx.client,
             iperf_args=exp.iperf,
             patches=exp.patches,
-            cni=exp.cni,
             fortio_args=exp.fortio,
             observer=ctx.observer,
         )
@@ -457,13 +456,7 @@ def run_baseline(ctx: RunContext) -> None:
         ctx.output,
     )
     logger.info("Mean TCP throughput: %.1f Mbps", trial.mean_tcp_throughput() / 1e6)
-    logger.info("Mean CPU: %.1f%%", trial.mean_cpu())
-    nmem = trial.mean_node_memory()
-    if nmem is not None:
-        logger.info("Mean node memory: %.1f MiB", nmem / 1024 / 1024)
-    cmem = trial.mean_cni_memory()
-    if cmem is not None:
-        logger.info("Mean CNI memory: %.1f MiB", cmem / 1024 / 1024)
+    logger.info("Mean UDP throughput: %.1f Mbps", trial.mean_udp_throughput() / 1e6)
     rps = trial.mean_rps()
     if rps > 0:
         logger.info("Mean RPS (saturation): %.1f", rps)
@@ -472,7 +465,7 @@ def run_baseline(ctx: RunContext) -> None:
         logger.info("Mean p99 latency (fixed_qps): %s", format_duration(p99))
 
 
-def run_trial(ctx: RunContext) -> None:  # noqa: PLR0914, PLR0915
+def run_trial(ctx: RunContext) -> None:
     """Apply a fixed sysctl set, benchmark, and restore.
 
     Snapshots only the keys being applied (plus ``kernel.osrelease``),
@@ -534,7 +527,6 @@ def run_trial(ctx: RunContext) -> None:  # noqa: PLR0914, PLR0915
             client=ctx.client,
             iperf_args=exp.iperf,
             patches=exp.patches,
-            cni=exp.cni,
             fortio_args=exp.fortio,
             observer=ctx.observer,
         )
@@ -565,13 +557,6 @@ def run_trial(ctx: RunContext) -> None:  # noqa: PLR0914, PLR0915
         "Mean TCP throughput: %.1f Mbps",
         trial_result.mean_tcp_throughput() / 1e6,
     )
-    logger.info("Mean CPU: %.1f%%", trial_result.mean_cpu())
-    nmem = trial_result.mean_node_memory()
-    if nmem is not None:
-        logger.info("Mean node memory: %.1f MiB", nmem / 1024 / 1024)
-    cmem = trial_result.mean_cni_memory()
-    if cmem is not None:
-        logger.info("Mean CNI memory: %.1f MiB", cmem / 1024 / 1024)
     rps = trial_result.mean_rps()
     if rps > 0:
         logger.info("Mean RPS (saturation): %.1f", rps)
@@ -674,7 +659,6 @@ def run_optimize(  # noqa: PLR0914, PLR0915
         fortio_args=exp.fortio,
         patches=exp.patches,
         objectives=exp.objectives,
-        cni=exp.cni,
         observer=ctx.observer,
         prior_trials=resume.prior_trials,
     )
@@ -715,12 +699,10 @@ def run_optimize(  # noqa: PLR0914, PLR0915
     logger.info("=== Pareto-optimal configurations (%d) ===", len(pareto))
     for _params, metrics, trial_idx, _arm in pareto:
         tp = metrics.get("tcp_throughput", 0)
-        cpu = metrics.get("cpu", 0)
         rate = metrics.get("tcp_retransmit_rate")
         rps = metrics.get("rps")
         p99 = metrics.get("latency_p99")
         tp_val = tp[0] if isinstance(tp, tuple) else tp
-        cpu_val = cpu[0] if isinstance(cpu, tuple) else cpu
         if rate is None:
             rate_val: float | None = None
         else:
@@ -731,10 +713,9 @@ def run_optimize(  # noqa: PLR0914, PLR0915
         rps_str = "n/a" if math.isnan(rps_val) else f"{rps_val:.1f}"
         p99_str = "n/a" if math.isnan(p99_val) else format_duration(p99_val)
         logger.info(
-            "  [%d] tcp_throughput=%.1f Mbps cpu=%.1f%% rate=%s retx/MB rps=%s p99=%s",
+            "  [%d] tcp_throughput=%.1f Mbps rate=%s retx/MB rps=%s p99=%s",
             trial_idx,
             float(tp_val) / 1e6,
-            float(cpu_val),
             format_retransmit_rate(rate_val),
             rps_str,
             p99_str,
@@ -754,7 +735,7 @@ def _log_verification_summary(  # noqa: PLR0914 - unit picking adds three locals
     :func:`kube_autotuner.scoring.score_rows`, and prints one row per
     verified parent showing the primary score, the combined score,
     the score delta, and per-metric ``mean ± SEM`` for the headline
-    metrics (tcp_throughput, cpu, tcp_retransmit_rate, latency_p99).
+    metrics (tcp_throughput, tcp_retransmit_rate, latency_p99).
 
     Only parents with at least one verification child are rendered --
     listing every primary would dilute the table and confuse the
@@ -815,7 +796,6 @@ def _log_verification_summary(  # noqa: PLR0914 - unit picking adds three locals
     table.add_column("combined", justify="right")
     table.add_column("Δ", justify="right")
     table.add_column("tcp_throughput", justify="right")
-    table.add_column("cpu", justify="right")
     table.add_column("tcp_retx_rate", justify="right")
     table.add_column(f"p99 {p99_suffix}", justify="right")
 
@@ -836,7 +816,6 @@ def _log_verification_summary(  # noqa: PLR0914 - unit picking adds three locals
             f"{combined:.4f}",
             "n/a" if math.isnan(delta) else f"{delta:+.4f}",
             _format_mean_sem(row, METRIC_TO_DF_COLUMN["tcp_throughput"], scale=1e-6),
-            _format_mean_sem(row, METRIC_TO_DF_COLUMN["cpu"]),
             _format_mean_sem(
                 row,
                 METRIC_TO_DF_COLUMN["tcp_retransmit_rate"],

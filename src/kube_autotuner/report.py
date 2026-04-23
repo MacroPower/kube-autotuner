@@ -197,9 +197,6 @@ def _slug(s: str) -> str:
 _TARGET_METRIC_LABELS: dict[str, str] = {
     "mean_tcp_throughput": "TCP throughput",
     "mean_udp_throughput": "UDP throughput",
-    "mean_cpu": "CPU",
-    "mean_node_memory": "node memory",
-    "mean_cni_memory": "CNI memory",
     "tcp_retransmit_rate": "TCP retransmit rate",
     "udp_loss_rate": "UDP loss rate",
     "mean_udp_jitter": "UDP jitter",
@@ -525,9 +522,6 @@ const DEGENERATE = 0.5;
 const METRIC_TO_DF_COLUMN = {
   tcp_throughput: "mean_tcp_throughput",
   udp_throughput: "mean_udp_throughput",
-  cpu: "mean_cpu",
-  node_memory: "mean_node_memory",
-  cni_memory: "mean_cni_memory",
   tcp_retransmit_rate: "tcp_retransmit_rate",
   udp_loss_rate: "udp_loss_rate",
   udp_jitter: "mean_udp_jitter",
@@ -540,14 +534,12 @@ const METRIC_TO_DF_COLUMN = {
 const PRESETS = {
   "default": null,
   "latency-sensitive": {latency_p99: 0.4, latency_p90: 0.2, tcp_retransmit_rate: 0.1},
-  "efficient": {cpu: 0.4, node_memory: 0.3, tcp_retransmit_rate: 0.1},
   "throughput-only": {}
 };
 
 const PRESET_LABELS = {
   "default": "Default",
   "latency-sensitive": "Latency-sensitive",
-  "efficient": "Efficient",
   "throughput-only": "Throughput-only"
 };
 
@@ -556,11 +548,6 @@ const METRIC_DISPLAY = {
                         format: v => (v / 1e6).toFixed(1)},
   mean_udp_throughput: {label: "UDP throughput", unit: "Mbps",
                         format: v => (v / 1e6).toFixed(1)},
-  mean_cpu: {label: "CPU", unit: "%", format: v => v.toFixed(1)},
-  mean_node_memory: {label: "Node mem", unit: "MiB",
-                     format: v => (v / 1048576).toFixed(0)},
-  mean_cni_memory: {label: "CNI mem", unit: "MiB",
-                    format: v => (v / 1048576).toFixed(0)},
   tcp_retransmit_rate: {label: "TCP retx", unit: "/MB",
                         format: v => (v * 1e6).toFixed(2)},
   udp_loss_rate: {label: "UDP loss", unit: "%",

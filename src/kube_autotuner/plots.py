@@ -21,7 +21,7 @@ if TYPE_CHECKING:
 
 _ANALYSIS_HINT = "install analysis group: uv sync --group analysis"
 _MS_SCALED_COLUMNS: frozenset[str] = frozenset({
-    "mean_jitter",
+    "mean_udp_jitter",
     "mean_latency_p50",
     "mean_latency_p90",
     "mean_latency_p99",
@@ -73,24 +73,24 @@ def plot_pareto_scatter_matrix(
             Pareto-optimal rows.
 
     Returns:
-        A :class:`plotly.graph_objects.Figure` rendering the subset of
-        the eight objective columns (TCP throughput, UDP throughput,
-        CPU, node memory, CNI memory, TCP retransmit_rate,
-        udp_loss_rate, UDP jitter) that have at least one non-null
-        value in ``df``. Columns with no data (e.g. ``mean_cni_memory``
-        when ``cni.enabled=false``) are skipped so the matrix does
-        not show a dead axis.
+        A :class:`plotly.graph_objects.Figure` rendering the subset
+        of the objective columns (TCP throughput, UDP throughput,
+        TCP retransmit_rate, udp_loss_rate, UDP jitter, RPS, latency
+        percentiles) that have at least one non-null value in ``df``.
+        Columns with no data are skipped so the matrix does not show
+        a dead axis.
     """
     px, _ = _require_plotly()
     candidate_cols = [
         "mean_tcp_throughput",
         "mean_udp_throughput",
-        "mean_cpu",
-        "mean_node_memory",
-        "mean_cni_memory",
         "tcp_retransmit_rate",
         "udp_loss_rate",
         "mean_udp_jitter",
+        "mean_rps",
+        "mean_latency_p50",
+        "mean_latency_p90",
+        "mean_latency_p99",
     ]
     cols = [c for c in candidate_cols if c in df.columns and df[c].notna().any()]
     plot_df = df[[*cols, "trial_id"]].copy()

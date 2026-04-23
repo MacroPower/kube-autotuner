@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 import hashlib
 import json
 import logging
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -116,8 +116,6 @@ class BenchmarkResult(BaseModel):
             "end.sum_sent.bytes for TCP, None for UDP or legacy records."
         ),
     )
-    cpu_utilization_percent: float = 0.0
-    cpu_server_percent: float | None = None
     jitter: float | None = Field(
         default=None,
         description=(
@@ -138,20 +136,6 @@ class BenchmarkResult(BaseModel):
         description=(
             "UDP datagrams reported lost during the iperf3 run, from "
             "end.sum.lost_packets; None for TCP."
-        ),
-    )
-    node_memory_used_bytes: int | None = Field(
-        default=None,
-        description=(
-            "Peak memory observed on the iperf target node during the "
-            "iteration, sampled from metrics.k8s.io/v1beta1 nodes/<name>."
-        ),
-    )
-    cni_memory_used_bytes: int | None = Field(
-        default=None,
-        description=(
-            "Peak memory summed across CNI pods on the target node during "
-            "the iteration, selected via the experiment's cni selector."
         ),
     )
     client_node: str = ""
@@ -194,8 +178,6 @@ class LatencyResult(BaseModel):
             "p99 latency in seconds (SI base unit); from fortio fixed-QPS runs."
         ),
     )
-    node_memory_used_bytes: int | None = None
-    cni_memory_used_bytes: int | None = None
     raw_json: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -427,32 +409,6 @@ class TrialResult(BaseModel):
         ]
         return sum(per_iter_sums) / len(per_iter_sums)
 
-    def mean_cpu(self) -> float:
-        """Return the mean CPU utilization percent across TCP iterations.
-
-        Filters to ``mode == "tcp"`` records before aggregating -- the
-        ``cpu`` objective has always meant CPU observed during the TCP
-        bandwidth stage. Uses the server-side CPU when every TCP
-        record reports it (since all clients share the same server);
-        otherwise falls back to the per-client host CPU.
-
-        Returns:
-            The averaged CPU percent, or ``0.0`` when there are no TCP
-            results.
-        """
-        tcp_results = [r for r in self.results if r.mode == "tcp"]
-        if not tcp_results:
-            return 0.0
-        use_server = all(r.cpu_server_percent is not None for r in tcp_results)
-        per_iter_means: list[float] = []
-        for group in _group_by_iteration(tcp_results).values():
-            if use_server:
-                values = [cast("float", r.cpu_server_percent) for r in group]
-            else:
-                values = [r.cpu_utilization_percent for r in group]
-            per_iter_means.append(sum(values) / len(values))
-        return sum(per_iter_means) / len(per_iter_means)
-
     def total_bytes_sent(self) -> int:
         """Return total bytes sent, summed across every record.
 
@@ -521,55 +477,6 @@ class TrialResult(BaseModel):
                 per_iter_means.append(sum(vals) / len(vals))
         if not per_iter_means:
             return 0.0
-        return sum(per_iter_means) / len(per_iter_means)
-
-    def mean_node_memory(self) -> float | None:
-        """Return the mean target-node memory usage in bytes.
-
-        Takes the per-iteration mean across records that reported
-        node memory, then averages across iterations.
-
-        Returns:
-            The averaged node memory in bytes, or ``None`` when no
-            results report node memory. ``None`` signals "not
-            measured" and is distinct from a real reading of ``0.0``.
-        """
-        per_iter_means: list[float] = []
-        for group in _group_by_iteration(self.results).values():
-            vals = [
-                r.node_memory_used_bytes
-                for r in group
-                if r.node_memory_used_bytes is not None
-            ]
-            if vals:
-                per_iter_means.append(sum(vals) / len(vals))
-        if not per_iter_means:
-            return None
-        return sum(per_iter_means) / len(per_iter_means)
-
-    def mean_cni_memory(self) -> float | None:
-        """Return the mean CNI memory usage in bytes on the target node.
-
-        Takes the per-iteration mean across records that reported CNI
-        memory, then averages across iterations.
-
-        Returns:
-            The averaged CNI memory in bytes, or ``None`` when no
-            results report CNI memory (e.g. ``cni.enabled=false`` or
-            the selector matched no pods). ``None`` signals "not
-            measured" and is distinct from a real reading of ``0.0``.
-        """
-        per_iter_means: list[float] = []
-        for group in _group_by_iteration(self.results).values():
-            vals = [
-                r.cni_memory_used_bytes
-                for r in group
-                if r.cni_memory_used_bytes is not None
-            ]
-            if vals:
-                per_iter_means.append(sum(vals) / len(vals))
-        if not per_iter_means:
-            return None
         return sum(per_iter_means) / len(per_iter_means)
 
     def mean_rps(self) -> float:

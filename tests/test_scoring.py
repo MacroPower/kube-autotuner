@@ -17,7 +17,7 @@ def _col(metric: str) -> str:
 def test_score_rows_matches_recommend_configs_formula() -> None:
     """Hand-computed scores match the helper on a minimal three-row fixture.
 
-    Throughput (maximize) normalizes to (1.0, 0.5, 0.0); CPU
+    Throughput (maximize) normalizes to (1.0, 0.5, 0.0); jitter
     (minimize, weight 0.15) normalizes to (1.0, 0.5, 0.0); no other
     objectives participate. The expected scores are:
 
@@ -27,14 +27,14 @@ def test_score_rows_matches_recommend_configs_formula() -> None:
     """
     objectives = [
         ParetoObjective(metric="tcp_throughput", direction="maximize"),
-        ParetoObjective(metric="cpu", direction="minimize"),
+        ParetoObjective(metric="udp_jitter", direction="minimize"),
     ]
     rows = [
-        {_col("tcp_throughput"): 2.0e9, _col("cpu"): 80.0},
-        {_col("tcp_throughput"): 1.5e9, _col("cpu"): 50.0},
-        {_col("tcp_throughput"): 1.0e9, _col("cpu"): 20.0},
+        {_col("tcp_throughput"): 2.0e9, _col("udp_jitter"): 8.0},
+        {_col("tcp_throughput"): 1.5e9, _col("udp_jitter"): 5.0},
+        {_col("tcp_throughput"): 1.0e9, _col("udp_jitter"): 2.0},
     ]
-    scores = score_rows(rows, objectives, {"cpu": 0.15})
+    scores = score_rows(rows, objectives, {"udp_jitter": 0.15})
     assert scores[0] == pytest.approx(0.85)
     assert scores[1] == pytest.approx(0.425)
     assert scores[2] == pytest.approx(0.0)
@@ -44,36 +44,36 @@ def test_score_rows_handles_nan_and_degenerate_columns() -> None:
     """NaN rows, constant columns, and all-NaN columns resolve to ``0.5``."""
     objectives = [
         ParetoObjective(metric="tcp_throughput", direction="maximize"),
-        ParetoObjective(metric="cpu", direction="minimize"),
-        ParetoObjective(metric="node_memory", direction="minimize"),
+        ParetoObjective(metric="udp_jitter", direction="minimize"),
+        ParetoObjective(metric="latency_p99", direction="minimize"),
     ]
     rows = [
-        # One all-NaN column (node_memory), one constant column (cpu),
+        # One all-NaN column (latency_p99), one constant column (jitter),
         # one row with a NaN throughput.
         {
             _col("tcp_throughput"): 1.0e9,
-            _col("cpu"): 10.0,
-            _col("node_memory"): math.nan,
+            _col("udp_jitter"): 1.0,
+            _col("latency_p99"): math.nan,
         },
         {
             _col("tcp_throughput"): math.nan,
-            _col("cpu"): 10.0,
-            _col("node_memory"): math.nan,
+            _col("udp_jitter"): 1.0,
+            _col("latency_p99"): math.nan,
         },
         {
             _col("tcp_throughput"): 2.0e9,
-            _col("cpu"): 10.0,
-            _col("node_memory"): math.nan,
+            _col("udp_jitter"): 1.0,
+            _col("latency_p99"): math.nan,
         },
     ]
     scores = score_rows(
         rows,
         objectives,
-        {"cpu": 0.15, "node_memory": 0.15},
+        {"udp_jitter": 0.15, "latency_p99": 0.15},
     )
     # throughput norms: row0 -> 0.0, row1 -> NaN-fallback 0.5, row2 -> 1.0.
-    # cpu norms: all 0.5 (constant column); contribution = -0.15 * 0.5 = -0.075 each.
-    # node_memory: all-NaN column -> 0.5 each; contribution = -0.15 * 0.5 = -0.075 each.
+    # jitter norms: all 0.5 (constant column); contribution = -0.15 * 0.5 = -0.075.
+    # latency_p99: all-NaN column -> 0.5 each; contribution = -0.15 * 0.5 = -0.075.
     assert scores[0] == pytest.approx(0.0 - 0.075 - 0.075)
     assert scores[1] == pytest.approx(0.5 - 0.075 - 0.075)
     assert scores[2] == pytest.approx(1.0 - 0.075 - 0.075)
@@ -89,20 +89,20 @@ def test_score_rows_accepts_none_and_float_nan() -> None:
     """
     objectives = [
         ParetoObjective(metric="tcp_throughput", direction="maximize"),
-        ParetoObjective(metric="cpu", direction="minimize"),
+        ParetoObjective(metric="udp_jitter", direction="minimize"),
     ]
     rows_nan = [
-        {_col("tcp_throughput"): 1e9, _col("cpu"): 20.0},
-        {_col("tcp_throughput"): float("nan"), _col("cpu"): float("nan")},
-        {_col("tcp_throughput"): 2e9, _col("cpu"): 40.0},
+        {_col("tcp_throughput"): 1e9, _col("udp_jitter"): 2.0},
+        {_col("tcp_throughput"): float("nan"), _col("udp_jitter"): float("nan")},
+        {_col("tcp_throughput"): 2e9, _col("udp_jitter"): 4.0},
     ]
     rows_none = [
-        {_col("tcp_throughput"): 1e9, _col("cpu"): 20.0},
-        {_col("tcp_throughput"): None, _col("cpu"): None},
-        {_col("tcp_throughput"): 2e9, _col("cpu"): 40.0},
+        {_col("tcp_throughput"): 1e9, _col("udp_jitter"): 2.0},
+        {_col("tcp_throughput"): None, _col("udp_jitter"): None},
+        {_col("tcp_throughput"): 2e9, _col("udp_jitter"): 4.0},
     ]
-    scores_nan = score_rows(rows_nan, objectives, {"cpu": 0.15})
-    scores_none = score_rows(rows_none, objectives, {"cpu": 0.15})
+    scores_nan = score_rows(rows_nan, objectives, {"udp_jitter": 0.15})
+    scores_none = score_rows(rows_none, objectives, {"udp_jitter": 0.15})
     for a, b in zip(scores_nan, scores_none, strict=True):
         assert a == pytest.approx(b)
 
@@ -116,7 +116,7 @@ def test_score_rows_empty_input() -> None:
 def test_score_rows_missing_metric_column_is_neutral() -> None:
     """A metric absent from every row collapses to a flat 0.5 contribution.
 
-    The objective is ``node_memory`` (minimize, weight 0.15) but no
+    The objective is ``latency_p99`` (minimize, weight 0.15) but no
     row supplies that column. The column's ``_normalize_column``
     falls into the no-finite-values branch and maps every row to
     ``0.5``, so the contribution is ``-0.075`` for every row --
@@ -125,13 +125,13 @@ def test_score_rows_missing_metric_column_is_neutral() -> None:
     """
     objectives = [
         ParetoObjective(metric="tcp_throughput", direction="maximize"),
-        ParetoObjective(metric="node_memory", direction="minimize"),
+        ParetoObjective(metric="latency_p99", direction="minimize"),
     ]
     rows = [
         {_col("tcp_throughput"): 1e9},
         {_col("tcp_throughput"): 2e9},
     ]
-    scores = score_rows(rows, objectives, {"node_memory": 0.15})
-    # throughput norms: 0.0 and 1.0; node_memory norms: 0.5 each.
+    scores = score_rows(rows, objectives, {"latency_p99": 0.15})
+    # throughput norms: 0.0 and 1.0; latency_p99 norms: 0.5 each.
     assert scores[0] == pytest.approx(0.0 - 0.075)
     assert scores[1] == pytest.approx(1.0 - 0.075)

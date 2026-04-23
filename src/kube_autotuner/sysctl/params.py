@@ -6,10 +6,10 @@ kept for consumers that prefer a ready-made constant.
 
 Each :class:`SysctlParam` below carries a short comment summarising how
 changing that knob is expected to move the configured objectives
-(tcp_throughput, udp_throughput, cpu, tcp_retransmit_rate,
-udp_loss_rate, udp_jitter, node_memory, cni_memory, rps,
-latency_p50/p90/p99). These are expectations used to read results, not
-guarantees; the optimizer discovers the actual response surface.
+(tcp_throughput, udp_throughput, tcp_retransmit_rate, udp_loss_rate,
+udp_jitter, rps, latency_p50/p90/p99). These are expectations used to
+read results, not guarantees; the optimizer discovers the actual
+response surface.
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ from kube_autotuner.models import ParamSpace, SysctlParam
 _TCP_BUFFER_PARAMS: list[SysctlParam] = [
     # System-wide SO_RCVBUF ceiling. Low rungs cap the TCP receive
     # window on fat pipes and throttle throughput on long-BDP paths;
-    # high rungs trade node_memory for headroom under many flows.
+    # high rungs trade node memory headroom under many flows.
     SysctlParam(
         name="net.core.rmem_max",
         values=[212992, 4194304, 16777216, 67108864],
@@ -37,9 +37,9 @@ _TCP_BUFFER_PARAMS: list[SysctlParam] = [
     ),
     # Autotuning triple (min default max) for TCP receive buffers.
     # Governs the peak receive window. Under-sized max caps iperf3
-    # throughput on high-BDP links and can raise tcp_retransmit_rate when
-    # the window collapses; over-sized max raises node_memory under
-    # many concurrent flows.
+    # throughput on high-BDP links and can raise tcp_retransmit_rate
+    # when the window collapses; over-sized max raises node memory
+    # under many concurrent flows.
     SysctlParam(
         name="net.ipv4.tcp_rmem",
         values=[
@@ -62,7 +62,7 @@ _TCP_BUFFER_PARAMS: list[SysctlParam] = [
     ),
     # Global TCP memory pressure thresholds in pages (min pressure max).
     # Too small and the kernel prunes/throttles under load (throughput
-    # drops, tcp_retransmit_rate rises); too large and node_memory climbs.
+    # drops, tcp_retransmit_rate rises); too large and node memory climbs.
     # Represented as the canonical three-integer string form.
     SysctlParam(
         name="net.ipv4.tcp_mem",
@@ -164,7 +164,7 @@ _MEMORY_PARAMS: list[SysctlParam] = [
     # Floor on free pages the kernel keeps reserved. Too low and
     # allocations stall under pressure (packet drops, p99 spikes,
     # tcp_retransmit_rate); too high wastes headroom and inflates
-    # node_memory.
+    # node memory.
     SysctlParam(
         name="vm.min_free_kbytes",
         values=[65536, 131072, 262144],
@@ -251,7 +251,7 @@ _UDP_PARAMS: list[SysctlParam] = [
         param_type="int",
     ),
     # Global UDP memory pressure thresholds (pages). Too small and
-    # the kernel prunes under load; too large and node_memory climbs.
+    # the kernel prunes under load; too large and node memory climbs.
     SysctlParam(
         name="net.ipv4.udp_mem",
         values=["393216 524288 786432", "786432 1048576 1572864"],

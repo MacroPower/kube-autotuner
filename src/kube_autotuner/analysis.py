@@ -44,12 +44,9 @@ _SYSCTL_COLUMNS: list[str] = PARAM_SPACE.param_names()
 DEFAULT_OBJECTIVES: list[tuple[str, str]] = [
     (METRIC_TO_DF_COLUMN["tcp_throughput"], "maximize"),
     (METRIC_TO_DF_COLUMN["udp_throughput"], "maximize"),
-    (METRIC_TO_DF_COLUMN["cpu"], "minimize"),
     (METRIC_TO_DF_COLUMN["tcp_retransmit_rate"], "minimize"),
     (METRIC_TO_DF_COLUMN["udp_loss_rate"], "minimize"),
     (METRIC_TO_DF_COLUMN["udp_jitter"], "minimize"),
-    (METRIC_TO_DF_COLUMN["node_memory"], "minimize"),
-    (METRIC_TO_DF_COLUMN["cni_memory"], "minimize"),
     (METRIC_TO_DF_COLUMN["rps"], "maximize"),
     (METRIC_TO_DF_COLUMN["latency_p50"], "minimize"),
     (METRIC_TO_DF_COLUMN["latency_p90"], "minimize"),
@@ -64,9 +61,6 @@ _FRAME_BASE_COLUMNS: list[str] = [
     "target_zone",
     "mean_tcp_throughput",
     "mean_udp_throughput",
-    "mean_cpu",
-    "mean_node_memory",
-    "mean_cni_memory",
     "tcp_retransmit_rate",
     "udp_loss_rate",
     "mean_udp_jitter",
@@ -215,9 +209,6 @@ def trials_to_dataframe(
             "target_zone": t.node_pair.target_zone,
             "mean_tcp_throughput": t.mean_tcp_throughput(),
             "mean_udp_throughput": t.mean_udp_throughput(),
-            "mean_cpu": t.mean_cpu(),
-            "mean_node_memory": t.mean_node_memory(),
-            "mean_cni_memory": t.mean_cni_memory(),
             "tcp_retransmit_rate": t.tcp_retransmit_rate(),
             "udp_loss_rate": t.udp_loss_rate(),
             "mean_udp_jitter": t.mean_udp_jitter(),
@@ -287,8 +278,7 @@ def _objectives_with_data(
 
     A metric is excluded when its column is absent from ``df`` entirely
     or when every value in that column is NaN. Both cases mean "not
-    measured for this experiment" -- the canonical example is
-    ``cni_memory`` when ``cni.enabled=false``.
+    measured for this experiment".
 
     Args:
         df: Frame produced by :func:`trials_to_dataframe`.
@@ -546,7 +536,7 @@ def pareto_recommendation_rows(
         hardware_class: Hardware-class label to filter on.
         topology: Optional topology filter.
         objectives: Pareto objectives driving frontier selection and
-            scoring. Defaults to the nine built-in metrics.
+            scoring. Defaults to the seven built-in metrics.
         weights: Per-metric negative coefficients for
             minimize-direction metrics. Missing metrics default to
             ``0.0``.
@@ -628,9 +618,6 @@ def pareto_recommendation_rows(
                 "sysctl_values": trial.sysctl_values,
                 "mean_tcp_throughput": _maybe(row, "mean_tcp_throughput"),
                 "mean_udp_throughput": _maybe(row, "mean_udp_throughput"),
-                "mean_cpu": _maybe(row, "mean_cpu"),
-                "mean_node_memory": _maybe(row, "mean_node_memory"),
-                "mean_cni_memory": _maybe(row, "mean_cni_memory"),
                 "tcp_retransmit_rate": _maybe(row, "tcp_retransmit_rate"),
                 "udp_loss_rate": _maybe(row, "udp_loss_rate"),
                 "mean_udp_jitter": _maybe(row, "mean_udp_jitter"),
@@ -664,11 +651,10 @@ def recommend_configs(
 
     Default weights come from
     :class:`~kube_autotuner.experiment.ObjectivesSection` --
-    ``{cpu: 0.15, node_memory: 0.15, tcp_retransmit_rate: 0.3,
-    udp_loss_rate: 0.3, udp_jitter: 0.1, latency_p90: 0.1,
-    latency_p99: 0.15}`` at the time of writing -- so the live ``Best
-    so far`` panel and this recommendation output rank trials
-    identically.
+    ``{tcp_retransmit_rate: 0.3, udp_loss_rate: 0.3, udp_jitter: 0.1,
+    latency_p90: 0.1, latency_p99: 0.15}`` at the time of writing --
+    so the live ``Best so far`` panel and this recommendation output
+    rank trials identically.
 
     Args:
         trials: Input trial records (any number of hardware classes).
@@ -676,7 +662,7 @@ def recommend_configs(
         n: Maximum number of recommendations to return.
         topology: Optional topology filter.
         objectives: Pareto objectives driving both frontier selection
-            and scoring. Defaults to the nine built-in metrics.
+            and scoring. Defaults to the seven built-in metrics.
         weights: Per-metric negative coefficients for
             minimize-direction metrics. Missing metrics default to
             ``0.0`` (i.e. they do not influence the score).
@@ -687,16 +673,14 @@ def recommend_configs(
 
     Returns:
         A list of recommendation dicts. Each dict always contains the
-        same keys (``rank``, ``trial_id``, ``sysctl_values``, the
-        twelve base metric names -- ``mean_tcp_throughput``,
-        ``mean_udp_throughput``, ``mean_cpu``, ``mean_node_memory``,
-        ``mean_cni_memory``, ``tcp_retransmit_rate``,
+        same keys (``rank``, ``trial_id``, ``sysctl_values``, the nine
+        base metric names -- ``mean_tcp_throughput``,
+        ``mean_udp_throughput``, ``tcp_retransmit_rate``,
         ``udp_loss_rate``, ``mean_udp_jitter``, ``mean_rps``,
         ``mean_latency_p50``, ``mean_latency_p90``,
-        ``mean_latency_p99`` -- and a ``score``). A metric value
-        is ``None`` when the trial produced no reading for it (e.g.
-        ``mean_cni_memory`` when CNI was disabled). Returns an empty
-        list when no trials match.
+        ``mean_latency_p99`` -- and a ``score``). A metric value is
+        ``None`` when the trial produced no reading for it. Returns
+        an empty list when no trials match.
     """
     rows = pareto_recommendation_rows(
         trials,
@@ -714,9 +698,6 @@ def recommend_configs(
                 "sysctl_values": row["sysctl_values"],
                 "mean_tcp_throughput": row["mean_tcp_throughput"],
                 "mean_udp_throughput": row["mean_udp_throughput"],
-                "mean_cpu": row["mean_cpu"],
-                "mean_node_memory": row["mean_node_memory"],
-                "mean_cni_memory": row["mean_cni_memory"],
                 "tcp_retransmit_rate": row["tcp_retransmit_rate"],
                 "udp_loss_rate": row["udp_loss_rate"],
                 "mean_udp_jitter": row["mean_udp_jitter"],

@@ -37,7 +37,6 @@ def _prior_trial(sysctl_value: int = 1048576) -> TrialResult:
                 bits_per_second=9e9,
                 retransmits=5,
                 bytes_sent=10**9,
-                cpu_utilization_percent=20.0,
             ),
         ],
         phase="bayesian",

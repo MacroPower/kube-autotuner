@@ -47,7 +47,6 @@ def _results() -> IterationResults:
                 bits_per_second=9_000_000_000,
                 retransmits=5,
                 bytes_sent=33_750_000_000,
-                cpu_utilization_percent=30.0,
             ),
         ],
         latency=[],
@@ -191,7 +190,6 @@ def _prior_trial(sysctl_value: int = 1048576) -> TrialResult:
                 bits_per_second=9e9,
                 retransmits=5,
                 bytes_sent=1_000_000_000,
-                cpu_utilization_percent=20.0,
             ),
         ],
     )

@@ -942,25 +942,15 @@ def _format_top_recommendation(r: dict[str, Any]) -> str:
             :func:`kube_autotuner.analysis.recommend_configs`.
 
     Returns:
-        A comma-separated summary covering every measured metric: all
-        metrics whose value is ``None`` (e.g. ``mean_cni_memory`` when
-        CNI is disabled) are skipped.
+        A comma-separated summary covering every measured metric:
+        metrics whose value is ``None`` are skipped.
     """
     parts: list[str] = [
         f"{r['mean_tcp_throughput'] / 1e6:.1f} Mbps TCP",
         f"{r['mean_udp_throughput'] / 1e6:.1f} Mbps UDP",
-        f"{r['mean_cpu']:.1f}% CPU",
-    ]
-    nmem = r["mean_node_memory"]
-    if nmem is not None:
-        parts.append(f"node {nmem / 1024 / 1024:.0f} MiB")
-    cmem = r["mean_cni_memory"]
-    if cmem is not None:
-        parts.append(f"cni {cmem / 1024 / 1024:.0f} MiB")
-    parts.extend([
         f"{format_retransmit_rate(r['tcp_retransmit_rate'])} TCP retx/MB",
         f"{r['udp_loss_rate'] * 100:.2f}% UDP loss",
-    ])
+    ]
     jit = r.get("mean_udp_jitter")
     if jit is not None:
         parts.append(f"{format_duration(jit)} UDP jitter")
@@ -1166,17 +1156,10 @@ def _write_figures(
         return col in df.columns and bool(df[col].notna().any())
 
     pair_candidates = [
-        ("mean_tcp_throughput", "mean_cpu"),
-        ("mean_tcp_throughput", "mean_node_memory"),
-        ("mean_tcp_throughput", "mean_cni_memory"),
         ("mean_tcp_throughput", "tcp_retransmit_rate"),
         ("mean_tcp_throughput", "mean_udp_jitter"),
         ("mean_udp_throughput", "udp_loss_rate"),
         ("mean_udp_throughput", "mean_udp_jitter"),
-        ("mean_cpu", "mean_node_memory"),
-        ("mean_cpu", "mean_cni_memory"),
-        ("mean_cpu", "tcp_retransmit_rate"),
-        ("mean_cpu", "mean_udp_jitter"),
     ]
     for x, y in pair_candidates:
         if not (_has_data(x) and _has_data(y)):

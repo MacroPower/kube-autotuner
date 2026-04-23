@@ -912,12 +912,9 @@ class TestObjectivesSection:
         assert [(p.metric, p.direction) for p in section.pareto] == [
             ("tcp_throughput", "maximize"),
             ("udp_throughput", "maximize"),
-            ("cpu", "minimize"),
             ("tcp_retransmit_rate", "minimize"),
             ("udp_loss_rate", "minimize"),
             ("udp_jitter", "minimize"),
-            ("node_memory", "minimize"),
-            ("cni_memory", "minimize"),
             ("rps", "maximize"),
             ("latency_p50", "minimize"),
             ("latency_p90", "minimize"),
@@ -949,20 +946,19 @@ class TestObjectivesSection:
             ObjectivesSection(
                 recommendation_weights={
                     "nosuch": 0.1,
-                    "cpu": 0.15,
-                    "node_memory": 0.15,
+                    "tcp_retransmit_rate": 0.3,
                 },
             )
 
     def test_negative_weight_rejected(self) -> None:
         with pytest.raises(ValueError, match="non-negative"):
             ObjectivesSection(
-                recommendation_weights={"cpu": -0.1, "node_memory": 0.15},
+                recommendation_weights={"tcp_retransmit_rate": -0.1},
             )
 
     def test_malformed_constraint_rejected(self) -> None:
         with pytest.raises(ValueError, match="does not match"):
-            ObjectivesSection(constraints=["cpu !! 200"])
+            ObjectivesSection(constraints=["tcp_retransmit_rate !! 0.1"])
 
     def test_unknown_constraint_metric_rejected(self) -> None:
         with pytest.raises(ValueError, match="unknown metric"):
@@ -976,29 +972,27 @@ class TestObjectivesSection:
         section = ObjectivesSection.model_validate(
             {
                 "recommendationWeights": {
-                    "cpu": 0.2,
-                    "node_memory": 0.2,
                     "tcp_retransmit_rate": 0.4,
+                    "udp_jitter": 0.2,
                 },
             },
         )
         assert section.recommendation_weights == {
-            "cpu": 0.2,
-            "node_memory": 0.2,
             "tcp_retransmit_rate": 0.4,
+            "udp_jitter": 0.2,
         }
 
     def test_pareto_with_custom_metrics(self) -> None:
         section = ObjectivesSection(
             pareto=[
                 ParetoObjective(metric="tcp_throughput", direction="maximize"),
-                ParetoObjective(metric="node_memory", direction="minimize"),
+                ParetoObjective(metric="udp_jitter", direction="minimize"),
             ],
             constraints=[],
-            recommendation_weights={"node_memory": 0.5},
+            recommendation_weights={"udp_jitter": 0.5},
         )
         assert len(section.pareto) == 2
-        assert section.recommendation_weights == {"node_memory": 0.5}
+        assert section.recommendation_weights == {"udp_jitter": 0.5}
 
 
 class TestObjectivesSectionConstraintUnits:
@@ -1014,14 +1008,11 @@ class TestObjectivesSectionConstraintUnits:
         expected = [
             "tcp_throughput >= 1000000",
             "udp_throughput >= 1000000",
-            "cpu <= 200",
             "tcp_retransmit_rate <= 1e-06",
             "udp_loss_rate <= 0.05",
-            "node_memory <= 10000000000",
             "rps >= 100",
             "latency_p99 <= 1",
             "udp_jitter <= 0.01",
-            "cni_memory <= 1000000000",
             "latency_p50 <= 0.1",
             "latency_p90 <= 0.5",
         ]
@@ -1033,8 +1024,8 @@ class TestObjectivesSectionConstraintUnits:
         assert section.constraints == ["tcp_throughput >= 1073741824"]
 
     def test_milli_suffix_normalized(self) -> None:
-        section = ObjectivesSection(constraints=["cpu <= 500m"])
-        assert section.constraints == ["cpu <= 0.5"]
+        section = ObjectivesSection(constraints=["udp_jitter <= 500m"])
+        assert section.constraints == ["udp_jitter <= 0.5"]
 
     def test_nano_suffix_normalized(self) -> None:
         section = ObjectivesSection(constraints=["tcp_retransmit_rate <= 1n"])
@@ -1045,20 +1036,20 @@ class TestObjectivesSectionConstraintUnits:
         assert section.constraints == ["tcp_retransmit_rate <= 0.001"]
 
     def test_fractional_iec_normalized(self) -> None:
-        section = ObjectivesSection(constraints=["node_memory <= 1.5Gi"])
-        assert section.constraints == ["node_memory <= 1610612736"]
+        section = ObjectivesSection(constraints=["tcp_throughput >= 1.5Gi"])
+        assert section.constraints == ["tcp_throughput >= 1610612736"]
 
     def test_decimal_exponent_suffix_normalized(self) -> None:
-        section = ObjectivesSection(constraints=["node_memory <= 1e9"])
-        assert section.constraints == ["node_memory <= 1000000000"]
+        section = ObjectivesSection(constraints=["tcp_throughput >= 1e9"])
+        assert section.constraints == ["tcp_throughput >= 1000000000"]
 
     def test_mixed_list_preserves_bare(self) -> None:
         section = ObjectivesSection(
-            constraints=["tcp_throughput >= 1Gi", "cpu <= 200"],
+            constraints=["tcp_throughput >= 1Gi", "rps >= 200"],
         )
         assert section.constraints == [
             "tcp_throughput >= 1073741824",
-            "cpu <= 200",
+            "rps >= 200",
         ]
 
     def test_unknown_suffix_rejected(self) -> None:
@@ -1075,7 +1066,7 @@ class TestObjectivesSectionConstraintUnits:
 
     def test_normalization_idempotent(self) -> None:
         first = ObjectivesSection(
-            constraints=["tcp_throughput >= 1Gi", "cpu <= 500m"],
+            constraints=["tcp_throughput >= 1Gi", "udp_jitter <= 500m"],
         )
         second = ObjectivesSection(constraints=list(first.constraints))
         assert second.constraints == first.constraints

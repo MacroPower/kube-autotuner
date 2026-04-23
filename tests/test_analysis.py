@@ -44,7 +44,6 @@ _DEFAULT_BYTES_SENT = 1_000_000_000
 def _result(
     bps: float,
     retransmits: int = 0,
-    cpu: float = 10.0,
     bytes_sent: int | None = _DEFAULT_BYTES_SENT,
 ) -> BenchmarkResult:
     return BenchmarkResult(
@@ -53,7 +52,6 @@ def _result(
         bits_per_second=bps,
         retransmits=retransmits,
         bytes_sent=bytes_sent,
-        cpu_utilization_percent=cpu,
     )
 
 
@@ -61,7 +59,6 @@ def _trial(  # noqa: PLR0913, PLR0917
     hw: str = "10g",
     bps: float = 5e9,
     retransmits: int = 5,
-    cpu: float = 25.0,
     rmem_max: int = 212992,
     congestion: str = "cubic",
     trial_id: str | None = None,
@@ -85,7 +82,7 @@ def _trial(  # noqa: PLR0913, PLR0917
             "net.ipv4.tcp_congestion_control": congestion,
         },
         config=BenchmarkConfig(duration=10, iterations=1),
-        results=[_result(bps, retransmits, cpu, bytes_sent)],
+        results=[_result(bps, retransmits, bytes_sent)],
         **kw,
     )
 
@@ -101,7 +98,6 @@ def _build_10g_trials() -> list[TrialResult]:
                 hw="10g",
                 bps=bps,
                 retransmits=max(0, 20 - i),
-                cpu=20 + i * 2,
                 rmem_max=rmem,
                 congestion=cc,
             ),
@@ -115,7 +111,6 @@ def _build_1g_trials() -> list[TrialResult]:
             hw="1g",
             bps=5e8 + i * 1e7,
             retransmits=10 + i,
-            cpu=15 + i,
         )
         for i in range(5)
     ]
@@ -221,23 +216,23 @@ class TestSplitByHardwareClass:
 
 
 def _pad_latency_cols(rows: int) -> dict[str, list[float]]:
-    """Pad a synthetic pareto DataFrame with constant latency/RPS columns.
+    """Pad a synthetic pareto DataFrame with constant latency/RPS/jitter columns.
 
-    The new default :data:`DEFAULT_OBJECTIVES` spans nine axes; filling
-    the latency/RPS columns with constants keeps the dominance scan
-    deterministic so the pre-existing throughput/CPU/memory tests still
+    The default :data:`DEFAULT_OBJECTIVES` spans seven axes; filling
+    the latency/RPS/jitter columns with constants keeps the dominance
+    scan deterministic so the throughput/retransmit_rate tests still
     exercise the exact trials they were designed for.
 
     Returns:
-        A mapping of latency/RPS column name to a list of ``rows``
-        constant values suitable for splatting into a DataFrame
-        constructor.
+        A mapping of column name to a list of ``rows`` constant values
+        suitable for splatting into a DataFrame constructor.
     """
     return {
+        "mean_udp_jitter": [0.1] * rows,
         "mean_rps": [1000.0] * rows,
-        "mean_latency_p50": [0.001] * rows,
-        "mean_latency_p90": [0.005] * rows,
-        "mean_latency_p99": [0.010] * rows,
+        "mean_latency_p50": [1.0] * rows,
+        "mean_latency_p90": [5.0] * rows,
+        "mean_latency_p99": [10.0] * rows,
     }
 
 
@@ -247,9 +242,6 @@ class TestParetoFront:
             {
                 "trial_id": ["A", "B", "C", "D"],
                 "mean_tcp_throughput": [100, 80, 60, 50],
-                "mean_cpu": [10, 5, 30, 20],
-                "mean_node_memory": [1e8, 2e8, 3e8, 5e8],
-                "mean_cni_memory": [1e7, 2e7, 3e7, 5e7],
                 "tcp_retransmit_rate": [1, 2, 0, 5],
                 **_pad_latency_cols(4),
             },
@@ -264,10 +256,7 @@ class TestParetoFront:
             {
                 "trial_id": ["A", "B"],
                 "mean_tcp_throughput": [100, 50],
-                "mean_cpu": [50, 10],
-                "mean_node_memory": [1e8, 2e8],
-                "mean_cni_memory": [1e7, 2e7],
-                "tcp_retransmit_rate": [5, 5],
+                "tcp_retransmit_rate": [5, 1],
                 **_pad_latency_cols(2),
             },
         )
@@ -279,39 +268,19 @@ class TestParetoFront:
             {
                 "trial_id": ["A"],
                 "mean_tcp_throughput": [100],
-                "mean_cpu": [10],
-                "mean_node_memory": [1e8],
-                "mean_cni_memory": [1e7],
                 "tcp_retransmit_rate": [1],
                 **_pad_latency_cols(1),
             },
         )
         assert len(pareto_front(df)) == 1
 
-    def test_memory_makes_trial_nondominated(self) -> None:
-        df = pd.DataFrame(
-            {
-                "trial_id": ["A", "B"],
-                "mean_tcp_throughput": [100, 100],
-                "mean_cpu": [10, 10],
-                "mean_node_memory": [1e8, 5e7],
-                "mean_cni_memory": [1e7, 1e7],
-                "tcp_retransmit_rate": [1, 1],
-                **_pad_latency_cols(2),
-            },
-        )
-        ids = set(pareto_front(df)["trial_id"])
-        assert "B" in ids
-
     def test_empty(self) -> None:
         df = pd.DataFrame(
             columns=[
                 "trial_id",
                 "mean_tcp_throughput",
-                "mean_cpu",
-                "mean_node_memory",
-                "mean_cni_memory",
                 "tcp_retransmit_rate",
+                "mean_udp_jitter",
                 "mean_rps",
                 "mean_latency_p50",
                 "mean_latency_p90",
@@ -321,15 +290,15 @@ class TestParetoFront:
         assert pareto_front(df).empty
 
     def test_default_objectives_shape(self) -> None:
-        assert len(DEFAULT_OBJECTIVES) == 12
+        assert len(DEFAULT_OBJECTIVES) == 9
         names = [n for n, _ in DEFAULT_OBJECTIVES]
-        assert "mean_node_memory" in names
-        assert "mean_cni_memory" in names
-        assert "mean_udp_jitter" in names
+        assert "mean_tcp_throughput" in names
         assert "mean_udp_throughput" in names
-        assert "udp_loss_rate" in names
+        assert "mean_udp_jitter" in names
         assert "mean_rps" in names
         assert "mean_latency_p99" in names
+        assert "tcp_retransmit_rate" in names
+        assert "udp_loss_rate" in names
 
     def test_drops_nan_rows_with_warning(
         self,
@@ -339,9 +308,6 @@ class TestParetoFront:
             {
                 "trial_id": ["A", "B"],
                 "mean_tcp_throughput": [100, 50],
-                "mean_cpu": [10, 20],
-                "mean_node_memory": [1e8, 2e8],
-                "mean_cni_memory": [1e7, 2e7],
                 "tcp_retransmit_rate": [1e-7, float("nan")],
                 **_pad_latency_cols(2),
             },
@@ -357,29 +323,28 @@ class TestParetoFront:
     ) -> None:
         """A metric whose column is entirely NaN is silently excluded.
 
-        The canonical case is a trial log produced with
-        ``cni.enabled=false``: every ``mean_cni_memory`` cell is NaN.
-        Rather than dropping every trial (the previous behavior, which
-        emptied the frontier) or poisoning dominance with ``0.0``, the
-        objective is removed and the frontier is computed from the
-        remaining axes.
+        Rather than dropping every trial (which would empty the
+        frontier) or poisoning dominance with ``0.0``, the objective
+        is removed and the frontier is computed from the remaining
+        axes.
         """
         df = pd.DataFrame(
             {
                 "trial_id": ["A", "B"],
                 "mean_tcp_throughput": [100, 50],
-                "mean_cpu": [50, 10],
-                "mean_node_memory": [1e8, 2e8],
-                "mean_cni_memory": [float("nan"), float("nan")],
-                "tcp_retransmit_rate": [1e-7, 2e-7],
-                **_pad_latency_cols(2),
+                "tcp_retransmit_rate": [2e-7, 1e-7],
+                "mean_udp_jitter": [float("nan"), float("nan")],
+                "mean_rps": [1000.0] * 2,
+                "mean_latency_p50": [1.0] * 2,
+                "mean_latency_p90": [5.0] * 2,
+                "mean_latency_p99": [10.0] * 2,
             },
         )
         with caplog.at_level("INFO", logger="kube_autotuner.analysis"):
             front = pareto_front(df)
         assert set(front["trial_id"]) == {"A", "B"}
         assert any(
-            "mean_cni_memory" in rec.message and "excluded" in rec.message
+            "mean_udp_jitter" in rec.message and "excluded" in rec.message
             for rec in caplog.records
         )
 
@@ -389,10 +354,8 @@ class TestParetoFront:
             {
                 "trial_id": ["A", "B"],
                 "mean_tcp_throughput": [float("nan"), float("nan")],
-                "mean_cpu": [float("nan"), float("nan")],
-                "mean_node_memory": [float("nan"), float("nan")],
-                "mean_cni_memory": [float("nan"), float("nan")],
                 "tcp_retransmit_rate": [float("nan"), float("nan")],
+                "mean_udp_jitter": [float("nan"), float("nan")],
                 "mean_rps": [float("nan"), float("nan")],
                 "mean_latency_p50": [float("nan"), float("nan")],
                 "mean_latency_p90": [float("nan"), float("nan")],
@@ -485,162 +448,15 @@ class TestRecommendConfigs:
             if t.trial_id in rec_ids:
                 assert t.topology == "intra-az"
 
-    def test_output_includes_memory_fields(
+    def test_output_includes_surviving_metric_fields(
         self,
         mixed_trials: list[TrialResult],
     ) -> None:
         recs = recommend_configs(mixed_trials, "10g", n=5)
         assert recs, "expected at least one recommendation"
         for r in recs:
-            assert "mean_node_memory" in r
-            assert "mean_cni_memory" in r
-
-    def test_output_includes_udp_fields(
-        self,
-        mixed_trials: list[TrialResult],
-    ) -> None:
-        recs = recommend_configs(mixed_trials, "10g", n=5)
-        assert recs, "expected at least one recommendation"
-        for r in recs:
-            assert "mean_udp_throughput" in r
-            assert "udp_loss_rate" in r
-
-    def test_default_scoring_snapshot(self) -> None:
-        """Pin default scores against the baseline formula.
-
-        With two non-dominated trials whose ``cpu``,
-        ``tcp_retransmit_rate``, ``rps``, and every latency percentile
-        are constant, ``_norm`` clamps those columns to ``0.5``.
-        ``cni_memory`` is all-NaN (never set on these trials) so
-        :func:`_objectives_with_data` excludes it -- score-neutral
-        because the default weights do not include ``cni_memory``.
-        ``udp_jitter`` (stored in seconds), ``mean_udp_throughput``,
-        and ``udp_loss_rate`` are ``0.0`` for both TCP-only trials
-        (no UDP records in the fixture); each column survives
-        :func:`_objectives_with_data` with finite values but collapses
-        to ``0.5`` in :func:`_normalize_column` because ``min == max``.
-        For the surviving ``throughput`` and ``node_memory`` axes,
-        trial A (higher throughput, higher memory) normalizes to
-        ``(1.0, 1.0)`` and trial B (lower throughput, lower memory) to
-        ``(0.0, 0.0)``. Latency percentiles are all-NaN across both
-        rows, so ``_norm`` resolves each of ``latency_p50``,
-        ``latency_p90``, ``latency_p99`` to ``0.5`` via the "no
-        finite values" branch. Under the default weights
-        ``{cpu: 0.15, node_memory: 0.15, tcp_retransmit_rate: 0.3,
-        udp_loss_rate: 0.3, udp_jitter: 0.1, latency_p90: 0.1,
-        latency_p99: 0.15}`` and the ``rps`` / ``udp_throughput``
-        maximize objectives (unweighted ``+0.5`` each for both):
-
-        - score_A = 1.0 (tcp_throughput) + 0.5 (rps) + 0.5 (udp_throughput)
-          - 0.15 * 0.5 (cpu) - 0.15 * 1.0 (node_memory)
-          - 0.3 * 0.5 (tcp_retransmit_rate) - 0.3 * 0.5 (udp_loss_rate)
-          - 0.1 * 0.5 (udp_jitter) - 0.1 * 0.5 (latency_p90)
-          - 0.15 * 0.5 (latency_p99) = 1.300
-        - score_B = 0.0 + 0.5 + 0.5 - 0.15 * 0.5 - 0.15 * 0.0
-          - 0.3 * 0.5 - 0.3 * 0.5 - 0.1 * 0.5 - 0.1 * 0.5
-          - 0.15 * 0.5 = 0.450
-
-        Both rows shift by the same +0.35 (UDP throughput +0.5,
-        udp_loss_rate -0.15) versus the pre-UDP-objectives baseline,
-        preserving the relative ordering.
-        """
-
-        def _mk(
-            tp_gbps: float,
-            mem_mib: int,
-            tid: str,
-        ) -> TrialResult:
-            return TrialResult(
-                trial_id=tid,
-                node_pair=NodePair(source="a", target="b", hardware_class="10g"),
-                sysctl_values={"net.core.rmem_max": 212992},
-                config=BenchmarkConfig(duration=10, iterations=1),
-                results=[
-                    BenchmarkResult(
-                        timestamp=datetime.now(UTC),
-                        mode="tcp",
-                        bits_per_second=tp_gbps * 1e9,
-                        retransmits=5,
-                        bytes_sent=1_000_000_000,
-                        cpu_utilization_percent=20.0,
-                        node_memory_used_bytes=mem_mib * 1024 * 1024,
-                    ),
-                ],
-            )
-
-        trials = [_mk(10.0, 100, "a"), _mk(5.0, 50, "b")]
-        recs = recommend_configs(trials, "10g", n=2)
-        assert [r["trial_id"] for r in recs] == ["a", "b"]
-        assert recs[0]["score"] == pytest.approx(1.300)
-        assert recs[1]["score"] == pytest.approx(0.450)
-
-    def test_default_scoring_with_udp_records(self) -> None:
-        """UDP records actively contribute to the score under default objectives.
-
-        Trial A: TCP 10 Gbps, UDP 1 Gbps, UDP loss 1%, 100 MiB node
-        memory. Trial B: TCP 5 Gbps, UDP 0.5 Gbps, UDP loss 5%, 50
-        MiB. With the new ``udp_throughput`` (maximize) and
-        ``udp_loss_rate`` (minimize, weight 0.3) objectives present:
-
-        - tcp_throughput norms (A=1.0, B=0.0); +1.0 / 0.0 contribution.
-        - udp_throughput norms (A=1.0, B=0.0); +1.0 / 0.0 contribution.
-        - udp_loss_rate norms (A=0.0, B=1.0); -0.0 / -0.3 contribution.
-        - rps unweighted +0.5 each (NaN -> degenerate).
-        - cpu / tcp_retransmit_rate / udp_jitter / latency cols all
-          collapse to 0.5 each as in :meth:`test_default_scoring_snapshot`.
-        - node_memory norms (A=1.0, B=0.0); -0.15 / 0.0.
-
-        Score deltas vs the TCP-only baseline (0.950 / 0.100):
-        - A: +1.0 (udp_throughput norm 1.0) - 0.0 (udp_loss_rate norm 0)
-          = +1.0  ->  1.950
-        - B: +0.0 (udp_throughput norm 0.0) - 0.3 (udp_loss_rate norm 1)
-          = -0.3  ->  -0.200
-        """
-
-        def _mk(
-            tp_gbps: float,
-            mem_mib: int,
-            tid: str,
-            udp_gbps: float,
-            udp_loss: float,
-        ) -> TrialResult:
-            packets = 100_000
-            return TrialResult(
-                trial_id=tid,
-                node_pair=NodePair(source="a", target="b", hardware_class="10g"),
-                sysctl_values={"net.core.rmem_max": 212992},
-                config=BenchmarkConfig(duration=10, iterations=1),
-                results=[
-                    BenchmarkResult(
-                        timestamp=datetime.now(UTC),
-                        mode="tcp",
-                        bits_per_second=tp_gbps * 1e9,
-                        retransmits=5,
-                        bytes_sent=1_000_000_000,
-                        cpu_utilization_percent=20.0,
-                        node_memory_used_bytes=mem_mib * 1024 * 1024,
-                    ),
-                    BenchmarkResult(
-                        timestamp=datetime.now(UTC),
-                        mode="udp",
-                        bits_per_second=udp_gbps * 1e9,
-                        packets=packets,
-                        lost_packets=int(packets * udp_loss),
-                        cpu_utilization_percent=15.0,
-                    ),
-                ],
-            )
-
-        trials = [_mk(10.0, 100, "a", 1.0, 0.01), _mk(5.0, 50, "b", 0.5, 0.05)]
-        recs = recommend_configs(trials, "10g", n=2)
-        assert [r["trial_id"] for r in recs] == ["a", "b"]
-        assert recs[0]["score"] == pytest.approx(1.950)
-        assert recs[1]["score"] == pytest.approx(-0.200)
-        # And the new UDP fields are populated on the dict.
-        assert recs[0]["mean_udp_throughput"] == pytest.approx(1e9)
-        assert recs[0]["udp_loss_rate"] == pytest.approx(0.01)
-        assert recs[1]["mean_udp_throughput"] == pytest.approx(0.5e9)
-        assert recs[1]["udp_loss_rate"] == pytest.approx(0.05)
+            assert "mean_tcp_throughput" in r
+            assert "tcp_retransmit_rate" in r
 
     def test_rate_metric_reranks_over_absolute_count(self) -> None:
         """Per-byte rate reorders candidates vs. absolute retransmit count.
@@ -671,8 +487,6 @@ class TestRecommendConfigs:
                         bits_per_second=tp_gbps * 1e9,
                         retransmits=retx,
                         bytes_sent=bytes_,
-                        cpu_utilization_percent=20.0,
-                        node_memory_used_bytes=100 * 1024 * 1024,
                     ),
                 ],
             )
@@ -693,9 +507,6 @@ class TestRecommendConfigs:
             for m in (
                 "tcp_throughput",
                 "udp_throughput",
-                "cpu",
-                "node_memory",
-                "cni_memory",
                 "tcp_retransmit_rate",
                 "udp_loss_rate",
                 "udp_jitter",
@@ -713,15 +524,19 @@ class TestRecommendConfigs:
         mixed_trials: list[TrialResult],
     ) -> None:
         default_recs = recommend_configs(mixed_trials, "10g", n=5)
-        heavy_cpu_recs = recommend_configs(
+        heavy_rate_recs = recommend_configs(
             mixed_trials,
             "10g",
             n=5,
-            weights={"cpu": 5.0, "node_memory": 0.15, "tcp_retransmit_rate": 0.3},
+            weights={
+                "tcp_retransmit_rate": 5.0,
+                "udp_jitter": 0.1,
+                "latency_p99": 0.15,
+            },
         )
-        assert default_recs != heavy_cpu_recs or all(
+        assert default_recs != heavy_rate_recs or all(
             a["score"] != b["score"]
-            for a, b in zip(default_recs, heavy_cpu_recs, strict=False)
+            for a, b in zip(default_recs, heavy_rate_recs, strict=False)
         )
 
     def test_reduced_pareto_drops_rate_from_scoring(
@@ -730,95 +545,22 @@ class TestRecommendConfigs:
     ) -> None:
         reduced = [
             ParetoObjective(metric="tcp_throughput", direction="maximize"),
-            ParetoObjective(metric="node_memory", direction="minimize"),
+            ParetoObjective(metric="udp_jitter", direction="minimize"),
         ]
         recs = recommend_configs(
             mixed_trials,
             "10g",
             n=5,
             objectives=reduced,
-            weights={"node_memory": 0.15},
+            weights={"udp_jitter": 0.15},
         )
         assert recs
         for r in recs:
             assert set(r.keys()) >= {
                 "mean_tcp_throughput",
-                "mean_cpu",
-                "mean_node_memory",
-                "mean_cni_memory",
                 "tcp_retransmit_rate",
+                "mean_udp_jitter",
             }
-
-    def test_lower_memory_outranks_higher(self) -> None:
-        """Trials identical except node memory: the lower-memory one wins.
-
-        node_memory is a Pareto minimize-objective, so the higher-memory
-        twin is strictly dominated and drops out of the frontier before
-        scoring runs, leaving only the lower-memory trial.
-        """
-
-        def _trial_with_mem(mem: int, tid: str) -> TrialResult:
-            return TrialResult(
-                trial_id=tid,
-                node_pair=NodePair(source="a", target="b", hardware_class="10g"),
-                sysctl_values={"net.core.rmem_max": 212992 + mem},
-                config=BenchmarkConfig(duration=10, iterations=1),
-                results=[
-                    BenchmarkResult(
-                        timestamp=datetime.now(UTC),
-                        mode="tcp",
-                        bits_per_second=5e9,
-                        retransmits=3,
-                        bytes_sent=1_000_000_000,
-                        cpu_utilization_percent=25.0,
-                        node_memory_used_bytes=mem,
-                    ),
-                ],
-            )
-
-        trials = [
-            _trial_with_mem(100_000_000, "hi-mem"),
-            _trial_with_mem(50_000_000, "lo-mem"),
-        ]
-        recs = recommend_configs(trials, "10g", n=2)
-        assert [r["trial_id"] for r in recs] == ["lo-mem"]
-
-    def test_cni_disabled_returns_none_value_for_that_key(self) -> None:
-        """CNI-disabled trials keep the key present with a ``None`` value.
-
-        Every trial sets ``node_memory`` but leaves ``cni_memory`` unset,
-        mirroring a run with ``cni.enabled=false``. The recommendation
-        dict still has ``"mean_cni_memory"`` (contract preserved for
-        downstream consumers) but the value is ``None`` rather than a
-        misleading ``0.0``.
-        """
-
-        def _cni_disabled_trial(bps: float, tid: str) -> TrialResult:
-            return TrialResult(
-                trial_id=tid,
-                node_pair=NodePair(source="a", target="b", hardware_class="10g"),
-                sysctl_values={"net.core.rmem_max": 212992 + int(bps)},
-                config=BenchmarkConfig(duration=10, iterations=1),
-                results=[
-                    BenchmarkResult(
-                        timestamp=datetime.now(UTC),
-                        mode="tcp",
-                        bits_per_second=bps,
-                        retransmits=5,
-                        bytes_sent=1_000_000_000,
-                        cpu_utilization_percent=20.0,
-                        node_memory_used_bytes=100 * 1024 * 1024,
-                    ),
-                ],
-            )
-
-        trials = [_cni_disabled_trial(10e9, "a"), _cni_disabled_trial(5e9, "b")]
-        recs = recommend_configs(trials, "10g", n=2)
-        assert recs
-        for r in recs:
-            assert "mean_cni_memory" in r
-            assert r["mean_cni_memory"] is None
-            assert r["mean_node_memory"] is not None
 
     def test_matches_pareto_recommendation_rows_wrapper(
         self,
@@ -843,12 +585,7 @@ class TestRecommendConfigs:
             # every metric key carries through unchanged
             for key in (
                 "mean_tcp_throughput",
-                "mean_udp_throughput",
-                "mean_cpu",
-                "mean_node_memory",
-                "mean_cni_memory",
                 "tcp_retransmit_rate",
-                "udp_loss_rate",
                 "mean_udp_jitter",
                 "mean_rps",
                 "mean_latency_p50",
@@ -880,13 +617,7 @@ class TestPlots:
     def test_2d(self, mixed_trials: list[TrialResult]) -> None:
         df, _ = trials_to_dataframe(mixed_trials, hardware_class="10g")
         front = pareto_front(df)
-        fig = plot_pareto_2d(df, front, "mean_tcp_throughput", "mean_cpu")
-        assert fig is not None
-
-    def test_2d_node_memory_axis(self, mixed_trials: list[TrialResult]) -> None:
-        df, _ = trials_to_dataframe(mixed_trials, hardware_class="10g")
-        front = pareto_front(df)
-        fig = plot_pareto_2d(df, front, "mean_tcp_throughput", "mean_node_memory")
+        fig = plot_pareto_2d(df, front, "mean_tcp_throughput", "tcp_retransmit_rate")
         assert fig is not None
 
 
@@ -1000,31 +731,29 @@ class TestCLIAnalyze:
     ) -> None:
         """End-to-end: JSONL + sidecar → analyze → custom weights applied.
 
-        Two non-dominated trials differ only in memory. With the
-        default memory weight (0.15) the high-throughput trial wins;
-        with a heavy memory weight the low-memory trial wins.
+        Two non-dominated trials differ in throughput and retransmit
+        rate. With a heavy retransmit_rate weight the lower-retx trial
+        wins over the higher-throughput one.
         """
 
-        def _mk(tp_gbps: float, mem_mib: int, tid: str) -> TrialResult:
+        def _mk(tp_gbps: float, retx: int, tid: str) -> TrialResult:
             return TrialResult(
                 trial_id=tid,
                 node_pair=NodePair(source="a", target="b", hardware_class="10g"),
-                sysctl_values={"net.core.rmem_max": 212992 + mem_mib},
+                sysctl_values={"net.core.rmem_max": 212992 + retx},
                 config=BenchmarkConfig(duration=10, iterations=1),
                 results=[
                     BenchmarkResult(
                         timestamp=datetime.now(UTC),
                         mode="tcp",
                         bits_per_second=tp_gbps * 1e9,
-                        retransmits=5,
+                        retransmits=retx,
                         bytes_sent=1_000_000_000,
-                        cpu_utilization_percent=20.0,
-                        node_memory_used_bytes=mem_mib * 1024 * 1024,
                     ),
                 ],
             )
 
-        trials = [_mk(10.0, 500, "hi-tp"), _mk(5.0, 50, "lo-mem")]
+        trials = [_mk(10.0, 500, "hi-tp"), _mk(5.0, 0, "lo-retx")]
         jsonl = tmp_path / "trials.jsonl"
         for t in trials:
             TrialLog.append(jsonl, t)
@@ -1032,10 +761,10 @@ class TestCLIAnalyze:
         section = ObjectivesSection(
             pareto=[
                 ParetoObjective(metric="tcp_throughput", direction="maximize"),
-                ParetoObjective(metric="node_memory", direction="minimize"),
+                ParetoObjective(metric="tcp_retransmit_rate", direction="minimize"),
             ],
             constraints=[],
-            recommendation_weights={"node_memory": 5.0},
+            recommendation_weights={"tcp_retransmit_rate": 5.0},
         )
         TrialLog.write_resume_metadata(
             jsonl,
@@ -1063,7 +792,7 @@ class TestCLIAnalyze:
         assert result.exit_code == 0, result.output
 
         recs = json.loads((out_dir / "10g" / "recommendations.json").read_text())
-        assert recs[0]["trial_id"] == "lo-mem"
+        assert recs[0]["trial_id"] == "lo-retx"
 
     def test_analyze_empty_file(self, tmp_path: Path) -> None:
         empty = tmp_path / "empty.jsonl"
