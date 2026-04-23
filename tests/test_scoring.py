@@ -26,13 +26,13 @@ def test_score_rows_matches_recommend_configs_formula() -> None:
     - row C: 0.0 - 0.15 * 0.0 = 0.0
     """
     objectives = [
-        ParetoObjective(metric="throughput", direction="maximize"),
+        ParetoObjective(metric="tcp_throughput", direction="maximize"),
         ParetoObjective(metric="cpu", direction="minimize"),
     ]
     rows = [
-        {_col("throughput"): 2.0e9, _col("cpu"): 80.0},
-        {_col("throughput"): 1.5e9, _col("cpu"): 50.0},
-        {_col("throughput"): 1.0e9, _col("cpu"): 20.0},
+        {_col("tcp_throughput"): 2.0e9, _col("cpu"): 80.0},
+        {_col("tcp_throughput"): 1.5e9, _col("cpu"): 50.0},
+        {_col("tcp_throughput"): 1.0e9, _col("cpu"): 20.0},
     ]
     scores = score_rows(rows, objectives, {"cpu": 0.15})
     assert scores[0] == pytest.approx(0.85)
@@ -43,7 +43,7 @@ def test_score_rows_matches_recommend_configs_formula() -> None:
 def test_score_rows_handles_nan_and_degenerate_columns() -> None:
     """NaN rows, constant columns, and all-NaN columns resolve to ``0.5``."""
     objectives = [
-        ParetoObjective(metric="throughput", direction="maximize"),
+        ParetoObjective(metric="tcp_throughput", direction="maximize"),
         ParetoObjective(metric="cpu", direction="minimize"),
         ParetoObjective(metric="node_memory", direction="minimize"),
     ]
@@ -51,17 +51,17 @@ def test_score_rows_handles_nan_and_degenerate_columns() -> None:
         # One all-NaN column (node_memory), one constant column (cpu),
         # one row with a NaN throughput.
         {
-            _col("throughput"): 1.0e9,
+            _col("tcp_throughput"): 1.0e9,
             _col("cpu"): 10.0,
             _col("node_memory"): math.nan,
         },
         {
-            _col("throughput"): math.nan,
+            _col("tcp_throughput"): math.nan,
             _col("cpu"): 10.0,
             _col("node_memory"): math.nan,
         },
         {
-            _col("throughput"): 2.0e9,
+            _col("tcp_throughput"): 2.0e9,
             _col("cpu"): 10.0,
             _col("node_memory"): math.nan,
         },
@@ -88,18 +88,18 @@ def test_score_rows_accepts_none_and_float_nan() -> None:
     and the post-hoc ranking agree on the same inputs.
     """
     objectives = [
-        ParetoObjective(metric="throughput", direction="maximize"),
+        ParetoObjective(metric="tcp_throughput", direction="maximize"),
         ParetoObjective(metric="cpu", direction="minimize"),
     ]
     rows_nan = [
-        {_col("throughput"): 1e9, _col("cpu"): 20.0},
-        {_col("throughput"): float("nan"), _col("cpu"): float("nan")},
-        {_col("throughput"): 2e9, _col("cpu"): 40.0},
+        {_col("tcp_throughput"): 1e9, _col("cpu"): 20.0},
+        {_col("tcp_throughput"): float("nan"), _col("cpu"): float("nan")},
+        {_col("tcp_throughput"): 2e9, _col("cpu"): 40.0},
     ]
     rows_none = [
-        {_col("throughput"): 1e9, _col("cpu"): 20.0},
-        {_col("throughput"): None, _col("cpu"): None},
-        {_col("throughput"): 2e9, _col("cpu"): 40.0},
+        {_col("tcp_throughput"): 1e9, _col("cpu"): 20.0},
+        {_col("tcp_throughput"): None, _col("cpu"): None},
+        {_col("tcp_throughput"): 2e9, _col("cpu"): 40.0},
     ]
     scores_nan = score_rows(rows_nan, objectives, {"cpu": 0.15})
     scores_none = score_rows(rows_none, objectives, {"cpu": 0.15})
@@ -109,7 +109,7 @@ def test_score_rows_accepts_none_and_float_nan() -> None:
 
 def test_score_rows_empty_input() -> None:
     """Zero rows return an empty list, not an error."""
-    objectives = [ParetoObjective(metric="throughput", direction="maximize")]
+    objectives = [ParetoObjective(metric="tcp_throughput", direction="maximize")]
     assert score_rows([], objectives, {}) == []
 
 
@@ -124,12 +124,12 @@ def test_score_rows_missing_metric_column_is_neutral() -> None:
     maximize-throughput term.
     """
     objectives = [
-        ParetoObjective(metric="throughput", direction="maximize"),
+        ParetoObjective(metric="tcp_throughput", direction="maximize"),
         ParetoObjective(metric="node_memory", direction="minimize"),
     ]
     rows = [
-        {_col("throughput"): 1e9},
-        {_col("throughput"): 2e9},
+        {_col("tcp_throughput"): 1e9},
+        {_col("tcp_throughput"): 2e9},
     ]
     scores = score_rows(rows, objectives, {"node_memory": 0.15})
     # throughput norms: 0.0 and 1.0; node_memory norms: 0.5 each.

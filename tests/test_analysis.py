@@ -140,7 +140,7 @@ class TestTrialsToDataframe:
         df, _ = trials_to_dataframe(mixed_trials, hardware_class="10g")
         assert len(df) == 15
         assert "trial_id" in df.columns
-        assert "mean_throughput" in df.columns
+        assert "mean_tcp_throughput" in df.columns
         assert "net.core.rmem_max" in df.columns
 
     def test_hardware_filter(self, mixed_trials: list[TrialResult]) -> None:
@@ -158,7 +158,7 @@ class TestTrialsToDataframe:
     ) -> None:
         df, _ = trials_to_dataframe(mixed_trials, hardware_class="99g")
         assert df.empty
-        assert "mean_throughput" in df.columns
+        assert "mean_tcp_throughput" in df.columns
 
     def test_int_params_numeric(self, mixed_trials: list[TrialResult]) -> None:
         df, _ = trials_to_dataframe(mixed_trials, hardware_class="10g")
@@ -246,11 +246,11 @@ class TestParetoFront:
         df = pd.DataFrame(
             {
                 "trial_id": ["A", "B", "C", "D"],
-                "mean_throughput": [100, 80, 60, 50],
+                "mean_tcp_throughput": [100, 80, 60, 50],
                 "mean_cpu": [10, 5, 30, 20],
                 "mean_node_memory": [1e8, 2e8, 3e8, 5e8],
                 "mean_cni_memory": [1e7, 2e7, 3e7, 5e7],
-                "retransmit_rate": [1, 2, 0, 5],
+                "tcp_retransmit_rate": [1, 2, 0, 5],
                 **_pad_latency_cols(4),
             },
         )
@@ -263,11 +263,11 @@ class TestParetoFront:
         df = pd.DataFrame(
             {
                 "trial_id": ["A", "B"],
-                "mean_throughput": [100, 50],
+                "mean_tcp_throughput": [100, 50],
                 "mean_cpu": [50, 10],
                 "mean_node_memory": [1e8, 2e8],
                 "mean_cni_memory": [1e7, 2e7],
-                "retransmit_rate": [5, 5],
+                "tcp_retransmit_rate": [5, 5],
                 **_pad_latency_cols(2),
             },
         )
@@ -278,11 +278,11 @@ class TestParetoFront:
         df = pd.DataFrame(
             {
                 "trial_id": ["A"],
-                "mean_throughput": [100],
+                "mean_tcp_throughput": [100],
                 "mean_cpu": [10],
                 "mean_node_memory": [1e8],
                 "mean_cni_memory": [1e7],
-                "retransmit_rate": [1],
+                "tcp_retransmit_rate": [1],
                 **_pad_latency_cols(1),
             },
         )
@@ -292,11 +292,11 @@ class TestParetoFront:
         df = pd.DataFrame(
             {
                 "trial_id": ["A", "B"],
-                "mean_throughput": [100, 100],
+                "mean_tcp_throughput": [100, 100],
                 "mean_cpu": [10, 10],
                 "mean_node_memory": [1e8, 5e7],
                 "mean_cni_memory": [1e7, 1e7],
-                "retransmit_rate": [1, 1],
+                "tcp_retransmit_rate": [1, 1],
                 **_pad_latency_cols(2),
             },
         )
@@ -307,11 +307,11 @@ class TestParetoFront:
         df = pd.DataFrame(
             columns=[
                 "trial_id",
-                "mean_throughput",
+                "mean_tcp_throughput",
                 "mean_cpu",
                 "mean_node_memory",
                 "mean_cni_memory",
-                "retransmit_rate",
+                "tcp_retransmit_rate",
                 "mean_rps",
                 "mean_latency_p50_ms",
                 "mean_latency_p90_ms",
@@ -321,11 +321,13 @@ class TestParetoFront:
         assert pareto_front(df).empty
 
     def test_default_objectives_shape(self) -> None:
-        assert len(DEFAULT_OBJECTIVES) == 10
+        assert len(DEFAULT_OBJECTIVES) == 12
         names = [n for n, _ in DEFAULT_OBJECTIVES]
         assert "mean_node_memory" in names
         assert "mean_cni_memory" in names
-        assert "mean_jitter_ms" in names
+        assert "mean_udp_jitter_ms" in names
+        assert "mean_udp_throughput" in names
+        assert "udp_loss_rate" in names
         assert "mean_rps" in names
         assert "mean_latency_p99_ms" in names
 
@@ -336,11 +338,11 @@ class TestParetoFront:
         df = pd.DataFrame(
             {
                 "trial_id": ["A", "B"],
-                "mean_throughput": [100, 50],
+                "mean_tcp_throughput": [100, 50],
                 "mean_cpu": [10, 20],
                 "mean_node_memory": [1e8, 2e8],
                 "mean_cni_memory": [1e7, 2e7],
-                "retransmit_rate": [1e-7, float("nan")],
+                "tcp_retransmit_rate": [1e-7, float("nan")],
                 **_pad_latency_cols(2),
             },
         )
@@ -365,11 +367,11 @@ class TestParetoFront:
         df = pd.DataFrame(
             {
                 "trial_id": ["A", "B"],
-                "mean_throughput": [100, 50],
+                "mean_tcp_throughput": [100, 50],
                 "mean_cpu": [50, 10],
                 "mean_node_memory": [1e8, 2e8],
                 "mean_cni_memory": [float("nan"), float("nan")],
-                "retransmit_rate": [1e-7, 2e-7],
+                "tcp_retransmit_rate": [1e-7, 2e-7],
                 **_pad_latency_cols(2),
             },
         )
@@ -386,11 +388,11 @@ class TestParetoFront:
         df = pd.DataFrame(
             {
                 "trial_id": ["A", "B"],
-                "mean_throughput": [float("nan"), float("nan")],
+                "mean_tcp_throughput": [float("nan"), float("nan")],
                 "mean_cpu": [float("nan"), float("nan")],
                 "mean_node_memory": [float("nan"), float("nan")],
                 "mean_cni_memory": [float("nan"), float("nan")],
-                "retransmit_rate": [float("nan"), float("nan")],
+                "tcp_retransmit_rate": [float("nan"), float("nan")],
                 "mean_rps": [float("nan"), float("nan")],
                 "mean_latency_p50_ms": [float("nan"), float("nan")],
                 "mean_latency_p90_ms": [float("nan"), float("nan")],
@@ -406,7 +408,7 @@ class TestParetoFront:
 class TestParameterImportance:
     def test_identifies_top_param(self, mixed_trials: list[TrialResult]) -> None:
         df, _ = trials_to_dataframe(mixed_trials, hardware_class="10g")
-        imp = parameter_importance(df, target="mean_throughput")
+        imp = parameter_importance(df, target="mean_tcp_throughput")
         assert not imp.empty
         assert imp.iloc[0]["param"] == "net.core.rmem_max"
 
@@ -493,38 +495,54 @@ class TestRecommendConfigs:
             assert "mean_node_memory" in r
             assert "mean_cni_memory" in r
 
+    def test_output_includes_udp_fields(
+        self,
+        mixed_trials: list[TrialResult],
+    ) -> None:
+        recs = recommend_configs(mixed_trials, "10g", n=5)
+        assert recs, "expected at least one recommendation"
+        for r in recs:
+            assert "mean_udp_throughput" in r
+            assert "udp_loss_rate" in r
+
     def test_default_scoring_snapshot(self) -> None:
         """Pin default scores against the baseline formula.
 
         With two non-dominated trials whose ``cpu``,
-        ``retransmit_rate``, ``rps``, and every latency percentile
+        ``tcp_retransmit_rate``, ``rps``, and every latency percentile
         are constant, ``_norm`` clamps those columns to ``0.5``.
         ``cni_memory`` is all-NaN (never set on these trials) so
         :func:`_objectives_with_data` excludes it -- score-neutral
         because the default weights do not include ``cni_memory``.
-        ``jitter_ms`` is ``0.0`` for both TCP-only trials (no UDP
-        records in the fixture); the column survives
-        :func:`_objectives_with_data` with finite values but
-        collapses to ``0.5`` in :func:`_normalize_column` because
-        ``min == max``. For the surviving ``throughput`` and
-        ``node_memory`` axes, trial A (higher throughput, higher
-        memory) normalizes to ``(1.0, 1.0)`` and trial B (lower
-        throughput, lower memory) to ``(0.0, 0.0)``. Latency
-        percentiles are all-NaN across both rows, so ``_norm``
-        resolves each of ``latency_p50``, ``latency_p90``,
-        ``latency_p99`` to ``0.5`` via the "no finite values"
-        branch. Under the default weights
-        ``{cpu: 0.15, node_memory: 0.15, retransmit_rate: 0.3,
-        jitter: 0.1, latency_p90: 0.1, latency_p99: 0.15}`` and the
-        ``rps`` maximize objective (unweighted ``+0.5`` for both):
+        ``jitter_ms``, ``mean_udp_throughput``, and ``udp_loss_rate``
+        are ``0.0`` for both TCP-only trials (no UDP records in the
+        fixture); each column survives :func:`_objectives_with_data`
+        with finite values but collapses to ``0.5`` in
+        :func:`_normalize_column` because ``min == max``. For the
+        surviving ``throughput`` and ``node_memory`` axes, trial A
+        (higher throughput, higher memory) normalizes to ``(1.0,
+        1.0)`` and trial B (lower throughput, lower memory) to
+        ``(0.0, 0.0)``. Latency percentiles are all-NaN across both
+        rows, so ``_norm`` resolves each of ``latency_p50``,
+        ``latency_p90``, ``latency_p99`` to ``0.5`` via the "no
+        finite values" branch. Under the default weights
+        ``{cpu: 0.15, node_memory: 0.15, tcp_retransmit_rate: 0.3,
+        udp_loss_rate: 0.3, udp_jitter: 0.1, latency_p90: 0.1,
+        latency_p99: 0.15}`` and the ``rps`` / ``udp_throughput``
+        maximize objectives (unweighted ``+0.5`` each for both):
 
-        - score_A = 1.0 + 0.5 - 0.15 * 0.5 - 0.15 * 1.0 - 0.3 * 0.5
-          - 0.1 * 0.5 (jitter) - 0.1 * 0.5 - 0.15 * 0.5 = 0.950
-        - score_B = 0.0 + 0.5 - 0.15 * 0.5 - 0.15 * 0.0 - 0.3 * 0.5
-          - 0.1 * 0.5 (jitter) - 0.1 * 0.5 - 0.15 * 0.5 = 0.100
+        - score_A = 1.0 (tcp_throughput) + 0.5 (rps) + 0.5 (udp_throughput)
+          - 0.15 * 0.5 (cpu) - 0.15 * 1.0 (node_memory)
+          - 0.3 * 0.5 (tcp_retransmit_rate) - 0.3 * 0.5 (udp_loss_rate)
+          - 0.1 * 0.5 (udp_jitter) - 0.1 * 0.5 (latency_p90)
+          - 0.15 * 0.5 (latency_p99) = 1.300
+        - score_B = 0.0 + 0.5 + 0.5 - 0.15 * 0.5 - 0.15 * 0.0
+          - 0.3 * 0.5 - 0.3 * 0.5 - 0.1 * 0.5 - 0.1 * 0.5
+          - 0.15 * 0.5 = 0.450
 
-        Both rows drop by the same ``0.05`` jitter term, preserving
-        the relative ordering.
+        Both rows shift by the same +0.35 (UDP throughput +0.5,
+        udp_loss_rate -0.15) versus the pre-UDP-objectives baseline,
+        preserving the relative ordering.
         """
 
         def _mk(
@@ -553,8 +571,76 @@ class TestRecommendConfigs:
         trials = [_mk(10.0, 100, "a"), _mk(5.0, 50, "b")]
         recs = recommend_configs(trials, "10g", n=2)
         assert [r["trial_id"] for r in recs] == ["a", "b"]
-        assert recs[0]["score"] == pytest.approx(0.950)
-        assert recs[1]["score"] == pytest.approx(0.100)
+        assert recs[0]["score"] == pytest.approx(1.300)
+        assert recs[1]["score"] == pytest.approx(0.450)
+
+    def test_default_scoring_with_udp_records(self) -> None:
+        """UDP records actively contribute to the score under default objectives.
+
+        Trial A: TCP 10 Gbps, UDP 1 Gbps, UDP loss 1%, 100 MiB node
+        memory. Trial B: TCP 5 Gbps, UDP 0.5 Gbps, UDP loss 5%, 50
+        MiB. With the new ``udp_throughput`` (maximize) and
+        ``udp_loss_rate`` (minimize, weight 0.3) objectives present:
+
+        - tcp_throughput norms (A=1.0, B=0.0); +1.0 / 0.0 contribution.
+        - udp_throughput norms (A=1.0, B=0.0); +1.0 / 0.0 contribution.
+        - udp_loss_rate norms (A=0.0, B=1.0); -0.0 / -0.3 contribution.
+        - rps unweighted +0.5 each (NaN -> degenerate).
+        - cpu / tcp_retransmit_rate / udp_jitter / latency cols all
+          collapse to 0.5 each as in :meth:`test_default_scoring_snapshot`.
+        - node_memory norms (A=1.0, B=0.0); -0.15 / 0.0.
+
+        Score deltas vs the TCP-only baseline (0.950 / 0.100):
+        - A: +1.0 (udp_throughput norm 1.0) - 0.0 (udp_loss_rate norm 0)
+          = +1.0  ->  1.950
+        - B: +0.0 (udp_throughput norm 0.0) - 0.3 (udp_loss_rate norm 1)
+          = -0.3  ->  -0.200
+        """
+
+        def _mk(
+            tp_gbps: float,
+            mem_mib: int,
+            tid: str,
+            udp_gbps: float,
+            udp_loss: float,
+        ) -> TrialResult:
+            packets = 100_000
+            return TrialResult(
+                trial_id=tid,
+                node_pair=NodePair(source="a", target="b", hardware_class="10g"),
+                sysctl_values={"net.core.rmem_max": 212992},
+                config=BenchmarkConfig(duration=10, iterations=1),
+                results=[
+                    BenchmarkResult(
+                        timestamp=datetime.now(UTC),
+                        mode="tcp",
+                        bits_per_second=tp_gbps * 1e9,
+                        retransmits=5,
+                        bytes_sent=1_000_000_000,
+                        cpu_utilization_percent=20.0,
+                        node_memory_used_bytes=mem_mib * 1024 * 1024,
+                    ),
+                    BenchmarkResult(
+                        timestamp=datetime.now(UTC),
+                        mode="udp",
+                        bits_per_second=udp_gbps * 1e9,
+                        packets=packets,
+                        lost_packets=int(packets * udp_loss),
+                        cpu_utilization_percent=15.0,
+                    ),
+                ],
+            )
+
+        trials = [_mk(10.0, 100, "a", 1.0, 0.01), _mk(5.0, 50, "b", 0.5, 0.05)]
+        recs = recommend_configs(trials, "10g", n=2)
+        assert [r["trial_id"] for r in recs] == ["a", "b"]
+        assert recs[0]["score"] == pytest.approx(1.950)
+        assert recs[1]["score"] == pytest.approx(-0.200)
+        # And the new UDP fields are populated on the dict.
+        assert recs[0]["mean_udp_throughput"] == pytest.approx(1e9)
+        assert recs[0]["udp_loss_rate"] == pytest.approx(0.01)
+        assert recs[1]["mean_udp_throughput"] == pytest.approx(0.5e9)
+        assert recs[1]["udp_loss_rate"] == pytest.approx(0.05)
 
     def test_rate_metric_reranks_over_absolute_count(self) -> None:
         """Per-byte rate reorders candidates vs. absolute retransmit count.
@@ -597,7 +683,7 @@ class TestRecommendConfigs:
         ]
         recs = recommend_configs(trials, "10g", n=2)
         assert [r["trial_id"] for r in recs] == ["a", "b"]
-        assert recs[0]["retransmit_rate"] == pytest.approx(
+        assert recs[0]["tcp_retransmit_rate"] == pytest.approx(
             1000 / 37_500_000_000,
         )
 
@@ -605,12 +691,14 @@ class TestRecommendConfigs:
         expected = {
             METRIC_TO_DF_COLUMN[m]
             for m in (
-                "throughput",
+                "tcp_throughput",
+                "udp_throughput",
                 "cpu",
                 "node_memory",
                 "cni_memory",
-                "retransmit_rate",
-                "jitter",
+                "tcp_retransmit_rate",
+                "udp_loss_rate",
+                "udp_jitter",
                 "rps",
                 "latency_p50",
                 "latency_p90",
@@ -629,7 +717,7 @@ class TestRecommendConfigs:
             mixed_trials,
             "10g",
             n=5,
-            weights={"cpu": 5.0, "node_memory": 0.15, "retransmit_rate": 0.3},
+            weights={"cpu": 5.0, "node_memory": 0.15, "tcp_retransmit_rate": 0.3},
         )
         assert default_recs != heavy_cpu_recs or all(
             a["score"] != b["score"]
@@ -641,7 +729,7 @@ class TestRecommendConfigs:
         mixed_trials: list[TrialResult],
     ) -> None:
         reduced = [
-            ParetoObjective(metric="throughput", direction="maximize"),
+            ParetoObjective(metric="tcp_throughput", direction="maximize"),
             ParetoObjective(metric="node_memory", direction="minimize"),
         ]
         recs = recommend_configs(
@@ -654,11 +742,11 @@ class TestRecommendConfigs:
         assert recs
         for r in recs:
             assert set(r.keys()) >= {
-                "mean_throughput",
+                "mean_tcp_throughput",
                 "mean_cpu",
                 "mean_node_memory",
                 "mean_cni_memory",
-                "retransmit_rate",
+                "tcp_retransmit_rate",
             }
 
     def test_lower_memory_outranks_higher(self) -> None:
@@ -754,12 +842,14 @@ class TestRecommendConfigs:
             assert rec["rank"] == i + 1
             # every metric key carries through unchanged
             for key in (
-                "mean_throughput",
+                "mean_tcp_throughput",
+                "mean_udp_throughput",
                 "mean_cpu",
                 "mean_node_memory",
                 "mean_cni_memory",
-                "retransmit_rate",
-                "mean_jitter_ms",
+                "tcp_retransmit_rate",
+                "udp_loss_rate",
+                "mean_udp_jitter_ms",
                 "mean_rps",
                 "mean_latency_p50_ms",
                 "mean_latency_p90_ms",
@@ -790,13 +880,13 @@ class TestPlots:
     def test_2d(self, mixed_trials: list[TrialResult]) -> None:
         df, _ = trials_to_dataframe(mixed_trials, hardware_class="10g")
         front = pareto_front(df)
-        fig = plot_pareto_2d(df, front, "mean_throughput", "mean_cpu")
+        fig = plot_pareto_2d(df, front, "mean_tcp_throughput", "mean_cpu")
         assert fig is not None
 
     def test_2d_node_memory_axis(self, mixed_trials: list[TrialResult]) -> None:
         df, _ = trials_to_dataframe(mixed_trials, hardware_class="10g")
         front = pareto_front(df)
-        fig = plot_pareto_2d(df, front, "mean_throughput", "mean_node_memory")
+        fig = plot_pareto_2d(df, front, "mean_tcp_throughput", "mean_node_memory")
         assert fig is not None
 
 
@@ -941,7 +1031,7 @@ class TestCLIAnalyze:
 
         section = ObjectivesSection(
             pareto=[
-                ParetoObjective(metric="throughput", direction="maximize"),
+                ParetoObjective(metric="tcp_throughput", direction="maximize"),
                 ParetoObjective(metric="node_memory", direction="minimize"),
             ],
             constraints=[],

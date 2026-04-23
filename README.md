@@ -20,13 +20,13 @@ offered load.
 - **Expensive trials.** A single iteration expands into four
   sequential sub-stages: an iperf3 TCP bandwidth fan-out
   (`duration=30s` + `omit=5s` warmup), an iperf3 UDP bandwidth
-  fan-out (same budget, sole source of `jitter_ms` and the residual
-  pressure that exercises the UDP-tuning dimensions), a fortio
-  saturation run (`-qps 0`, `fortio.duration=30s`), and a fortio
-  fixed-QPS run at `fortio.fixedQps`. The sequence repeats
-  `iterations` times before setup and teardown. A 50-trial run
-  takes hours. Grid search over the default space is infeasible by
-  orders of magnitude.
+  fan-out (same budget, source of `jitter_ms`, UDP throughput,
+  and UDP packet-loss rate; also the residual pressure that
+  exercises the UDP-tuning dimensions), a fortio saturation run
+  (`-qps 0`, `fortio.duration=30s`), and a fortio fixed-QPS run at
+  `fortio.fixedQps`. The sequence repeats `iterations` times before
+  setup and teardown. A 50-trial run takes hours. Grid search over
+  the default space is infeasible by orders of magnitude.
 - **Noisy measurements.** iperf3 throughput has real run-to-run
   variance. The optimizer collapses each metric into a `(mean, SEM)`
   pair and accounts for the fact that samples are correlated when
@@ -120,12 +120,13 @@ Either way, exhaustive search is not an option.
 | Conntrack          | 3     | `net.netfilter.nf_conntrack_max`, `net.netfilter.nf_conntrack_tcp_timeout_established` |
 
 UDP-category params are always part of the default search space: every
-iteration runs both a TCP and a UDP iperf3 bandwidth stage, so UDP
-metrics (`jitter_ms`) and the residual kernel pressure that these
-knobs control are always observable. Conntrack tuning assumes the
-`nf_conntrack` kernel module is loaded on the target node; on nodes
-without `/proc/sys/net/netfilter` these writes will fail at apply
-time.
+iteration runs both a TCP and a UDP iperf3 bandwidth stage, so
+`udp_throughput`, `udp_loss_rate`, and `udp_jitter` -- plus the
+residual kernel pressure that these knobs control -- are always
+observable. All three are first-class Pareto objectives by default;
+see [Metric catalog](#metric-catalog). Conntrack tuning assumes the `nf_conntrack`
+kernel module is loaded on the target node; on nodes without
+`/proc/sys/net/netfilter` these writes will fail at apply time.
 
 Two shapes of customisation:
 
@@ -253,10 +254,12 @@ patches:
 
 objectives:
   pareto:
-    - { metric: throughput, direction: maximize }
+    - { metric: tcp_throughput, direction: maximize }
+    - { metric: udp_throughput, direction: maximize }
     - { metric: cpu, direction: minimize }
-    - { metric: retransmit_rate, direction: minimize }
-    - { metric: jitter, direction: minimize }
+    - { metric: tcp_retransmit_rate, direction: minimize }
+    - { metric: udp_loss_rate, direction: minimize }
+    - { metric: udp_jitter, direction: minimize }
     - { metric: node_memory, direction: minimize }
     - { metric: cni_memory, direction: minimize }
     - { metric: rps, direction: maximize }
@@ -264,24 +267,30 @@ objectives:
     - { metric: latency_p90, direction: minimize }
     - { metric: latency_p99, direction: minimize }
   constraints:
-    - "throughput >= 1e6"
+    - "tcp_throughput >= 1e6"
+    - "udp_throughput >= 1e6"
     - "cpu <= 200"
-    - "retransmit_rate <= 1e-6"   # retransmits per byte sent; 1e-6 ~ 1 retx/MB
+    - "tcp_retransmit_rate <= 1e-6"  # retransmits per byte sent; 1e-6 ~ 1 retx/MB
+    - "udp_loss_rate <= 0.05"        # 5% UDP packet loss cap; UDP loss naturally runs
+                                     # higher than TCP retransmit rate.
     - "node_memory <= 1e10"
-    - "rps >= 100"                # requests/sec; only the saturation sub-stage feeds rps,
-                                  # so this floor only fails on fortio server crash.
-    - "latency_p99 <= 1000"       # milliseconds; from the fixed_qps sub-stage only.
+    - "rps >= 100"                   # requests/sec; only the saturation sub-stage feeds
+                                     # rps, so this floor only fails on fortio server crash.
+    - "latency_p99 <= 1000"          # milliseconds; from the fixed_qps sub-stage only.
   recommendationWeights:
     cpu: 0.15
-    retransmit_rate: 0.3
-    jitter: 0.1                   # UDP jitter ms; modest weight -- a stability signal,
-                                  # not a primary optimization target.
+    tcp_retransmit_rate: 0.3
+    udp_loss_rate: 0.3               # mirror tcp_retransmit_rate's weight; UDP loss pushes
+                                     # back on the score with the same force TCP retransmit
+                                     # rate does.
+    udp_jitter: 0.1                  # UDP inter-arrival jitter (ms); modest weight -- a
+                                     # stability signal, not a primary optimization target.
     node_memory: 0.15
-    latency_p90: 0.1              # tail-latency weights keep the live Best-so-far panel
-    latency_p99: 0.15             # and the post-hoc recommendation from over-indexing on
-                                  # raw throughput; latency_p50 stays unweighted so the
-                                  # mean-latency axis enters the Pareto set without
-                                  # dominating the score.
+    latency_p90: 0.1                 # tail-latency weights keep the live Best-so-far panel
+    latency_p99: 0.15                # and the post-hoc recommendation from over-indexing on
+                                     # raw throughput; latency_p50 stays unweighted so the
+                                     # mean-latency axis enters the Pareto set without
+                                     # dominating the score.
 
 output: out/results.jsonl
 ```
@@ -299,20 +308,24 @@ A few rules govern how the `objectives:` block is interpreted:
   load: the `modes:` key is silently dropped at parse time, so a
   resume will rerun against the new always-both semantics.
 
-Valid metric names and their sources:
+## Metric catalog
 
-| Metric            | Direction | Source sub-stage         | Notes                                                                                                  |
-|-------------------|-----------|--------------------------|--------------------------------------------------------------------------------------------------------|
-| `throughput`      | maximize  | iperf3 bw-tcp            | Bits per second; TCP-only. Summed across source clients per iteration, averaged across iterations.    |
-| `cpu`             | minimize  | iperf3 bw-tcp            | Percent; TCP-only. Server-side CPU when every record reports it, per-client host CPU otherwise.       |
-| `retransmit_rate` | minimize  | iperf3 bw-tcp            | Retransmits per byte sent; scale-invariant, so high-throughput/high-loss does not win on raw count.   |
-| `jitter`          | minimize  | iperf3 bw-udp            | Milliseconds. Mean UDP inter-arrival jitter; tail-stability signal that TCP-only runs cannot observe. |
-| `node_memory`     | minimize  | iperf3 (peak over iter.) | Whole-node memory on the iperf target, from `metrics.k8s.io/v1beta1 nodes/<name>`.                    |
-| `cni_memory`      | minimize  | iperf3 (peak over iter.) | Memory summed across the CNI pods selected by `cni:`; what most sysctl tweaks actually move.          |
-| `rps`             | maximize  | fortio saturation        | Achieved QPS under `-qps 0`. Fixed-QPS RPS would clamp to the offered load, so it is not a source.    |
-| `latency_p50`     | minimize  | fortio fixed-QPS         | Milliseconds; measured under the configured `fortio.fixedQps` offered load.                           |
-| `latency_p90`     | minimize  | fortio fixed-QPS         | Milliseconds; see `latency_p50`.                                                                      |
-| `latency_p99`     | minimize  | fortio fixed-QPS         | Milliseconds; comparable across trials because offered load is stable.                                |
+Valid `pareto.metric` values and their sources:
+
+| Metric                | Direction | Source sub-stage         | Notes                                                                                                  |
+|-----------------------|-----------|--------------------------|--------------------------------------------------------------------------------------------------------|
+| `tcp_throughput`      | maximize  | iperf3 bw-tcp            | Bits per second. Summed across source clients per iteration, averaged across iterations.              |
+| `udp_throughput`      | maximize  | iperf3 bw-udp            | Bits per second. Same aggregation as `tcp_throughput`.                                                |
+| `cpu`                 | minimize  | iperf3 bw-tcp            | Percent; sampled during the TCP bandwidth stage. Server-side CPU when every record reports it, per-client host CPU otherwise. |
+| `tcp_retransmit_rate` | minimize  | iperf3 bw-tcp            | Retransmits per byte sent; scale-invariant, so high-throughput/high-loss does not win on raw count.   |
+| `udp_loss_rate`       | minimize  | iperf3 bw-udp            | Lost packets per packet sent; per-iteration ratio-of-sums then averaged. UDP analog of `tcp_retransmit_rate`. |
+| `udp_jitter`          | minimize  | iperf3 bw-udp            | Milliseconds. Mean UDP inter-arrival jitter; tail-stability signal that TCP-only runs cannot observe. |
+| `node_memory`         | minimize  | iperf3 (peak over iter.) | Whole-node memory on the iperf target, from `metrics.k8s.io/v1beta1 nodes/<name>`.                    |
+| `cni_memory`          | minimize  | iperf3 (peak over iter.) | Memory summed across the CNI pods selected by `cni:`; what most sysctl tweaks actually move.          |
+| `rps`                 | maximize  | fortio saturation        | Achieved QPS under `-qps 0`. Fixed-QPS RPS would clamp to the offered load, so it is not a source.    |
+| `latency_p50`         | minimize  | fortio fixed-QPS         | Milliseconds; measured under the configured `fortio.fixedQps` offered load.                           |
+| `latency_p90`         | minimize  | fortio fixed-QPS         | Milliseconds; see `latency_p50`.                                                                      |
+| `latency_p99`         | minimize  | fortio fixed-QPS         | Milliseconds; comparable across trials because offered load is stable.                                |
 
 Splitting latency and RPS across two fortio sub-stages avoids the
 "overloaded system has high latency because it's overloaded" confound:

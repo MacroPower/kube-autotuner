@@ -910,10 +910,12 @@ class TestObjectivesSection:
     def test_default_pareto_shape(self) -> None:
         section = ObjectivesSection()
         assert [(p.metric, p.direction) for p in section.pareto] == [
-            ("throughput", "maximize"),
+            ("tcp_throughput", "maximize"),
+            ("udp_throughput", "maximize"),
             ("cpu", "minimize"),
-            ("retransmit_rate", "minimize"),
-            ("jitter", "minimize"),
+            ("tcp_retransmit_rate", "minimize"),
+            ("udp_loss_rate", "minimize"),
+            ("udp_jitter", "minimize"),
             ("node_memory", "minimize"),
             ("cni_memory", "minimize"),
             ("rps", "maximize"),
@@ -934,12 +936,12 @@ class TestObjectivesSection:
 
     def test_default_constraints_include_retransmit_rate(self) -> None:
         section = ObjectivesSection()
-        assert "retransmit_rate <= 1e-6" in section.constraints
+        assert "tcp_retransmit_rate <= 1e-6" in section.constraints
 
     def test_weight_on_maximize_metric_rejected(self) -> None:
         with pytest.raises(ValueError, match="maximize-direction"):
             ObjectivesSection(
-                recommendation_weights={"throughput": 1.0},
+                recommendation_weights={"tcp_throughput": 1.0},
             )
 
     def test_weight_on_unknown_metric_rejected(self) -> None:
@@ -976,20 +978,20 @@ class TestObjectivesSection:
                 "recommendationWeights": {
                     "cpu": 0.2,
                     "node_memory": 0.2,
-                    "retransmit_rate": 0.4,
+                    "tcp_retransmit_rate": 0.4,
                 },
             },
         )
         assert section.recommendation_weights == {
             "cpu": 0.2,
             "node_memory": 0.2,
-            "retransmit_rate": 0.4,
+            "tcp_retransmit_rate": 0.4,
         }
 
     def test_pareto_with_custom_metrics(self) -> None:
         section = ObjectivesSection(
             pareto=[
-                ParetoObjective(metric="throughput", direction="maximize"),
+                ParetoObjective(metric="tcp_throughput", direction="maximize"),
                 ParetoObjective(metric="node_memory", direction="minimize"),
             ],
             constraints=[],

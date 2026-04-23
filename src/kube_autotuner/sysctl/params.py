@@ -6,7 +6,8 @@ kept for consumers that prefer a ready-made constant.
 
 Each :class:`SysctlParam` below carries a short comment summarising how
 changing that knob is expected to move the configured objectives
-(throughput, cpu, retransmit_rate, node_memory, cni_memory, rps,
+(tcp_throughput, udp_throughput, cpu, tcp_retransmit_rate,
+udp_loss_rate, udp_jitter, node_memory, cni_memory, rps,
 latency_p50/p90/p99). These are expectations used to read results, not
 guarantees; the optimizer discovers the actual response surface.
 """
@@ -36,7 +37,7 @@ _TCP_BUFFER_PARAMS: list[SysctlParam] = [
     ),
     # Autotuning triple (min default max) for TCP receive buffers.
     # Governs the peak receive window. Under-sized max caps iperf3
-    # throughput on high-BDP links and can raise retransmit_rate when
+    # throughput on high-BDP links and can raise tcp_retransmit_rate when
     # the window collapses; over-sized max raises node_memory under
     # many concurrent flows.
     SysctlParam(
@@ -61,7 +62,7 @@ _TCP_BUFFER_PARAMS: list[SysctlParam] = [
     ),
     # Global TCP memory pressure thresholds in pages (min pressure max).
     # Too small and the kernel prunes/throttles under load (throughput
-    # drops, retransmit_rate rises); too large and node_memory climbs.
+    # drops, tcp_retransmit_rate rises); too large and node_memory climbs.
     # Represented as the canonical three-integer string form.
     SysctlParam(
         name="net.ipv4.tcp_mem",
@@ -72,7 +73,7 @@ _TCP_BUFFER_PARAMS: list[SysctlParam] = [
 
 _CONGESTION_PARAMS: list[SysctlParam] = [
     # cubic vs. bbr. BBR drives higher throughput on shallow-buffered
-    # paths and generally cuts retransmit_rate, but can move p99
+    # paths and generally cuts tcp_retransmit_rate, but can move p99
     # latency in either direction depending on the fabric. One of the
     # largest single levers in the whole space.
     SysctlParam(
@@ -100,7 +101,7 @@ _CONGESTION_PARAMS: list[SysctlParam] = [
         param_type="choice",
     ),
     # Path-MTU probing. Only helps when the path has a PMTUD blackhole
-    # (rare intra-cluster). When it matters, it cuts retransmit_rate
+    # (rare intra-cluster). When it matters, it cuts tcp_retransmit_rate
     # and latency spikes caused by fragmentation-induced loss.
     SysctlParam(
         name="net.ipv4.tcp_mtu_probing",
@@ -112,7 +113,7 @@ _CONGESTION_PARAMS: list[SysctlParam] = [
     # negotiate ECN on outbound connections). Rung 2 (responder-only)
     # is omitted because the clients initiate every flow in this
     # harness, making it equivalent to 0. On fabrics that honour ECN
-    # marks, 1 substitutes marks for drops and lowers retransmit_rate
+    # marks, 1 substitutes marks for drops and lowers tcp_retransmit_rate
     # without hurting throughput; on fabrics that don't, it's a no-op.
     SysctlParam(
         name="net.ipv4.tcp_ecn",
@@ -133,7 +134,7 @@ _CONGESTION_PARAMS: list[SysctlParam] = [
 _NAPI_PARAMS: list[SysctlParam] = [
     # Per-CPU input queue length before drops under RX bursts. Low
     # rungs cause packet drops on bursty workloads (visible as
-    # retransmit_rate spikes); very high rungs add queuing latency
+    # tcp_retransmit_rate spikes); very high rungs add queuing latency
     # once the system is already overloaded.
     SysctlParam(
         name="net.core.netdev_max_backlog",
@@ -162,7 +163,7 @@ _NAPI_PARAMS: list[SysctlParam] = [
 _MEMORY_PARAMS: list[SysctlParam] = [
     # Floor on free pages the kernel keeps reserved. Too low and
     # allocations stall under pressure (packet drops, p99 spikes,
-    # retransmit_rate); too high wastes headroom and inflates
+    # tcp_retransmit_rate); too high wastes headroom and inflates
     # node_memory.
     SysctlParam(
         name="vm.min_free_kbytes",
@@ -242,8 +243,8 @@ _CONNECTION_PARAMS: list[SysctlParam] = [
 
 _UDP_PARAMS: list[SysctlParam] = [
     # Per-socket receive-buffer floor for UDP. Too small and bursts
-    # overflow the socket queue, producing datagram loss (UDP
-    # retransmit/jitter metrics).
+    # overflow the socket queue, producing datagram loss (visible as
+    # udp_loss_rate / udp_jitter spikes).
     SysctlParam(
         name="net.ipv4.udp_rmem_min",
         values=[4096, 65536],

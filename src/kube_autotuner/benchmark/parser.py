@@ -46,7 +46,7 @@ def parse_k8s_memory(mem_str: str) -> int:
     return value * _K8S_MEM_MULTIPLIERS[suffix]
 
 
-def parse_iperf_json(  # noqa: PLR0915 - linear sanity-check ladder, no branching
+def parse_iperf_json(  # noqa: PLR0914, PLR0915 - linear sanity-check ladder, no branching
     raw: dict[str, Any],
     mode: Literal["tcp", "udp"],
     client_node: str = "",
@@ -106,6 +106,8 @@ def parse_iperf_json(  # noqa: PLR0915 - linear sanity-check ladder, no branchin
         retransmits = sum_sent.get("retransmits")
         bytes_sent = sum_sent.get("bytes")
         jitter_ms = None
+        packets = None
+        lost_packets = None
         if not bytes_sent and not bits_per_second:
             msg = "iperf3 TCP produced zero bytes and zero bits_per_second"
             raise ResultValidationError(msg)
@@ -119,6 +121,7 @@ def parse_iperf_json(  # noqa: PLR0915 - linear sanity-check ladder, no branchin
         retransmits = None
         bytes_sent = None
         packets = sum_data.get("packets")
+        lost_packets = sum_data.get("lost_packets")
         if not packets and not bits_per_second:
             msg = "iperf3 UDP produced zero packets and zero bits_per_second"
             raise ResultValidationError(msg)
@@ -142,6 +145,8 @@ def parse_iperf_json(  # noqa: PLR0915 - linear sanity-check ladder, no branchin
         cpu_utilization_percent=cpu_pct,
         cpu_server_percent=cpu_server,
         jitter_ms=jitter_ms,
+        packets=packets,
+        lost_packets=lost_packets,
         client_node=client_node,
         iteration=iteration,
         raw_json=raw,

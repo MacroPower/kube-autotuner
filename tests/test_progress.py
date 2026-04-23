@@ -83,7 +83,7 @@ def test_null_observer_is_protocol_compliant() -> None:
         active.on_trial_complete(
             0,
             _stub_trial("sobol"),
-            {"throughput": (9_400_000_000.0, 1e6), "cpu": (42.0, 0.5)},
+            {"tcp_throughput": (9_400_000_000.0, 1e6), "cpu": (42.0, 0.5)},
         )
         active.on_trial_failed(1, RuntimeError("boom"))
 
@@ -100,20 +100,20 @@ def test_rich_observer_renders_bars_and_table() -> None:
             0,
             _stub_trial("sobol"),
             {
-                "throughput": (9_412_000_000.0, 1e7),
+                "tcp_throughput": (9_412_000_000.0, 1e7),
                 "cpu": (42.1, 0.4),
-                "retransmit_rate": (1.2e-7, 1e-9),
-                "jitter": (0.128, 0.01),
+                "tcp_retransmit_rate": (1.2e-7, 1e-9),
+                "udp_jitter": (0.128, 0.01),
             },
         )
         observer.on_trial_complete(
             1,
             _stub_trial("bayesian"),
             {
-                "throughput": (9_188_000_000.0, 1e7),
+                "tcp_throughput": (9_188_000_000.0, 1e7),
                 "cpu": (38.4, 0.3),
-                "retransmit_rate": (float("nan"), float("nan")),
-                "jitter": (float("nan"), float("nan")),
+                "tcp_retransmit_rate": (float("nan"), float("nan")),
+                "udp_jitter": (float("nan"), float("nan")),
             },
         )
         observer.on_trial_failed(2, RuntimeError("boom"))
@@ -152,7 +152,11 @@ def test_rich_observer_refresh_does_not_force_immediate_paint(
         observer.on_benchmark_start(2)
         observer.on_iteration_start(0)
         observer.on_iteration_end(0)
-        observer.on_trial_complete(0, _stub_trial("sobol"), {"throughput": (1e9, 0.0)})
+        observer.on_trial_complete(
+            0,
+            _stub_trial("sobol"),
+            {"tcp_throughput": (1e9, 0.0)},
+        )
         observer.on_trial_failed(1, RuntimeError("boom"))
     assert calls, "expected at least one Live.update call"
     assert all(not kwargs.get("refresh", False) for kwargs in calls)
@@ -257,7 +261,11 @@ def test_seed_history_importable_without_ax(
     console = _capture_console()
     observer = RichProgressObserver(console)
     # Constructing + using the non-seed methods must still work.
-    observer.on_trial_complete(0, _stub_trial("sobol"), {"throughput": (1e9, 0.0)})
+    observer.on_trial_complete(
+        0,
+        _stub_trial("sobol"),
+        {"tcp_throughput": (1e9, 0.0)},
+    )
     assert observer._top
 
 
@@ -271,9 +279,9 @@ def test_rich_observer_tracks_top_n() -> None:
                 i,
                 _stub_trial("bayesian"),
                 {
-                    "throughput": (tp * 1e9, 0.0),
+                    "tcp_throughput": (tp * 1e9, 0.0),
                     "cpu": (10.0, 0.0),
-                    "retransmit_rate": (0.0, 0.0),
+                    "tcp_retransmit_rate": (0.0, 0.0),
                 },
             )
     # Keep the top five by throughput, descending.
@@ -302,11 +310,19 @@ def test_rich_observer_trial_eta_survives_long_gaps_between_completions(
     with observer:
         observer.on_trial_start(0, 5, "sobol", {})
         clock["t"] += 120.0
-        observer.on_trial_complete(0, _stub_trial("sobol"), {"throughput": (1e9, 0.0)})
+        observer.on_trial_complete(
+            0,
+            _stub_trial("sobol"),
+            {"tcp_throughput": (1e9, 0.0)},
+        )
         clock["t"] += 120.0  # >> 30s default speed window
         observer.on_trial_start(1, 5, "sobol", {})
         clock["t"] += 120.0
-        observer.on_trial_complete(1, _stub_trial("sobol"), {"throughput": (1e9, 0.0)})
+        observer.on_trial_complete(
+            1,
+            _stub_trial("sobol"),
+            {"tcp_throughput": (1e9, 0.0)},
+        )
         column = _find_eta_column(observer)
         rendered = column.render(_task_for(observer, observer._trial_task_id)).plain
         assert rendered != "-:--:--"
@@ -385,7 +401,11 @@ def test_rich_observer_trial_eta_ticks_down_mid_trial(
     with observer:
         observer.on_trial_start(0, 3, "sobol", {})
         clock["t"] += 120.0
-        observer.on_trial_complete(0, _stub_trial("sobol"), {"throughput": (1e9, 0.0)})
+        observer.on_trial_complete(
+            0,
+            _stub_trial("sobol"),
+            {"tcp_throughput": (1e9, 0.0)},
+        )
         observer.on_trial_start(1, 3, "sobol", {})
         column = _find_eta_column(observer)
         task = _task_for(observer, observer._trial_task_id)
@@ -423,7 +443,11 @@ def test_rich_observer_trial_eta_available_after_first_completion(
     with observer:
         observer.on_trial_start(0, 5, "sobol", {})
         clock["t"] += 120.0
-        observer.on_trial_complete(0, _stub_trial("sobol"), {"throughput": (1e9, 0.0)})
+        observer.on_trial_complete(
+            0,
+            _stub_trial("sobol"),
+            {"tcp_throughput": (1e9, 0.0)},
+        )
         column = _find_eta_column(observer)
         trial_task = _task_for(observer, observer._trial_task_id)
         # 4 remaining trials * 120s mean = 0:08:00.
@@ -449,7 +473,11 @@ def test_rich_observer_trial_eta_counts_failed_trials(
         observer.on_trial_failed(0, RuntimeError("x"))
         observer.on_trial_start(1, 5, "sobol", {})
         clock["t"] += 120.0
-        observer.on_trial_complete(1, _stub_trial("sobol"), {"throughput": (1e9, 0.0)})
+        observer.on_trial_complete(
+            1,
+            _stub_trial("sobol"),
+            {"tcp_throughput": (1e9, 0.0)},
+        )
         assert observer._trial_count == 2
         assert observer._trial_total_seconds == pytest.approx(180.0)
         column = _find_eta_column(observer)
@@ -671,7 +699,7 @@ def _score_row_complete(  # noqa: PLR0913 - keyword-only metric bundle
     throughput: float,
     cpu: float = 50.0,
     node_memory: float = 1e9,
-    retransmit_rate: float = 1e-8,
+    tcp_retransmit_rate: float = 1e-8,
     rps: float = 1000.0,
     latency_p50: float = 1.0,
     latency_p90: float = 2.0,
@@ -683,11 +711,11 @@ def _score_row_complete(  # noqa: PLR0913 - keyword-only metric bundle
         index,
         _stub_trial(phase, trial_id=f"trial-{index:02d}"),
         {
-            "throughput": (throughput, 0.0),
+            "tcp_throughput": (throughput, 0.0),
             "cpu": (cpu, 0.0),
             "node_memory": (node_memory, 0.0),
             "cni_memory": (cni_memory, 0.0),
-            "retransmit_rate": (retransmit_rate, 0.0),
+            "tcp_retransmit_rate": (tcp_retransmit_rate, 0.0),
             "rps": (rps, 0.0),
             "latency_p50": (latency_p50, 0.0),
             "latency_p90": (latency_p90, 0.0),
@@ -788,19 +816,19 @@ def test_top5_handles_nan_metrics() -> None:
         observer,
         index=0,
         throughput=1.5e9,
-        retransmit_rate=1e-8,
+        tcp_retransmit_rate=1e-8,
         latency_p90=2.0,
         latency_p99=4.0,
     )
-    # UDP-only trial: retransmit_rate and every latency percentile NaN.
+    # UDP-only trial: tcp_retransmit_rate and every latency percentile NaN.
     observer.on_trial_complete(
         1,
         _stub_trial("bayesian"),
         {
-            "throughput": (2.0e9, 0.0),
+            "tcp_throughput": (2.0e9, 0.0),
             "cpu": (50.0, 0.0),
             "node_memory": (1e9, 0.0),
-            "retransmit_rate": (math.nan, math.nan),
+            "tcp_retransmit_rate": (math.nan, math.nan),
             "rps": (math.nan, math.nan),
             "latency_p50": (math.nan, math.nan),
             "latency_p90": (math.nan, math.nan),
@@ -823,15 +851,15 @@ def test_top5_fallback_sorts_by_throughput_when_objectives_none() -> None:
                 i,
                 _stub_trial("bayesian"),
                 {
-                    "throughput": (tp * 1e9, 0.0),
+                    "tcp_throughput": (tp * 1e9, 0.0),
                     "cpu": (10.0, 0.0),
-                    "retransmit_rate": (0.0, 0.0),
+                    "tcp_retransmit_rate": (0.0, 0.0),
                 },
             )
     top_mbps = [int(r.throughput_mbps / 1000) for r in observer._top]
     assert top_mbps == [9, 8, 7, 5, 3]
     output = cast("io.StringIO", console.file).getvalue()
-    assert "by throughput" in output
+    assert "by tcp_throughput" in output
     assert "by weighted score" not in output
 
 

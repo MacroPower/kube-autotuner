@@ -77,7 +77,7 @@ def test_trial_result_mean_throughput():
         config=BenchmarkConfig(),
         results=results,
     )
-    assert trial.mean_throughput() == pytest.approx(1_500_000_000)
+    assert trial.mean_tcp_throughput() == pytest.approx(1_500_000_000)
     assert trial.mean_cpu() == pytest.approx(15.0)
 
 
@@ -313,10 +313,10 @@ def test_trial_result_single_client_multiple_iterations():
         config=BenchmarkConfig(),
         results=results,
     )
-    assert trial.mean_throughput() == pytest.approx(2e9)
+    assert trial.mean_tcp_throughput() == pytest.approx(2e9)
     assert trial.mean_cpu() == pytest.approx(20.0)
     # rates: iter0=5/1e9, iter1=2/1e9; mean=3.5/1e9.
-    assert trial.retransmit_rate() == pytest.approx(3.5e-9)
+    assert trial.tcp_retransmit_rate() == pytest.approx(3.5e-9)
     assert trial.total_bytes_sent() == 2_000_000_000
 
 
@@ -354,11 +354,11 @@ def test_trial_result_multi_client_per_iteration_grouping():
         results=results,
     )
     # Iter 0 sum = 9e9, Iter 1 sum = 9e9 -> mean 9e9.
-    assert trial.mean_throughput() == pytest.approx(9e9)
+    assert trial.mean_tcp_throughput() == pytest.approx(9e9)
     # CPU uses cpu_server_percent when all present: iter0=15, iter1=20 -> mean 17.5.
     assert trial.mean_cpu() == pytest.approx(17.5)
     # Rate: each iteration has 2 retx over 2GB; per-iter rate = 1e-9.
-    assert trial.retransmit_rate() == pytest.approx(1e-9)
+    assert trial.tcp_retransmit_rate() == pytest.approx(1e-9)
     assert trial.total_bytes_sent() == 4_000_000_000
 
 
@@ -381,7 +381,7 @@ def test_retransmit_rate_returns_none_when_no_bytes():
         config=BenchmarkConfig(),
         results=results,
     )
-    assert trial.retransmit_rate() is None
+    assert trial.tcp_retransmit_rate() is None
     assert trial.total_bytes_sent() == 0
 
 
@@ -417,7 +417,7 @@ def test_retransmit_rate_drops_iterations_missing_retx_record():
         results=results,
     )
     # Only iter 0 contributes (bytes present AND retx recorded).
-    assert trial.retransmit_rate() == pytest.approx(1e-8)
+    assert trial.tcp_retransmit_rate() == pytest.approx(1e-8)
 
 
 def test_mean_throughput_and_cpu_filter_to_tcp_records():
@@ -463,7 +463,7 @@ def test_mean_throughput_and_cpu_filter_to_tcp_records():
         results=results,
     )
     # TCP-only: iter0=1e9, iter1=3e9 -> mean 2e9. UDP records dropped.
-    assert trial.mean_throughput() == pytest.approx(2e9)
+    assert trial.mean_tcp_throughput() == pytest.approx(2e9)
     # TCP-only CPU: iter0=10, iter1=20 -> mean 15. UDP records dropped.
     assert trial.mean_cpu() == pytest.approx(15.0)
 
@@ -486,8 +486,151 @@ def test_mean_throughput_and_cpu_return_zero_when_no_tcp_records():
         config=BenchmarkConfig(),
         results=results,
     )
-    assert trial.mean_throughput() == pytest.approx(0.0)
+    assert trial.mean_tcp_throughput() == pytest.approx(0.0)
     assert trial.mean_cpu() == pytest.approx(0.0)
+
+
+def test_mean_udp_throughput_filters_to_udp_records():
+    """Mixed TCP+UDP results: TCP must not poison UDP throughput aggregate."""
+    results = [
+        BenchmarkResult(
+            timestamp=datetime.now(UTC),
+            mode="tcp",
+            bits_per_second=9e9,
+            client_node="n",
+            iteration=0,
+        ),
+        BenchmarkResult(
+            timestamp=datetime.now(UTC),
+            mode="udp",
+            bits_per_second=1e9,
+            client_node="n",
+            iteration=0,
+        ),
+        BenchmarkResult(
+            timestamp=datetime.now(UTC),
+            mode="udp",
+            bits_per_second=3e9,
+            client_node="n",
+            iteration=1,
+        ),
+    ]
+    trial = TrialResult(
+        node_pair=NodePair(source="n", target="t", hardware_class="10g"),
+        sysctl_values={},
+        config=BenchmarkConfig(),
+        results=results,
+    )
+    # UDP-only: iter0=1e9, iter1=3e9 -> mean 2e9.
+    assert trial.mean_udp_throughput() == pytest.approx(2e9)
+
+
+def test_mean_udp_throughput_returns_zero_when_no_udp_records():
+    results = [
+        BenchmarkResult(
+            timestamp=datetime.now(UTC),
+            mode="tcp",
+            bits_per_second=1e9,
+            client_node="n",
+            iteration=0,
+        ),
+    ]
+    trial = TrialResult(
+        node_pair=NodePair(source="n", target="t", hardware_class="10g"),
+        sysctl_values={},
+        config=BenchmarkConfig(),
+        results=results,
+    )
+    assert trial.mean_udp_throughput() == pytest.approx(0.0)
+
+
+def test_udp_loss_rate_typical():
+    """Multi-iteration UDP trial: per-iter ratio-of-sums then mean."""
+    results = [
+        # iter 0: 100 lost / 10000 packets = 0.01
+        BenchmarkResult(
+            timestamp=datetime.now(UTC),
+            mode="udp",
+            bits_per_second=1e9,
+            packets=10000,
+            lost_packets=100,
+            client_node="n",
+            iteration=0,
+        ),
+        # iter 1: 30 lost / 10000 packets = 0.003
+        BenchmarkResult(
+            timestamp=datetime.now(UTC),
+            mode="udp",
+            bits_per_second=1e9,
+            packets=10000,
+            lost_packets=30,
+            client_node="n",
+            iteration=1,
+        ),
+    ]
+    trial = TrialResult(
+        node_pair=NodePair(source="n", target="t", hardware_class="10g"),
+        sysctl_values={},
+        config=BenchmarkConfig(),
+        results=results,
+    )
+    # mean(0.01, 0.003) = 0.0065
+    assert trial.udp_loss_rate() == pytest.approx(0.0065)
+
+
+def test_udp_loss_rate_returns_zero_when_no_udp_records():
+    results = [
+        BenchmarkResult(
+            timestamp=datetime.now(UTC),
+            mode="tcp",
+            bits_per_second=1e9,
+            retransmits=0,
+            bytes_sent=1_000_000,
+            client_node="n",
+            iteration=0,
+        ),
+    ]
+    trial = TrialResult(
+        node_pair=NodePair(source="n", target="t", hardware_class="10g"),
+        sysctl_values={},
+        config=BenchmarkConfig(),
+        results=results,
+    )
+    assert trial.udp_loss_rate() == pytest.approx(0.0)
+
+
+def test_udp_loss_rate_drops_iterations_missing_packets():
+    """Iter where no UDP record reports packets is excluded from the mean."""
+    results = [
+        # iter 0: real UDP measurement, rate = 0.02
+        BenchmarkResult(
+            timestamp=datetime.now(UTC),
+            mode="udp",
+            bits_per_second=1e9,
+            packets=5000,
+            lost_packets=100,
+            client_node="n",
+            iteration=0,
+        ),
+        # iter 1: UDP record but packets missing -> excluded by filter
+        BenchmarkResult(
+            timestamp=datetime.now(UTC),
+            mode="udp",
+            bits_per_second=1e9,
+            packets=None,
+            lost_packets=None,
+            client_node="n",
+            iteration=1,
+        ),
+    ]
+    trial = TrialResult(
+        node_pair=NodePair(source="n", target="t", hardware_class="10g"),
+        sysctl_values={},
+        config=BenchmarkConfig(),
+        results=results,
+    )
+    # only iter 0 contributes -> 0.02
+    assert trial.udp_loss_rate() == pytest.approx(0.02)
 
 
 def test_mean_jitter_ms_with_mixed_tcp_udp_records():
@@ -533,7 +676,7 @@ def test_mean_jitter_ms_with_mixed_tcp_udp_records():
         results=results,
     )
     # Iter 0 jitter=0.2, iter 1 jitter=0.4 -> mean 0.3; TCP's None jitter dropped.
-    assert trial.mean_jitter_ms() == pytest.approx(0.3)
+    assert trial.mean_udp_jitter_ms() == pytest.approx(0.3)
 
 
 def test_trial_result_multi_client_falls_back_to_host_cpu():
@@ -596,7 +739,7 @@ def test_trial_result_mean_jitter_ms_single_client():
         config=BenchmarkConfig(),
         results=results,
     )
-    assert trial.mean_jitter_ms() == pytest.approx(0.2)
+    assert trial.mean_udp_jitter_ms() == pytest.approx(0.2)
 
 
 def test_trial_result_mean_jitter_ms_multi_client():
@@ -628,7 +771,7 @@ def test_trial_result_mean_jitter_ms_multi_client():
         results=results,
     )
     # Iter 0 mean = 0.2, Iter 1 mean = 0.3 -> overall mean 0.25.
-    assert trial.mean_jitter_ms() == pytest.approx(0.25)
+    assert trial.mean_udp_jitter_ms() == pytest.approx(0.25)
 
 
 def test_trial_result_mean_node_memory_single_client():
@@ -1091,10 +1234,10 @@ class TestResumeMetadata:
         return ResumeMetadata(
             objectives=ObjectivesSection(
                 pareto=[
-                    ParetoObjective(metric="throughput", direction="maximize"),
+                    ParetoObjective(metric="tcp_throughput", direction="maximize"),
                     ParetoObjective(metric="node_memory", direction="minimize"),
                 ],
-                constraints=["throughput >= 1e6"],
+                constraints=["tcp_throughput >= 1e6"],
                 recommendation_weights={"node_memory": 0.5},
             ),
             param_space=ParamSpace(
@@ -1126,7 +1269,7 @@ class TestResumeMetadata:
         path = tmp_path / "results.jsonl"
         meta_path = path.parent / f"{path.name}.meta.json"
         meta_path.write_text(
-            '{"objectives": {"pareto": [{"metric": "throughput", '
+            '{"objectives": {"pareto": [{"metric": "tcp_throughput", '
             '"direction": "maximize"}], "constraints": [], '
             '"recommendationWeights": {}}, '
             '"param_space": {"params": []}}\n',
@@ -1142,7 +1285,7 @@ class TestResumeMetadata:
         path = tmp_path / "results.jsonl"
         meta_path = path.parent / f"{path.name}.meta.json"
         meta_path.write_text(
-            '{"pareto": [{"metric": "throughput", '
+            '{"pareto": [{"metric": "tcp_throughput", '
             '"direction": "maximize"}], "constraints": [], '
             '"recommendationWeights": {}}\n',
         )

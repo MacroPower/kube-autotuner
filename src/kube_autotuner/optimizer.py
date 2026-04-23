@@ -39,7 +39,8 @@ from kube_autotuner.models import (
     TrialLog,
     TrialResult,
     is_primary,
-    retransmit_rate_by_iteration,
+    tcp_retransmit_rate_by_iteration,
+    udp_loss_rate_by_iteration,
 )
 from kube_autotuner.progress import NullObserver
 from kube_autotuner.sysctl.setter import make_sysctl_setter_from_env
@@ -326,7 +327,7 @@ def _aggregate_latency_by_iteration(
     return [reducer(vals) for vals in grouped.values() if vals]
 
 
-def _compute_metrics(  # noqa: PLR0914
+def _compute_metrics(  # noqa: PLR0914, PLR0915
     trial: TrialResult,
 ) -> dict[str, tuple[float, float]]:
     """Collapse raw trial results into per-metric ``(mean, SEM)`` pairs.
@@ -339,19 +340,22 @@ def _compute_metrics(  # noqa: PLR0914
     replaces it with a per-client SEM (best-effort -- the samples share
     server state and are correlated).
 
-    ``throughput`` and ``cpu`` filter to ``mode == "tcp"`` records
+    ``tcp_throughput`` and ``cpu`` filter to ``mode == "tcp"`` records
     before aggregating, preserving the optimizer's historical
-    TCP-only semantics for those objectives.
+    TCP-only semantics for those objectives. ``udp_throughput``
+    mirrors ``tcp_throughput`` but filters to ``mode == "udp"`` records.
 
-    ``retransmit_rate`` is the per-iteration ratio
+    ``tcp_retransmit_rate`` is the per-iteration ratio
     ``sum(retransmits) / sum(bytes_sent)`` averaged across iterations.
     When no iteration produced both a ``retransmits`` reading and a
     non-zero ``bytes_sent`` total (i.e. every ``bw-tcp`` stage
     failed), the mean is ``NaN`` and callers are expected to drop the
-    key before handing results to Ax.
+    key before handing results to Ax. ``udp_loss_rate`` is the
+    UDP-side analog: per-iteration ``sum(lost_packets) / sum(packets)``
+    averaged across iterations, with the same NaN-when-empty contract.
 
-    ``jitter`` is the mean of the per-iteration cross-client mean of
-    ``jitter_ms`` (only UDP records carry it). When every ``bw-udp``
+    ``udp_jitter`` is the mean of the per-iteration cross-client mean
+    of ``jitter_ms`` (only UDP records carry it). When every ``bw-udp``
     stage failed, the mean is ``NaN`` and callers drop the key
     before handing results to Ax.
 
@@ -361,51 +365,67 @@ def _compute_metrics(  # noqa: PLR0914
     meaningless under saturation). When the corresponding sub-stage
     produced no records, the mean is ``NaN`` and callers drop the
     key before handing results to Ax -- exactly as they do for
-    ``retransmit_rate``.
+    ``tcp_retransmit_rate``.
 
     Args:
         trial: The trial whose raw records are to be summarised.
 
     Returns:
-        A dict keyed by ``"throughput"`` / ``"cpu"`` /
-        ``"retransmit_rate"`` / ``"node_memory"`` / ``"cni_memory"`` /
+        A dict keyed by ``"tcp_throughput"`` / ``"udp_throughput"`` /
+        ``"cpu"`` / ``"tcp_retransmit_rate"`` / ``"udp_loss_rate"`` /
+        ``"udp_jitter"`` / ``"node_memory"`` / ``"cni_memory"`` /
         ``"rps"`` / ``"latency_p50"`` / ``"latency_p90"`` /
         ``"latency_p99"`` with ``(mean, SEM)`` values ready for
         :meth:`ax.api.client.Client.complete_trial`.
     """
     results = trial.results
     tcp_results = [r for r in results if r.mode == "tcp"]
-    throughput_vals = _aggregate_by_iteration(
+    udp_results = [r for r in results if r.mode == "udp"]
+    tcp_throughput_vals = _aggregate_by_iteration(
         tcp_results,
         lambda r: r.bits_per_second,
         sum,
     )
+    udp_throughput_vals = _aggregate_by_iteration(
+        udp_results,
+        lambda r: r.bits_per_second,
+        sum,
+    )
     cpu_vals = _aggregate_by_iteration(tcp_results, _cpu_value, statistics.mean)
-    rate_vals = retransmit_rate_by_iteration(results)
-    jitter_vals = _aggregate_by_iteration(
+    tcp_rate_vals = tcp_retransmit_rate_by_iteration(results)
+    udp_loss_vals = udp_loss_rate_by_iteration(results)
+    udp_jitter_vals = _aggregate_by_iteration(
         results,
         lambda r: r.jitter_ms,
         statistics.mean,
     )
 
-    throughput_mean, throughput_sem = _mean_sem(throughput_vals)
+    tcp_throughput_mean, tcp_throughput_sem = _mean_sem(tcp_throughput_vals)
+    udp_throughput_mean, udp_throughput_sem = _mean_sem(udp_throughput_vals)
     cpu_mean, cpu_sem = _mean_sem(cpu_vals)
-    if rate_vals:
-        rate_mean, rate_sem = _mean_sem(rate_vals)
+    if tcp_rate_vals:
+        tcp_rate_mean, tcp_rate_sem = _mean_sem(tcp_rate_vals)
     else:
-        rate_mean, rate_sem = float("nan"), 0.0
-    if jitter_vals:
-        jitter_mean, jitter_sem = _mean_sem(jitter_vals)
+        tcp_rate_mean, tcp_rate_sem = float("nan"), 0.0
+    if udp_loss_vals:
+        udp_loss_mean, udp_loss_sem = _mean_sem(udp_loss_vals)
     else:
-        jitter_mean, jitter_sem = float("nan"), 0.0
+        udp_loss_mean, udp_loss_sem = float("nan"), 0.0
+    if udp_jitter_vals:
+        udp_jitter_mean, udp_jitter_sem = _mean_sem(udp_jitter_vals)
+    else:
+        udp_jitter_mean, udp_jitter_sem = float("nan"), 0.0
 
-    if len(throughput_vals) == 1 and len(tcp_results) > 1:
+    if len(tcp_throughput_vals) == 1 and len(tcp_results) > 1:
         raw = [r.bits_per_second for r in tcp_results]
-        throughput_sem = statistics.stdev(raw) / math.sqrt(len(raw))
+        tcp_throughput_sem = statistics.stdev(raw) / math.sqrt(len(raw))
         logger.info(
             "iterations=1 with multiple clients: using per-client SEM "
             "approximation (samples are correlated via shared server)",
         )
+    if len(udp_throughput_vals) == 1 and len(udp_results) > 1:
+        raw_udp = [r.bits_per_second for r in udp_results]
+        udp_throughput_sem = statistics.stdev(raw_udp) / math.sqrt(len(raw_udp))
 
     saturation = [r for r in trial.latency_results if r.workload == "saturation"]
     fixed_qps = [r for r in trial.latency_results if r.workload == "fixed_qps"]
@@ -429,10 +449,12 @@ def _compute_metrics(  # noqa: PLR0914
         return float("nan"), 0.0
 
     return {
-        "throughput": (throughput_mean, throughput_sem),
+        "tcp_throughput": (tcp_throughput_mean, tcp_throughput_sem),
+        "udp_throughput": (udp_throughput_mean, udp_throughput_sem),
         "cpu": (cpu_mean, cpu_sem),
-        "retransmit_rate": (rate_mean, rate_sem),
-        "jitter": (jitter_mean, jitter_sem),
+        "tcp_retransmit_rate": (tcp_rate_mean, tcp_rate_sem),
+        "udp_loss_rate": (udp_loss_mean, udp_loss_sem),
+        "udp_jitter": (udp_jitter_mean, udp_jitter_sem),
         "node_memory": _memory_mean_sem(results, lambda r: r.node_memory_used_bytes),
         "cni_memory": _memory_mean_sem(results, lambda r: r.cni_memory_used_bytes),
         "rps": (rps_mean, rps_sem),
@@ -838,17 +860,17 @@ class OptimizationLoop:
             raw_data[name] = pair
         self.client.complete_trial(trial_index=trial_index, raw_data=raw_data)
 
-        tp = metrics["throughput"][0]
+        tp = metrics["tcp_throughput"][0]
         cpu = metrics["cpu"][0]
-        rate = metrics["retransmit_rate"][0]
+        rate = metrics["tcp_retransmit_rate"][0]
         rate_str = "NaN" if math.isnan(rate) else f"{rate * 1e6:.2f}"
         rps = metrics.get("rps", (float("nan"), 0.0))[0]
         rps_str = "NaN" if math.isnan(rps) else f"{rps:.1f}"
         p99 = metrics.get("latency_p99", (float("nan"), 0.0))[0]
         p99_str = "NaN" if math.isnan(p99) else f"{p99:.1f}"
         logger.info(
-            "Trial %d/%d [%s] throughput=%.1f Mbps cpu=%.1f%% "
-            "retransmit_rate=%s retx/MB rps=%s p99=%s ms",
+            "Trial %d/%d [%s] tcp_throughput=%.1f Mbps cpu=%.1f%% "
+            "tcp_retransmit_rate=%s retx/MB rps=%s p99=%s ms",
             self.prior_count + i + 1,
             self.n_trials,
             phase,
@@ -1127,10 +1149,11 @@ class OptimizationLoop:
                         ordinal += 1
                         continue
                     logger.info(
-                        "Verification [%s] parent=%s throughput=%.1f Mbps cpu=%.1f%%",
+                        "Verification [%s] parent=%s "
+                        "tcp_throughput=%.1f Mbps cpu=%.1f%%",
                         parent.trial_id,
                         parent.trial_id,
-                        metrics["throughput"][0] / 1e6,
+                        metrics["tcp_throughput"][0] / 1e6,
                         metrics["cpu"][0],
                     )
                     self.observer.on_trial_complete(

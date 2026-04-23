@@ -97,7 +97,25 @@ def test_parse_udp():
     assert result.jitter_ms == pytest.approx(0.025)
     assert result.retransmits is None
     assert result.bytes_sent is None
+    assert result.packets == 85000
+    assert result.lost_packets == 3
     assert result.cpu_utilization_percent == pytest.approx(12.5)
+
+
+def test_parse_tcp_leaves_udp_only_fields_none():
+    result = parse_iperf_json(SAMPLE_TCP_JSON, "tcp")
+    assert result.packets is None
+    assert result.lost_packets is None
+
+
+def test_parse_udp_lost_packets_missing():
+    raw = {
+        "start": {"timestamp": {"timesecs": 1700000000}},
+        "end": {"sum": {"packets": 100, "bits_per_second": 1e9}},
+    }
+    result = parse_iperf_json(raw, "udp")
+    assert result.packets == 100
+    assert result.lost_packets is None
 
 
 def test_parse_minimal_json_raises_on_missing_sum_sent():

@@ -32,12 +32,14 @@ if TYPE_CHECKING:
 
 
 METRIC_TO_DF_COLUMN: dict[str, str] = {
-    "throughput": "mean_throughput",
+    "tcp_throughput": "mean_tcp_throughput",
+    "udp_throughput": "mean_udp_throughput",
     "cpu": "mean_cpu",
     "node_memory": "mean_node_memory",
     "cni_memory": "mean_cni_memory",
-    "retransmit_rate": "retransmit_rate",
-    "jitter": "mean_jitter_ms",
+    "tcp_retransmit_rate": "tcp_retransmit_rate",
+    "udp_loss_rate": "udp_loss_rate",
+    "udp_jitter": "mean_udp_jitter_ms",
     "rps": "mean_rps",
     "latency_p50": "mean_latency_p50_ms",
     "latency_p90": "mean_latency_p90_ms",
@@ -190,14 +192,18 @@ def _per_trial_metric_means(t: TrialResult) -> dict[str, float]:
     """
     nmem = t.mean_node_memory()
     cmem = t.mean_cni_memory()
-    rate = t.retransmit_rate()
+    rate = t.tcp_retransmit_rate()
     return {
-        METRIC_TO_DF_COLUMN["throughput"]: t.mean_throughput(),
+        METRIC_TO_DF_COLUMN["tcp_throughput"]: t.mean_tcp_throughput(),
+        METRIC_TO_DF_COLUMN["udp_throughput"]: t.mean_udp_throughput(),
         METRIC_TO_DF_COLUMN["cpu"]: t.mean_cpu(),
         METRIC_TO_DF_COLUMN["node_memory"]: (math.nan if nmem is None else nmem),
         METRIC_TO_DF_COLUMN["cni_memory"]: (math.nan if cmem is None else cmem),
-        METRIC_TO_DF_COLUMN["retransmit_rate"]: (math.nan if rate is None else rate),
-        METRIC_TO_DF_COLUMN["jitter"]: t.mean_jitter_ms(),
+        METRIC_TO_DF_COLUMN["tcp_retransmit_rate"]: (
+            math.nan if rate is None else rate
+        ),
+        METRIC_TO_DF_COLUMN["udp_loss_rate"]: t.udp_loss_rate(),
+        METRIC_TO_DF_COLUMN["udp_jitter"]: t.mean_udp_jitter_ms(),
         METRIC_TO_DF_COLUMN["rps"]: t.mean_rps(),
         METRIC_TO_DF_COLUMN["latency_p50"]: t.mean_latency_p50_ms(),
         METRIC_TO_DF_COLUMN["latency_p90"]: t.mean_latency_p90_ms(),
@@ -234,11 +240,13 @@ def aggregate_verification(
     single-sample row. Per-metric aggregation mirrors
     :func:`kube_autotuner.optimizer._compute_metrics`:
 
-    * ``throughput`` / ``rps``: mean of per-trial means.
-    * ``cpu`` / ``jitter`` / ``node_memory`` / ``cni_memory`` /
+    * ``tcp_throughput`` / ``udp_throughput`` / ``rps``: mean of
+      per-trial means.
+    * ``cpu`` / ``udp_jitter`` / ``node_memory`` / ``cni_memory`` /
       ``latency_p50`` / ``latency_p90`` / ``latency_p99``: mean of
       per-trial means; NaN (not measured) drops out of the mean.
-    * ``retransmit_rate``: mean of per-trial rates; NaN drops out.
+    * ``tcp_retransmit_rate`` / ``udp_loss_rate``: mean of per-trial
+      rates; NaN drops out.
 
     Each ``<metric>_sem`` is the standard error of the mean over the
     parent's finite samples (``stdev / sqrt(n)``); ``0.0`` when fewer

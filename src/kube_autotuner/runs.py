@@ -451,7 +451,7 @@ def run_baseline(ctx: RunContext) -> None:
         len(results.latency),
         ctx.output,
     )
-    logger.info("Mean throughput: %.1f Mbps", trial.mean_throughput() / 1e6)
+    logger.info("Mean TCP throughput: %.1f Mbps", trial.mean_tcp_throughput() / 1e6)
     logger.info("Mean CPU: %.1f%%", trial.mean_cpu())
     nmem = trial.mean_node_memory()
     if nmem is not None:
@@ -557,8 +557,8 @@ def run_trial(ctx: RunContext) -> None:  # noqa: PLR0914, PLR0915
         ctx.output,
     )
     logger.info(
-        "Mean throughput: %.1f Mbps",
-        trial_result.mean_throughput() / 1e6,
+        "Mean TCP throughput: %.1f Mbps",
+        trial_result.mean_tcp_throughput() / 1e6,
     )
     logger.info("Mean CPU: %.1f%%", trial_result.mean_cpu())
     nmem = trial_result.mean_node_memory()
@@ -709,9 +709,9 @@ def run_optimize(  # noqa: PLR0914, PLR0915
 
     logger.info("=== Pareto-optimal configurations (%d) ===", len(pareto))
     for _params, metrics, trial_idx, _arm in pareto:
-        tp = metrics.get("throughput", 0)
+        tp = metrics.get("tcp_throughput", 0)
         cpu = metrics.get("cpu", 0)
-        rate = metrics.get("retransmit_rate")
+        rate = metrics.get("tcp_retransmit_rate")
         rps = metrics.get("rps")
         p99 = metrics.get("latency_p99")
         tp_val = tp[0] if isinstance(tp, tuple) else tp
@@ -726,7 +726,8 @@ def run_optimize(  # noqa: PLR0914, PLR0915
         rps_str = "n/a" if math.isnan(rps_val) else f"{rps_val:.1f}"
         p99_str = "n/a" if math.isnan(p99_val) else f"{p99_val:.1f}"
         logger.info(
-            "  [%d] throughput=%.1f Mbps cpu=%.1f%% rate=%s retx/MB rps=%s p99=%s ms",
+            "  [%d] tcp_throughput=%.1f Mbps cpu=%.1f%% rate=%s retx/MB "
+            "rps=%s p99=%s ms",
             trial_idx,
             float(tp_val) / 1e6,
             float(cpu_val),
@@ -749,7 +750,7 @@ def _log_verification_summary(
     :func:`kube_autotuner.scoring.score_rows`, and prints one row per
     verified parent showing the primary score, the combined score,
     the score delta, and per-metric ``mean ± SEM`` for the headline
-    metrics (throughput, cpu, retransmit_rate, latency_p99).
+    metrics (tcp_throughput, cpu, tcp_retransmit_rate, latency_p99).
 
     Only parents with at least one verification child are rendered --
     listing every primary would dilute the table and confuse the
@@ -804,9 +805,9 @@ def _log_verification_summary(
     table.add_column("primary", justify="right")
     table.add_column("combined", justify="right")
     table.add_column("Δ", justify="right")
-    table.add_column("throughput", justify="right")
+    table.add_column("tcp_throughput", justify="right")
     table.add_column("cpu", justify="right")
-    table.add_column("retx_rate", justify="right")
+    table.add_column("tcp_retx_rate", justify="right")
     table.add_column("p99 ms", justify="right")
 
     rank = 0
@@ -825,11 +826,11 @@ def _log_verification_summary(
             "n/a" if math.isnan(primary) else f"{primary:.4f}",
             f"{combined:.4f}",
             "n/a" if math.isnan(delta) else f"{delta:+.4f}",
-            _format_mean_sem(row, METRIC_TO_DF_COLUMN["throughput"], scale=1e-6),
+            _format_mean_sem(row, METRIC_TO_DF_COLUMN["tcp_throughput"], scale=1e-6),
             _format_mean_sem(row, METRIC_TO_DF_COLUMN["cpu"]),
             _format_mean_sem(
                 row,
-                METRIC_TO_DF_COLUMN["retransmit_rate"],
+                METRIC_TO_DF_COLUMN["tcp_retransmit_rate"],
                 scale=1e6,
             ),
             _format_mean_sem(row, METRIC_TO_DF_COLUMN["latency_p99"]),

@@ -62,12 +62,14 @@ def _minimal_section(
                 "net.core.rmem_max": "67108864",
                 "net.ipv4.tcp_congestion_control": "bbr",
             },
-            "mean_throughput": 4.2e10 - 1e9 * i,
+            "mean_tcp_throughput": 4.2e10 - 1e9 * i,
+            "mean_udp_throughput": 9.5e9 - 1e8 * i,
             "mean_cpu": 33.9 + i,
             "mean_node_memory": 67108864.0,
             "mean_cni_memory": 8388608.0,
-            "retransmit_rate": 1e-8 * (i + 1),
-            "mean_jitter_ms": 0.1,
+            "tcp_retransmit_rate": 1e-8 * (i + 1),
+            "udp_loss_rate": 0.001 * (i + 1),
+            "mean_udp_jitter_ms": 0.1,
             "mean_rps": 12345.0,
             "mean_latency_p50_ms": 1.0,
             "mean_latency_p90_ms": 2.0,
@@ -77,10 +79,12 @@ def _minimal_section(
         for i in range(n_pareto_rows)
     ]
     objectives = [
-        {"metric": "throughput", "direction": "maximize"},
+        {"metric": "tcp_throughput", "direction": "maximize"},
+        {"metric": "udp_throughput", "direction": "maximize"},
         {"metric": "cpu", "direction": "minimize"},
-        {"metric": "retransmit_rate", "direction": "minimize"},
-        {"metric": "jitter", "direction": "minimize"},
+        {"metric": "tcp_retransmit_rate", "direction": "minimize"},
+        {"metric": "udp_loss_rate", "direction": "minimize"},
+        {"metric": "udp_jitter", "direction": "minimize"},
         {"metric": "node_memory", "direction": "minimize"},
         {"metric": "cni_memory", "direction": "minimize"},
         {"metric": "rps", "direction": "maximize"},
@@ -99,7 +103,7 @@ def _minimal_section(
                 "rank": 1,
                 "trial_id": pareto_rows[0]["trial_id"] if pareto_rows else "",
                 "sysctl_values": {},
-                "mean_throughput": 4.2e10,
+                "mean_tcp_throughput": 4.2e10,
                 "mean_cpu": 33.9,
                 "score": 0.95,
             },
@@ -248,7 +252,7 @@ def test_write_index_html_escapes_script_close_in_payload(tmp_path: Path) -> Non
 
 def test_write_index_html_rejects_nan_in_payload(tmp_path: Path) -> None:
     section = _minimal_section("10g", n_figures=1, n_pareto_rows=1)
-    section["pareto_rows"][0]["mean_throughput"] = float("nan")
+    section["pareto_rows"][0]["mean_tcp_throughput"] = float("nan")
 
     with pytest.raises(ValueError, match="Out of range float values"):
         report.write_index_html(tmp_path, [section])

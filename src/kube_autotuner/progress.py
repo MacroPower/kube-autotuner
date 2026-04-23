@@ -440,7 +440,7 @@ class _TrialRow:
                 when the trial produced no fortio records.
             metrics: Raw-domain per-metric means keyed by the
                 :data:`kube_autotuner.scoring.METRIC_TO_DF_COLUMN`
-                DataFrame column name (``mean_throughput``,
+                DataFrame column name (``mean_tcp_throughput``,
                 ``mean_cpu``, ...). Fed to
                 :func:`kube_autotuner.scoring.score_rows` for the
                 live top-N ranking, which min-max normalizes across
@@ -497,10 +497,10 @@ def _build_trial_row(  # noqa: PLR0914 one-pass projection over the full metric 
     Returns:
         A :class:`_TrialRow` ready to append to ``_all_rows``.
     """
-    tp_pair = metrics.get("throughput")
+    tp_pair = metrics.get("tcp_throughput")
     cpu_pair = metrics.get("cpu")
-    rate_pair = metrics.get("retransmit_rate")
-    jitter_pair = metrics.get("jitter")
+    rate_pair = metrics.get("tcp_retransmit_rate")
+    jitter_pair = metrics.get("udp_jitter")
     rps_pair = metrics.get("rps")
     nmem_pair = metrics.get("node_memory")
     p99_pair = metrics.get("latency_p99")
@@ -516,10 +516,12 @@ def _build_trial_row(  # noqa: PLR0914 one-pass projection over the full metric 
     raw_metrics: dict[str, float] = {
         METRIC_TO_DF_COLUMN[key]: (pair[0] if pair is not None else math.nan)
         for key, pair in (
-            ("throughput", tp_pair),
+            ("tcp_throughput", tp_pair),
+            ("udp_throughput", metrics.get("udp_throughput")),
             ("cpu", cpu_pair),
-            ("retransmit_rate", rate_pair),
-            ("jitter", jitter_pair),
+            ("tcp_retransmit_rate", rate_pair),
+            ("udp_loss_rate", metrics.get("udp_loss_rate")),
+            ("udp_jitter", jitter_pair),
             ("node_memory", nmem_pair),
             ("cni_memory", metrics.get("cni_memory")),
             ("rps", rps_pair),
@@ -744,7 +746,9 @@ class RichProgressObserver:
         """
         if not self._top:
             return Group(self._progress)
-        sort_key = "weighted score" if self._objectives is not None else "throughput"
+        sort_key = (
+            "weighted score" if self._objectives is not None else "tcp_throughput"
+        )
         has_verification = any(r.phase == "verification" for r in self._all_rows)
         suffix = ", verified" if has_verification else ""
         table = Table(

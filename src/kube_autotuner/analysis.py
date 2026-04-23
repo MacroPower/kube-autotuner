@@ -42,10 +42,12 @@ _PARAM_TYPE_LOOKUP: dict[str, str] = {p.name: p.param_type for p in PARAM_SPACE.
 _SYSCTL_COLUMNS: list[str] = PARAM_SPACE.param_names()
 
 DEFAULT_OBJECTIVES: list[tuple[str, str]] = [
-    (METRIC_TO_DF_COLUMN["throughput"], "maximize"),
+    (METRIC_TO_DF_COLUMN["tcp_throughput"], "maximize"),
+    (METRIC_TO_DF_COLUMN["udp_throughput"], "maximize"),
     (METRIC_TO_DF_COLUMN["cpu"], "minimize"),
-    (METRIC_TO_DF_COLUMN["retransmit_rate"], "minimize"),
-    (METRIC_TO_DF_COLUMN["jitter"], "minimize"),
+    (METRIC_TO_DF_COLUMN["tcp_retransmit_rate"], "minimize"),
+    (METRIC_TO_DF_COLUMN["udp_loss_rate"], "minimize"),
+    (METRIC_TO_DF_COLUMN["udp_jitter"], "minimize"),
     (METRIC_TO_DF_COLUMN["node_memory"], "minimize"),
     (METRIC_TO_DF_COLUMN["cni_memory"], "minimize"),
     (METRIC_TO_DF_COLUMN["rps"], "maximize"),
@@ -60,12 +62,14 @@ _FRAME_BASE_COLUMNS: list[str] = [
     "topology",
     "source_zone",
     "target_zone",
-    "mean_throughput",
+    "mean_tcp_throughput",
+    "mean_udp_throughput",
     "mean_cpu",
     "mean_node_memory",
     "mean_cni_memory",
-    "retransmit_rate",
-    "mean_jitter_ms",
+    "tcp_retransmit_rate",
+    "udp_loss_rate",
+    "mean_udp_jitter_ms",
     "mean_rps",
     "mean_latency_p50_ms",
     "mean_latency_p90_ms",
@@ -209,12 +213,14 @@ def trials_to_dataframe(
             "topology": t.topology,
             "source_zone": t.node_pair.source_zone,
             "target_zone": t.node_pair.target_zone,
-            "mean_throughput": t.mean_throughput(),
+            "mean_tcp_throughput": t.mean_tcp_throughput(),
+            "mean_udp_throughput": t.mean_udp_throughput(),
             "mean_cpu": t.mean_cpu(),
             "mean_node_memory": t.mean_node_memory(),
             "mean_cni_memory": t.mean_cni_memory(),
-            "retransmit_rate": t.retransmit_rate(),
-            "mean_jitter_ms": t.mean_jitter_ms(),
+            "tcp_retransmit_rate": t.tcp_retransmit_rate(),
+            "udp_loss_rate": t.udp_loss_rate(),
+            "mean_udp_jitter_ms": t.mean_udp_jitter_ms(),
             "mean_rps": t.mean_rps(),
             "mean_latency_p50_ms": t.mean_latency_p50_ms(),
             "mean_latency_p90_ms": t.mean_latency_p90_ms(),
@@ -390,7 +396,7 @@ def pareto_front(
 
 def parameter_importance(
     df: pd.DataFrame,
-    target: str = "mean_throughput",
+    target: str = "mean_tcp_throughput",
 ) -> pd.DataFrame:
     """Rank sysctl parameters by importance for the ``target`` metric.
 
@@ -401,7 +407,7 @@ def parameter_importance(
     Args:
         df: Frame produced by :func:`trials_to_dataframe`.
         target: Metric column name to score against (defaults to
-            ``"mean_throughput"``).
+            ``"mean_tcp_throughput"``).
 
     Returns:
         A DataFrame with columns ``param``, ``category``,
@@ -620,12 +626,14 @@ def pareto_recommendation_rows(
             {
                 "trial_id": row["trial_id"],
                 "sysctl_values": trial.sysctl_values,
-                "mean_throughput": _maybe(row, "mean_throughput"),
+                "mean_tcp_throughput": _maybe(row, "mean_tcp_throughput"),
+                "mean_udp_throughput": _maybe(row, "mean_udp_throughput"),
                 "mean_cpu": _maybe(row, "mean_cpu"),
                 "mean_node_memory": _maybe(row, "mean_node_memory"),
                 "mean_cni_memory": _maybe(row, "mean_cni_memory"),
-                "retransmit_rate": _maybe(row, "retransmit_rate"),
-                "mean_jitter_ms": _maybe(row, "mean_jitter_ms"),
+                "tcp_retransmit_rate": _maybe(row, "tcp_retransmit_rate"),
+                "udp_loss_rate": _maybe(row, "udp_loss_rate"),
+                "mean_udp_jitter_ms": _maybe(row, "mean_udp_jitter_ms"),
                 "mean_rps": _maybe(row, "mean_rps"),
                 "mean_latency_p50_ms": _maybe(row, "mean_latency_p50_ms"),
                 "mean_latency_p90_ms": _maybe(row, "mean_latency_p90_ms"),
@@ -656,10 +664,11 @@ def recommend_configs(
 
     Default weights come from
     :class:`~kube_autotuner.experiment.ObjectivesSection` --
-    ``{cpu: 0.15, node_memory: 0.15, retransmit_rate: 0.3,
-    jitter: 0.1, latency_p90: 0.1, latency_p99: 0.15}`` at the time of
-    writing -- so the live ``Best so far`` panel and this
-    recommendation output rank trials identically.
+    ``{cpu: 0.15, node_memory: 0.15, tcp_retransmit_rate: 0.3,
+    udp_loss_rate: 0.3, udp_jitter: 0.1, latency_p90: 0.1,
+    latency_p99: 0.15}`` at the time of writing -- so the live ``Best
+    so far`` panel and this recommendation output rank trials
+    identically.
 
     Args:
         trials: Input trial records (any number of hardware classes).
@@ -678,10 +687,11 @@ def recommend_configs(
 
     Returns:
         A list of recommendation dicts. Each dict always contains the
-        same keys (``rank``, ``trial_id``, ``sysctl_values``, the ten
-        base metric names -- ``mean_throughput``, ``mean_cpu``,
-        ``mean_node_memory``, ``mean_cni_memory``,
-        ``retransmit_rate``, ``mean_jitter_ms``, ``mean_rps``,
+        same keys (``rank``, ``trial_id``, ``sysctl_values``, the
+        twelve base metric names -- ``mean_tcp_throughput``,
+        ``mean_udp_throughput``, ``mean_cpu``, ``mean_node_memory``,
+        ``mean_cni_memory``, ``tcp_retransmit_rate``,
+        ``udp_loss_rate``, ``mean_udp_jitter_ms``, ``mean_rps``,
         ``mean_latency_p50_ms``, ``mean_latency_p90_ms``,
         ``mean_latency_p99_ms`` -- and a ``score``). A metric value
         is ``None`` when the trial produced no reading for it (e.g.
@@ -702,12 +712,14 @@ def recommend_configs(
                 "rank": rank,
                 "trial_id": row["trial_id"],
                 "sysctl_values": row["sysctl_values"],
-                "mean_throughput": row["mean_throughput"],
+                "mean_tcp_throughput": row["mean_tcp_throughput"],
+                "mean_udp_throughput": row["mean_udp_throughput"],
                 "mean_cpu": row["mean_cpu"],
                 "mean_node_memory": row["mean_node_memory"],
                 "mean_cni_memory": row["mean_cni_memory"],
-                "retransmit_rate": row["retransmit_rate"],
-                "mean_jitter_ms": row["mean_jitter_ms"],
+                "tcp_retransmit_rate": row["tcp_retransmit_rate"],
+                "udp_loss_rate": row["udp_loss_rate"],
+                "mean_udp_jitter_ms": row["mean_udp_jitter_ms"],
                 "mean_rps": row["mean_rps"],
                 "mean_latency_p50_ms": row["mean_latency_p50_ms"],
                 "mean_latency_p90_ms": row["mean_latency_p90_ms"],

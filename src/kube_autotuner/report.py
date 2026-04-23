@@ -158,12 +158,14 @@ def _slug(s: str) -> str:
 
 
 _TARGET_METRIC_LABELS: dict[str, str] = {
-    "mean_throughput": "throughput",
+    "mean_tcp_throughput": "TCP throughput",
+    "mean_udp_throughput": "UDP throughput",
     "mean_cpu": "CPU",
     "mean_node_memory": "node memory",
     "mean_cni_memory": "CNI memory",
-    "retransmit_rate": "retransmit rate",
-    "mean_jitter_ms": "jitter",
+    "tcp_retransmit_rate": "TCP retransmit rate",
+    "udp_loss_rate": "UDP loss rate",
+    "mean_udp_jitter_ms": "UDP jitter",
     "mean_rps": "RPS",
     "mean_latency_p50_ms": "latency p50",
     "mean_latency_p90_ms": "latency p90",
@@ -274,7 +276,7 @@ def _render_importance_block(
     Args:
         hw_slug: Slugified hardware-class label; used to namespace ids.
         importance_by_target: Per-target importance frames. Keys are
-            DataFrame column names (e.g. ``"mean_throughput"``).
+            DataFrame column names (e.g. ``"mean_tcp_throughput"``).
         fallback: Legacy single-frame fallback used when the per-target
             dict is empty.
 
@@ -290,8 +292,8 @@ def _render_importance_block(
         col for col in importance_by_target if col not in _TARGET_METRIC_LABELS
     )
     default_target = (
-        "mean_throughput"
-        if "mean_throughput" in importance_by_target
+        "mean_tcp_throughput"
+        if "mean_tcp_throughput" in importance_by_target
         else target_order[0]
     )
 
@@ -482,12 +484,14 @@ _JS_MODULE = r"""
 const DEGENERATE = 0.5;
 
 const METRIC_TO_DF_COLUMN = {
-  throughput: "mean_throughput",
+  tcp_throughput: "mean_tcp_throughput",
+  udp_throughput: "mean_udp_throughput",
   cpu: "mean_cpu",
   node_memory: "mean_node_memory",
   cni_memory: "mean_cni_memory",
-  retransmit_rate: "retransmit_rate",
-  jitter: "mean_jitter_ms",
+  tcp_retransmit_rate: "tcp_retransmit_rate",
+  udp_loss_rate: "udp_loss_rate",
+  udp_jitter: "mean_udp_jitter_ms",
   rps: "mean_rps",
   latency_p50: "mean_latency_p50_ms",
   latency_p90: "mean_latency_p90_ms",
@@ -496,8 +500,8 @@ const METRIC_TO_DF_COLUMN = {
 
 const PRESETS = {
   "default": null,
-  "latency-sensitive": {latency_p99: 0.4, latency_p90: 0.2, retransmit_rate: 0.1},
-  "efficient": {cpu: 0.4, node_memory: 0.3, retransmit_rate: 0.1},
+  "latency-sensitive": {latency_p99: 0.4, latency_p90: 0.2, tcp_retransmit_rate: 0.1},
+  "efficient": {cpu: 0.4, node_memory: 0.3, tcp_retransmit_rate: 0.1},
   "throughput-only": {}
 };
 
@@ -509,18 +513,22 @@ const PRESET_LABELS = {
 };
 
 const METRIC_DISPLAY = {
-  mean_throughput: {label: "Throughput", unit: "Mbps",
-                    format: v => (v / 1e6).toFixed(1)},
+  mean_tcp_throughput: {label: "TCP throughput", unit: "Mbps",
+                        format: v => (v / 1e6).toFixed(1)},
+  mean_udp_throughput: {label: "UDP throughput", unit: "Mbps",
+                        format: v => (v / 1e6).toFixed(1)},
   mean_cpu: {label: "CPU", unit: "%", format: v => v.toFixed(1)},
   mean_node_memory: {label: "Node mem", unit: "MiB",
                      format: v => (v / 1048576).toFixed(0)},
   mean_cni_memory: {label: "CNI mem", unit: "MiB",
                     format: v => (v / 1048576).toFixed(0)},
-  retransmit_rate: {label: "Retx", unit: "/MB",
-                    format: v => (v * 1e6).toFixed(2)},
+  tcp_retransmit_rate: {label: "TCP retx", unit: "/MB",
+                        format: v => (v * 1e6).toFixed(2)},
+  udp_loss_rate: {label: "UDP loss", unit: "%",
+                  format: v => (v * 100).toFixed(2)},
   mean_rps: {label: "RPS", unit: "",
              format: v => v.toLocaleString("en-US", {maximumFractionDigits: 1})},
-  mean_jitter_ms: {label: "Jitter", unit: "ms", format: v => v.toFixed(3)},
+  mean_udp_jitter_ms: {label: "UDP jitter", unit: "ms", format: v => v.toFixed(3)},
   mean_latency_p50_ms: {label: "p50", unit: "ms", format: v => v.toFixed(1)},
   mean_latency_p90_ms: {label: "p90", unit: "ms", format: v => v.toFixed(1)},
   mean_latency_p99_ms: {label: "p99", unit: "ms", format: v => v.toFixed(1)},

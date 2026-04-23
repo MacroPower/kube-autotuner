@@ -491,25 +491,28 @@ class TestIterationsOneSEMFallback:
 
         results = [_r(4e9, "c1"), _r(6e9, "c2")]
         metrics = _compute_metrics(_trial_from(results))
-        assert metrics["throughput"][0] == pytest.approx(1e10)
-        assert metrics["throughput"][1] > 0.0
+        assert metrics["tcp_throughput"][0] == pytest.approx(1e10)
+        assert metrics["tcp_throughput"][1] > 0.0
 
 
 class TestBuildAxObjective:
     def test_default_section(self) -> None:
         objective, constraints = build_ax_objective(ObjectivesSection())
         assert objective == (
-            "throughput, -cpu, -retransmit_rate, -jitter, -node_memory, "
-            "-cni_memory, rps, -latency_p50, -latency_p90, -latency_p99"
+            "tcp_throughput, udp_throughput, -cpu, -tcp_retransmit_rate, "
+            "-udp_loss_rate, -udp_jitter, -node_memory, -cni_memory, rps, "
+            "-latency_p50, -latency_p90, -latency_p99"
         )
         assert constraints == [
-            "throughput >= 1e6",
+            "tcp_throughput >= 1e6",
+            "udp_throughput >= 1e6",
             "cpu <= 200",
-            "retransmit_rate <= 1e-6",
+            "tcp_retransmit_rate <= 1e-6",
+            "udp_loss_rate <= 0.05",
             "node_memory <= 1e10",
             "rps >= 100",
             "latency_p99 <= 1000",
-            "jitter <= 10",
+            "udp_jitter <= 10",
             "cni_memory <= 1e9",
             "latency_p50 <= 100",
             "latency_p90 <= 500",
@@ -518,15 +521,15 @@ class TestBuildAxObjective:
     def test_reduced_two_metric_section(self) -> None:
         section = ObjectivesSection(
             pareto=[
-                ParetoObjective(metric="throughput", direction="maximize"),
+                ParetoObjective(metric="tcp_throughput", direction="maximize"),
                 ParetoObjective(metric="node_memory", direction="minimize"),
             ],
-            constraints=["throughput >= 1e6"],
+            constraints=["tcp_throughput >= 1e6"],
             recommendation_weights={"node_memory": 0.5},
         )
         objective, constraints = build_ax_objective(section)
-        assert objective == "throughput, -node_memory"
-        assert constraints == ["throughput >= 1e6"]
+        assert objective == "tcp_throughput, -node_memory"
+        assert constraints == ["tcp_throughput >= 1e6"]
 
 
 class TestComputeMetricsMemory:
@@ -571,7 +574,7 @@ class TestComputeMetricsJitter:
         ]
         metrics = _compute_metrics(_trial_from(results))
         # Iter 0 jitter mean 0.2, iter 1 jitter mean 0.4 -> 0.3.
-        assert metrics["jitter"][0] == pytest.approx(0.3)
+        assert metrics["udp_jitter"][0] == pytest.approx(0.3)
 
     def test_jitter_nan_when_no_udp_records(self) -> None:
         results = [
@@ -586,7 +589,7 @@ class TestComputeMetricsJitter:
             ),
         ]
         metrics = _compute_metrics(_trial_from(results))
-        assert math.isnan(metrics["jitter"][0])
+        assert math.isnan(metrics["udp_jitter"][0])
 
 
 class TestComputeMetricsRate:
@@ -603,7 +606,7 @@ class TestComputeMetricsRate:
             ),
         ]
         metrics = _compute_metrics(_trial_from(results))
-        assert math.isnan(metrics["retransmit_rate"][0])
+        assert math.isnan(metrics["tcp_retransmit_rate"][0])
 
     def test_rate_zero_when_no_retransmits(self) -> None:
         results = [
@@ -618,8 +621,85 @@ class TestComputeMetricsRate:
             ),
         ]
         metrics = _compute_metrics(_trial_from(results))
-        assert metrics["retransmit_rate"][0] == pytest.approx(0.0)
-        assert not math.isnan(metrics["retransmit_rate"][0])
+        assert metrics["tcp_retransmit_rate"][0] == pytest.approx(0.0)
+        assert not math.isnan(metrics["tcp_retransmit_rate"][0])
+
+
+class TestComputeMetricsUdp:
+    def test_udp_throughput_and_loss_rate_populated(self) -> None:
+        """UDP aggregation produces non-NaN means across multiple iterations."""
+        packets = 10_000
+        results = [
+            BenchmarkResult(
+                timestamp=datetime.now(UTC),
+                mode="udp",
+                bits_per_second=1e9,
+                packets=packets,
+                lost_packets=100,  # iter 0: 1% loss
+                cpu_utilization_percent=15.0,
+                iteration=0,
+            ),
+            BenchmarkResult(
+                timestamp=datetime.now(UTC),
+                mode="udp",
+                bits_per_second=3e9,
+                packets=packets,
+                lost_packets=500,  # iter 1: 5% loss
+                cpu_utilization_percent=15.0,
+                iteration=1,
+            ),
+        ]
+        metrics = _compute_metrics(_trial_from(results))
+        # iter 0 = 1e9, iter 1 = 3e9 -> mean 2e9.
+        assert metrics["udp_throughput"][0] == pytest.approx(2e9)
+        assert metrics["udp_throughput"][1] > 0.0
+        # iter 0 = 0.01, iter 1 = 0.05 -> mean 0.03.
+        assert metrics["udp_loss_rate"][0] == pytest.approx(0.03)
+        assert metrics["udp_loss_rate"][1] > 0.0
+
+    def test_udp_loss_rate_nan_when_no_udp_records(self) -> None:
+        """TCP-only trial: udp_loss_rate is NaN so callers drop it."""
+        results = [
+            BenchmarkResult(
+                timestamp=datetime.now(UTC),
+                mode="tcp",
+                bits_per_second=1e9,
+                retransmits=0,
+                bytes_sent=1_000_000_000,
+                cpu_utilization_percent=10.0,
+                iteration=0,
+            ),
+        ]
+        metrics = _compute_metrics(_trial_from(results))
+        assert math.isnan(metrics["udp_loss_rate"][0])
+
+    def test_udp_throughput_single_iteration_multi_client_sem(self) -> None:
+        """With iterations=1 and N UDP clients, fall back to per-client SEM."""
+        results = [
+            BenchmarkResult(
+                timestamp=datetime.now(UTC),
+                mode="udp",
+                bits_per_second=1e9,
+                packets=1000,
+                lost_packets=0,
+                client_node="c1",
+                iteration=0,
+            ),
+            BenchmarkResult(
+                timestamp=datetime.now(UTC),
+                mode="udp",
+                bits_per_second=3e9,
+                packets=1000,
+                lost_packets=0,
+                client_node="c2",
+                iteration=0,
+            ),
+        ]
+        metrics = _compute_metrics(_trial_from(results))
+        # iter 0 sum across clients = 4e9 -> mean 4e9.
+        assert metrics["udp_throughput"][0] == pytest.approx(4e9)
+        # Single-iteration fallback: per-client stdev / sqrt(n).
+        assert metrics["udp_throughput"][1] > 0.0
 
 
 class TestComputeMetricsLatency:
@@ -750,7 +830,7 @@ class TestSeedPriorTrials:
         assert len(complete_calls) == 3
         for call in complete_calls:
             raw = call.kwargs["raw_data"]
-            assert "throughput" in raw
+            assert "tcp_throughput" in raw
 
     @patch("kube_autotuner.optimizer.BenchmarkRunner")
     @patch("kube_autotuner.optimizer.make_sysctl_setter_from_env")
@@ -767,7 +847,7 @@ class TestSeedPriorTrials:
         fake_client = MagicMock()
         fake_client.attach_trial.return_value = 42
         mock_require_client.return_value = lambda: fake_client
-        # UDP-only trial produces NaN retransmit_rate.
+        # UDP-only trial produces NaN tcp_retransmit_rate.
         nan_prior = self._prior(rate_nan=True)
 
         from kube_autotuner.optimizer import OptimizationLoop  # noqa: PLC0415
@@ -784,8 +864,8 @@ class TestSeedPriorTrials:
         )
         assert fake_client.complete_trial.call_count == 1
         raw = fake_client.complete_trial.call_args.kwargs["raw_data"]
-        assert "retransmit_rate" not in raw
-        assert "throughput" in raw
+        assert "tcp_retransmit_rate" not in raw
+        assert "tcp_throughput" in raw
 
     @patch("kube_autotuner.optimizer.BenchmarkRunner")
     @patch("kube_autotuner.optimizer.make_sysctl_setter_from_env")
@@ -980,7 +1060,7 @@ class TestComputeMetricsTcpFilter:
         ]
         metrics = _compute_metrics(_trial_from([*tcp_results, *udp_results]))
         # Throughput: TCP-only mean of 1e9 and 3e9.
-        assert metrics["throughput"][0] == pytest.approx(2e9)
+        assert metrics["tcp_throughput"][0] == pytest.approx(2e9)
         # CPU: TCP-only mean of 10 and 20.
         assert metrics["cpu"][0] == pytest.approx(15.0)
 
@@ -1021,10 +1101,10 @@ class TestComputeMetricsTcpFilter:
         ]
         metrics = _compute_metrics(_trial_from([*tcp_results, *udp_results]))
         # TCP-summed: 4e9 + 6e9 = 10e9.
-        assert metrics["throughput"][0] == pytest.approx(1e10)
+        assert metrics["tcp_throughput"][0] == pytest.approx(1e10)
         # With 2 TCP samples (single iteration), SEM must be non-zero
         # and computed over TCP samples only (not mixed with UDP).
-        assert metrics["throughput"][1] > 0.0
+        assert metrics["tcp_throughput"][1] > 0.0
 
 
 class TestWarnOnCollapsedObjectives:
@@ -1067,21 +1147,21 @@ class TestWarnOnCollapsedObjectives:
         """Two-metric Pareto set that matches the synthetic fixtures' signal.
 
         The ``_trial`` fixture only varies ``throughput`` and
-        ``retransmit_rate``; every other metric is constant or unset. A
+        ``tcp_retransmit_rate``; every other metric is constant or unset. A
         reduced Pareto set keeps the tests from tripping the helper on
         unrelated collapsed axes.
 
         Returns:
             An :class:`ObjectivesSection` whose Pareto set contains only
-            ``throughput`` and ``retransmit_rate``.
+            ``throughput`` and ``tcp_retransmit_rate``.
         """
         return ObjectivesSection(
             pareto=[
-                ParetoObjective(metric="throughput", direction="maximize"),
-                ParetoObjective(metric="retransmit_rate", direction="minimize"),
+                ParetoObjective(metric="tcp_throughput", direction="maximize"),
+                ParetoObjective(metric="tcp_retransmit_rate", direction="minimize"),
             ],
-            constraints=["throughput >= 1e6"],
-            recommendation_weights={"retransmit_rate": 0.5},
+            constraints=["tcp_throughput >= 1e6"],
+            recommendation_weights={"tcp_retransmit_rate": 0.5},
         )
 
     @patch("kube_autotuner.optimizer.BenchmarkRunner")
@@ -1102,7 +1182,7 @@ class TestWarnOnCollapsedObjectives:
         mock_require_client.return_value = lambda: fake_client
 
         # Four trials with varying throughput but identical retransmit
-        # counts AND identical bytes_sent => retransmit_rate is constant
+        # counts AND identical bytes_sent => tcp_retransmit_rate is constant
         # across trials, throughput is not.
         priors = [
             self._trial(bps=8e9, retransmits=5),
@@ -1127,14 +1207,14 @@ class TestWarnOnCollapsedObjectives:
         caplog.set_level("WARNING", logger="kube_autotuner.optimizer")
         warned = loop._warn_on_collapsed_objectives()
 
-        assert warned == ["retransmit_rate"]
+        assert warned == ["tcp_retransmit_rate"]
         collapse_records = [
             rec
             for rec in caplog.records
             if "collapsed to near-constant variance" in rec.message
         ]
         assert len(collapse_records) == 1
-        assert "retransmit_rate" in collapse_records[0].message
+        assert "tcp_retransmit_rate" in collapse_records[0].message
 
         caplog.clear()
         warned_again = loop._warn_on_collapsed_objectives()

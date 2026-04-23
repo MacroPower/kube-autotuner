@@ -25,7 +25,7 @@ from kube_autotuner.progress import (
     RichProgressObserver,
     _build_trial_row,  # noqa: PLC2701
 )
-from kube_autotuner.scoring import score_rows
+from kube_autotuner.scoring import METRIC_TO_DF_COLUMN, score_rows
 
 
 def _trial(trial_id: str, bps: float) -> TrialResult:
@@ -64,7 +64,7 @@ def test_live_panel_rerank_ties_break_on_trial_id() -> None:
             0,
             "bayesian",
             {
-                "throughput": (b.mean_throughput(), 0.0),
+                "tcp_throughput": (b.mean_tcp_throughput(), 0.0),
                 "cpu": (b.mean_cpu(), 0.0),
             },
             trial_id=b.trial_id,
@@ -74,7 +74,7 @@ def test_live_panel_rerank_ties_break_on_trial_id() -> None:
             1,
             "bayesian",
             {
-                "throughput": (a.mean_throughput(), 0.0),
+                "tcp_throughput": (a.mean_tcp_throughput(), 0.0),
                 "cpu": (a.mean_cpu(), 0.0),
             },
             trial_id=a.trial_id,
@@ -97,6 +97,31 @@ def test_recommend_configs_agrees_on_trial_id_tiebreak() -> None:
     assert [r["trial_id"] for r in results] == ["aaa", "zzz"]
 
 
+def test_build_trial_row_populates_udp_keys() -> None:
+    """The live panel pathway must propagate udp_throughput / udp_loss_rate.
+
+    Otherwise the live ``Best so far`` ranking diverges from
+    :func:`recommend_configs` once those metrics enter the default
+    objective set.
+    """
+    row = _build_trial_row(
+        0,
+        "bayesian",
+        {
+            "tcp_throughput": (5e9, 0.0),
+            "udp_throughput": (1e9, 0.0),
+            "cpu": (15.0, 0.0),
+            "tcp_retransmit_rate": (1e-8, 0.0),
+            "udp_loss_rate": (0.02, 0.0),
+            "udp_jitter": (0.5, 0.0),
+        },
+        trial_id="t-1",
+        parent_trial_id=None,
+    )
+    assert row.metrics[METRIC_TO_DF_COLUMN["udp_throughput"]] == pytest.approx(1e9)
+    assert row.metrics[METRIC_TO_DF_COLUMN["udp_loss_rate"]] == pytest.approx(0.02)
+
+
 def test_run_verification_top_k_selector_agrees_on_trial_id_tiebreak() -> None:
     """The selector inside run_verification uses the same tiebreak key."""
     a = _trial("aaa", 1e9)
@@ -106,7 +131,7 @@ def test_run_verification_top_k_selector_agrees_on_trial_id_tiebreak() -> None:
             0,
             "bayesian",
             {
-                "throughput": (t.mean_throughput(), 0.0),
+                "tcp_throughput": (t.mean_tcp_throughput(), 0.0),
                 "cpu": (t.mean_cpu(), 0.0),
             },
             trial_id=t.trial_id,

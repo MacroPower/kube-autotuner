@@ -118,10 +118,10 @@ def test_full_run_records_results(
     assert udp.jitter_ms >= 0.0
     assert udp.bytes_sent is None
     # Aggregates reflect the new always-both semantics.
-    assert t.mean_jitter_ms() > 0.0
-    # retransmit_rate may be 0 on a clean intra-cluster path, but it
+    assert t.mean_udp_jitter_ms() > 0.0
+    # tcp_retransmit_rate may be 0 on a clean intra-cluster path, but it
     # must be a finite number (not None) now that bw-tcp always runs.
-    assert t.retransmit_rate() is not None
+    assert t.tcp_retransmit_rate() is not None
     assert t.node_pair.source == node_names["source"]
     assert t.node_pair.target == node_names["target"]
     # Both fortio sub-stages fire per iteration.

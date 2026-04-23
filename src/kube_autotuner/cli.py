@@ -946,7 +946,8 @@ def _format_top_recommendation(r: dict[str, Any]) -> str:
         CNI is disabled) are skipped.
     """
     parts: list[str] = [
-        f"{r['mean_throughput'] / 1e6:.1f} Mbps",
+        f"{r['mean_tcp_throughput'] / 1e6:.1f} Mbps TCP",
+        f"{r['mean_udp_throughput'] / 1e6:.1f} Mbps UDP",
         f"{r['mean_cpu']:.1f}% CPU",
     ]
     nmem = r["mean_node_memory"]
@@ -955,10 +956,13 @@ def _format_top_recommendation(r: dict[str, Any]) -> str:
     cmem = r["mean_cni_memory"]
     if cmem is not None:
         parts.append(f"cni {cmem / 1024 / 1024:.0f} MiB")
-    parts.append(f"{format_retransmit_rate(r['retransmit_rate'])} retx/MB")
-    jit = r.get("mean_jitter_ms")
+    parts.extend([
+        f"{format_retransmit_rate(r['tcp_retransmit_rate'])} TCP retx/MB",
+        f"{r['udp_loss_rate'] * 100:.2f}% UDP loss",
+    ])
+    jit = r.get("mean_udp_jitter_ms")
     if jit is not None:
-        parts.append(f"{jit:.3f} ms jitter")
+        parts.append(f"{jit:.3f} ms UDP jitter")
     rps = r.get("mean_rps")
     if rps is not None:
         parts.append(f"{rps:,.1f} rps")
@@ -1161,15 +1165,17 @@ def _write_figures(
         return col in df.columns and bool(df[col].notna().any())
 
     pair_candidates = [
-        ("mean_throughput", "mean_cpu"),
-        ("mean_throughput", "mean_node_memory"),
-        ("mean_throughput", "mean_cni_memory"),
-        ("mean_throughput", "retransmit_rate"),
-        ("mean_throughput", "mean_jitter_ms"),
+        ("mean_tcp_throughput", "mean_cpu"),
+        ("mean_tcp_throughput", "mean_node_memory"),
+        ("mean_tcp_throughput", "mean_cni_memory"),
+        ("mean_tcp_throughput", "tcp_retransmit_rate"),
+        ("mean_tcp_throughput", "mean_udp_jitter_ms"),
+        ("mean_udp_throughput", "udp_loss_rate"),
+        ("mean_udp_throughput", "mean_udp_jitter_ms"),
         ("mean_cpu", "mean_node_memory"),
         ("mean_cpu", "mean_cni_memory"),
-        ("mean_cpu", "retransmit_rate"),
-        ("mean_cpu", "mean_jitter_ms"),
+        ("mean_cpu", "tcp_retransmit_rate"),
+        ("mean_cpu", "mean_udp_jitter_ms"),
     ]
     for x, y in pair_candidates:
         if not (_has_data(x) and _has_data(y)):

@@ -119,6 +119,20 @@ class BenchmarkResult(BaseModel):
     cpu_utilization_percent: float = 0.0
     cpu_server_percent: float | None = None
     jitter_ms: float | None = None
+    packets: int | None = Field(
+        default=None,
+        description=(
+            "Total UDP packets sent during the iperf3 run; populated from "
+            "end.sum.packets for UDP, None for TCP."
+        ),
+    )
+    lost_packets: int | None = Field(
+        default=None,
+        description=(
+            "UDP datagrams reported lost during the iperf3 run, from "
+            "end.sum.lost_packets; None for TCP."
+        ),
+    )
     node_memory_used_bytes: int | None = Field(
         default=None,
         description=(
@@ -193,8 +207,10 @@ def compute_sysctl_hash(sysctl_values: Mapping[str, str | int]) -> str:
     return hashlib.sha256(canonical.encode()).hexdigest()[:16]
 
 
-def retransmit_rate_by_iteration(results: list[BenchmarkResult]) -> list[float]:
-    """Return one retransmit rate (retx per byte) per iteration.
+def tcp_retransmit_rate_by_iteration(
+    results: list[BenchmarkResult],
+) -> list[float]:
+    """Return one TCP retransmit rate (retx per byte) per iteration.
 
     Each iteration's rate is ``sum(retransmits) / sum(bytes_sent)``
     over its records. Every iteration now runs both TCP and UDP
@@ -222,6 +238,36 @@ def retransmit_rate_by_iteration(results: list[BenchmarkResult]) -> list[float]:
         per_iter_retx[it] / bytes_
         for it, bytes_ in per_iter_bytes.items()
         if bytes_ > 0 and per_iter_saw_retx[it]
+    ]
+
+
+def udp_loss_rate_by_iteration(results: list[BenchmarkResult]) -> list[float]:
+    """Return one UDP loss rate (lost packets per packet) per iteration.
+
+    Each iteration's rate is ``sum(lost_packets) / sum(packets)`` over
+    its UDP records. Iterations where no UDP record reported a
+    non-zero ``packets`` total are skipped; TCP records are dropped
+    naturally because they never report ``packets`` / ``lost_packets``.
+
+    Args:
+        results: Raw benchmark records for a single trial.
+
+    Returns:
+        The per-iteration loss rates, in iteration-index order.
+    """
+    per_iter_lost: dict[int, int] = defaultdict(int)
+    per_iter_packets: dict[int, int] = defaultdict(int)
+    per_iter_saw_lost: dict[int, bool] = defaultdict(bool)
+    for r in results:
+        if r.lost_packets is not None:
+            per_iter_lost[r.iteration] += r.lost_packets
+            per_iter_saw_lost[r.iteration] = True
+        if r.packets is not None and r.packets > 0:
+            per_iter_packets[r.iteration] += r.packets
+    return [
+        per_iter_lost[it] / packets
+        for it, packets in per_iter_packets.items()
+        if packets > 0 and per_iter_saw_lost[it]
     ]
 
 
@@ -318,12 +364,11 @@ class TrialResult(BaseModel):
         if self.topology == "unknown":
             self.topology = self.node_pair.topology
 
-    def mean_throughput(self) -> float:
+    def mean_tcp_throughput(self) -> float:
         """Return the mean total TCP throughput in bits per second.
 
-        Filters to ``mode == "tcp"`` records before aggregating -- every
-        iteration now runs both TCP and UDP bandwidth stages, and the
-        ``throughput`` objective has always meant TCP. Throughput is
+        Filters to ``mode == "tcp"`` records before aggregating; UDP
+        throughput lives on :meth:`mean_udp_throughput`. Throughput is
         summed across clients within each iteration, then averaged
         across iterations.
 
@@ -337,6 +382,26 @@ class TrialResult(BaseModel):
         per_iter_sums = [
             sum(r.bits_per_second for r in group)
             for group in _group_by_iteration(tcp_results).values()
+        ]
+        return sum(per_iter_sums) / len(per_iter_sums)
+
+    def mean_udp_throughput(self) -> float:
+        """Return the mean total UDP throughput in bits per second.
+
+        Mirrors :meth:`mean_tcp_throughput` but filters to ``mode ==
+        "udp"`` records. Throughput is summed across clients within
+        each iteration, then averaged across iterations.
+
+        Returns:
+            The averaged UDP throughput, or ``0.0`` when there are no
+            UDP results.
+        """
+        udp_results = [r for r in self.results if r.mode == "udp"]
+        if not udp_results:
+            return 0.0
+        per_iter_sums = [
+            sum(r.bits_per_second for r in group)
+            for group in _group_by_iteration(udp_results).values()
         ]
         return sum(per_iter_sums) / len(per_iter_sums)
 
@@ -375,11 +440,30 @@ class TrialResult(BaseModel):
         """
         return sum(r.bytes_sent or 0 for r in self.results)
 
-    def retransmit_rate(self) -> float | None:
-        """Return retransmits per byte as a per-trial rate.
+    def udp_loss_rate(self) -> float:
+        """Return UDP lost packets per packet sent as a per-trial rate.
 
         Aggregates per-iteration ratio-of-sums then means across
-        iterations -- matching how :meth:`mean_throughput` folds
+        iterations -- mirroring :meth:`tcp_retransmit_rate` but feeding
+        from UDP-mode records via ``lost_packets`` / ``packets``.
+        Iterations where no UDP record reported a non-zero ``packets``
+        total are dropped from the mean.
+
+        Returns:
+            The averaged UDP loss rate (e.g. ``0.01`` is 1% loss), or
+            ``0.0`` when no UDP iteration contributed (no UDP stage,
+            or every UDP stage failed before reporting packet counts).
+        """
+        rate_vals = udp_loss_rate_by_iteration(self.results)
+        if not rate_vals:
+            return 0.0
+        return sum(rate_vals) / len(rate_vals)
+
+    def tcp_retransmit_rate(self) -> float | None:
+        """Return TCP retransmits per byte as a per-trial rate.
+
+        Aggregates per-iteration ratio-of-sums then means across
+        iterations -- matching how :meth:`mean_tcp_throughput` folds
         clients within an iteration and averages across iterations.
         Iterations where no record reported ``bytes_sent`` (or the
         per-iteration byte total was zero) are dropped from the mean
@@ -394,16 +478,16 @@ class TrialResult(BaseModel):
             stage. Returns ``None`` only when every ``bw-tcp`` stage
             failed.
         """
-        rate_vals = retransmit_rate_by_iteration(self.results)
+        rate_vals = tcp_retransmit_rate_by_iteration(self.results)
         if not rate_vals:
             return None
         return sum(rate_vals) / len(rate_vals)
 
-    def mean_jitter_ms(self) -> float:
-        """Return the mean jitter in milliseconds.
+    def mean_udp_jitter_ms(self) -> float:
+        """Return the mean UDP inter-arrival jitter in milliseconds.
 
         Takes the per-iteration mean across clients that reported jitter,
-        then averages across iterations.
+        then averages across iterations. Only UDP records carry jitter.
 
         Returns:
             The averaged jitter, or ``0.0`` when no results report jitter.
