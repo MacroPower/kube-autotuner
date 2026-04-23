@@ -85,18 +85,6 @@ def parse_quantity(s: str) -> float:
     return value * 10.0 ** int(suffix[1:])
 
 
-def seconds_to_ms(v: float) -> float:
-    """Convert a seconds value to milliseconds for display.
-
-    Args:
-        v: Seconds value; callers guard on ``None`` before calling.
-
-    Returns:
-        The input scaled by ``1000.0``.
-    """
-    return v * 1000.0
-
-
 _DURATION_UNITS: tuple[tuple[float, str], ...] = (
     (1.0, "s"),
     (1e-3, "ms"),

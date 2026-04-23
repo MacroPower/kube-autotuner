@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 import json
+import math
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -22,7 +23,7 @@ from kube_autotuner.analysis import (  # noqa: E402
     split_trials_by_hardware_class,
     trials_to_dataframe,
 )
-from kube_autotuner.cli import app  # noqa: E402
+from kube_autotuner.cli import _build_axis_payload, app  # noqa: E402, PLC2701
 from kube_autotuner.experiment import ObjectivesSection, ParetoObjective  # noqa: E402
 from kube_autotuner.models import (  # noqa: E402
     BenchmarkConfig,
@@ -595,30 +596,95 @@ class TestRecommendConfigs:
                 assert rec[key] == row[key]
 
 
-# --- plots ---------------------------------------------------------------
+# --- _build_axis_payload -------------------------------------------------
 
 
-pytest.importorskip("plotly")
+class TestBuildAxisPayload:
+    def test_coerces_nan_inf_and_none_to_none(self) -> None:
+        df = pd.DataFrame(
+            [
+                {
+                    "trial_id": 1,
+                    "mean_tcp_throughput": 4.2e10,
+                    "tcp_retransmit_rate": 1e-6,
+                    "mean_udp_jitter": 0.001,
+                },
+                {
+                    "trial_id": 2,
+                    "mean_tcp_throughput": float("nan"),
+                    "tcp_retransmit_rate": math.inf,
+                    "mean_udp_jitter": -math.inf,
+                },
+                {
+                    "trial_id": 3,
+                    "mean_tcp_throughput": None,
+                    "tcp_retransmit_rate": 2e-6,
+                    "mean_udp_jitter": None,
+                },
+            ],
+        )
+        pareto_mask = pd.Series([True, False, True])
 
-from kube_autotuner.plots import (  # noqa: E402
-    plot_pareto_2d,
-    plot_pareto_scatter_matrix,
-)
+        rows, axis_columns = _build_axis_payload(df, pareto_mask)
 
+        assert axis_columns == [
+            "mean_tcp_throughput",
+            "tcp_retransmit_rate",
+            "mean_udp_jitter",
+        ]
+        assert rows[0] == {
+            "trial_id": "1",
+            "pareto": True,
+            "mean_tcp_throughput": 4.2e10,
+            "tcp_retransmit_rate": 1e-6,
+            "mean_udp_jitter": 0.001,
+        }
+        assert rows[1] == {
+            "trial_id": "2",
+            "pareto": False,
+            "mean_tcp_throughput": None,
+            "tcp_retransmit_rate": None,
+            "mean_udp_jitter": None,
+        }
+        assert rows[2] == {
+            "trial_id": "3",
+            "pareto": True,
+            "mean_tcp_throughput": None,
+            "tcp_retransmit_rate": 2e-6,
+            "mean_udp_jitter": None,
+        }
 
-class TestPlots:
-    def test_scatter_matrix(self, mixed_trials: list[TrialResult]) -> None:
-        df, _ = trials_to_dataframe(mixed_trials, hardware_class="10g")
-        front = pareto_front(df)
-        mask = df["trial_id"].isin(front["trial_id"])
-        fig = plot_pareto_scatter_matrix(df, mask)
-        assert fig is not None
+    def test_drops_all_null_columns_from_axis_columns(self) -> None:
+        df = pd.DataFrame(
+            [
+                {
+                    "trial_id": "t1",
+                    "mean_tcp_throughput": 1e10,
+                    "udp_loss_rate": None,
+                },
+            ],
+        )
+        rows, axis_columns = _build_axis_payload(df, pd.Series([True]))
 
-    def test_2d(self, mixed_trials: list[TrialResult]) -> None:
-        df, _ = trials_to_dataframe(mixed_trials, hardware_class="10g")
-        front = pareto_front(df)
-        fig = plot_pareto_2d(df, front, "mean_tcp_throughput", "tcp_retransmit_rate")
-        assert fig is not None
+        assert axis_columns == ["mean_tcp_throughput"]
+        assert "udp_loss_rate" not in rows[0]
+
+    def test_json_dumps_allow_nan_false_roundtrips(self) -> None:
+        df = pd.DataFrame(
+            [
+                {
+                    "trial_id": "t1",
+                    "mean_tcp_throughput": float("nan"),
+                    "tcp_retransmit_rate": math.inf,
+                },
+            ],
+        )
+        rows, _ = _build_axis_payload(df, pd.Series([True]))
+
+        # The whole point of the scrubbing: json.dumps with allow_nan=False
+        # must not raise ValueError on the output.
+        encoded = json.dumps(rows, allow_nan=False)
+        assert json.loads(encoded) == rows
 
 
 # --- CLI analyze command -------------------------------------------------
@@ -653,7 +719,6 @@ class TestCLIAnalyze:
         hw_dir = out_dir / "10g"
         assert (hw_dir / "recommendations.json").exists()
         assert (hw_dir / "importance.json").exists()
-        assert (hw_dir / "pareto_scatter_matrix.html").exists()
 
         recs = json.loads((hw_dir / "recommendations.json").read_text())
         assert len(recs) >= 1

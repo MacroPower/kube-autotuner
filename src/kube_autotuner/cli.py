@@ -879,7 +879,7 @@ def analyze(
         typer.Exit: Input JSONL is empty or the requested hardware
             class has no trials.
     """
-    from kube_autotuner import analysis, plots, report  # noqa: PLC0415
+    from kube_autotuner import analysis, report  # noqa: PLC0415
     from kube_autotuner.experiment import ObjectivesSection  # noqa: PLC0415
 
     trials = TrialLog.load(input_file)
@@ -921,7 +921,6 @@ def analyze(
                 top_n=top_n,
                 output_dir=output_dir,
                 analysis=analysis,
-                plots=plots,
                 explicit_class=hardware_class is not None,
                 objectives=objectives,
             )
@@ -976,16 +975,14 @@ def _analyze_one_class(
     top_n: int,
     output_dir: Path,
     analysis: Any,  # noqa: ANN401
-    plots: Any,  # noqa: ANN401
     explicit_class: bool,
     objectives: ObjectivesSection,
 ) -> dict[str, Any] | None:
     """Produce analysis output for a single hardware class.
 
-    Writes per-figure HTML, ``recommendations.json``, and
-    ``importance.json`` under ``output_dir / hardware_class / ...`` and
-    returns a section dict suitable for
-    :func:`kube_autotuner.report.write_index_html`.
+    Writes ``recommendations.json`` and ``importance.json`` under
+    ``output_dir / hardware_class / ...`` and returns a section dict
+    suitable for :func:`kube_autotuner.report.write_index_html`.
 
     Args:
         trials: The full trial list (unfiltered).
@@ -994,7 +991,6 @@ def _analyze_one_class(
         top_n: Number of recommendations to emit.
         output_dir: Root output directory.
         analysis: The lazy-imported ``kube_autotuner.analysis`` module.
-        plots: The lazy-imported ``kube_autotuner.plots`` module.
         explicit_class: ``True`` when the user supplied
             ``--hardware-class``; in that case an empty result is a
             hard error (no other class will be tried), otherwise we
@@ -1087,13 +1083,7 @@ def _analyze_one_class(
     hw_dir = output_dir / hardware_class
     hw_dir.mkdir(parents=True, exist_ok=True)
 
-    figures = _write_figures(
-        df=df,
-        front=front,
-        pareto_mask=pareto_mask,
-        hw_dir=hw_dir,
-        plots=plots,
-    )
+    all_rows, axis_columns = _build_axis_payload(df, pareto_mask)
 
     (hw_dir / "recommendations.json").write_text(
         json.dumps(recs, indent=2) + "\n",
@@ -1122,51 +1112,68 @@ def _analyze_one_class(
         "top_n": top_n,
         "importance": importance,
         "importance_by_target": importance_by_target,
-        "figures": figures,
+        "all_rows": all_rows,
+        "axis_columns": axis_columns,
     }
 
 
-def _write_figures(
-    *,
+_AXIS_METRIC_COLUMNS: tuple[str, ...] = (
+    "mean_tcp_throughput",
+    "mean_udp_throughput",
+    "tcp_retransmit_rate",
+    "udp_loss_rate",
+    "mean_udp_jitter",
+    "mean_rps",
+    "mean_latency_p50",
+    "mean_latency_p90",
+    "mean_latency_p99",
+)
+
+
+def _build_axis_payload(
     df: Any,  # noqa: ANN401
-    front: Any,  # noqa: ANN401
     pareto_mask: Any,  # noqa: ANN401
-    hw_dir: Path,
-    plots: Any,  # noqa: ANN401
-) -> list[tuple[str, Any]]:
-    """Render every per-hardware-class figure and write it to disk.
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Return JSON-safe per-trial rows plus the chart's axis columns.
+
+    Mirrors the NaN-to-None coercion used by
+    :func:`kube_autotuner.analysis.pareto_recommendation_rows` so the
+    browser-side ``json.dumps(allow_nan=False)`` in
+    :func:`kube_autotuner.report._embed_json` cannot choke. Also
+    guards against infinities (``math.isfinite``), which ``pd.isna``
+    does not catch.
 
     Args:
-        df: The per-class DataFrame.
-        front: The Pareto frontier DataFrame.
-        pareto_mask: Boolean mask marking Pareto-optimal rows of
-            ``df``.
-        hw_dir: Per-hardware-class output directory.
-        plots: The lazy-imported ``kube_autotuner.plots`` module.
+        df: The per-class DataFrame from
+            :func:`kube_autotuner.analysis.trials_to_dataframe`.
+        pareto_mask: Boolean Series aligned with ``df``; ``True``
+            marks Pareto-optimal rows.
 
     Returns:
-        A list of ``(label, figure)`` tuples ready to hand to
-        :func:`kube_autotuner.report.write_index_html`.
+        ``(all_rows, axis_columns)`` where ``all_rows`` has one dict
+        per df row with ``trial_id`` (str), ``pareto`` (bool), and
+        every axis column, and ``axis_columns`` lists those metric
+        columns that have at least one non-null value in ``df``.
     """
-    scatter_fig = plots.plot_pareto_scatter_matrix(df, pareto_mask)
-    plots.write_standalone_html(scatter_fig, hw_dir / "pareto_scatter_matrix.html")
-    figures: list[tuple[str, Any]] = [
-        ("Objective space (scatter matrix)", scatter_fig),
-    ]
+    import math  # noqa: PLC0415
 
-    def _has_data(col: str) -> bool:
-        return col in df.columns and bool(df[col].notna().any())
+    import pandas as pd  # noqa: PLC0415
 
-    pair_candidates = [
-        ("mean_tcp_throughput", "tcp_retransmit_rate"),
-        ("mean_tcp_throughput", "mean_udp_jitter"),
-        ("mean_udp_throughput", "udp_loss_rate"),
-        ("mean_udp_throughput", "mean_udp_jitter"),
+    axis_columns = [
+        c for c in _AXIS_METRIC_COLUMNS if c in df.columns and df[c].notna().any()
     ]
-    for x, y in pair_candidates:
-        if not (_has_data(x) and _has_data(y)):
-            continue
-        fig = plots.plot_pareto_2d(df, front, x, y)
-        plots.write_standalone_html(fig, hw_dir / f"pareto_{x}_vs_{y}.html")
-        figures.append((f"Pareto: {x} vs {y}", fig))
-    return figures
+    rows: list[dict[str, Any]] = []
+    records = df.to_dict(orient="records")
+    for record, is_pareto in zip(records, pareto_mask, strict=True):
+        out: dict[str, Any] = {
+            "trial_id": str(record["trial_id"]),
+            "pareto": bool(is_pareto),
+        }
+        for col in axis_columns:
+            v = record.get(col)
+            if v is None or pd.isna(v) or not math.isfinite(float(v)):
+                out[col] = None
+            else:
+                out[col] = float(v)
+        rows.append(out)
+    return rows, axis_columns

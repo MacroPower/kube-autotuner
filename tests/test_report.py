@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 pd = pytest.importorskip("pandas")
-go = pytest.importorskip("plotly.graph_objects")
 
 from kube_autotuner import report  # noqa: E402
 from kube_autotuner.experiment import ObjectivesSection, ParetoObjective  # noqa: E402
@@ -24,11 +23,9 @@ def _minimal_section(
     hw: str,
     *,
     with_importance: bool = True,
-    n_figures: int = 6,
     n_pareto_rows: int = 3,
+    trial_count: int = 12,
 ) -> dict[str, Any]:
-    fig = go.Figure(data=[go.Scatter(x=[1, 2, 3], y=[1, 4, 9])])
-    figures = [(f"Chart {i}", go.Figure(fig)) for i in range(n_figures)]
     importance_df = (
         pd.DataFrame(
             [
@@ -76,6 +73,16 @@ def _minimal_section(
         }
         for i in range(n_pareto_rows)
     ]
+    all_rows = [
+        {
+            "trial_id": f"trial-{hw}-{i:02d}",
+            "pareto": i < n_pareto_rows,
+            "mean_tcp_throughput": 4.2e10 - 1e9 * i,
+            "tcp_retransmit_rate": 1e-8 * (i + 1),
+        }
+        for i in range(trial_count)
+    ]
+    axis_columns = ["mean_tcp_throughput", "tcp_retransmit_rate"]
     objectives = [
         {"metric": "tcp_throughput", "direction": "maximize"},
         {"metric": "udp_throughput", "direction": "maximize"},
@@ -89,7 +96,7 @@ def _minimal_section(
     ]
     return {
         "hardware_class": hw,
-        "trial_count": 12,
+        "trial_count": trial_count,
         "pareto_count": n_pareto_rows,
         "topology": None,
         "top_n": 3,
@@ -107,7 +114,8 @@ def _minimal_section(
         "default_weights": dict(_DEFAULT_WEIGHTS),
         "memory_cost_weight": 0.1,
         "importance": importance_df,
-        "figures": figures,
+        "all_rows": all_rows,
+        "axis_columns": axis_columns,
     }
 
 
@@ -147,31 +155,75 @@ def test_write_index_html_renders_all_sections(
 
 
 def test_write_index_html_slugifies_hardware_class_in_ids(tmp_path: Path) -> None:
-    section = _minimal_section("10G NIC", n_figures=1)
+    section = _minimal_section("10G NIC")
     path = report.write_index_html(tmp_path, [section])
     html_text = path.read_text()
 
     assert "href='#hw-10g-nic'" in html_text
     assert "id='hw-10g-nic'" in html_text
-    assert 'id="fig-10g-nic-chart-0"' in html_text
+    assert 'id="axis-chart-10g-nic"' in html_text
     assert 'id="section-data-10g-nic"' in html_text
     assert "Hardware class: 10G NIC" in html_text
 
 
 def test_write_index_html_handles_empty_importance(tmp_path: Path) -> None:
-    section = _minimal_section("10g", with_importance=False, n_figures=4)
+    section = _minimal_section("10g", with_importance=False)
     path = report.write_index_html(tmp_path, [section])
     html_text = path.read_text()
 
     assert "Parameter importance unavailable" in html_text
-    for i in range(4):
-        assert f"Chart {i}" in html_text
+    assert "Objective space" in html_text
+    assert 'id="axis-chart-10g"' in html_text
+
+
+def test_write_index_html_axis_chart_defaults_are_selected(tmp_path: Path) -> None:
+    section = _minimal_section("10g")
+    path = report.write_index_html(tmp_path, [section])
+    html_text = path.read_text()
+
+    # Python's `selected` attribute must agree with the JS-side default
+    # computation so the first paint does not mismatch the <select>
+    # values displayed in the DOM.
+    assert (
+        '<select class="axis-select-x" data-hw-slug="10g">'
+        '<option value="mean_tcp_throughput" selected>'
+    ) in html_text
+    assert '<option value="tcp_retransmit_rate" selected>' in html_text
+
+
+def test_write_index_html_axis_chart_degenerates_below_two_columns(
+    tmp_path: Path,
+) -> None:
+    section = _minimal_section("10g")
+    section["axis_columns"] = ["mean_tcp_throughput"]
+    path = report.write_index_html(tmp_path, [section])
+    html_text = path.read_text()
+
+    # Fallback message replaces the controls, but the div keeps its
+    # stable id (hidden) so highlightInPlots can tolerate it.
+    assert "Not enough metrics with data" in html_text
+    assert re.search(
+        r'<div[^>]*id="axis-chart-10g"[^>]*hidden',
+        html_text,
+    )
+    assert 'class="axis-select-x"' not in html_text
+    assert 'class="axis-select-y"' not in html_text
+
+
+def test_write_index_html_no_legacy_pareto_labels(tmp_path: Path) -> None:
+    section = _minimal_section("10g")
+    path = report.write_index_html(tmp_path, [section])
+    html_text = path.read_text()
+
+    # Guard against regressing the scatter-matrix / Pareto-2D plots.
+    assert "Pareto: " not in html_text
+    assert "scatter matrix" not in html_text.lower()
 
 
 def test_write_index_html_uses_cdn_not_inlined_plotly(tmp_path: Path) -> None:
     sections = [
-        _minimal_section("10g", n_figures=2),
-        _minimal_section("1g", n_figures=2),
+        _minimal_section("10g"),
+        _minimal_section("1g"),
     ]
     path = report.write_index_html(tmp_path, sections)
     html_text = path.read_text()
@@ -189,8 +241,8 @@ def test_write_index_html_uses_cdn_not_inlined_plotly(tmp_path: Path) -> None:
 
 def test_write_index_html_embeds_pareto_rows(tmp_path: Path) -> None:
     sections = [
-        _minimal_section("10g", n_figures=2, n_pareto_rows=4),
-        _minimal_section("1g", n_figures=1, n_pareto_rows=2),
+        _minimal_section("10g", n_pareto_rows=4),
+        _minimal_section("1g", n_pareto_rows=2),
     ]
     path = report.write_index_html(tmp_path, sections)
     html_text = path.read_text()
@@ -229,9 +281,9 @@ def test_write_index_html_embeds_pareto_rows(tmp_path: Path) -> None:
         for obj in payload["objectives"]:
             ParetoObjective.model_validate(obj)
 
-        for label, _ in section["figures"]:
-            fig_id = report._figure_div_id(hw_slug, label)
-            assert fig_id in payload["figureDivIds"]
+        assert payload["figureDivIds"] == [f"axis-chart-{hw_slug}"]
+        assert payload["axisColumns"] == section["axis_columns"]
+        assert len(payload["allRows"]) == len(section["all_rows"])
 
     js_module_matches = re.findall(
         r"<script type='module'>",
@@ -241,7 +293,7 @@ def test_write_index_html_embeds_pareto_rows(tmp_path: Path) -> None:
 
 
 def test_write_index_html_escapes_script_close_in_payload(tmp_path: Path) -> None:
-    section = _minimal_section("10g", n_figures=1, n_pareto_rows=1)
+    section = _minimal_section("10g", n_pareto_rows=1)
     section["pareto_rows"][0]["sysctl_values"]["payload"] = "</script><b>xss</b>"
     path = report.write_index_html(tmp_path, [section])
     html_text = path.read_text()
@@ -255,7 +307,7 @@ def test_write_index_html_escapes_script_close_in_payload(tmp_path: Path) -> Non
 
 
 def test_write_index_html_rejects_nan_in_payload(tmp_path: Path) -> None:
-    section = _minimal_section("10g", n_figures=1, n_pareto_rows=1)
+    section = _minimal_section("10g", n_pareto_rows=1)
     section["pareto_rows"][0]["mean_tcp_throughput"] = float("nan")
 
     with pytest.raises(ValueError, match="Out of range float values"):
@@ -390,7 +442,7 @@ def _active_preset_key_py(
 
 def test_apply_preset_throughput_only_sets_maximize_to_one() -> None:
     """``throughput-only`` zeros minimize weights and keeps maximize at 1.0."""
-    section = _minimal_section("10g", n_figures=0, n_pareto_rows=1)
+    section = _minimal_section("10g", n_pareto_rows=1)
     presets = _extract_js_object_literal(report._JS_MODULE, "PRESETS")
     weights = _apply_preset_py("throughput-only", section, presets)
     for obj in section["objectives"]:
@@ -402,7 +454,7 @@ def test_apply_preset_throughput_only_sets_maximize_to_one() -> None:
 
 def test_active_preset_key_round_trip_throughput_only() -> None:
     """The weights produced by ``throughput-only`` round-trip back to it."""
-    section = _minimal_section("10g", n_figures=0, n_pareto_rows=1)
+    section = _minimal_section("10g", n_pareto_rows=1)
     presets = _extract_js_object_literal(report._JS_MODULE, "PRESETS")
     weights = _apply_preset_py("throughput-only", section, presets)
     assert _active_preset_key_py(weights, section, presets) == "throughput-only"
@@ -413,7 +465,7 @@ def test_apply_preset_latency_sensitive_keeps_maximize_at_one() -> None:
 
     Maximize weights stay at their 1.0 default.
     """
-    section = _minimal_section("10g", n_figures=0, n_pareto_rows=1)
+    section = _minimal_section("10g", n_pareto_rows=1)
     presets = _extract_js_object_literal(report._JS_MODULE, "PRESETS")
     overrides = presets["latency-sensitive"]
     assert overrides is not None
@@ -456,7 +508,6 @@ def test_decomposition_uses_table_not_plotly() -> None:
     # name `renderDecompositionTable` does not satisfy the assertion.
     assert not re.search(r"\bfunction\s+renderDecomposition\s*\(", js)
     assert "Plotly.newPlot(divEl" not in js
-    assert "displayModeBar: false" not in js
     assert "decomposition-chart" not in js
 
 
@@ -488,7 +539,7 @@ def test_js_score_rows_port_matches_python(tmp_path: Path) -> None:  # noqa: PLR
     from kube_autotuner.experiment import ParetoObjective as Obj  # noqa: PLC0415
     from kube_autotuner.scoring import METRIC_TO_DF_COLUMN, score_rows  # noqa: PLC0415
 
-    section = _minimal_section("10g", n_figures=1, n_pareto_rows=5)
+    section = _minimal_section("10g", n_pareto_rows=5)
     # Give rows distinct-enough metric spreads that the ranking is not
     # determined by a single axis.
     for i, row in enumerate(section["pareto_rows"]):

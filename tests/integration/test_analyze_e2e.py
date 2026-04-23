@@ -85,10 +85,6 @@ def test_analyze_generates_reports_from_baseline_output(
 
     hw_dir = analysis_dir / "1g"
 
-    pareto_html = hw_dir / "pareto_scatter_matrix.html"
-    assert pareto_html.exists()
-    assert pareto_html.stat().st_size > 0
-
     recs = json.loads((hw_dir / "recommendations.json").read_text(encoding="utf-8"))
     assert isinstance(recs, list)
     assert len(recs) == 1
@@ -102,14 +98,14 @@ def test_analyze_generates_reports_from_baseline_output(
     assert index_html.stat().st_size > 0
     index_text = index_html.read_text(encoding="utf-8")
     assert "Hardware class: 1g" in index_text
-    # Labels that are always produced: iperf3 bw-tcp emits throughput
-    # and tcp_retransmit_rate; bw-udp emits udp_loss_rate and jitter.
-    required_labels = [
-        "Objective space (scatter matrix)",
-        "Pareto: mean_tcp_throughput vs tcp_retransmit_rate",
-        "Pareto: mean_tcp_throughput vs mean_udp_jitter",
-        "Pareto: mean_udp_throughput vs udp_loss_rate",
-        "Pareto: mean_udp_throughput vs mean_udp_jitter",
-    ]
-    for label in required_labels:
-        assert label in index_text, f"missing figure label in index.html: {label}"
+    # The new single interactive chart replaces the scatter matrix and
+    # the four hardcoded Pareto 2D plots.
+    hw_slug = "1g"
+    assert f'id="axis-chart-{hw_slug}"' in index_text
+    assert f'class="axis-select-x" data-hw-slug="{hw_slug}"' in index_text
+    assert f'class="axis-select-y" data-hw-slug="{hw_slug}"' in index_text
+    assert "Objective space" in index_text
+    assert "Pareto: " not in index_text
+    assert "scatter matrix" not in index_text.lower()
+    assert not (hw_dir / "pareto_scatter_matrix.html").exists()
+    assert not any(hw_dir.glob("pareto_mean_*_vs_*.html"))

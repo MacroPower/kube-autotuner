@@ -209,7 +209,6 @@ unresolved-import = "ignore"
 include = [
     "src/kube_autotuner/analysis.py",
     "src/kube_autotuner/report.py",
-    "src/kube_autotuner/plots.py",
 ]
 
 [tool.ty.overrides.rules]

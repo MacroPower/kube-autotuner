@@ -24,11 +24,12 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     import pandas as pd
-    import plotly.graph_objects as go
 
 _ANALYSIS_HINT = "install analysis group: uv sync --group analysis"
 
 _TOP_IMPORTANCE_ROWS = 20
+
+_MIN_AXIS_COLUMNS = 2
 
 _PLOTLY_CDN = "https://cdn.plot.ly/plotly-2.35.2.min.js"
 
@@ -142,6 +143,14 @@ table.decomposition-table col.contrib-w { width: 30%; }
 table.decomposition-table td.metric-col { font-family: ui-monospace,
     SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.82rem;
     white-space: normal; word-break: break-all; }
+.axis-controls { display: flex; gap: 0.75rem; margin-bottom: 0.5rem;
+    font-size: 0.85rem; align-items: center; flex-wrap: wrap; }
+.axis-controls label { display: inline-flex; align-items: center;
+    gap: 0.35rem; color: var(--fg-muted); }
+.axis-controls select { background: var(--panel-2); color: var(--fg);
+    border: 1px solid var(--border); border-radius: 6px;
+    padding: 0.2rem 0.4rem; font-size: 0.85rem; }
+.axis-chart { width: 100%; min-height: 480px; }
 .importance-controls { margin: 0.5rem 0 0.75rem; font-size: 0.85rem;
     display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; }
 .importance-controls .meta { margin: 0; }
@@ -371,32 +380,9 @@ def _render_importance_block(
     )
 
 
-def _figure_div_id(hw_slug: str, label: str) -> str:
-    """Return the stable div id for a per-hardware-class figure."""
-    return f"fig-{hw_slug}-{_slug(label)}"
-
-
-def _render_figure(hw_slug: str, label: str, fig: go.Figure) -> str:
-    """Render a Plotly figure with a stable div id, no JS include.
-
-    The Plotly CDN script is emitted once at the top of the document
-    (see :func:`write_index_html`), so every figure uses
-    ``include_plotlyjs=False``.
-
-    Args:
-        hw_slug: Slugified hardware-class label.
-        label: Human-readable chart label (rendered as ``<h3>``).
-        fig: The Plotly figure.
-
-    Returns:
-        An HTML fragment containing the chart.
-    """
-    div = fig.to_html(
-        include_plotlyjs=False,
-        full_html=False,
-        div_id=_figure_div_id(hw_slug, label),
-    )
-    return f"<section class='fig'><h3>{html.escape(label)}</h3>\n{div}\n</section>"
+def _axis_chart_id(hw_slug: str) -> str:
+    """Return the stable div id for a per-hardware-class axis chart."""
+    return f"axis-chart-{hw_slug}"
 
 
 def _section_payload(section: dict[str, Any]) -> dict[str, Any]:
@@ -408,13 +394,13 @@ def _section_payload(section: dict[str, Any]) -> dict[str, Any]:
     Returns:
         A dict safe to pass to :func:`json.dumps` with
         ``allow_nan=False``: every unmeasured metric is ``None`` (from
-        :func:`kube_autotuner.analysis.pareto_recommendation_rows`) and
-        every Pydantic ``ParetoObjective`` has already been lowered to
-        a plain dict upstream.
+        :func:`kube_autotuner.analysis.pareto_recommendation_rows`
+        and :func:`kube_autotuner.cli._build_axis_payload`) and every
+        Pydantic ``ParetoObjective`` has already been lowered to a
+        plain dict upstream.
     """
     hw = section["hardware_class"]
     hw_slug = _slug(hw)
-    figure_labels = [label for label, _ in section.get("figures", [])]
     return {
         "hardwareClass": hw,
         "hwSlug": hw_slug,
@@ -426,7 +412,9 @@ def _section_payload(section: dict[str, Any]) -> dict[str, Any]:
         "defaultWeights": section["default_weights"],
         "memoryCostWeight": section["memory_cost_weight"],
         "paretoRows": section["pareto_rows"],
-        "figureDivIds": [_figure_div_id(hw_slug, label) for label in figure_labels],
+        "allRows": section["all_rows"],
+        "axisColumns": section["axis_columns"],
+        "figureDivIds": [_axis_chart_id(hw_slug)],
     }
 
 
@@ -472,6 +460,75 @@ def _render_interactive_panel(hw_slug: str) -> str:
     )
 
 
+def _render_axis_chart(hw_slug: str, axis_columns: list[str]) -> str:
+    """Render the skeleton for the interactive axis-selector chart.
+
+    The JS module (see :data:`_JS_MODULE`) populates the select
+    options, wires change listeners, and calls Plotly on the chart
+    div. Python's only job here is to emit a stable skeleton with the
+    initial ``selected`` ``<option>`` set so the JS-side default
+    state (X=``mean_tcp_throughput`` else first, Y=``tcp_retransmit_rate``
+    else first-differs-from-X) agrees with the DOM.
+
+    Args:
+        hw_slug: Slugified hardware-class label; used to namespace
+            ids and data attributes.
+        axis_columns: Metric columns with at least one non-null value
+            for this hardware class, in canonical order.
+
+    Returns:
+        An HTML ``<section>`` fragment. When fewer than two axis
+        columns are available, renders a "not enough metrics" meta
+        paragraph in place of the controls so the page does not carry
+        a degenerate chart the user cannot configure.
+    """
+    chart_id = _axis_chart_id(hw_slug)
+    if len(axis_columns) < _MIN_AXIS_COLUMNS:
+        return (
+            "<section class='fig'>\n"
+            "<h3>Objective space</h3>\n"
+            "<p class='meta'>Not enough metrics with data to render the "
+            "objective-space chart.</p>\n"
+            f'<div class="axis-chart" id="{html.escape(chart_id)}" hidden></div>\n'
+            "</section>"
+        )
+
+    default_x = (
+        "mean_tcp_throughput"
+        if "mean_tcp_throughput" in axis_columns
+        else axis_columns[0]
+    )
+    default_y = (
+        "tcp_retransmit_rate"
+        if "tcp_retransmit_rate" in axis_columns
+        else next((c for c in axis_columns if c != default_x), default_x)
+    )
+
+    def _options(selected: str) -> str:
+        parts: list[str] = []
+        for col in axis_columns:
+            label = _TARGET_METRIC_LABELS.get(col, col)
+            sel = " selected" if col == selected else ""
+            parts.append(
+                f'<option value="{html.escape(col)}"{sel}>{html.escape(label)}</option>'
+            )
+        return "".join(parts)
+
+    slug_attr = html.escape(hw_slug)
+    return (
+        "<section class='fig'>\n"
+        "<h3>Objective space</h3>\n"
+        "<div class='axis-controls'>\n"
+        f'<label>X <select class="axis-select-x" data-hw-slug="{slug_attr}">'
+        f"{_options(default_x)}</select></label>\n"
+        f'<label>Y <select class="axis-select-y" data-hw-slug="{slug_attr}">'
+        f"{_options(default_y)}</select></label>\n"
+        "</div>\n"
+        f'<div class="axis-chart" id="{html.escape(chart_id)}"></div>\n'
+        "</section>"
+    )
+
+
 def _render_section(section: dict[str, Any]) -> str:
     """Render one per-hardware-class section.
 
@@ -479,7 +536,8 @@ def _render_section(section: dict[str, Any]) -> str:
         section: Section payload with ``hardware_class``, ``topology``,
             ``trial_count``, ``pareto_count``, ``recommendations``,
             ``pareto_rows``, ``objectives``, ``default_weights``,
-            ``top_n``, ``importance``, and ``figures``.
+            ``top_n``, ``importance``, ``all_rows``, and
+            ``axis_columns``.
 
     Returns:
         An HTML fragment for the section.
@@ -491,10 +549,6 @@ def _render_section(section: dict[str, Any]) -> str:
     meta = (
         f"<p class='meta'>{section['trial_count']} trials, "
         f"{section['pareto_count']} Pareto-optimal{topology_suffix}</p>"
-    )
-
-    fig_html = "".join(
-        _render_figure(hw_slug, label, fig) for label, fig in section["figures"]
     )
 
     data_script = _embed_json(
@@ -509,6 +563,8 @@ def _render_section(section: dict[str, Any]) -> str:
         section["importance"],
     )
 
+    axis_chart = _render_axis_chart(hw_slug, section["axis_columns"])
+
     return (
         f"<section class='hw' id='hw-{hw_slug}'>\n"
         f"<h2>Hardware class: {html.escape(hw)}</h2>\n"
@@ -517,7 +573,7 @@ def _render_section(section: dict[str, Any]) -> str:
         f"{data_script}\n"
         f"<h3>Parameter importance (top {_TOP_IMPORTANCE_ROWS})</h3>\n"
         f"{importance_block}\n"
-        f"<h3>Charts</h3>\n{fig_html}\n"
+        f"{axis_chart}\n"
         f"</section>"
     )
 
@@ -569,6 +625,23 @@ const METRIC_DISPLAY = {
   mean_latency_p90: {label: "p90", unit: "ms", format: v => (v * 1000).toFixed(1)},
   mean_latency_p99: {label: "p99", unit: "ms", format: v => (v * 1000).toFixed(1)},
 };
+
+const MS_SCALED = new Set([
+  "mean_udp_jitter", "mean_latency_p50",
+  "mean_latency_p90", "mean_latency_p99"
+]);
+
+function axisValue(row, col) {
+  const v = row[col];
+  if (v === null || v === undefined) return null;
+  return MS_SCALED.has(col) ? v * 1000 : v;
+}
+
+function axisLabel(col) {
+  const d = METRIC_DISPLAY[col];
+  if (!d) return col;
+  return d.unit ? `${d.label} (${d.unit})` : d.label;
+}
 
 function toFloatOrNaN(v) {
   if (v === null || v === undefined) return NaN;
@@ -965,7 +1038,6 @@ function highlightInPlots(figureDivIds, topTrialIds) {
     if (!el || !el.data) continue;
     for (let t = 0; t < el.data.length; t++) {
       const trace = el.data[t];
-      if (trace.name === "pareto front") continue;
       const cd = trace.customdata;
       if (!cd) continue;
       // Plotly customdata can be a flat array or an array of arrays.
@@ -987,6 +1059,88 @@ function highlightInPlots(figureDivIds, topTrialIds) {
   }
 }
 
+// Build the two traces (non-pareto grey + pareto red) for the
+// interactive axis chart and hand them to Plotly. Preserves the
+// top-N marker-size highlight across axis swaps by re-applying
+// ``highlightInPlots`` with ``state.lastTopIds`` after every render.
+function renderAxisChart(state) {
+  const section = state.section;
+  const div = document.getElementById("axis-chart-" + section.hwSlug);
+  if (!div) return;
+  const x = state.axisX;
+  const y = state.axisY;
+  const others = [];
+  const paretos = [];
+  for (const row of section.allRows) {
+    (row.pareto ? paretos : others).push(row);
+  }
+  const traces = [
+    {
+      type: "scatter", mode: "markers", name: "other",
+      x: others.map(r => axisValue(r, x)),
+      y: others.map(r => axisValue(r, y)),
+      customdata: others.map(r => r.trial_id),
+      marker: {color: "#BABBBD", size: 6},
+      hovertemplate:
+        `trial %{customdata}<br>${axisLabel(x)}=%{x:.3g}<br>`
+        + `${axisLabel(y)}=%{y:.3g}<extra></extra>`,
+    },
+    {
+      type: "scatter", mode: "markers", name: "pareto",
+      x: paretos.map(r => axisValue(r, x)),
+      y: paretos.map(r => axisValue(r, y)),
+      customdata: paretos.map(r => r.trial_id),
+      marker: {color: "#EF553B", size: 9},
+      hovertemplate:
+        `trial %{customdata}<br>${axisLabel(x)}=%{x:.3g}<br>`
+        + `${axisLabel(y)}=%{y:.3g}<extra></extra>`,
+    },
+  ];
+  const layout = {
+    template: "plotly_dark",
+    paper_bgcolor: "rgba(0,0,0,0)",
+    plot_bgcolor: "rgba(0,0,0,0)",
+    font: {color: "#abb2bf"},
+    xaxis: {title: axisLabel(x)},
+    yaxis: {title: axisLabel(y)},
+    autosize: true,
+    height: 480,
+    margin: {l: 60, r: 20, t: 10, b: 50},
+    showlegend: true,
+    legend: {orientation: "h", y: -0.2},
+  };
+  const config = {responsive: true, displayModeBar: false};
+  if (div._fullLayout) {
+    Plotly.react(div, traces, layout, config);
+  } else {
+    Plotly.newPlot(div, traces, layout, config);
+  }
+  if (state.lastTopIds) {
+    highlightInPlots(section.figureDivIds, state.lastTopIds);
+  }
+}
+
+function setupAxisChart(section, state) {
+  const axisCols = section.axisColumns || [];
+  if (axisCols.length < 2) return;
+  const selX = document.querySelector(
+    `select.axis-select-x[data-hw-slug="${section.hwSlug}"]`);
+  const selY = document.querySelector(
+    `select.axis-select-y[data-hw-slug="${section.hwSlug}"]`);
+  if (!selX || !selY) return;
+  selX.value = state.axisX;
+  selY.value = state.axisY;
+  selX.addEventListener("change", () => {
+    state.axisX = selX.value;
+    renderAxisChart(state);
+  });
+  selY.addEventListener("change", () => {
+    state.axisY = selY.value;
+    renderAxisChart(state);
+  });
+  renderAxisChart(state);
+}
+
 function renderSection(panel, section) {
   // Column visibility is computed once from the full frontier so the
   // table's column set is stable under slider and top-N changes.
@@ -1002,6 +1156,12 @@ function renderSection(panel, section) {
     initialWeights[metric] =
       section.defaultWeights[metric] ?? directionDefault(section, metric);
   }
+  const axisCols = section.axisColumns || [];
+  const axisX = axisCols.includes("mean_tcp_throughput")
+    ? "mean_tcp_throughput" : axisCols[0];
+  const axisY = axisCols.includes("tcp_retransmit_rate")
+    ? "tcp_retransmit_rate"
+    : (axisCols.find(c => c !== axisX) || axisX);
   const state = {
     section,
     panel,
@@ -1011,6 +1171,9 @@ function renderSection(panel, section) {
     // applyPreset) is untouched; memory cost is not a Pareto metric.
     memoryCostWeight: section.memoryCostWeight ?? 0.0,
     topN: Math.max(1, Math.min(section.topN || 3, section.paretoRows.length)),
+    axisX,
+    axisY,
+    lastTopIds: null,
   };
   const presetsEl = panel.querySelector(".presets");
   const slidersEl = panel.querySelector(".sliders");
@@ -1038,6 +1201,7 @@ function renderSection(panel, section) {
     updateRankedTable(state, ranked);
     updatePresetHighlight(state);
     const topIds = ranked.slice(0, state.topN).map(r => r.row.trial_id);
+    state.lastTopIds = topIds;
     highlightInPlots(section.figureDivIds, topIds);
   }
 
@@ -1051,6 +1215,7 @@ function renderSection(panel, section) {
     rerank();
   });
   rerank();
+  setupAxisChart(section, state);
   // Open the rank-1 details after the first rerank so ``ref.entry`` is
   // populated when the toggle listener fires -- avoids the first-load
   // double-render the reviewer flagged.

@@ -16,9 +16,8 @@ Import constraint: this module is reachable from ``cli.py`` at import
 time (``task completions`` eagerly imports the Typer ``app``), so it
 MUST NOT import ``ax-platform``, ``pandas``, ``plotly``,
 ``scikit-learn``, or anything under ``kube_autotuner.optimizer`` /
-``kube_autotuner.analysis`` / ``kube_autotuner.plots`` /
-``kube_autotuner.report``. Keep the import set to ``rich``, the
-standard library, and pure-typing helpers.
+``kube_autotuner.analysis`` / ``kube_autotuner.report``. Keep the
+import set to ``rich``, the standard library, and pure-typing helpers.
 :mod:`kube_autotuner.scoring` is pure-stdlib and :mod:`kube_autotuner.experiment`
 is Pydantic-only, so both are safe to import here.
 """
