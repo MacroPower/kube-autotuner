@@ -69,11 +69,11 @@ _FRAME_BASE_COLUMNS: list[str] = [
     "mean_cni_memory",
     "tcp_retransmit_rate",
     "udp_loss_rate",
-    "mean_udp_jitter_ms",
+    "mean_udp_jitter",
     "mean_rps",
-    "mean_latency_p50_ms",
-    "mean_latency_p90_ms",
-    "mean_latency_p99_ms",
+    "mean_latency_p50",
+    "mean_latency_p90",
+    "mean_latency_p99",
 ]
 
 _MIN_SPEARMAN_SAMPLES = 3
@@ -220,11 +220,11 @@ def trials_to_dataframe(
             "mean_cni_memory": t.mean_cni_memory(),
             "tcp_retransmit_rate": t.tcp_retransmit_rate(),
             "udp_loss_rate": t.udp_loss_rate(),
-            "mean_udp_jitter_ms": t.mean_udp_jitter_ms(),
+            "mean_udp_jitter": t.mean_udp_jitter(),
             "mean_rps": t.mean_rps(),
-            "mean_latency_p50_ms": t.mean_latency_p50_ms(),
-            "mean_latency_p90_ms": t.mean_latency_p90_ms(),
-            "mean_latency_p99_ms": t.mean_latency_p99_ms(),
+            "mean_latency_p50": t.mean_latency_p50(),
+            "mean_latency_p90": t.mean_latency_p90(),
+            "mean_latency_p99": t.mean_latency_p99(),
         }
         for key in _SYSCTL_COLUMNS:
             row[key] = t.sysctl_values.get(key)
@@ -633,11 +633,11 @@ def pareto_recommendation_rows(
                 "mean_cni_memory": _maybe(row, "mean_cni_memory"),
                 "tcp_retransmit_rate": _maybe(row, "tcp_retransmit_rate"),
                 "udp_loss_rate": _maybe(row, "udp_loss_rate"),
-                "mean_udp_jitter_ms": _maybe(row, "mean_udp_jitter_ms"),
+                "mean_udp_jitter": _maybe(row, "mean_udp_jitter"),
                 "mean_rps": _maybe(row, "mean_rps"),
-                "mean_latency_p50_ms": _maybe(row, "mean_latency_p50_ms"),
-                "mean_latency_p90_ms": _maybe(row, "mean_latency_p90_ms"),
-                "mean_latency_p99_ms": _maybe(row, "mean_latency_p99_ms"),
+                "mean_latency_p50": _maybe(row, "mean_latency_p50"),
+                "mean_latency_p90": _maybe(row, "mean_latency_p90"),
+                "mean_latency_p99": _maybe(row, "mean_latency_p99"),
                 "score": float(row["score"]),
             },
         )
@@ -691,9 +691,9 @@ def recommend_configs(
         twelve base metric names -- ``mean_tcp_throughput``,
         ``mean_udp_throughput``, ``mean_cpu``, ``mean_node_memory``,
         ``mean_cni_memory``, ``tcp_retransmit_rate``,
-        ``udp_loss_rate``, ``mean_udp_jitter_ms``, ``mean_rps``,
-        ``mean_latency_p50_ms``, ``mean_latency_p90_ms``,
-        ``mean_latency_p99_ms`` -- and a ``score``). A metric value
+        ``udp_loss_rate``, ``mean_udp_jitter``, ``mean_rps``,
+        ``mean_latency_p50``, ``mean_latency_p90``,
+        ``mean_latency_p99`` -- and a ``score``). A metric value
         is ``None`` when the trial produced no reading for it (e.g.
         ``mean_cni_memory`` when CNI was disabled). Returns an empty
         list when no trials match.
@@ -719,11 +719,11 @@ def recommend_configs(
                 "mean_cni_memory": row["mean_cni_memory"],
                 "tcp_retransmit_rate": row["tcp_retransmit_rate"],
                 "udp_loss_rate": row["udp_loss_rate"],
-                "mean_udp_jitter_ms": row["mean_udp_jitter_ms"],
+                "mean_udp_jitter": row["mean_udp_jitter"],
                 "mean_rps": row["mean_rps"],
-                "mean_latency_p50_ms": row["mean_latency_p50_ms"],
-                "mean_latency_p90_ms": row["mean_latency_p90_ms"],
-                "mean_latency_p99_ms": row["mean_latency_p99_ms"],
+                "mean_latency_p50": row["mean_latency_p50"],
+                "mean_latency_p90": row["mean_latency_p90"],
+                "mean_latency_p99": row["mean_latency_p99"],
                 "score": round(row["score"], 4),
             },
         )

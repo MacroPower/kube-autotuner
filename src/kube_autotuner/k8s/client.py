@@ -28,6 +28,7 @@ from kubernetes.client.exceptions import ApiException
 import yaml
 
 from kube_autotuner.benchmark.parser import parse_k8s_memory
+from kube_autotuner.units import format_duration
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -553,7 +554,10 @@ class K8sClient:
                         op=f"wait {resource_type}/{name}",
                         status=0,
                         reason="Timeout",
-                        message=f"timed out after {timeout}s waiting for {condition}",
+                        message=(
+                            f"timed out after {format_duration(timeout)} "
+                            f"waiting for {condition}"
+                        ),
                     )
         finally:
             watcher.stop()
@@ -636,7 +640,10 @@ class K8sClient:
                         op=f"rollout_status deployment/{name}",
                         status=0,
                         reason="Timeout",
-                        message=f"timed out after {timeout}s waiting for rollout",
+                        message=(
+                            f"timed out after {format_duration(timeout)} "
+                            f"waiting for rollout"
+                        ),
                     )
         finally:
             watcher.stop()

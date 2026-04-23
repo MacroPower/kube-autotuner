@@ -235,9 +235,9 @@ def _pad_latency_cols(rows: int) -> dict[str, list[float]]:
     """
     return {
         "mean_rps": [1000.0] * rows,
-        "mean_latency_p50_ms": [1.0] * rows,
-        "mean_latency_p90_ms": [5.0] * rows,
-        "mean_latency_p99_ms": [10.0] * rows,
+        "mean_latency_p50": [0.001] * rows,
+        "mean_latency_p90": [0.005] * rows,
+        "mean_latency_p99": [0.010] * rows,
     }
 
 
@@ -313,9 +313,9 @@ class TestParetoFront:
                 "mean_cni_memory",
                 "tcp_retransmit_rate",
                 "mean_rps",
-                "mean_latency_p50_ms",
-                "mean_latency_p90_ms",
-                "mean_latency_p99_ms",
+                "mean_latency_p50",
+                "mean_latency_p90",
+                "mean_latency_p99",
             ],
         )
         assert pareto_front(df).empty
@@ -325,11 +325,11 @@ class TestParetoFront:
         names = [n for n, _ in DEFAULT_OBJECTIVES]
         assert "mean_node_memory" in names
         assert "mean_cni_memory" in names
-        assert "mean_udp_jitter_ms" in names
+        assert "mean_udp_jitter" in names
         assert "mean_udp_throughput" in names
         assert "udp_loss_rate" in names
         assert "mean_rps" in names
-        assert "mean_latency_p99_ms" in names
+        assert "mean_latency_p99" in names
 
     def test_drops_nan_rows_with_warning(
         self,
@@ -394,9 +394,9 @@ class TestParetoFront:
                 "mean_cni_memory": [float("nan"), float("nan")],
                 "tcp_retransmit_rate": [float("nan"), float("nan")],
                 "mean_rps": [float("nan"), float("nan")],
-                "mean_latency_p50_ms": [float("nan"), float("nan")],
-                "mean_latency_p90_ms": [float("nan"), float("nan")],
-                "mean_latency_p99_ms": [float("nan"), float("nan")],
+                "mean_latency_p50": [float("nan"), float("nan")],
+                "mean_latency_p90": [float("nan"), float("nan")],
+                "mean_latency_p99": [float("nan"), float("nan")],
             },
         )
         assert pareto_front(df).empty
@@ -514,14 +514,14 @@ class TestRecommendConfigs:
         ``cni_memory`` is all-NaN (never set on these trials) so
         :func:`_objectives_with_data` excludes it -- score-neutral
         because the default weights do not include ``cni_memory``.
-        ``jitter_ms``, ``mean_udp_throughput``, and ``udp_loss_rate``
-        are ``0.0`` for both TCP-only trials (no UDP records in the
-        fixture); each column survives :func:`_objectives_with_data`
-        with finite values but collapses to ``0.5`` in
-        :func:`_normalize_column` because ``min == max``. For the
-        surviving ``throughput`` and ``node_memory`` axes, trial A
-        (higher throughput, higher memory) normalizes to ``(1.0,
-        1.0)`` and trial B (lower throughput, lower memory) to
+        ``udp_jitter`` (stored in seconds), ``mean_udp_throughput``,
+        and ``udp_loss_rate`` are ``0.0`` for both TCP-only trials
+        (no UDP records in the fixture); each column survives
+        :func:`_objectives_with_data` with finite values but collapses
+        to ``0.5`` in :func:`_normalize_column` because ``min == max``.
+        For the surviving ``throughput`` and ``node_memory`` axes,
+        trial A (higher throughput, higher memory) normalizes to
+        ``(1.0, 1.0)`` and trial B (lower throughput, lower memory) to
         ``(0.0, 0.0)``. Latency percentiles are all-NaN across both
         rows, so ``_norm`` resolves each of ``latency_p50``,
         ``latency_p90``, ``latency_p99`` to ``0.5`` via the "no
@@ -849,11 +849,11 @@ class TestRecommendConfigs:
                 "mean_cni_memory",
                 "tcp_retransmit_rate",
                 "udp_loss_rate",
-                "mean_udp_jitter_ms",
+                "mean_udp_jitter",
                 "mean_rps",
-                "mean_latency_p50_ms",
-                "mean_latency_p90_ms",
-                "mean_latency_p99_ms",
+                "mean_latency_p50",
+                "mean_latency_p90",
+                "mean_latency_p99",
             ):
                 assert rec[key] == row[key]
 

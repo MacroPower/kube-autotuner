@@ -27,7 +27,7 @@ REQUIRED_RECOMMENDATION_KEYS = {
     "mean_node_memory",
     "mean_cni_memory",
     "tcp_retransmit_rate",
-    "mean_udp_jitter_ms",
+    "mean_udp_jitter",
     "score",
 }
 
@@ -104,7 +104,7 @@ def test_analyze_generates_reports_from_baseline_output(
     index_text = index_html.read_text(encoding="utf-8")
     assert "Hardware class: 1g" in index_text
     # Labels that are always produced: iperf3 itself emits throughput,
-    # CPU, and (via bw-tcp) tcp_retransmit_rate; bw-udp emits jitter_ms.
+    # CPU, and (via bw-tcp) tcp_retransmit_rate; bw-udp emits jitter.
     # Memory labels depend on metrics-server being deployed on the test
     # cluster, which is not part of the default Talos Docker bring-up,
     # so node_memory labels are opportunistic rather than required.
@@ -112,9 +112,9 @@ def test_analyze_generates_reports_from_baseline_output(
         "Objective space (scatter matrix)",
         "Pareto: mean_tcp_throughput vs mean_cpu",
         "Pareto: mean_tcp_throughput vs tcp_retransmit_rate",
-        "Pareto: mean_tcp_throughput vs mean_udp_jitter_ms",
+        "Pareto: mean_tcp_throughput vs mean_udp_jitter",
         "Pareto: mean_cpu vs tcp_retransmit_rate",
-        "Pareto: mean_cpu vs mean_udp_jitter_ms",
+        "Pareto: mean_cpu vs mean_udp_jitter",
     ]
     for label in required_labels:
         assert label in index_text, f"missing figure label in index.html: {label}"

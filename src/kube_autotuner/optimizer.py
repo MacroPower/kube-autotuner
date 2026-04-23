@@ -44,6 +44,7 @@ from kube_autotuner.models import (
 )
 from kube_autotuner.progress import NullObserver
 from kube_autotuner.sysctl.setter import make_sysctl_setter_from_env
+from kube_autotuner.units import format_duration
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Mapping
@@ -355,7 +356,8 @@ def _compute_metrics(  # noqa: PLR0914, PLR0915
     averaged across iterations, with the same NaN-when-empty contract.
 
     ``udp_jitter`` is the mean of the per-iteration cross-client mean
-    of ``jitter_ms`` (only UDP records carry it). When every ``bw-udp``
+    of ``jitter`` (seconds; only UDP records carry it). When every
+    ``bw-udp``
     stage failed, the mean is ``NaN`` and callers drop the key
     before handing results to Ax.
 
@@ -396,7 +398,7 @@ def _compute_metrics(  # noqa: PLR0914, PLR0915
     udp_loss_vals = udp_loss_rate_by_iteration(results)
     udp_jitter_vals = _aggregate_by_iteration(
         results,
-        lambda r: r.jitter_ms,
+        lambda r: r.jitter,
         statistics.mean,
     )
 
@@ -458,9 +460,9 @@ def _compute_metrics(  # noqa: PLR0914, PLR0915
         "node_memory": _memory_mean_sem(results, lambda r: r.node_memory_used_bytes),
         "cni_memory": _memory_mean_sem(results, lambda r: r.cni_memory_used_bytes),
         "rps": (rps_mean, rps_sem),
-        "latency_p50": _pct_mean_sem(lambda r: r.latency_p50_ms),
-        "latency_p90": _pct_mean_sem(lambda r: r.latency_p90_ms),
-        "latency_p99": _pct_mean_sem(lambda r: r.latency_p99_ms),
+        "latency_p50": _pct_mean_sem(lambda r: r.latency_p50),
+        "latency_p90": _pct_mean_sem(lambda r: r.latency_p90),
+        "latency_p99": _pct_mean_sem(lambda r: r.latency_p99),
     }
 
 
@@ -867,10 +869,10 @@ class OptimizationLoop:
         rps = metrics.get("rps", (float("nan"), 0.0))[0]
         rps_str = "NaN" if math.isnan(rps) else f"{rps:.1f}"
         p99 = metrics.get("latency_p99", (float("nan"), 0.0))[0]
-        p99_str = "NaN" if math.isnan(p99) else f"{p99:.1f}"
+        p99_str = "NaN" if math.isnan(p99) else format_duration(p99)
         logger.info(
             "Trial %d/%d [%s] tcp_throughput=%.1f Mbps cpu=%.1f%% "
-            "tcp_retransmit_rate=%s retx/MB rps=%s p99=%s ms",
+            "tcp_retransmit_rate=%s retx/MB rps=%s p99=%s",
             self.prior_count + i + 1,
             self.n_trials,
             phase,

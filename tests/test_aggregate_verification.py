@@ -142,7 +142,7 @@ def test_aggregate_emits_udp_columns() -> None:
                 bits_per_second=1e9,
                 packets=10000,
                 lost_packets=50,
-                jitter_ms=0.5,
+                jitter=0.0005,
                 cpu_utilization_percent=15.0,
                 iteration=0,
                 client_node="a",

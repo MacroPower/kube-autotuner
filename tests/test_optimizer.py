@@ -68,9 +68,9 @@ def _make_latency_results(n: int = 3) -> list[LatencyResult]:
                 client_node="kmain07",
                 iteration=i,
                 rps=1000.0 + i,
-                latency_p50_ms=None,
-                latency_p90_ms=None,
-                latency_p99_ms=None,
+                latency_p50=None,
+                latency_p90=None,
+                latency_p99=None,
             ),
             LatencyResult(
                 timestamp=datetime.now(UTC),
@@ -78,9 +78,9 @@ def _make_latency_results(n: int = 3) -> list[LatencyResult]:
                 client_node="kmain07",
                 iteration=i,
                 rps=1000.0,
-                latency_p50_ms=1.0 + i,
-                latency_p90_ms=5.0 + i,
-                latency_p99_ms=10.0 + i,
+                latency_p50=(1.0 + i) / 1000.0,
+                latency_p90=(5.0 + i) / 1000.0,
+                latency_p99=(10.0 + i) / 1000.0,
             ),
         ])
     return records
@@ -504,18 +504,18 @@ class TestBuildAxObjective:
             "-latency_p50, -latency_p90, -latency_p99"
         )
         assert constraints == [
-            "tcp_throughput >= 1e6",
-            "udp_throughput >= 1e6",
+            "tcp_throughput >= 1000000",
+            "udp_throughput >= 1000000",
             "cpu <= 200",
-            "tcp_retransmit_rate <= 1e-6",
+            "tcp_retransmit_rate <= 1e-06",
             "udp_loss_rate <= 0.05",
-            "node_memory <= 1e10",
+            "node_memory <= 10000000000",
             "rps >= 100",
-            "latency_p99 <= 1000",
-            "udp_jitter <= 10",
-            "cni_memory <= 1e9",
-            "latency_p50 <= 100",
-            "latency_p90 <= 500",
+            "latency_p99 <= 1",
+            "udp_jitter <= 0.01",
+            "cni_memory <= 1000000000",
+            "latency_p50 <= 0.1",
+            "latency_p90 <= 0.5",
         ]
 
     def test_reduced_two_metric_section(self) -> None:
@@ -529,7 +529,7 @@ class TestBuildAxObjective:
         )
         objective, constraints = build_ax_objective(section)
         assert objective == "tcp_throughput, -node_memory"
-        assert constraints == ["tcp_throughput >= 1e6"]
+        assert constraints == ["tcp_throughput >= 1000000"]
 
 
 class TestComputeMetricsMemory:
@@ -560,7 +560,7 @@ class TestComputeMetricsJitter:
                 mode="udp",
                 bits_per_second=1e9,
                 cpu_utilization_percent=99.0,
-                jitter_ms=0.2,
+                jitter=0.0002,
                 iteration=0,
             ),
             BenchmarkResult(
@@ -568,13 +568,13 @@ class TestComputeMetricsJitter:
                 mode="udp",
                 bits_per_second=1e9,
                 cpu_utilization_percent=99.0,
-                jitter_ms=0.4,
+                jitter=0.0004,
                 iteration=1,
             ),
         ]
         metrics = _compute_metrics(_trial_from(results))
-        # Iter 0 jitter mean 0.2, iter 1 jitter mean 0.4 -> 0.3.
-        assert metrics["udp_jitter"][0] == pytest.approx(0.3)
+        # Iter 0 jitter mean 0.0002, iter 1 jitter mean 0.0004 -> 0.0003.
+        assert metrics["udp_jitter"][0] == pytest.approx(0.0003)
 
     def test_jitter_nan_when_no_udp_records(self) -> None:
         results = [
@@ -712,8 +712,8 @@ class TestComputeMetricsLatency:
         # rps: per-iteration sum across clients, averaged across
         # iterations. Single client per iter: 1000, 1001 -> 1000.5.
         assert metrics["rps"][0] == pytest.approx(1000.5)
-        # p99 from fixed_qps only: iter0=10, iter1=11 -> 10.5.
-        assert metrics["latency_p99"][0] == pytest.approx(10.5)
+        # p99 from fixed_qps only: iter0=0.010, iter1=0.011 -> 0.0105.
+        assert metrics["latency_p99"][0] == pytest.approx(0.0105)
 
     def test_rps_nan_when_no_saturation(self) -> None:
         bench = _make_results(1)
@@ -725,12 +725,12 @@ class TestComputeMetricsLatency:
                 client_node="c1",
                 iteration=0,
                 rps=1000.0,
-                latency_p99_ms=5.0,
+                latency_p99=0.005,
             ),
         ]
         metrics = _compute_metrics(_trial_from(bench, latency))
         assert math.isnan(metrics["rps"][0])
-        assert metrics["latency_p99"][0] == pytest.approx(5.0)
+        assert metrics["latency_p99"][0] == pytest.approx(0.005)
 
     def test_latency_nan_when_no_fixed_qps(self) -> None:
         bench = _make_results(1)
@@ -1046,7 +1046,7 @@ class TestComputeMetricsTcpFilter:
                 mode="udp",
                 bits_per_second=9e9,
                 cpu_utilization_percent=99.0,
-                jitter_ms=0.1,
+                jitter=0.0001,
                 iteration=0,
             ),
             BenchmarkResult(
@@ -1054,7 +1054,7 @@ class TestComputeMetricsTcpFilter:
                 mode="udp",
                 bits_per_second=9e9,
                 cpu_utilization_percent=99.0,
-                jitter_ms=0.2,
+                jitter=0.0002,
                 iteration=1,
             ),
         ]
@@ -1094,7 +1094,7 @@ class TestComputeMetricsTcpFilter:
                 mode="udp",
                 bits_per_second=9e9,
                 cpu_utilization_percent=99.0,
-                jitter_ms=0.1,
+                jitter=0.0001,
                 client_node="c1",
                 iteration=0,
             ),

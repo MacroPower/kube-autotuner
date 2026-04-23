@@ -633,14 +633,14 @@ def test_udp_loss_rate_drops_iterations_missing_packets():
     assert trial.udp_loss_rate() == pytest.approx(0.02)
 
 
-def test_mean_jitter_ms_with_mixed_tcp_udp_records():
-    """UDP is always observable now: jitter filter honours jitter_ms is not None."""
+def test_mean_jitter_with_mixed_tcp_udp_records():
+    """UDP is always observable now: jitter filter honours jitter is not None."""
     results = [
         BenchmarkResult(
             timestamp=datetime.now(UTC),
             mode="tcp",
             bits_per_second=1e9,
-            jitter_ms=None,
+            jitter=None,
             client_node="n",
             iteration=0,
         ),
@@ -648,7 +648,7 @@ def test_mean_jitter_ms_with_mixed_tcp_udp_records():
             timestamp=datetime.now(UTC),
             mode="udp",
             bits_per_second=1e9,
-            jitter_ms=0.2,
+            jitter=0.0002,
             client_node="n",
             iteration=0,
         ),
@@ -656,7 +656,7 @@ def test_mean_jitter_ms_with_mixed_tcp_udp_records():
             timestamp=datetime.now(UTC),
             mode="tcp",
             bits_per_second=1e9,
-            jitter_ms=None,
+            jitter=None,
             client_node="n",
             iteration=1,
         ),
@@ -664,7 +664,7 @@ def test_mean_jitter_ms_with_mixed_tcp_udp_records():
             timestamp=datetime.now(UTC),
             mode="udp",
             bits_per_second=1e9,
-            jitter_ms=0.4,
+            jitter=0.0004,
             client_node="n",
             iteration=1,
         ),
@@ -675,8 +675,8 @@ def test_mean_jitter_ms_with_mixed_tcp_udp_records():
         config=BenchmarkConfig(),
         results=results,
     )
-    # Iter 0 jitter=0.2, iter 1 jitter=0.4 -> mean 0.3; TCP's None jitter dropped.
-    assert trial.mean_udp_jitter_ms() == pytest.approx(0.3)
+    # Iter 0 jitter=0.0002, iter 1 jitter=0.0004 -> mean 0.0003 s; TCP None dropped.
+    assert trial.mean_udp_jitter() == pytest.approx(0.0003)
 
 
 def test_trial_result_multi_client_falls_back_to_host_cpu():
@@ -714,13 +714,13 @@ def test_trial_result_multi_client_falls_back_to_host_cpu():
     assert trial.mean_cpu() == pytest.approx(15.0)
 
 
-def test_trial_result_mean_jitter_ms_single_client():
+def test_trial_result_mean_jitter_single_client():
     results = [
         BenchmarkResult(
             timestamp=datetime.now(UTC),
             mode="udp",
             bits_per_second=1e9,
-            jitter_ms=0.1,
+            jitter=0.0001,
             client_node="n",
             iteration=0,
         ),
@@ -728,7 +728,7 @@ def test_trial_result_mean_jitter_ms_single_client():
             timestamp=datetime.now(UTC),
             mode="udp",
             bits_per_second=1e9,
-            jitter_ms=0.3,
+            jitter=0.0003,
             client_node="n",
             iteration=1,
         ),
@@ -739,25 +739,25 @@ def test_trial_result_mean_jitter_ms_single_client():
         config=BenchmarkConfig(),
         results=results,
     )
-    assert trial.mean_udp_jitter_ms() == pytest.approx(0.2)
+    assert trial.mean_udp_jitter() == pytest.approx(0.0002)
 
 
-def test_trial_result_mean_jitter_ms_multi_client():
+def test_trial_result_mean_jitter_multi_client():
     def _r(j, client, itr):
         return BenchmarkResult(
             timestamp=datetime.now(UTC),
             mode="udp",
             bits_per_second=1e9,
-            jitter_ms=j,
+            jitter=j,
             client_node=client,
             iteration=itr,
         )
 
     results = [
-        _r(0.1, "c1", 0),
-        _r(0.3, "c2", 0),
-        _r(0.2, "c1", 1),
-        _r(0.4, "c2", 1),
+        _r(0.0001, "c1", 0),
+        _r(0.0003, "c2", 0),
+        _r(0.0002, "c1", 1),
+        _r(0.0004, "c2", 1),
     ]
     trial = TrialResult(
         node_pair=NodePair(
@@ -770,8 +770,8 @@ def test_trial_result_mean_jitter_ms_multi_client():
         config=BenchmarkConfig(),
         results=results,
     )
-    # Iter 0 mean = 0.2, Iter 1 mean = 0.3 -> overall mean 0.25.
-    assert trial.mean_udp_jitter_ms() == pytest.approx(0.25)
+    # Iter 0 mean = 0.0002, Iter 1 mean = 0.0003 -> overall mean 0.00025.
+    assert trial.mean_udp_jitter() == pytest.approx(0.00025)
 
 
 def test_trial_result_mean_node_memory_single_client():
@@ -1036,9 +1036,9 @@ class TestLatencyAggregation:
             client_node=client_node,
             iteration=iteration,
             rps=rps,
-            latency_p50_ms=p50,
-            latency_p90_ms=p90,
-            latency_p99_ms=p99,
+            latency_p50=p50,
+            latency_p90=p90,
+            latency_p99=p99,
         )
 
     def test_mean_rps_sums_across_clients_per_iteration(self) -> None:
@@ -1133,7 +1133,7 @@ class TestLatencyAggregation:
                 ),
             ],
         )
-        assert trial.mean_latency_p99_ms() == pytest.approx(15.0)
+        assert trial.mean_latency_p99() == pytest.approx(15.0)
 
     def test_mean_latency_percentiles_per_client_mean(self) -> None:
         trial = TrialResult(
@@ -1165,9 +1165,9 @@ class TestLatencyAggregation:
             ],
         )
         # Single iteration; per-client mean -> (1+3)/2 = 2 for p50.
-        assert trial.mean_latency_p50_ms() == pytest.approx(2.0)
-        assert trial.mean_latency_p90_ms() == pytest.approx(3.0)
-        assert trial.mean_latency_p99_ms() == pytest.approx(4.0)
+        assert trial.mean_latency_p50() == pytest.approx(2.0)
+        assert trial.mean_latency_p90() == pytest.approx(3.0)
+        assert trial.mean_latency_p99() == pytest.approx(4.0)
 
 
 class TestIterationResults:
@@ -1218,7 +1218,7 @@ def test_trial_result_round_trip_preserves_latency_results(tmp_path: Path) -> No
                 client_node="c1",
                 iteration=0,
                 rps=1000.0,
-                latency_p99_ms=5.0,
+                latency_p99=5.0,
             ),
         ],
     )

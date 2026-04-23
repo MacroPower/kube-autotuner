@@ -5,7 +5,7 @@ fortio server Deployment on the target node, then drives each iteration
 as four sub-stages executed sequentially:
 
 1. **bw-tcp** (iperf3 TCP fan-out).
-2. **bw-udp** (iperf3 UDP fan-out; sole source of ``jitter_ms`` and
+2. **bw-udp** (iperf3 UDP fan-out; sole source of ``jitter`` and
    the residual pressure that exercises the UDP-tuning dimensions).
 3. **fortio-saturation** (fortio ``-qps 0`` fan-out; sole source of
    the ``rps`` metric).

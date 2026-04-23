@@ -202,11 +202,11 @@ _TARGET_METRIC_LABELS: dict[str, str] = {
     "mean_cni_memory": "CNI memory",
     "tcp_retransmit_rate": "TCP retransmit rate",
     "udp_loss_rate": "UDP loss rate",
-    "mean_udp_jitter_ms": "UDP jitter",
+    "mean_udp_jitter": "UDP jitter",
     "mean_rps": "RPS",
-    "mean_latency_p50_ms": "latency p50",
-    "mean_latency_p90_ms": "latency p90",
-    "mean_latency_p99_ms": "latency p99",
+    "mean_latency_p50": "latency p50",
+    "mean_latency_p90": "latency p90",
+    "mean_latency_p99": "latency p99",
 }
 
 
@@ -530,11 +530,11 @@ const METRIC_TO_DF_COLUMN = {
   cni_memory: "mean_cni_memory",
   tcp_retransmit_rate: "tcp_retransmit_rate",
   udp_loss_rate: "udp_loss_rate",
-  udp_jitter: "mean_udp_jitter_ms",
+  udp_jitter: "mean_udp_jitter",
   rps: "mean_rps",
-  latency_p50: "mean_latency_p50_ms",
-  latency_p90: "mean_latency_p90_ms",
-  latency_p99: "mean_latency_p99_ms",
+  latency_p50: "mean_latency_p50",
+  latency_p90: "mean_latency_p90",
+  latency_p99: "mean_latency_p99",
 };
 
 const PRESETS = {
@@ -567,10 +567,11 @@ const METRIC_DISPLAY = {
                   format: v => (v * 100).toFixed(2)},
   mean_rps: {label: "RPS", unit: "",
              format: v => v.toLocaleString("en-US", {maximumFractionDigits: 1})},
-  mean_udp_jitter_ms: {label: "UDP jitter", unit: "ms", format: v => v.toFixed(3)},
-  mean_latency_p50_ms: {label: "p50", unit: "ms", format: v => v.toFixed(1)},
-  mean_latency_p90_ms: {label: "p90", unit: "ms", format: v => v.toFixed(1)},
-  mean_latency_p99_ms: {label: "p99", unit: "ms", format: v => v.toFixed(1)},
+  mean_udp_jitter: {label: "UDP jitter", unit: "ms",
+                    format: v => (v * 1000).toFixed(3)},
+  mean_latency_p50: {label: "p50", unit: "ms", format: v => (v * 1000).toFixed(1)},
+  mean_latency_p90: {label: "p90", unit: "ms", format: v => (v * 1000).toFixed(1)},
+  mean_latency_p99: {label: "p99", unit: "ms", format: v => (v * 1000).toFixed(1)},
 };
 
 function toFloatOrNaN(v) {

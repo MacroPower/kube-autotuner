@@ -455,3 +455,39 @@ def test_run_trial_writes_resume_meta_without_n_sobol(tmp_path: Path):
     loaded = TrialLog.load_resume_metadata(out)
     assert loaded is not None
     assert loaded.n_sobol is None
+
+
+class TestFormatMeanSem:
+    """Pin the mean / SEM formatting rule used by the verification table."""
+
+    def test_small_sem_renders_with_scientific_notation(self) -> None:
+        """Regression: SEM around 5e-5 must not collapse to ``"0"``.
+
+        The live table uses fixed-point for the mean to avoid
+        scientific notation at seconds-scale p99 values, but the SEM
+        keeps ``.3g`` so tiny uncertainties still show their
+        magnitude rather than rounding to zero.
+        """
+        row = {"latency_p99": 0.010, "latency_p99_sem": 5e-5}
+        out = runs._format_mean_sem(row, "latency_p99", scale=1.0)
+        assert out.startswith("0.01 ± ")
+        sem_str = out.split("± ", 1)[1]
+        assert sem_str != "0"
+        assert float(sem_str) == pytest.approx(5e-5)
+
+    def test_nan_mean_returns_n_a(self) -> None:
+        """NaN means render as ``"n/a"`` regardless of SEM."""
+        row = {"latency_p99": float("nan"), "latency_p99_sem": 1e-5}
+        assert runs._format_mean_sem(row, "latency_p99") == "n/a"
+
+    def test_missing_column_returns_n_a(self) -> None:
+        """An absent column is treated as missing and renders ``"n/a"``."""
+        assert runs._format_mean_sem({}, "latency_p99") == "n/a"
+
+    def test_mean_uses_fixed_point_at_seconds_scale(self) -> None:
+        """Mean values scaled into the seconds range stay fixed-point."""
+        row = {"throughput": 9.4e9, "throughput_sem": 1e7}
+        # scale=1e-6 converts bits/sec -> Mbps: 9400 ± 10.
+        out = runs._format_mean_sem(row, "throughput", scale=1e-6)
+        assert "e" not in out.split(" ± ")[0]
+        assert out.startswith("9400 ± ")

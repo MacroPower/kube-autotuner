@@ -112,13 +112,13 @@ def test_full_run_records_results(
     assert t.results[0].mode == "tcp"
     assert t.results[0].bits_per_second > 0
     assert t.results[0].bytes_sent is not None  # TCP records carry bytes_sent
-    # The UDP record carries jitter_ms (only UDP does) and not retransmits.
+    # The UDP record carries jitter (only UDP does) and not retransmits.
     udp = next(r for r in t.results if r.mode == "udp")
-    assert udp.jitter_ms is not None
-    assert udp.jitter_ms >= 0.0
+    assert udp.jitter is not None
+    assert udp.jitter >= 0.0
     assert udp.bytes_sent is None
     # Aggregates reflect the new always-both semantics.
-    assert t.mean_udp_jitter_ms() > 0.0
+    assert t.mean_udp_jitter() > 0.0
     # tcp_retransmit_rate may be 0 on a clean intra-cluster path, but it
     # must be a finite number (not None) now that bw-tcp always runs.
     assert t.tcp_retransmit_rate() is not None

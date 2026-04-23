@@ -33,6 +33,7 @@ import yaml
 from kube_autotuner.models import BenchmarkConfig, NodePair, ParamSpace, SysctlParam
 from kube_autotuner.subproc import run_tool
 from kube_autotuner.sysctl.params import PARAM_SPACE
+from kube_autotuner.units import NUMBER_PATTERN, SUFFIX_PATTERN, parse_quantity
 
 if TYPE_CHECKING:
     from kube_autotuner.k8s.client import K8sClient
@@ -350,26 +351,31 @@ Metric = Literal[
 Direction = Literal["maximize", "minimize"]
 
 _CONSTRAINT_RE = re.compile(
-    r"^\s*(?P<metric>[a-z_0-9]+)\s*(?P<op><=|>=|==)\s*(?P<value>[+-]?"
-    r"(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)\s*$",
+    rf"^\s*(?P<metric>[a-z_0-9]+)\s*(?P<op><=|>=|==)\s*"
+    rf"(?P<value>{NUMBER_PATTERN})(?P<suffix>{SUFFIX_PATTERN})?\s*$",
 )
 
+# Stored in post-normalization form so ``_validate_objectives`` is a no-op
+# when defaults are used. Users may write suffixed forms in YAML (e.g.
+# ``"throughput >= 1Gi"``) and the validator rewrites them to the same
+# bare-numeric shape.
 _DEFAULT_CONSTRAINTS: list[str] = [
-    "tcp_throughput >= 1e6",
-    "udp_throughput >= 1e6",
+    "tcp_throughput >= 1000000",
+    "udp_throughput >= 1000000",
     "cpu <= 200",
-    "tcp_retransmit_rate <= 1e-6",
+    "tcp_retransmit_rate <= 1e-06",
     # UDP loss rate; lost_packets / packets summed per iteration,
     # then averaged. UDP loss naturally runs higher than TCP retransmit
     # rate, so the cap is correspondingly looser.
     "udp_loss_rate <= 0.05",
-    "node_memory <= 1e10",
+    "node_memory <= 10000000000",
     # requests/sec; only the saturation sub-stage feeds ``rps``, so
     # this floor only fails on fortio server crash (zero achieved
     # QPS). Not intended as a performance gate.
     "rps >= 100",
-    # milliseconds; from the fixed_qps sub-stage only.
-    "latency_p99 <= 1000",
+    # seconds; from the fixed_qps sub-stage only. Equivalent suffix
+    # form: ``"latency_p99 <= 1000m"`` (k8s milli = 1e-3).
+    "latency_p99 <= 1",
     # Explicit thresholds for every remaining Pareto objective. Ax's
     # string parser auto-converts these into ObjectiveThresholds, which
     # silences the per-generate ``AxOptimizationWarning: Encountered a
@@ -378,10 +384,12 @@ _DEFAULT_CONSTRAINTS: list[str] = [
     # to stay close to observed ranges so hypervolume geometry remains
     # informative; final recommendation ranking runs through
     # ``score_rows`` min-max normalization, not Ax's hypervolume.
-    "udp_jitter <= 10",
-    "cni_memory <= 1e9",
-    "latency_p50 <= 100",
-    "latency_p90 <= 500",
+    # udp_jitter is in seconds; suffix form: ``"udp_jitter <= 10m"``.
+    "udp_jitter <= 0.01",
+    "cni_memory <= 1000000000",
+    # seconds; suffix forms: ``"latency_p50 <= 100m"``, ``"latency_p90 <= 500m"``.
+    "latency_p50 <= 0.1",
+    "latency_p90 <= 0.5",
 ]
 
 _DEFAULT_WEIGHTS: dict[str, float] = {
@@ -393,6 +401,30 @@ _DEFAULT_WEIGHTS: dict[str, float] = {
     "latency_p90": 0.1,
     "latency_p99": 0.15,
 }
+
+
+def _normalize_constraint(constraint: str, match: re.Match[str]) -> str:
+    """Rewrite a suffixed constraint to bare numeric form.
+
+    Suffixless constraints are returned unchanged. Scientific-notation
+    inputs like ``"1e-06"`` match as decimal-exponent suffixes, so they
+    take the normalization path but round-trip via ``str(float)``
+    emitting the same literal.
+
+    Args:
+        constraint: The original constraint string.
+        match: Its :func:`re.Match` against :data:`_CONSTRAINT_RE`.
+
+    Returns:
+        ``constraint`` unchanged when the suffix group is empty;
+        otherwise ``"<metric> <op> <value>"`` with the value resolved
+        via :func:`kube_autotuner.units.parse_quantity`.
+    """
+    if match.group("suffix") is None:
+        return constraint
+    resolved = parse_quantity(f"{match.group('value')}{match.group('suffix')}")
+    value_str = str(int(resolved)) if resolved.is_integer() else str(resolved)
+    return f"{match.group('metric')} {match.group('op')} {value_str}"
 
 
 class ParetoObjective(BaseModel):
@@ -439,7 +471,12 @@ class ObjectivesSection(BaseModel):
     Drives both the live Ax optimization loop and post-hoc analysis.
     ``pareto`` selects which metrics form the Pareto frontier and
     whether each is maximized or minimized. ``constraints`` are
-    forwarded verbatim to Ax as outcome constraints.
+    forwarded to Ax as outcome constraints after k8s-style quantity
+    suffixes (e.g. ``"throughput >= 1Gi"``, ``"cpu <= 500m"``) are
+    resolved to bare numeric strings; see
+    :func:`kube_autotuner.units.parse_quantity` for the full accepted
+    suffix set. Storage is normalized -- e.g. a user-written
+    ``"throughput >= 1Gi"`` is stored as ``"throughput >= 1073741824"``.
     ``recommendation_weights`` (YAML key ``recommendationWeights``)
     scales minimize-direction metrics in the shared scoring formula
     implemented by :func:`kube_autotuner.scoring.score_rows` -- the
@@ -454,7 +491,7 @@ class ObjectivesSection(BaseModel):
     udp_loss_rate: 0.3, udp_jitter: 0.1, latency_p90: 0.1,
     latency_p99: 0.15}``; ``latency_p50`` is left unweighted so the
     mean-latency axis enters the Pareto set without dominating the
-    recommendation score. ``udp_jitter`` (inter-arrival, ms) is
+    recommendation score. ``udp_jitter`` (inter-arrival, seconds) is
     weighted lightly as a tail-stability signal; ``udp_loss_rate``
     mirrors ``tcp_retransmit_rate``'s 0.3 weight so UDP packet loss
     pushes back on the score with the same force TCP retransmit rate
@@ -486,8 +523,8 @@ class ObjectivesSection(BaseModel):
         Raises:
             ValueError: A weight targets an unknown metric, a
                 maximize-direction metric, or a negative value; or a
-                constraint does not parse as ``"<metric> <op> <float>"``
-                against the four known metrics.
+                constraint does not parse as ``"<metric> <op> <quantity>"``
+                against the known metric set.
         """
         directions: dict[str, str] = {obj.metric: obj.direction for obj in self.pareto}
         for metric, weight in self.recommendation_weights.items():
@@ -523,12 +560,13 @@ class ObjectivesSection(BaseModel):
             "latency_p90",
             "latency_p99",
         }
+        rewritten: list[str] = []
         for constraint in self.constraints:
             match = _CONSTRAINT_RE.match(constraint)
             if match is None:
                 msg = (
                     f"constraint {constraint!r} does not match "
-                    "'<metric> <=|>=|== <float>'"
+                    "'<metric> <=|>=|== <quantity>'"
                 )
                 raise ValueError(msg)
             metric = match.group("metric")
@@ -538,6 +576,8 @@ class ObjectivesSection(BaseModel):
                     f"{metric!r}; expected one of {sorted(known)}"
                 )
                 raise ValueError(msg)
+            rewritten.append(_normalize_constraint(constraint, match))
+        self.constraints = rewritten
         return self
 
 

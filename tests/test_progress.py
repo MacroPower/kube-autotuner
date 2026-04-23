@@ -103,7 +103,7 @@ def test_rich_observer_renders_bars_and_table() -> None:
                 "tcp_throughput": (9_412_000_000.0, 1e7),
                 "cpu": (42.1, 0.4),
                 "tcp_retransmit_rate": (1.2e-7, 1e-9),
-                "udp_jitter": (0.128, 0.01),
+                "udp_jitter": (0.000128, 1e-5),
             },
         )
         observer.on_trial_complete(
@@ -122,8 +122,8 @@ def test_rich_observer_renders_bars_and_table() -> None:
     assert "Best so far" in output
     assert "9,412.0 Mbps" in output
     assert "0.12" in output  # retx/MB rendered
-    assert "jitter ms" in output  # jitter column header
-    assert "0.128" in output  # jitter value rendered
+    assert "jitter us" in output  # jitter column header picks us (128 us)
+    assert "128" in output  # jitter value rendered as us coefficient
 
 
 def test_rich_observer_refresh_does_not_force_immediate_paint(

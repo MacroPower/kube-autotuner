@@ -46,6 +46,7 @@ from rich.table import Table
 from rich.text import Text
 
 from kube_autotuner.scoring import METRIC_TO_DF_COLUMN, score_rows
+from kube_autotuner.units import format_coefficient, pick_duration_unit_for_series
 
 try:
     import termios
@@ -384,10 +385,10 @@ class _TrialRow:
     __slots__ = (
         "cpu",
         "index",
-        "jitter_ms",
+        "jitter_seconds",
         "metrics",
         "node_memory_mib",
-        "p99_ms",
+        "p99_seconds",
         "parent_trial_id",
         "phase",
         "retx_per_mb",
@@ -406,10 +407,10 @@ class _TrialRow:
         throughput_mbps: float,
         cpu: float,
         retx_per_mb: float,
-        jitter_ms: float,
+        jitter_seconds: float,
         rps: float,
         node_memory_mib: float,
-        p99_ms: float,
+        p99_seconds: float,
         metrics: dict[str, float],
     ) -> None:
         """Store one trial's summary for display and scoring.
@@ -428,16 +429,19 @@ class _TrialRow:
             retx_per_mb: Retransmits per megabyte; ``NaN`` when the
                 trial produced no TCP bytes (every ``bw-tcp`` stage
                 failed).
-            jitter_ms: Mean UDP jitter in milliseconds from the
+            jitter_seconds: Mean UDP jitter in seconds from the
                 ``bw-udp`` stage; ``NaN`` when no UDP record
-                reported jitter.
+                reported jitter. Stored in native seconds so the
+                live-table unit can be picked at render time.
             rps: Mean requests-per-second from the fortio saturation
                 sub-stage; ``NaN`` when the trial produced no
                 saturation records.
             node_memory_mib: Mean target-node memory usage in MiB;
                 ``NaN`` when the trial produced no memory samples.
-            p99_ms: Fixed-QPS p99 latency in milliseconds; ``NaN``
-                when the trial produced no fortio records.
+            p99_seconds: Fixed-QPS p99 latency in seconds; ``NaN``
+                when the trial produced no fortio records. Stored
+                in native seconds so the live-table unit can be
+                picked at render time.
             metrics: Raw-domain per-metric means keyed by the
                 :data:`kube_autotuner.scoring.METRIC_TO_DF_COLUMN`
                 DataFrame column name (``mean_tcp_throughput``,
@@ -454,10 +458,10 @@ class _TrialRow:
         self.throughput_mbps = throughput_mbps
         self.cpu = cpu
         self.retx_per_mb = retx_per_mb
-        self.jitter_ms = jitter_ms
+        self.jitter_seconds = jitter_seconds
         self.rps = rps
         self.node_memory_mib = node_memory_mib
-        self.p99_ms = p99_ms
+        self.p99_seconds = p99_seconds
         self.metrics = metrics
 
 
@@ -508,11 +512,11 @@ def _build_trial_row(  # noqa: PLR0914 one-pass projection over the full metric 
     cpu = cpu_pair[0] if cpu_pair is not None else 0.0
     rate = rate_pair[0] if rate_pair is not None else math.nan
     retx_per_mb = math.nan if math.isnan(rate) else rate * 1e6
-    jitter = jitter_pair[0] if jitter_pair is not None else math.nan
+    jitter_seconds = jitter_pair[0] if jitter_pair is not None else math.nan
     rps = rps_pair[0] if rps_pair is not None else math.nan
     nmem_bytes = nmem_pair[0] if nmem_pair is not None else math.nan
     node_memory_mib = math.nan if math.isnan(nmem_bytes) else nmem_bytes / (1024 * 1024)
-    p99 = p99_pair[0] if p99_pair is not None else math.nan
+    p99_seconds = p99_pair[0] if p99_pair is not None else math.nan
     raw_metrics: dict[str, float] = {
         METRIC_TO_DF_COLUMN[key]: (pair[0] if pair is not None else math.nan)
         for key, pair in (
@@ -538,10 +542,10 @@ def _build_trial_row(  # noqa: PLR0914 one-pass projection over the full metric 
         throughput_mbps=tp,
         cpu=cpu,
         retx_per_mb=retx_per_mb,
-        jitter_ms=jitter,
+        jitter_seconds=jitter_seconds,
         rps=rps,
         node_memory_mib=node_memory_mib,
-        p99_ms=p99,
+        p99_seconds=p99_seconds,
         metrics=raw_metrics,
     )
 
@@ -758,25 +762,39 @@ class RichProgressObserver:
             header_style="bold",
             expand=True,
         )
+        jitter_scale, jitter_suffix = pick_duration_unit_for_series(
+            r.jitter_seconds for r in self._top
+        )
+        p99_scale, p99_suffix = pick_duration_unit_for_series(
+            r.p99_seconds for r in self._top
+        )
         table.add_column("#", justify="right", no_wrap=True)
         table.add_column("Phase", no_wrap=True)
         table.add_column("Throughput", justify="right")
         table.add_column("CPU", justify="right")
         table.add_column("retx/MB", justify="right")
-        table.add_column("jitter ms", justify="right")
+        table.add_column(f"jitter {jitter_suffix}", justify="right")
         table.add_column("RPS", justify="right")
         table.add_column("node mem", justify="right")
-        table.add_column("p99 ms", justify="right")
+        table.add_column(f"p99 {p99_suffix}", justify="right")
         for row in self._top:
             retx = "n/a" if math.isnan(row.retx_per_mb) else f"{row.retx_per_mb:.2f}"
-            jitter = "n/a" if math.isnan(row.jitter_ms) else f"{row.jitter_ms:.3f}"
+            jitter = (
+                "n/a"
+                if math.isnan(row.jitter_seconds)
+                else format_coefficient(row.jitter_seconds / jitter_scale)
+            )
             rps = "n/a" if math.isnan(row.rps) else f"{row.rps:,.1f}"
             nmem = (
                 "n/a"
                 if math.isnan(row.node_memory_mib)
                 else f"{row.node_memory_mib:,.0f} MiB"
             )
-            p99 = "n/a" if math.isnan(row.p99_ms) else f"{row.p99_ms:.1f}"
+            p99 = (
+                "n/a"
+                if math.isnan(row.p99_seconds)
+                else format_coefficient(row.p99_seconds / p99_scale)
+            )
             table.add_row(
                 str(row.index + 1),
                 row.phase,

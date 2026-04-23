@@ -118,7 +118,14 @@ class BenchmarkResult(BaseModel):
     )
     cpu_utilization_percent: float = 0.0
     cpu_server_percent: float | None = None
-    jitter_ms: float | None = None
+    jitter: float | None = Field(
+        default=None,
+        description=(
+            "UDP inter-arrival jitter in seconds (SI base unit). Parsed "
+            "from iperf3's end.sum.jitter_ms wire key and divided by 1000 "
+            "at ingest; display surfaces re-multiply for ms rendering."
+        ),
+    )
     packets: int | None = Field(
         default=None,
         description=(
@@ -169,9 +176,24 @@ class LatencyResult(BaseModel):
     iteration: int = 0
     rps: float = 0.0
     total_requests: int | None = None
-    latency_p50_ms: float | None = None
-    latency_p90_ms: float | None = None
-    latency_p99_ms: float | None = None
+    latency_p50: float | None = Field(
+        default=None,
+        description=(
+            "p50 latency in seconds (SI base unit); from fortio fixed-QPS runs."
+        ),
+    )
+    latency_p90: float | None = Field(
+        default=None,
+        description=(
+            "p90 latency in seconds (SI base unit); from fortio fixed-QPS runs."
+        ),
+    )
+    latency_p99: float | None = Field(
+        default=None,
+        description=(
+            "p99 latency in seconds (SI base unit); from fortio fixed-QPS runs."
+        ),
+    )
     node_memory_used_bytes: int | None = None
     cni_memory_used_bytes: int | None = None
     raw_json: dict[str, Any] = Field(default_factory=dict)
@@ -483,8 +505,8 @@ class TrialResult(BaseModel):
             return None
         return sum(rate_vals) / len(rate_vals)
 
-    def mean_udp_jitter_ms(self) -> float:
-        """Return the mean UDP inter-arrival jitter in milliseconds.
+    def mean_udp_jitter(self) -> float:
+        """Return the mean UDP inter-arrival jitter in seconds.
 
         Takes the per-iteration mean across clients that reported jitter,
         then averages across iterations. Only UDP records carry jitter.
@@ -494,7 +516,7 @@ class TrialResult(BaseModel):
         """
         per_iter_means: list[float] = []
         for group in _group_by_iteration(self.results).values():
-            vals = [r.jitter_ms for r in group if r.jitter_ms is not None]
+            vals = [r.jitter for r in group if r.jitter is not None]
             if vals:
                 per_iter_means.append(sum(vals) / len(vals))
         if not per_iter_means:
@@ -572,32 +594,32 @@ class TrialResult(BaseModel):
         ]
         return sum(per_iter_sums) / len(per_iter_sums)
 
-    def mean_latency_p50_ms(self) -> float:
+    def mean_latency_p50(self) -> float:
         """Return the mean p50 latency from fortio fixed-QPS runs.
 
         Returns:
-            The averaged p50 latency in milliseconds, or ``0.0`` when
+            The averaged p50 latency in seconds, or ``0.0`` when
             no fixed-QPS record reports p50.
         """
-        return self._mean_fixed_qps_latency(lambda r: r.latency_p50_ms)
+        return self._mean_fixed_qps_latency(lambda r: r.latency_p50)
 
-    def mean_latency_p90_ms(self) -> float:
+    def mean_latency_p90(self) -> float:
         """Return the mean p90 latency from fortio fixed-QPS runs.
 
         Returns:
-            The averaged p90 latency in milliseconds, or ``0.0`` when
+            The averaged p90 latency in seconds, or ``0.0`` when
             no fixed-QPS record reports p90.
         """
-        return self._mean_fixed_qps_latency(lambda r: r.latency_p90_ms)
+        return self._mean_fixed_qps_latency(lambda r: r.latency_p90)
 
-    def mean_latency_p99_ms(self) -> float:
+    def mean_latency_p99(self) -> float:
         """Return the mean p99 latency from fortio fixed-QPS runs.
 
         Returns:
-            The averaged p99 latency in milliseconds, or ``0.0`` when
+            The averaged p99 latency in seconds, or ``0.0`` when
             no fixed-QPS record reports p99.
         """
-        return self._mean_fixed_qps_latency(lambda r: r.latency_p99_ms)
+        return self._mean_fixed_qps_latency(lambda r: r.latency_p99)
 
     def _mean_fixed_qps_latency(
         self,
@@ -610,7 +632,7 @@ class TrialResult(BaseModel):
                 record, or ``None`` when the record did not report it.
 
         Returns:
-            The averaged latency in milliseconds, or ``0.0`` when no
+            The averaged latency in seconds, or ``0.0`` when no
             fixed-QPS record supplied a value.
         """
         fixed = [r for r in self.latency_results if r.workload == "fixed_qps"]

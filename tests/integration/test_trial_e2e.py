@@ -72,7 +72,7 @@ def test_trial_snapshots_applies_benchmarks_restores(
     assert trial.results[0].mode == "tcp"  # bw-tcp runs first
     assert trial.results[0].bits_per_second > 0
     # UDP jitter is the signal that the new bw-udp stage actually ran.
-    assert trial.mean_udp_jitter_ms() > 0.0
+    assert trial.mean_udp_jitter() > 0.0
 
     # Fake-state witness: after restore, the state file holds the pre-trial
     # default that snapshot captured (not the trial's 16777216), proving

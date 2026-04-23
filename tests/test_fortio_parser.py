@@ -38,9 +38,9 @@ def test_parses_rps_and_percentiles():
     )
     assert result.rps == pytest.approx(1234.5)
     assert result.total_requests == 5000
-    assert result.latency_p50_ms == pytest.approx(1.0)
-    assert result.latency_p90_ms == pytest.approx(4.0)
-    assert result.latency_p99_ms == pytest.approx(10.0)
+    assert result.latency_p50 == pytest.approx(0.001)
+    assert result.latency_p90 == pytest.approx(0.004)
+    assert result.latency_p99 == pytest.approx(0.010)
     assert result.client_node == "kmain07"
     assert result.iteration == 2
     assert result.workload == "fixed_qps"
@@ -57,9 +57,9 @@ def test_missing_percentile_is_none():
         iteration=0,
         workload="saturation",
     )
-    assert result.latency_p50_ms == pytest.approx(1.0)
-    assert result.latency_p90_ms is None
-    assert result.latency_p99_ms is None
+    assert result.latency_p50 == pytest.approx(0.001)
+    assert result.latency_p90 is None
+    assert result.latency_p99 is None
 
 
 def test_missing_duration_histogram_raises():
@@ -141,7 +141,7 @@ def test_percentile_float_tolerance_matches_near_integers():
         iteration=0,
         workload="fixed_qps",
     )
-    assert result.latency_p99_ms == pytest.approx(5.0)
+    assert result.latency_p99 == pytest.approx(0.005)
 
 
 def test_extract_returns_pure_json_unchanged():
@@ -225,4 +225,4 @@ def test_percentile_entry_without_value_returns_none():
         iteration=0,
         workload="fixed_qps",
     )
-    assert result.latency_p99_ms is None
+    assert result.latency_p99 is None

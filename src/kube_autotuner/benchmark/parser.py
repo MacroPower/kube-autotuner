@@ -105,7 +105,7 @@ def parse_iperf_json(  # noqa: PLR0914, PLR0915 - linear sanity-check ladder, no
         bits_per_second = sum_sent.get("bits_per_second", 0.0)
         retransmits = sum_sent.get("retransmits")
         bytes_sent = sum_sent.get("bytes")
-        jitter_ms = None
+        jitter = None
         packets = None
         lost_packets = None
         if not bytes_sent and not bits_per_second:
@@ -117,7 +117,8 @@ def parse_iperf_json(  # noqa: PLR0914, PLR0915 - linear sanity-check ladder, no
             msg = "iperf3 UDP result missing 'end.sum'"
             raise ResultValidationError(msg)
         bits_per_second = sum_data.get("bits_per_second", 0.0)
-        jitter_ms = sum_data.get("jitter_ms")
+        jitter_raw = sum_data.get("jitter_ms")
+        jitter = None if jitter_raw is None else jitter_raw / 1000.0
         retransmits = None
         bytes_sent = None
         packets = sum_data.get("packets")
@@ -144,7 +145,7 @@ def parse_iperf_json(  # noqa: PLR0914, PLR0915 - linear sanity-check ladder, no
         bytes_sent=bytes_sent,
         cpu_utilization_percent=cpu_pct,
         cpu_server_percent=cpu_server,
-        jitter_ms=jitter_ms,
+        jitter=jitter,
         packets=packets,
         lost_packets=lost_packets,
         client_node=client_node,

@@ -70,9 +70,14 @@ from kube_autotuner.scoring import (
     score_rows,
 )
 from kube_autotuner.sysctl.params import PARAM_SPACE
+from kube_autotuner.units import (
+    format_coefficient,
+    format_duration,
+    pick_duration_unit_for_series,
+)
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Container, Iterator, Mapping, Sequence
     from pathlib import Path
 
     from kube_autotuner.experiment import ExperimentConfig, ObjectivesSection
@@ -462,9 +467,9 @@ def run_baseline(ctx: RunContext) -> None:
     rps = trial.mean_rps()
     if rps > 0:
         logger.info("Mean RPS (saturation): %.1f", rps)
-    p99 = trial.mean_latency_p99_ms()
+    p99 = trial.mean_latency_p99()
     if p99 > 0:
-        logger.info("Mean p99 latency (fixed_qps): %.2f ms", p99)
+        logger.info("Mean p99 latency (fixed_qps): %s", format_duration(p99))
 
 
 def run_trial(ctx: RunContext) -> None:  # noqa: PLR0914, PLR0915
@@ -570,9 +575,9 @@ def run_trial(ctx: RunContext) -> None:  # noqa: PLR0914, PLR0915
     rps = trial_result.mean_rps()
     if rps > 0:
         logger.info("Mean RPS (saturation): %.1f", rps)
-    p99 = trial_result.mean_latency_p99_ms()
+    p99 = trial_result.mean_latency_p99()
     if p99 > 0:
-        logger.info("Mean p99 latency (fixed_qps): %.2f ms", p99)
+        logger.info("Mean p99 latency (fixed_qps): %s", format_duration(p99))
 
 
 def run_optimize(  # noqa: PLR0914, PLR0915
@@ -724,10 +729,9 @@ def run_optimize(  # noqa: PLR0914, PLR0915
         rps_val = _scalar_or_nan(rps)
         p99_val = _scalar_or_nan(p99)
         rps_str = "n/a" if math.isnan(rps_val) else f"{rps_val:.1f}"
-        p99_str = "n/a" if math.isnan(p99_val) else f"{p99_val:.1f}"
+        p99_str = "n/a" if math.isnan(p99_val) else format_duration(p99_val)
         logger.info(
-            "  [%d] tcp_throughput=%.1f Mbps cpu=%.1f%% rate=%s retx/MB "
-            "rps=%s p99=%s ms",
+            "  [%d] tcp_throughput=%.1f Mbps cpu=%.1f%% rate=%s retx/MB rps=%s p99=%s",
             trial_idx,
             float(tp_val) / 1e6,
             float(cpu_val),
@@ -737,7 +741,7 @@ def run_optimize(  # noqa: PLR0914, PLR0915
         )
 
 
-def _log_verification_summary(
+def _log_verification_summary(  # noqa: PLR0914 - unit picking adds three locals
     all_trials: list[TrialResult],
     objectives: ObjectivesSection,
 ) -> None:
@@ -793,6 +797,11 @@ def _log_verification_summary(
         ),
     )
 
+    p99_col = METRIC_TO_DF_COLUMN["latency_p99"]
+    p99_scale, p99_suffix = pick_duration_unit_for_series(
+        _iter_rendered_means(combined_rows, ordered, verification_parents, p99_col),
+    )
+
     table = Table(
         title="Verification summary",
         title_style="bold",
@@ -808,7 +817,7 @@ def _log_verification_summary(
     table.add_column("tcp_throughput", justify="right")
     table.add_column("cpu", justify="right")
     table.add_column("tcp_retx_rate", justify="right")
-    table.add_column("p99 ms", justify="right")
+    table.add_column(f"p99 {p99_suffix}", justify="right")
 
     rank = 0
     for i in ordered:
@@ -833,14 +842,53 @@ def _log_verification_summary(
                 METRIC_TO_DF_COLUMN["tcp_retransmit_rate"],
                 scale=1e6,
             ),
-            _format_mean_sem(row, METRIC_TO_DF_COLUMN["latency_p99"]),
+            _format_mean_sem(row, p99_col, scale=1.0 / p99_scale),
         )
 
     Console().print(table)
 
 
+def _iter_rendered_means(
+    combined_rows: Sequence[Mapping[str, float | int | str]],
+    ordered: Sequence[int],
+    verification_parents: Container[str],
+    col: str,
+) -> Iterator[float]:
+    """Yield finite ``col`` means for rows that will actually be rendered.
+
+    Used by :func:`_log_verification_summary` to collect a series
+    through which ``pick_duration_unit_for_series`` can pick one
+    column-wide display unit.
+
+    Args:
+        combined_rows: Aggregation rows produced by
+            :func:`aggregate_verification`.
+        ordered: Indices into ``combined_rows`` in render order.
+        verification_parents: The ``parent_trial_id`` set used by
+            :func:`_log_verification_summary` to filter rendered
+            rows.
+        col: DataFrame-column name for the metric (see
+            :data:`METRIC_TO_DF_COLUMN`).
+
+    Yields:
+        One finite ``float`` per rendered row where ``col`` has a
+        non-``NaN`` mean; rows missing the column or carrying a
+        ``NaN`` mean are skipped.
+    """
+    for i in ordered:
+        row = combined_rows[i]
+        if str(row["trial_id"]) not in verification_parents:
+            continue
+        raw = row.get(col)
+        if not isinstance(raw, (int, float)):
+            continue
+        mean_val = float(raw)
+        if not math.isnan(mean_val):
+            yield mean_val
+
+
 def _format_mean_sem(
-    row: dict[str, float | int | str],
+    row: Mapping[str, float | int | str],
     col: str,
     *,
     scale: float = 1.0,
@@ -859,15 +907,14 @@ def _format_mean_sem(
         the mean is NaN.
     """
     mean_raw = row.get(col)
-    sem_raw = row.get(f"{col}_sem", 0.0)
-    try:
-        mean = float(mean_raw)  # ty: ignore[invalid-argument-type]
-    except TypeError, ValueError:
+    if not isinstance(mean_raw, (int, float)):
         return "n/a"
+    mean = float(mean_raw)
     if math.isnan(mean):
         return "n/a"
-    sem = float(sem_raw) if sem_raw is not None else 0.0
-    return f"{mean * scale:.3g} ± {sem * scale:.2g}"
+    sem_raw = row.get(f"{col}_sem", 0.0)
+    sem = float(sem_raw) if isinstance(sem_raw, (int, float)) else 0.0
+    return f"{format_coefficient(mean * scale)} ± {sem * scale:.3g}"
 
 
 def _scalar_or_nan(

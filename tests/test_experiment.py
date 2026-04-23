@@ -936,7 +936,7 @@ class TestObjectivesSection:
 
     def test_default_constraints_include_retransmit_rate(self) -> None:
         section = ObjectivesSection()
-        assert "tcp_retransmit_rate <= 1e-6" in section.constraints
+        assert "tcp_retransmit_rate <= 1e-06" in section.constraints
 
     def test_weight_on_maximize_metric_rejected(self) -> None:
         with pytest.raises(ValueError, match="maximize-direction"):
@@ -999,6 +999,91 @@ class TestObjectivesSection:
         )
         assert len(section.pareto) == 2
         assert section.recommendation_weights == {"node_memory": 0.5}
+
+
+class TestObjectivesSectionConstraintUnits:
+    """k8s-style suffix normalization in ``ObjectivesSection.constraints``."""
+
+    def test_default_constraints_self_stable(self) -> None:
+        """Defaults are already in post-normalization form.
+
+        Pins that validation is a no-op on the shipped defaults so the
+        ``_DEFAULT_CONSTRAINTS`` literal stays in sync with the output
+        shape produced by :func:`_normalize_constraint`.
+        """
+        expected = [
+            "tcp_throughput >= 1000000",
+            "udp_throughput >= 1000000",
+            "cpu <= 200",
+            "tcp_retransmit_rate <= 1e-06",
+            "udp_loss_rate <= 0.05",
+            "node_memory <= 10000000000",
+            "rps >= 100",
+            "latency_p99 <= 1",
+            "udp_jitter <= 0.01",
+            "cni_memory <= 1000000000",
+            "latency_p50 <= 0.1",
+            "latency_p90 <= 0.5",
+        ]
+        section = ObjectivesSection()
+        assert section.constraints == expected
+
+    def test_iec_suffix_normalized(self) -> None:
+        section = ObjectivesSection(constraints=["tcp_throughput >= 1Gi"])
+        assert section.constraints == ["tcp_throughput >= 1073741824"]
+
+    def test_milli_suffix_normalized(self) -> None:
+        section = ObjectivesSection(constraints=["cpu <= 500m"])
+        assert section.constraints == ["cpu <= 0.5"]
+
+    def test_nano_suffix_normalized(self) -> None:
+        section = ObjectivesSection(constraints=["tcp_retransmit_rate <= 1n"])
+        assert section.constraints == ["tcp_retransmit_rate <= 1e-09"]
+
+    def test_milli_rate_normalized(self) -> None:
+        section = ObjectivesSection(constraints=["tcp_retransmit_rate <= 1m"])
+        assert section.constraints == ["tcp_retransmit_rate <= 0.001"]
+
+    def test_fractional_iec_normalized(self) -> None:
+        section = ObjectivesSection(constraints=["node_memory <= 1.5Gi"])
+        assert section.constraints == ["node_memory <= 1610612736"]
+
+    def test_decimal_exponent_suffix_normalized(self) -> None:
+        section = ObjectivesSection(constraints=["node_memory <= 1e9"])
+        assert section.constraints == ["node_memory <= 1000000000"]
+
+    def test_mixed_list_preserves_bare(self) -> None:
+        section = ObjectivesSection(
+            constraints=["tcp_throughput >= 1Gi", "cpu <= 200"],
+        )
+        assert section.constraints == [
+            "tcp_throughput >= 1073741824",
+            "cpu <= 200",
+        ]
+
+    def test_unknown_suffix_rejected(self) -> None:
+        with pytest.raises(ValueError, match="does not match"):
+            ObjectivesSection(constraints=["cpu <= 5Xi"])
+
+    def test_capital_k_rejected(self) -> None:
+        with pytest.raises(ValueError, match="does not match"):
+            ObjectivesSection(constraints=["cpu <= 1K"])
+
+    def test_mixed_form_rejected(self) -> None:
+        with pytest.raises(ValueError, match="does not match"):
+            ObjectivesSection(constraints=["tcp_throughput >= 1e3Ki"])
+
+    def test_normalization_idempotent(self) -> None:
+        first = ObjectivesSection(
+            constraints=["tcp_throughput >= 1Gi", "cpu <= 500m"],
+        )
+        second = ObjectivesSection(constraints=list(first.constraints))
+        assert second.constraints == first.constraints
+
+    def test_latency_milli_suffix_ergonomics(self) -> None:
+        """``500m`` on a time-valued metric parses as 500 ms = 0.5 s."""
+        section = ObjectivesSection(constraints=["latency_p99 <= 500m"])
+        assert section.constraints == ["latency_p99 <= 0.5"]
 
 
 def test_experiment_config_default_objectives() -> None:

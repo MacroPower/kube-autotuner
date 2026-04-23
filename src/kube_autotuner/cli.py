@@ -37,6 +37,7 @@ from kube_autotuner.sysctl.setter import (
     make_sysctl_setter,
     make_sysctl_setter_from_env,
 )
+from kube_autotuner.units import format_duration
 
 if TYPE_CHECKING:
     from kube_autotuner.experiment import ObjectivesSection
@@ -960,20 +961,20 @@ def _format_top_recommendation(r: dict[str, Any]) -> str:
         f"{format_retransmit_rate(r['tcp_retransmit_rate'])} TCP retx/MB",
         f"{r['udp_loss_rate'] * 100:.2f}% UDP loss",
     ])
-    jit = r.get("mean_udp_jitter_ms")
+    jit = r.get("mean_udp_jitter")
     if jit is not None:
-        parts.append(f"{jit:.3f} ms UDP jitter")
+        parts.append(f"{format_duration(jit)} UDP jitter")
     rps = r.get("mean_rps")
     if rps is not None:
         parts.append(f"{rps:,.1f} rps")
     for key, label in (
-        ("mean_latency_p50_ms", "p50"),
-        ("mean_latency_p90_ms", "p90"),
-        ("mean_latency_p99_ms", "p99"),
+        ("mean_latency_p50", "p50"),
+        ("mean_latency_p90", "p90"),
+        ("mean_latency_p99", "p99"),
     ):
         v = r.get(key)
         if v is not None:
-            parts.append(f"{label} {v:.1f} ms")
+            parts.append(f"{label} {format_duration(v)}")
     return ", ".join(parts)
 
 
@@ -1169,13 +1170,13 @@ def _write_figures(
         ("mean_tcp_throughput", "mean_node_memory"),
         ("mean_tcp_throughput", "mean_cni_memory"),
         ("mean_tcp_throughput", "tcp_retransmit_rate"),
-        ("mean_tcp_throughput", "mean_udp_jitter_ms"),
+        ("mean_tcp_throughput", "mean_udp_jitter"),
         ("mean_udp_throughput", "udp_loss_rate"),
-        ("mean_udp_throughput", "mean_udp_jitter_ms"),
+        ("mean_udp_throughput", "mean_udp_jitter"),
         ("mean_cpu", "mean_node_memory"),
         ("mean_cpu", "mean_cni_memory"),
         ("mean_cpu", "tcp_retransmit_rate"),
-        ("mean_cpu", "mean_udp_jitter_ms"),
+        ("mean_cpu", "mean_udp_jitter"),
     ]
     for x, y in pair_candidates:
         if not (_has_data(x) and _has_data(y)):

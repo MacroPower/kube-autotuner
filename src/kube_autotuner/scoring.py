@@ -39,11 +39,11 @@ METRIC_TO_DF_COLUMN: dict[str, str] = {
     "cni_memory": "mean_cni_memory",
     "tcp_retransmit_rate": "tcp_retransmit_rate",
     "udp_loss_rate": "udp_loss_rate",
-    "udp_jitter": "mean_udp_jitter_ms",
+    "udp_jitter": "mean_udp_jitter",
     "rps": "mean_rps",
-    "latency_p50": "mean_latency_p50_ms",
-    "latency_p90": "mean_latency_p90_ms",
-    "latency_p99": "mean_latency_p99_ms",
+    "latency_p50": "mean_latency_p50",
+    "latency_p90": "mean_latency_p90",
+    "latency_p99": "mean_latency_p99",
 }
 
 _DEGENERATE_NORM = 0.5
@@ -203,11 +203,11 @@ def _per_trial_metric_means(t: TrialResult) -> dict[str, float]:
             math.nan if rate is None else rate
         ),
         METRIC_TO_DF_COLUMN["udp_loss_rate"]: t.udp_loss_rate(),
-        METRIC_TO_DF_COLUMN["udp_jitter"]: t.mean_udp_jitter_ms(),
+        METRIC_TO_DF_COLUMN["udp_jitter"]: t.mean_udp_jitter(),
         METRIC_TO_DF_COLUMN["rps"]: t.mean_rps(),
-        METRIC_TO_DF_COLUMN["latency_p50"]: t.mean_latency_p50_ms(),
-        METRIC_TO_DF_COLUMN["latency_p90"]: t.mean_latency_p90_ms(),
-        METRIC_TO_DF_COLUMN["latency_p99"]: t.mean_latency_p99_ms(),
+        METRIC_TO_DF_COLUMN["latency_p50"]: t.mean_latency_p50(),
+        METRIC_TO_DF_COLUMN["latency_p90"]: t.mean_latency_p90(),
+        METRIC_TO_DF_COLUMN["latency_p99"]: t.mean_latency_p99(),
     }
 
 

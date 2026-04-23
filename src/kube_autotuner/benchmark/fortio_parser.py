@@ -9,7 +9,6 @@ from typing import Any, Literal
 from kube_autotuner.benchmark.errors import ResultValidationError
 from kube_autotuner.models import LatencyResult
 
-_MS_PER_SECOND = 1000.0
 _PERCENTILE_MATCH_TOLERANCE = 1e-6
 _FORTIO_RESULT_MARKER = "DurationHistogram"
 _LOG_SNIPPET_HEAD = 400
@@ -95,7 +94,7 @@ def _no_result_message(output: str) -> str:
     )
 
 
-def _percentile_value_ms(
+def _percentile_value_seconds(
     percentiles: list[dict[str, Any]],
     target: float,
 ) -> float | None:
@@ -111,7 +110,7 @@ def _percentile_value_ms(
         target: Percentile requested (e.g. ``50.0``).
 
     Returns:
-        The latency value in milliseconds, or ``None`` when ``target``
+        The latency value in seconds, or ``None`` when ``target``
         was not requested at load time.
     """
     for entry in percentiles:
@@ -129,7 +128,7 @@ def _percentile_value_ms(
             if value is None:
                 return None
             try:
-                return float(value) * _MS_PER_SECOND
+                return float(value)
             except TypeError, ValueError:
                 return None
     return None
@@ -193,9 +192,9 @@ def parse_fortio_json(
     if not isinstance(percentiles, list):
         percentiles = []
 
-    p50 = _percentile_value_ms(percentiles, 50.0)
-    p90 = _percentile_value_ms(percentiles, 90.0)
-    p99 = _percentile_value_ms(percentiles, 99.0)
+    p50 = _percentile_value_seconds(percentiles, 50.0)
+    p90 = _percentile_value_seconds(percentiles, 90.0)
+    p99 = _percentile_value_seconds(percentiles, 99.0)
 
     return LatencyResult(
         timestamp=datetime.now(UTC),
@@ -204,8 +203,8 @@ def parse_fortio_json(
         iteration=iteration,
         rps=rps,
         total_requests=total_requests,
-        latency_p50_ms=p50,
-        latency_p90_ms=p90,
-        latency_p99_ms=p99,
+        latency_p50=p50,
+        latency_p90=p90,
+        latency_p99=p99,
         raw_json=raw,
     )

@@ -63,5 +63,5 @@ def test_baseline_produces_results(
     assert trial["results"][0]["mode"] == "tcp"  # bw-tcp runs first
     assert trial["results"][0]["bits_per_second"] > 0
     udp = next(r for r in trial["results"] if r["mode"] == "udp")
-    assert udp["jitter_ms"] is not None
+    assert udp["jitter"] is not None
     assert trial["sysctl_values"]

@@ -54,7 +54,7 @@ def test_parse_tcp():
     assert result.bytes_sent == 35_250_000_000
     assert result.cpu_utilization_percent == pytest.approx(35.2)
     assert result.cpu_server_percent == pytest.approx(22.1)
-    assert result.jitter_ms is None
+    assert result.jitter is None
     assert result.timestamp.year == 2023
 
 
@@ -94,7 +94,7 @@ def test_parse_udp():
     result = parse_iperf_json(SAMPLE_UDP_JSON, "udp")
     assert result.mode == "udp"
     assert result.bits_per_second == pytest.approx(1_000_000_000.0)
-    assert result.jitter_ms == pytest.approx(0.025)
+    assert result.jitter == pytest.approx(0.025 / 1000.0)
     assert result.retransmits is None
     assert result.bytes_sent is None
     assert result.packets == 85000

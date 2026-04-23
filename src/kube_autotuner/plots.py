@@ -13,11 +13,19 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from kube_autotuner.units import seconds_to_ms
+
 if TYPE_CHECKING:
     import pandas as pd
     import plotly.graph_objects as go
 
 _ANALYSIS_HINT = "install analysis group: uv sync --group analysis"
+_MS_SCALED_COLUMNS: frozenset[str] = frozenset({
+    "mean_jitter",
+    "mean_latency_p50",
+    "mean_latency_p90",
+    "mean_latency_p99",
+})
 
 _DARK_LAYOUT: dict[str, Any] = {
     "template": "plotly_dark",
@@ -82,11 +90,16 @@ def plot_pareto_scatter_matrix(
         "mean_cni_memory",
         "tcp_retransmit_rate",
         "udp_loss_rate",
-        "mean_udp_jitter_ms",
+        "mean_udp_jitter",
     ]
     cols = [c for c in candidate_cols if c in df.columns and df[c].notna().any()]
     plot_df = df[[*cols, "trial_id"]].copy()
     plot_df["pareto"] = pareto_mask.map({True: "pareto", False: "other"})
+    labels = {c: f"{c} (ms)" for c in cols if c in _MS_SCALED_COLUMNS}
+    for c in labels:
+        plot_df[c] = plot_df[c].map(
+            lambda v: v if v is None or _is_nan(v) else seconds_to_ms(v),
+        )
     fig = px.scatter_matrix(
         plot_df,
         dimensions=cols,
@@ -95,10 +108,29 @@ def plot_pareto_scatter_matrix(
         hover_data=["trial_id"],
         custom_data=["trial_id"],
         title="Objective Space (Pareto-optimal highlighted)",
+        labels=labels,
     )
     fig.update_traces(diagonal_visible=False, marker={"size": 5})
     fig.update_layout(width=900, height=900, **_DARK_LAYOUT)
     return fig
+
+
+def _is_nan(v: Any) -> bool:  # noqa: ANN401
+    """Return ``True`` when ``v`` is a NaN float.
+
+    Args:
+        v: Arbitrary cell value from a pandas Series map.
+
+    Returns:
+        ``True`` only for NaN floats (identified via ``math.isnan``);
+        ``None``, strings, and other types return ``False`` so the
+        caller treats them as "non-scalable".
+    """
+    import math  # noqa: PLC0415 - local to avoid import at module top
+
+    if not isinstance(v, float):
+        return False
+    return math.isnan(v)
 
 
 def plot_pareto_2d(
@@ -127,14 +159,23 @@ def plot_pareto_2d(
     _, go = _require_plotly()
     fig = go.Figure()
 
+    x_vals = df[x].map(seconds_to_ms) if x in _MS_SCALED_COLUMNS else df[x]
+    y_vals = df[y].map(seconds_to_ms) if y in _MS_SCALED_COLUMNS else df[y]
+    frontier = pareto_df.sort_values(x)
+    front_x = frontier[x].map(seconds_to_ms) if x in _MS_SCALED_COLUMNS else frontier[x]
+    front_y = frontier[y].map(seconds_to_ms) if y in _MS_SCALED_COLUMNS else frontier[y]
+    x_label = f"{x} (ms)" if x in _MS_SCALED_COLUMNS else x
+    y_label = f"{y} (ms)" if y in _MS_SCALED_COLUMNS else y
+
     hover_template = (
-        f"trial %{{customdata}}<br>{x}=%{{x:.3g}}<br>{y}=%{{y:.3g}}<extra></extra>"
+        f"trial %{{customdata}}<br>{x_label}=%{{x:.3g}}<br>"
+        f"{y_label}=%{{y:.3g}}<extra></extra>"
     )
 
     fig.add_trace(
         go.Scatter(
-            x=df[x],
-            y=df[y],
+            x=x_vals,
+            y=y_vals,
             mode="markers",
             marker={"color": "#BABBBD", "size": 6},
             name="all trials",
@@ -143,11 +184,10 @@ def plot_pareto_2d(
         ),
     )
 
-    frontier = pareto_df.sort_values(x)
     fig.add_trace(
         go.Scatter(
-            x=frontier[x],
-            y=frontier[y],
+            x=front_x,
+            y=front_y,
             mode="markers+lines",
             marker={"color": "#EF553B", "size": 9},
             line={"color": "#EF553B", "width": 2},
@@ -158,9 +198,9 @@ def plot_pareto_2d(
     )
 
     fig.update_layout(
-        title=f"Pareto Frontier: {x} vs {y}",
-        xaxis_title=x,
-        yaxis_title=y,
+        title=f"Pareto Frontier: {x_label} vs {y_label}",
+        xaxis_title=x_label,
+        yaxis_title=y_label,
         width=800,
         height=600,
         **_DARK_LAYOUT,

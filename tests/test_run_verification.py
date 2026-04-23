@@ -69,9 +69,9 @@ def _make_latency_results() -> list[LatencyResult]:
             client_node="kmain07",
             iteration=0,
             rps=1000.0,
-            latency_p50_ms=1.0,
-            latency_p90_ms=5.0,
-            latency_p99_ms=10.0,
+            latency_p50=0.001,
+            latency_p90=0.005,
+            latency_p99=0.010,
         ),
     ]
 
