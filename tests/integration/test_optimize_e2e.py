@@ -12,6 +12,7 @@ from kube_autotuner.k8s.lease import NodeLease
 from kube_autotuner.trial_log import TrialLog
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
     from kube_autotuner.benchmark.runner import BenchmarkRunner
@@ -23,6 +24,36 @@ pytestmark = [
 ]
 
 
+def _invoke_optimize(
+    write_yaml: Callable[..., Path],
+    output_file: Path,
+    *,
+    node_names: dict[str, str],
+    test_namespace: str,
+    n_trials: int,
+    n_sobol: int = 2,
+    extra_args: list[str] | None = None,
+) -> Any:  # typer.testing.Result
+    """Build a YAML config and invoke ``optimize`` against it.
+
+    Each call produces a uniquely-named config file (via ``n_trials`` /
+    ``n_sobol``) so repeat invocations in the same test don't clobber
+    earlier configs.
+    """
+    config_path = write_yaml(
+        node_names=node_names,
+        namespace=test_namespace,
+        output=output_file,
+        optimize={"nTrials": n_trials, "nSobol": n_sobol},
+        filename=f"experiment-n{n_trials}-s{n_sobol}.yaml",
+    )
+    runner = CliRunner()
+    return runner.invoke(
+        app,
+        ["optimize", str(config_path), *(extra_args or [])],
+    )
+
+
 def test_optimize_runs_trials_and_writes_dataset(
     kubeconfig_env: str,  # noqa: ARG001 - activates KUBECONFIG env var
     k8s_client: K8sClient,
@@ -30,37 +61,18 @@ def test_optimize_runs_trials_and_writes_dataset(
     test_namespace: str,
     fake_sysctl_env: Path,  # noqa: ARG001 - activates fake backend env vars
     tmp_path: Path,
+    write_experiment_yaml: Callable[..., Path],
 ) -> None:
     pytest.importorskip("ax")
 
     output_file = tmp_path / "optimize"
-
-    runner = CliRunner()
-    result = runner.invoke(
-        app,
-        [
-            "optimize",
-            "--source",
-            node_names["source"],
-            "--target",
-            node_names["target"],
-            "--hardware-class",
-            "1g",
-            "--ip-family-policy",
-            "SingleStack",
-            "--namespace",
-            test_namespace,
-            "--duration",
-            "5",
-            "--iterations",
-            "1",
-            "--n-trials",
-            "2",
-            "--n-sobol",
-            "2",
-            "--output",
-            str(output_file),
-        ],
+    result = _invoke_optimize(
+        write_experiment_yaml,
+        output_file,
+        node_names=node_names,
+        test_namespace=test_namespace,
+        n_trials=2,
+        n_sobol=2,
     )
     assert result.exit_code == 0, f"CLI failed:\n{result.output}"
     assert "Completed 2 trials" in result.output
@@ -73,46 +85,6 @@ def test_optimize_runs_trials_and_writes_dataset(
 
     lease_name = f"{NodeLease.LEASE_PREFIX}-{node_names['target']}"
     assert k8s_client.get_json("lease", lease_name, test_namespace) is None
-
-
-def _invoke_optimize(
-    output_file: Path,
-    *,
-    node_names: dict[str, str],
-    test_namespace: str,
-    n_trials: int,
-    n_sobol: int = 2,
-    extra_args: list[str] | None = None,
-) -> Any:  # typer.testing.Result
-    """Invoke the optimize CLI with the canonical integration-test flags."""
-    runner = CliRunner()
-    return runner.invoke(
-        app,
-        [
-            "optimize",
-            "--source",
-            node_names["source"],
-            "--target",
-            node_names["target"],
-            "--hardware-class",
-            "1g",
-            "--ip-family-policy",
-            "SingleStack",
-            "--namespace",
-            test_namespace,
-            "--duration",
-            "5",
-            "--iterations",
-            "1",
-            "--n-trials",
-            str(n_trials),
-            "--n-sobol",
-            str(n_sobol),
-            "--output",
-            str(output_file),
-            *(extra_args or []),
-        ],
-    )
 
 
 class _BenchmarkRunCounter:
@@ -145,6 +117,7 @@ def test_optimize_resumes_from_prior_dataset(
     fake_sysctl_env: Path,  # noqa: ARG001 - activates fake backend env vars
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    write_experiment_yaml: Callable[..., Path],
 ) -> None:
     """Re-invoking optimize with the same output resumes from prior trials."""
     pytest.importorskip("ax")
@@ -153,6 +126,7 @@ def test_optimize_resumes_from_prior_dataset(
     counter = _BenchmarkRunCounter(monkeypatch)
 
     first = _invoke_optimize(
+        write_experiment_yaml,
         output_file,
         node_names=node_names,
         test_namespace=test_namespace,
@@ -168,6 +142,7 @@ def test_optimize_resumes_from_prior_dataset(
     first_two_ids = [t.trial_id for t in first_two]
 
     second = _invoke_optimize(
+        write_experiment_yaml,
         output_file,
         node_names=node_names,
         test_namespace=test_namespace,
@@ -186,7 +161,8 @@ def test_optimize_resumes_from_prior_dataset(
     # stderr swap; the unit test
     # ``test_seed_prior_trials_attaches_and_completes`` pins the
     # attach_trial/complete_trial calls directly instead.
-    assert "Resuming: 2 prior trials; running 2 more (budget=4)" in second.output
+    assert "Resuming: 2 prior trials" in second.output
+    assert "budget=4" in second.output
     assert "2 prior + 2 new" in second.output
     # The live log numerator continues past the priors rather than
     # restarting at 1 — pins the _prior_count + i + 1 rule against a
@@ -207,6 +183,7 @@ def test_optimize_fresh_archives_prior_artefacts(
     fake_sysctl_env: Path,  # noqa: ARG001 - activates fake backend env vars
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    write_experiment_yaml: Callable[..., Path],
 ) -> None:
     """``--fresh`` renames the prior trial dataset aside, runs from zero."""
     pytest.importorskip("ax")
@@ -215,6 +192,7 @@ def test_optimize_fresh_archives_prior_artefacts(
     counter = _BenchmarkRunCounter(monkeypatch)
 
     first = _invoke_optimize(
+        write_experiment_yaml,
         output_file,
         node_names=node_names,
         test_namespace=test_namespace,
@@ -228,6 +206,7 @@ def test_optimize_fresh_archives_prior_artefacts(
     # ``n_sobol=1`` keeps the config valid against the
     # ``n_sobol <= n_trials`` invariant.
     second = _invoke_optimize(
+        write_experiment_yaml,
         output_file,
         node_names=node_names,
         test_namespace=test_namespace,
@@ -239,8 +218,6 @@ def test_optimize_fresh_archives_prior_artefacts(
     assert counter.calls == 3, (
         f"--fresh invocation should run 1 benchmark from zero, total={counter.calls}"
     )
-
-    from kube_autotuner.trial_log import TrialLog  # noqa: PLC0415
 
     backups = [p for p in tmp_path.glob("optimize.*.bak") if p.is_dir()]
     assert len(backups) == 1, f"expected 1 archived dataset; got {backups}"
@@ -259,14 +236,16 @@ def test_optimize_rejects_incompatible_n_sobol(
     fake_sysctl_env: Path,  # noqa: ARG001 - activates fake backend env vars
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    write_experiment_yaml: Callable[..., Path],
 ) -> None:
-    """Changing ``--n-sobol`` across sessions is a hard error without ``--fresh``."""
+    """Changing ``n_sobol`` across sessions is a hard error without ``--fresh``."""
     pytest.importorskip("ax")
 
     output_file = tmp_path / "optimize"
     counter = _BenchmarkRunCounter(monkeypatch)
 
     first = _invoke_optimize(
+        write_experiment_yaml,
         output_file,
         node_names=node_names,
         test_namespace=test_namespace,
@@ -278,6 +257,7 @@ def test_optimize_rejects_incompatible_n_sobol(
 
     # Same output, different n_sobol -> compat check fails, no benchmark runs.
     second = _invoke_optimize(
+        write_experiment_yaml,
         output_file,
         node_names=node_names,
         test_namespace=test_namespace,
@@ -298,6 +278,7 @@ def test_optimize_short_circuits_when_budget_already_met(
     fake_sysctl_env: Path,  # noqa: ARG001 - activates fake backend env vars
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    write_experiment_yaml: Callable[..., Path],
 ) -> None:
     """Re-invoking with ``n_trials <= prior_count`` skips the loop entirely."""
     pytest.importorskip("ax")
@@ -306,6 +287,7 @@ def test_optimize_short_circuits_when_budget_already_met(
     counter = _BenchmarkRunCounter(monkeypatch)
 
     first = _invoke_optimize(
+        write_experiment_yaml,
         output_file,
         node_names=node_names,
         test_namespace=test_namespace,
@@ -316,6 +298,7 @@ def test_optimize_short_circuits_when_budget_already_met(
 
     # Budget already met (prior=2, n_trials=2) -> loop is skipped.
     second = _invoke_optimize(
+        write_experiment_yaml,
         output_file,
         node_names=node_names,
         test_namespace=test_namespace,

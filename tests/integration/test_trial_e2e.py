@@ -13,6 +13,8 @@ from typer.testing import CliRunner
 from kube_autotuner.cli import app
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from kube_autotuner.k8s.client import K8sClient
 
 pytestmark = [
@@ -28,34 +30,18 @@ def test_trial_snapshots_applies_benchmarks_restores(
     test_namespace: str,
     fake_sysctl_env: Path,  # noqa: ARG001 - activates fake backend env vars
     tmp_path: Path,
+    write_experiment_yaml: Callable[..., Path],
 ) -> None:
     output_file = tmp_path / "trial"
+    config_path = write_experiment_yaml(
+        node_names=node_names,
+        namespace=test_namespace,
+        output=output_file,
+        trial_sysctls={"net.core.rmem_max": "16777216"},
+    )
 
     runner = CliRunner()
-    result = runner.invoke(
-        app,
-        [
-            "trial",
-            "--source",
-            node_names["source"],
-            "--target",
-            node_names["target"],
-            "--hardware-class",
-            "1g",
-            "--ip-family-policy",
-            "SingleStack",
-            "--namespace",
-            test_namespace,
-            "--duration",
-            "5",
-            "--iterations",
-            "1",
-            "--output",
-            str(output_file),
-            "-p",
-            "net.core.rmem_max=16777216",
-        ],
-    )
+    result = runner.invoke(app, ["trial", str(config_path)])
     assert result.exit_code == 0, f"CLI failed:\n{result.output}"
     assert "Snapshotted" in result.stderr
     assert "Applied 1 sysctl(s)" in result.stderr

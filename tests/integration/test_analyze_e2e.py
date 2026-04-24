@@ -11,6 +11,7 @@ from typer.testing import CliRunner
 from kube_autotuner.cli import app
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
 pytestmark = [
@@ -37,40 +38,24 @@ def test_analyze_generates_reports_from_baseline_output(
     test_namespace: str,
     fake_sysctl_env: Path,  # noqa: ARG001 - activates fake backend env vars
     tmp_path: Path,
+    write_experiment_yaml: Callable[..., Path],
 ) -> None:
     trials_file = tmp_path / "trials"
     analysis_dir = tmp_path / "analysis"
+    config_path = write_experiment_yaml(
+        node_names=node_names,
+        namespace=test_namespace,
+        output=trials_file,
+    )
 
     runner = CliRunner()
-    baseline_result = runner.invoke(
-        app,
-        [
-            "baseline",
-            "--source",
-            node_names["source"],
-            "--target",
-            node_names["target"],
-            "--hardware-class",
-            "1g",
-            "--ip-family-policy",
-            "SingleStack",
-            "--namespace",
-            test_namespace,
-            "--duration",
-            "5",
-            "--iterations",
-            "1",
-            "--output",
-            str(trials_file),
-        ],
-    )
+    baseline_result = runner.invoke(app, ["baseline", str(config_path)])
     assert baseline_result.exit_code == 0, f"baseline failed:\n{baseline_result.output}"
 
     analyze_result = runner.invoke(
         app,
         [
             "analyze",
-            "-i",
             str(trials_file),
             "-o",
             str(analysis_dir),

@@ -14,6 +14,7 @@ from kube_autotuner.k8s.client import K8sClient
 from kube_autotuner.sysctl.setter import make_sysctl_setter_from_env
 
 if TYPE_CHECKING:
+    from collections.abc import Callable, Mapping
     from pathlib import Path
 
 CLUSTER_NAME = "kube-autotuner-test"
@@ -203,6 +204,59 @@ def fake_sysctl_env(monkeypatch: pytest.MonkeyPatch, fake_sysctl_state: Path) ->
     monkeypatch.setenv("KUBE_AUTOTUNER_SYSCTL_BACKEND", "fake")
     monkeypatch.setenv("KUBE_AUTOTUNER_SYSCTL_FAKE_STATE", str(fake_sysctl_state))
     return fake_sysctl_state
+
+
+@pytest.fixture
+def write_experiment_yaml(
+    tmp_path: Path,
+) -> Callable[..., Path]:
+    """Return a factory that materializes experiment YAML in ``tmp_path``.
+
+    Defaults to ``SingleStack`` and ``1g`` because the Talos Docker test
+    cluster has no dual-stack CNI and the tests never assert against
+    another hardware class. ``trial_sysctls`` makes the config valid
+    for the ``trial`` subcommand; ``optimize`` makes it valid for
+    ``optimize``; omitting both leaves a ``baseline``-shaped config.
+    """
+
+    def _write(  # noqa: PLR0913 - an experiment has many knobs
+        *,
+        node_names: Mapping[str, str],
+        namespace: str,
+        output: Path,
+        hardware_class: str = "1g",
+        ip_family_policy: str = "SingleStack",
+        duration: int = 5,
+        iterations: int = 1,
+        trial_sysctls: Mapping[str, str] | None = None,
+        optimize: Mapping[str, int] | None = None,
+        filename: str = "experiment.yaml",
+    ) -> Path:
+        lines = [
+            "nodes:",
+            f"  sources: [{node_names['source']}]",
+            f"  target: {node_names['target']}",
+            f"  hardwareClass: {hardware_class}",
+            f"  namespace: {namespace}",
+            f"  ipFamilyPolicy: {ip_family_policy}",
+            "benchmark:",
+            f"  duration: {duration}",
+            f"  iterations: {iterations}",
+        ]
+        if trial_sysctls is not None:
+            lines.extend(("trial:", "  sysctls:"))
+            lines.extend(
+                f"    {key}: {value!r}" for key, value in trial_sysctls.items()
+            )
+        if optimize is not None:
+            lines.append("optimize:")
+            lines.extend(f"  {key}: {value}" for key, value in optimize.items())
+        lines.append(f"output: {output}")
+        config_path = tmp_path / filename
+        config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return config_path
+
+    return _write
 
 
 @pytest.fixture
