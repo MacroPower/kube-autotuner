@@ -570,7 +570,7 @@ class TestBuildAxObjective:
         assert constraints == [
             "tcp_throughput >= 1000000",
             "udp_throughput >= 1000000",
-            "tcp_retransmit_rate <= 1e-06",
+            "tcp_retransmit_rate <= 1000",
             "udp_loss_rate <= 0.05",
             "rps >= 100",
             "latency_p99 <= 1",

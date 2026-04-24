@@ -399,7 +399,7 @@ class _TrialRow:
         "p99_seconds",
         "parent_trial_id",
         "phase",
-        "retx_per_mb",
+        "retx_per_gb",
         "rps",
         "throughput_mbps",
         "trial_id",
@@ -413,7 +413,7 @@ class _TrialRow:
         trial_id: str,
         parent_trial_id: str | None,
         throughput_mbps: float,
-        retx_per_mb: float,
+        retx_per_gb: float,
         jitter_seconds: float,
         rps: float,
         p99_seconds: float,
@@ -432,7 +432,7 @@ class _TrialRow:
             parent_trial_id: The primary trial's ``trial_id`` when
                 ``phase == "verification"``; ``None`` otherwise.
             throughput_mbps: Mean throughput in megabits-per-second.
-            retx_per_mb: Retransmits per megabyte; ``NaN`` when the
+            retx_per_gb: Retransmits per gigabyte; ``NaN`` when the
                 trial produced no TCP bytes (every ``bw-tcp`` stage
                 failed).
             jitter_seconds: Mean UDP jitter in seconds from the
@@ -466,7 +466,7 @@ class _TrialRow:
         self.trial_id = trial_id
         self.parent_trial_id = parent_trial_id
         self.throughput_mbps = throughput_mbps
-        self.retx_per_mb = retx_per_mb
+        self.retx_per_gb = retx_per_gb
         self.jitter_seconds = jitter_seconds
         self.rps = rps
         self.p99_seconds = p99_seconds
@@ -487,7 +487,7 @@ def _build_trial_row(
 
     Handles two concerns in one pass:
 
-    * derives the display-domain floats (Mbps / retx/MB) for the
+    * derives the display-domain floats (Mbps / retx/GB) for the
       rendered table, and
     * captures the full raw-domain metric bundle keyed by
       :data:`kube_autotuner.scoring.METRIC_TO_DF_COLUMN` so
@@ -514,7 +514,7 @@ def _build_trial_row(
     p99_pair = metrics.get("latency_p99")
     tp = (tp_pair[0] if tp_pair is not None else 0.0) / 1e6
     rate = rate_pair[0] if rate_pair is not None else math.nan
-    retx_per_mb = math.nan if math.isnan(rate) else rate * 1e6
+    retx_per_gb = math.nan if math.isnan(rate) else rate
     jitter_seconds = jitter_pair[0] if jitter_pair is not None else math.nan
     rps = rps_pair[0] if rps_pair is not None else math.nan
     p99_seconds = p99_pair[0] if p99_pair is not None else math.nan
@@ -538,7 +538,7 @@ def _build_trial_row(
         trial_id=trial_id,
         parent_trial_id=parent_trial_id,
         throughput_mbps=tp,
-        retx_per_mb=retx_per_mb,
+        retx_per_gb=retx_per_gb,
         jitter_seconds=jitter_seconds,
         rps=rps,
         p99_seconds=p99_seconds,
@@ -815,9 +815,9 @@ class RichProgressObserver:
             ),
             (
                 "tcp_retransmit_rate",
-                "retx/MB",
+                "retx/GB",
                 lambda r: (
-                    "n/a" if math.isnan(r.retx_per_mb) else f"{r.retx_per_mb:.2f}"
+                    "n/a" if math.isnan(r.retx_per_gb) else f"{r.retx_per_gb:.2f}"
                 ),
             ),
         ]

@@ -665,7 +665,14 @@ def _rf_importance_scores(
         feature importance.
     """
     features = df[sysctl_cols].apply(pd_module.to_numeric, errors="coerce").fillna(0)
-    y = df[target].to_numpy()
+    # Writable copy: pandas may hand back a read-only view here, and we
+    # mutate below. Scale y to unit std so MSE-based split improvements
+    # stay above sklearn's tree-splitter epsilon (~2.2e-15). Positive
+    # scaling preserves both ranking and the normalized per-feature shares.
+    y = df[target].to_numpy(dtype=float, copy=True)
+    std = y.std()
+    if std > 0:
+        y /= std
     rf = rf_cls(n_estimators=100, random_state=42, n_jobs=-1)
     rf.fit(features, y)
     return dict(zip(sysctl_cols, rf.feature_importances_, strict=True))

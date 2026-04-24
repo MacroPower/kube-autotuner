@@ -117,7 +117,7 @@ def test_build_trial_row_populates_udp_keys() -> None:
         {
             "tcp_throughput": (5e9, 0.0),
             "udp_throughput": (1e9, 0.0),
-            "tcp_retransmit_rate": (1e-8, 0.0),
+            "tcp_retransmit_rate": (0.01, 0.0),
             "udp_loss_rate": (0.02, 0.0),
             "udp_jitter": (0.5, 0.0),
         },

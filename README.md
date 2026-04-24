@@ -262,8 +262,8 @@ objectives:
     # bits/sec; 1M (decimal mega) = 1e6.
     - "tcp_throughput >= 1M"
     - "udp_throughput >= 1M"
-    # retransmits per byte sent; 1u (micro) ~ 1 retx/MB.
-    - "tcp_retransmit_rate <= 1u"
+    # retransmits per GB sent; 1000 retx/GB ~ 1 retx/MB.
+    - "tcp_retransmit_rate <= 1000"
     # 5% UDP packet loss cap; UDP loss naturally runs higher than TCP
     # retransmit rate.
     - "udp_loss_rate <= 0.05"
@@ -344,7 +344,7 @@ Valid `pareto.metric` values and their sources:
 |-----------------------|-----------|--------------------------|--------------------------------------------------------------------------------------------------------|
 | `tcp_throughput`      | maximize  | iperf3 bw-tcp            | Bits per second. Summed across source clients per iteration, averaged across iterations.              |
 | `udp_throughput`      | maximize  | iperf3 bw-udp            | Bits per second. Same aggregation as `tcp_throughput`.                                                |
-| `tcp_retransmit_rate` | minimize  | iperf3 bw-tcp            | Retransmits per byte sent; scale-invariant, so high-throughput/high-loss does not win on raw count.   |
+| `tcp_retransmit_rate` | minimize  | iperf3 bw-tcp            | Retransmits per GB sent (1.0 ~ one retransmit per gigabyte); scale-invariant, so high-throughput/high-loss does not win on raw count. |
 | `udp_loss_rate`       | minimize  | iperf3 bw-udp            | Lost packets per packet sent; per-iteration ratio-of-sums then averaged. UDP analog of `tcp_retransmit_rate`. |
 | `udp_jitter`          | minimize  | iperf3 bw-udp            | Seconds (stored); displayed as milliseconds. Mean UDP inter-arrival jitter; tail-stability signal that TCP-only runs cannot observe. |
 | `rps`                 | maximize  | fortio saturation        | Achieved QPS under `-qps 0`. Fixed-QPS RPS would clamp to the offered load, so it is not a source.    |

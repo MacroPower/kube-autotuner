@@ -36,19 +36,19 @@ _PLOTLY_CDN = "https://cdn.plot.ly/plotly-2.35.2.min.js"
 
 
 def format_retransmit_rate(rate: float | None) -> str:
-    """Format a retx-per-byte rate for display as retransmits per MB.
+    """Format a retx-per-GB rate for display.
 
     Args:
-        rate: Retransmits per byte, or ``None`` when the trial had no
-            observable rate (UDP-only, empty TCP).
+        rate: Retransmits per gigabyte, or ``None`` when the trial
+            had no observable rate (UDP-only, empty TCP).
 
     Returns:
-        ``"-"`` when ``rate`` is ``None``; otherwise ``rate * 1e6``
+        ``"-"`` when ``rate`` is ``None``; otherwise ``rate``
         formatted with two decimals.
     """
     if rate is None:
         return "-"
-    return f"{rate * 1e6:.2f}"
+    return f"{rate:.2f}"
 
 
 _STYLE = """
@@ -1223,8 +1223,8 @@ const METRIC_DISPLAY = {
                         format: v => (v / 1e6).toFixed(1)},
   mean_udp_throughput: {label: "UDP throughput", unit: "Mbps",
                         format: v => (v / 1e6).toFixed(1)},
-  tcp_retransmit_rate: {label: "TCP retx", unit: "/MB",
-                        format: v => (v * 1e6).toFixed(2)},
+  tcp_retransmit_rate: {label: "TCP retx", unit: "/GB",
+                        format: v => v.toFixed(2)},
   udp_loss_rate: {label: "UDP loss", unit: "%",
                   format: v => (v * 100).toFixed(2)},
   mean_rps: {label: "RPS", unit: "",

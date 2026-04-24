@@ -382,7 +382,7 @@ _CONSTRAINT_RE = re.compile(
 _DEFAULT_CONSTRAINTS: list[str] = [
     "tcp_throughput >= 1000000",
     "udp_throughput >= 1000000",
-    "tcp_retransmit_rate <= 1e-06",
+    "tcp_retransmit_rate <= 1000",
     # UDP loss rate; lost_packets / packets summed per iteration,
     # then averaged. UDP loss naturally runs higher than TCP retransmit
     # rate, so the cap is correspondingly looser.

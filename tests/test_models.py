@@ -351,8 +351,8 @@ def test_trial_result_single_client_multiple_iterations():
         results=results,
     )
     assert trial.mean_tcp_throughput() == pytest.approx(2e9)
-    # rates: iter0=5/1e9, iter1=2/1e9; mean=3.5/1e9.
-    assert trial.tcp_retransmit_rate() == pytest.approx(3.5e-9)
+    # rates (retx/GB): iter0=5, iter1=2; mean=3.5.
+    assert trial.tcp_retransmit_rate() == pytest.approx(3.5)
     assert trial.total_bytes_sent() == 2_000_000_000
 
 
@@ -388,8 +388,8 @@ def test_trial_result_multi_client_per_iteration_grouping():
         results=results,
     )
     assert trial.mean_tcp_throughput() == pytest.approx(9e9)
-    # Rate: each iteration has 2 retx over 2GB; per-iter rate = 1e-9.
-    assert trial.tcp_retransmit_rate() == pytest.approx(1e-9)
+    # Rate: each iteration has 2 retx over 2GB; per-iter rate = 1 retx/GB.
+    assert trial.tcp_retransmit_rate() == pytest.approx(1.0)
     assert trial.total_bytes_sent() == 4_000_000_000
 
 
@@ -448,7 +448,8 @@ def test_retransmit_rate_drops_iterations_missing_retx_record():
         results=results,
     )
     # Only iter 0 contributes (bytes present AND retx recorded).
-    assert trial.tcp_retransmit_rate() == pytest.approx(1e-8)
+    # 10 retx / 1e9 bytes * 1e9 = 10 retx/GB.
+    assert trial.tcp_retransmit_rate() == pytest.approx(10.0)
 
 
 def test_mean_throughput_filters_to_tcp_records():

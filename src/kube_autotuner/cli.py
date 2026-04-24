@@ -704,7 +704,7 @@ def _format_top_recommendation(r: dict[str, Any]) -> str:
         parts.append(f"{udp_tp / 1e6:.1f} Mbps UDP")
     retx = r.get("tcp_retransmit_rate")
     if retx is not None:
-        parts.append(f"{format_retransmit_rate(retx)} TCP retx/MB")
+        parts.append(f"{format_retransmit_rate(retx)} TCP retx/GB")
     udp_loss = r.get("udp_loss_rate")
     if udp_loss is not None:
         parts.append(f"{udp_loss * 100:.2f}% UDP loss")

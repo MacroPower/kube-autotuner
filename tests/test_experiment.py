@@ -970,7 +970,7 @@ class TestObjectivesSection:
 
     def test_default_constraints_include_retransmit_rate(self) -> None:
         section = ObjectivesSection()
-        assert "tcp_retransmit_rate <= 1e-06" in section.constraints
+        assert "tcp_retransmit_rate <= 1000" in section.constraints
 
     def test_weight_on_maximize_metric_accepted(self) -> None:
         section = ObjectivesSection(
@@ -1061,7 +1061,7 @@ class TestObjectivesSectionConstraintUnits:
         expected = [
             "tcp_throughput >= 1000000",
             "udp_throughput >= 1000000",
-            "tcp_retransmit_rate <= 1e-06",
+            "tcp_retransmit_rate <= 1000",
             "udp_loss_rate <= 0.05",
             "rps >= 100",
             "latency_p99 <= 1",

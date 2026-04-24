@@ -319,11 +319,11 @@ def _compute_metrics(  # noqa: PLR0914
     ``mode == "udp"`` records.
 
     ``tcp_retransmit_rate`` is the per-iteration ratio
-    ``sum(retransmits) / sum(bytes_sent)`` averaged across iterations.
-    When no iteration produced both a ``retransmits`` reading and a
-    non-zero ``bytes_sent`` total (i.e. every ``bw-tcp`` stage
-    failed), the mean is ``NaN`` and callers are expected to drop the
-    key before handing results to Ax. ``udp_loss_rate`` is the
+    ``sum(retransmits) * 1e9 / sum(bytes_sent)`` (retransmits per GB)
+    averaged across iterations. When no iteration produced both a
+    ``retransmits`` reading and a non-zero ``bytes_sent`` total (i.e.
+    every ``bw-tcp`` stage failed), the mean is ``NaN`` and callers
+    are expected to drop the key before handing results to Ax. ``udp_loss_rate`` is the
     UDP-side analog: per-iteration ``sum(lost_packets) / sum(packets)``
     averaged across iterations, with the same NaN-when-empty contract.
 
@@ -986,14 +986,14 @@ class OptimizationLoop:
         tp = metrics.get("tcp_throughput", (float("nan"), 0.0))[0]
         tp_str = "NaN" if math.isnan(tp) else f"{tp / 1e6:.1f}"
         rate = metrics.get("tcp_retransmit_rate", (float("nan"), 0.0))[0]
-        rate_str = "NaN" if math.isnan(rate) else f"{rate * 1e6:.2f}"
+        rate_str = "NaN" if math.isnan(rate) else f"{rate:.2f}"
         rps = metrics.get("rps", (float("nan"), 0.0))[0]
         rps_str = "NaN" if math.isnan(rps) else f"{rps:.1f}"
         p99 = metrics.get("latency_p99", (float("nan"), 0.0))[0]
         p99_str = "NaN" if math.isnan(p99) else format_duration(p99)
         logger.info(
             "Trial %d/%d [%s] tcp_throughput=%s Mbps "
-            "tcp_retransmit_rate=%s retx/MB rps=%s p99=%s",
+            "tcp_retransmit_rate=%s retx/GB rps=%s p99=%s",
             self.prior_count + i + 1,
             self.n_trials,
             phase,

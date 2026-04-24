@@ -378,14 +378,15 @@ def compute_sysctl_hash(sysctl_values: Mapping[str, str | int]) -> str:
 def tcp_retransmit_rate_by_iteration(
     results: list[BenchmarkResult],
 ) -> list[float]:
-    """Return one TCP retransmit rate (retx per byte) per iteration.
+    """Return one TCP retransmit rate (retx per GB) per iteration.
 
-    Each iteration's rate is ``sum(retransmits) / sum(bytes_sent)``
-    over its records. Every iteration now runs both TCP and UDP
-    bandwidth stages, so the filter's job is to skip iterations where
-    no TCP record reported ``retransmits`` / ``bytes_sent`` (e.g. a
-    failed ``bw-tcp`` stage). UDP records are dropped naturally
-    because they never report ``bytes_sent``.
+    Each iteration's rate is
+    ``sum(retransmits) * 1e9 / sum(bytes_sent)`` over its records --
+    i.e. retransmits per gigabyte sent. Every iteration now runs
+    both TCP and UDP bandwidth stages, so the filter's job is to
+    skip iterations where no TCP record reported ``retransmits`` /
+    ``bytes_sent`` (e.g. a failed ``bw-tcp`` stage). UDP records are
+    dropped naturally because they never report ``bytes_sent``.
 
     Args:
         results: Raw benchmark records for a single trial.
@@ -403,7 +404,7 @@ def tcp_retransmit_rate_by_iteration(
         if r.bytes_sent is not None and r.bytes_sent > 0:
             per_iter_bytes[r.iteration] += r.bytes_sent
     return [
-        per_iter_retx[it] / bytes_
+        per_iter_retx[it] * 1e9 / bytes_
         for it, bytes_ in per_iter_bytes.items()
         if bytes_ > 0 and per_iter_saw_retx[it]
     ]
@@ -577,7 +578,7 @@ class TrialResult(BaseModel):
         return sum(rate_vals) / len(rate_vals)
 
     def tcp_retransmit_rate(self) -> float | None:
-        """Return TCP retransmits per byte as a per-trial rate.
+        """Return TCP retransmits per GB as a per-trial rate.
 
         Aggregates per-iteration ratio-of-sums then means across
         iterations -- matching how :meth:`mean_tcp_throughput` folds
@@ -589,11 +590,10 @@ class TrialResult(BaseModel):
         check.
 
         Returns:
-            Retransmits per byte sent as a ``float`` (e.g. ``1e-6``
-            is approximately 1 retransmit per MB) -- the default
-            case, since every iteration now runs a TCP bandwidth
-            stage. Returns ``None`` only when every ``bw-tcp`` stage
-            failed.
+            Retransmits per gigabyte sent as a ``float`` (e.g. ``1.0``
+            is one retransmit per GB sent) -- the default case, since
+            every iteration now runs a TCP bandwidth stage. Returns
+            ``None`` only when every ``bw-tcp`` stage failed.
         """
         rate_vals = tcp_retransmit_rate_by_iteration(self.results)
         if not rate_vals:

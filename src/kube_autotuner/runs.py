@@ -714,7 +714,7 @@ def run_optimize(  # noqa: PLR0914, PLR0915
         rps_str = "n/a" if math.isnan(rps_val) else f"{rps_val:.1f}"
         p99_str = "n/a" if math.isnan(p99_val) else format_duration(p99_val)
         logger.info(
-            "  [%d] tcp_throughput=%.1f Mbps rate=%s retx/MB rps=%s p99=%s",
+            "  [%d] tcp_throughput=%.1f Mbps rate=%s retx/GB rps=%s p99=%s",
             trial_idx,
             float(tp_val) / 1e6,
             format_retransmit_rate(rate_val),
@@ -831,7 +831,7 @@ def _log_verification_summary(  # noqa: PLR0914, PLR0915 - per-stage column gate
     if "tcp_throughput" in relevant:
         table.add_column("tcp_throughput", justify="right")
     if "tcp_retransmit_rate" in relevant:
-        table.add_column("tcp_retx_rate", justify="right")
+        table.add_column("tcp_retx_rate (/GB)", justify="right")
     if "latency_p99" in relevant:
         table.add_column(f"p99 {p99_suffix}", justify="right")
 
@@ -865,7 +865,7 @@ def _log_verification_summary(  # noqa: PLR0914, PLR0915 - per-stage column gate
                 _format_mean_sem(
                     row,
                     METRIC_TO_DF_COLUMN["tcp_retransmit_rate"],
-                    scale=1e6,
+                    scale=1.0,
                 ),
             )
         if "latency_p99" in relevant and p99_scale is not None:

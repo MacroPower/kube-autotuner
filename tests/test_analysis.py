@@ -320,7 +320,7 @@ class TestParetoFront:
             {
                 "trial_id": ["A", "B"],
                 "mean_tcp_throughput": [100, 50],
-                "tcp_retransmit_rate": [1e-7, float("nan")],
+                "tcp_retransmit_rate": [0.1, float("nan")],
                 **_pad_latency_cols(2),
             },
         )
@@ -344,7 +344,7 @@ class TestParetoFront:
             {
                 "trial_id": ["A", "B"],
                 "mean_tcp_throughput": [100, 50],
-                "tcp_retransmit_rate": [2e-7, 1e-7],
+                "tcp_retransmit_rate": [0.2, 0.1],
                 "mean_udp_jitter": [float("nan"), float("nan")],
                 "mean_rps": [1000.0] * 2,
                 "mean_latency_p50": [1.0] * 2,
@@ -403,6 +403,36 @@ class TestParameterImportance:
             "net.core.rmem_max",
             "net.ipv4.tcp_congestion_control",
         }
+
+    def test_rf_importance_survives_tiny_target_magnitude(self) -> None:
+        """RF importance must not collapse to zero on ~1e-10 targets.
+
+        ``RandomForestRegressor`` uses MSE-based impurity, which scales
+        as ``y**2``. For ``y ~ 1e-10`` the per-split improvement is
+        ``~1e-20``, below sklearn's tree-splitter epsilon; without the
+        std-scale step in ``_rf_importance_scores`` every tree degenerates
+        into a single leaf and ``feature_importances_`` sums to zero. This
+        is not hypothetical: ``tcp_retransmit_rate`` (when stored as
+        retransmits per byte) lives in exactly this regime.
+        """
+        n = 40
+        driver = [i / (n - 1) for i in range(n)]
+        noise1 = [((i * 7) % n) / (n - 1) for i in range(n)]
+        noise2 = [((i * 13) % n) / (n - 1) for i in range(n)]
+        df = pd.DataFrame(
+            {
+                "trial_id": list(range(n)),
+                "hardware_class": ["1g"] * n,
+                "net.core.rmem_max": driver,
+                "net.core.wmem_max": noise1,
+                "net.core.netdev_max_backlog": noise2,
+                "tcp_retransmit_rate": [3e-10 + 5e-10 * d for d in driver],
+            },
+        )
+        imp = parameter_importance(df, target="tcp_retransmit_rate")
+        assert not imp.empty
+        assert imp["rf_importance"].sum() == pytest.approx(1.0)
+        assert imp.iloc[0]["param"] == "net.core.rmem_max"
 
 
 # --- recommend_configs ---------------------------------------------------
@@ -471,12 +501,12 @@ class TestRecommendConfigs:
             assert "tcp_retransmit_rate" in r
 
     def test_rate_metric_reranks_over_absolute_count(self) -> None:
-        """Per-byte rate reorders candidates vs. absolute retransmit count.
+        """Per-GB rate reorders candidates vs. absolute retransmit count.
 
-        Trial A: 10 Gbps, 1000 retransmits over 37.5 GB -> rate ~2.67e-8.
-        Trial B: 5 Gbps, 100 retransmits over 18.75 GB -> rate ~5.33e-9.
+        Trial A: 10 Gbps, 1000 retransmits over 37.5 GB -> rate ~26.67/GB.
+        Trial B: 5 Gbps, 100 retransmits over 18.75 GB -> rate ~5.33/GB.
 
-        On absolute count A looks bad (1000 > 100), but per byte A is
+        On absolute count A looks bad (1000 > 100), but per GB A is
         5x cleaner than B. Under the default (rate) objectives A wins
         on throughput AND ties/beats B on rate, so A is ranked first.
         """
@@ -510,7 +540,7 @@ class TestRecommendConfigs:
         recs = recommend_configs(trials, "10g", n=2)
         assert [r["trial_id"] for r in recs] == ["a", "b"]
         assert recs[0]["tcp_retransmit_rate"] == pytest.approx(
-            1000 / 37_500_000_000,
+            1000 * 1e9 / 37_500_000_000,
         )
 
     def test_metric_to_df_column_covers_default_objectives(self) -> None:
@@ -617,7 +647,7 @@ class TestBuildAxisPayload:
                 {
                     "trial_id": 1,
                     "mean_tcp_throughput": 4.2e10,
-                    "tcp_retransmit_rate": 1e-6,
+                    "tcp_retransmit_rate": 1.0,
                     "mean_udp_jitter": 0.001,
                 },
                 {
@@ -629,7 +659,7 @@ class TestBuildAxisPayload:
                 {
                     "trial_id": 3,
                     "mean_tcp_throughput": None,
-                    "tcp_retransmit_rate": 2e-6,
+                    "tcp_retransmit_rate": 2.0,
                     "mean_udp_jitter": None,
                 },
             ],
@@ -649,7 +679,7 @@ class TestBuildAxisPayload:
             "phase": "unknown",
             "mean_tcp_throughput": 4.2e10,
             "mean_tcp_throughput_std": None,
-            "tcp_retransmit_rate": 1e-6,
+            "tcp_retransmit_rate": 1.0,
             "tcp_retransmit_rate_std": None,
             "mean_udp_jitter": 0.001,
             "mean_udp_jitter_std": None,
@@ -671,7 +701,7 @@ class TestBuildAxisPayload:
             "phase": "unknown",
             "mean_tcp_throughput": None,
             "mean_tcp_throughput_std": None,
-            "tcp_retransmit_rate": 2e-6,
+            "tcp_retransmit_rate": 2.0,
             "tcp_retransmit_rate_std": None,
             "mean_udp_jitter": None,
             "mean_udp_jitter_std": None,
@@ -703,7 +733,7 @@ class TestBuildAxisPayload:
                 {
                     "trial_id": "t1",
                     "mean_tcp_throughput": 1.0e10,
-                    "tcp_retransmit_rate": 1e-6,
+                    "tcp_retransmit_rate": 1.0,
                     "mean_udp_jitter": 1e-4,
                     "udp_loss_rate": 1e-3,
                     "mean_udp_throughput": 5e9,
@@ -1230,7 +1260,7 @@ _SIMPLE_OBJECTIVES: list[dict[str, str]] = [
 
 def test_baseline_comparison_returns_none_when_no_match() -> None:
     trials = [_trial(hw="10g", bps=5e9, rmem_max=212992)]
-    top_row = {"mean_tcp_throughput": 6e9, "tcp_retransmit_rate": 1e-7}
+    top_row = {"mean_tcp_throughput": 6e9, "tcp_retransmit_rate": 0.1}
     assert baseline_comparison(trials, _SIMPLE_OBJECTIVES, top_row) is None
 
 

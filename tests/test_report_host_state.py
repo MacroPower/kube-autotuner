@@ -37,7 +37,7 @@ def _minimal_section(hw: str) -> dict[str, Any]:
             "sysctl_values": {"net.core.rmem_max": "67108864"},
             "mean_tcp_throughput": 4.2e10,
             "mean_udp_throughput": 9.5e9,
-            "tcp_retransmit_rate": 1e-8,
+            "tcp_retransmit_rate": 0.1,
             "udp_loss_rate": 0.001,
             "mean_udp_jitter": 0.0001,
             "mean_rps": 12345.0,
@@ -53,7 +53,7 @@ def _minimal_section(hw: str) -> dict[str, Any]:
             "trial_id": pareto_rows[0]["trial_id"],
             "pareto": True,
             "mean_tcp_throughput": 4.2e10,
-            "tcp_retransmit_rate": 1e-8,
+            "tcp_retransmit_rate": 0.1,
         },
     ]
     objectives = [

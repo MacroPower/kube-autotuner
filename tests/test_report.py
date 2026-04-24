@@ -61,7 +61,7 @@ def _minimal_section(
             },
             "mean_tcp_throughput": 4.2e10 - 1e9 * i,
             "mean_udp_throughput": 9.5e9 - 1e8 * i,
-            "tcp_retransmit_rate": 1e-8 * (i + 1),
+            "tcp_retransmit_rate": 0.1 * (i + 1),
             "udp_loss_rate": 0.001 * (i + 1),
             "mean_udp_jitter": 0.0001,
             "mean_rps": 12345.0,
@@ -78,7 +78,7 @@ def _minimal_section(
             "trial_id": f"trial-{hw}-{i:02d}",
             "pareto": i < n_pareto_rows,
             "mean_tcp_throughput": 4.2e10 - 1e9 * i,
-            "tcp_retransmit_rate": 1e-8 * (i + 1),
+            "tcp_retransmit_rate": 0.1 * (i + 1),
         }
         for i in range(trial_count)
     ]
@@ -749,7 +749,7 @@ def test_js_score_rows_port_matches_python(tmp_path: Path) -> None:  # noqa: PLR
     # determined by a single axis.
     for i, row in enumerate(section["pareto_rows"]):
         row["mean_tcp_throughput"] = 1.0e10 + 1e8 * i
-        row["tcp_retransmit_rate"] = 1e-6 * (5 - i)
+        row["tcp_retransmit_rate"] = 1.0 * (5 - i)
         row["memory_cost"] = float((i + 1) * 1_000_000_000)
     section["memory_cost_weight"] = 0.1
 

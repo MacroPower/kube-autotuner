@@ -102,7 +102,7 @@ def test_rich_observer_renders_bars_and_table() -> None:
             _stub_trial("sobol"),
             {
                 "tcp_throughput": (9_412_000_000.0, 1e7),
-                "tcp_retransmit_rate": (1.2e-7, 1e-9),
+                "tcp_retransmit_rate": (0.12, 1e-3),
                 "udp_jitter": (0.000128, 1e-5),
             },
         )
@@ -120,7 +120,7 @@ def test_rich_observer_renders_bars_and_table() -> None:
     assert "Trials" in output
     assert "Best so far" in output
     assert "9,412.0 Mbps" in output
-    assert "0.12" in output  # retx/MB rendered
+    assert "0.12" in output  # retx/GB rendered
     assert "jitter us" in output  # jitter column header picks us (128 us)
     assert "128" in output  # jitter value rendered as us coefficient
 
@@ -169,7 +169,7 @@ def test_rich_observer_handles_missing_metrics() -> None:
         observer.on_trial_complete(0, _stub_trial("sobol"), {})
     # No KeyError; row folded in with zeros / NaN.
     assert observer._top
-    assert math.isnan(observer._top[0].retx_per_mb)
+    assert math.isnan(observer._top[0].retx_per_gb)
 
 
 def _prior_trial(bps: float, *, phase: str | None = None) -> Any:
@@ -906,7 +906,7 @@ def _score_row_complete(  # noqa: PLR0913 - keyword-only metric bundle
     index: int,
     phase: str = "bayesian",
     throughput: float,
-    tcp_retransmit_rate: float = 1e-8,
+    tcp_retransmit_rate: float = 0.01,
     udp_jitter: float = 0.1,
     rps: float = 1000.0,
     latency_p50: float = 1.0,
@@ -1010,7 +1010,7 @@ def test_top5_phase_labels_roundtrip_through_rerank() -> None:
 
 
 def test_top5_handles_nan_metrics() -> None:
-    """A UDP-only trial (NaN retx_per_mb, NaN latency) still ranks."""
+    """A UDP-only trial (NaN retx_per_gb, NaN latency) still ranks."""
     console = _capture_console()
     observer = RichProgressObserver(console, objectives=ObjectivesSection())
     # TCP trial with a full bundle.
@@ -1018,7 +1018,7 @@ def test_top5_handles_nan_metrics() -> None:
         observer,
         index=0,
         throughput=1.5e9,
-        tcp_retransmit_rate=1e-8,
+        tcp_retransmit_rate=0.01,
         latency_p90=2.0,
         latency_p99=4.0,
     )
@@ -1065,7 +1065,7 @@ def test_top5_fallback_sorts_by_throughput_when_objectives_none() -> None:
 def test_best_so_far_hides_disabled_stage_columns() -> None:
     """Columns whose metric is only produced by a disabled stage vanish.
 
-    A bw-tcp-only run renders `Throughput` and `retx/MB`, but must
+    A bw-tcp-only run renders `Throughput` and `retx/GB`, but must
     drop `jitter`, `RPS`, and `p99` -- those come from bw-udp,
     fortio-sat, and fortio-fixed respectively.
     """
@@ -1078,7 +1078,7 @@ def test_best_so_far_hides_disabled_stage_columns() -> None:
             _stub_trial("bayesian"),
             {
                 "tcp_throughput": (1.5e9, 0.0),
-                "tcp_retransmit_rate": (1e-8, 0.0),
+                "tcp_retransmit_rate": (0.01, 0.0),
                 "udp_jitter": (math.nan, math.nan),
                 "rps": (math.nan, math.nan),
                 "latency_p99": (math.nan, math.nan),
@@ -1086,7 +1086,7 @@ def test_best_so_far_hides_disabled_stage_columns() -> None:
         )
     output = cast("io.StringIO", console.file).getvalue()
     assert "Throughput" in output
-    assert "retx/MB" in output
+    assert "retx/GB" in output
     assert "jitter" not in output
     assert " RPS " not in output
     assert "p99" not in output
@@ -1100,7 +1100,7 @@ def test_best_so_far_shows_all_columns_by_default() -> None:
         observer.on_trial_start(0, 1, "bayesian", {})
         _score_row_complete(observer, index=0, throughput=1.0e9)
     output = cast("io.StringIO", console.file).getvalue()
-    for header in ("Throughput", "retx/MB", "jitter", "RPS", "p99"):
+    for header in ("Throughput", "retx/GB", "jitter", "RPS", "p99"):
         assert header in output
 
 

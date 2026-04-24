@@ -432,10 +432,10 @@ def test_format_top_recommendation_skips_missing_metrics() -> None:
 
     rendered = _format_top_recommendation({
         "mean_tcp_throughput": 2.5e9,
-        "tcp_retransmit_rate": 1e-7,
+        "tcp_retransmit_rate": 0.1,
     })
     assert "Mbps TCP" in rendered
-    assert "retx/MB" in rendered
+    assert "retx/GB" in rendered
     assert "UDP" not in rendered
     assert "rps" not in rendered
 
@@ -447,7 +447,7 @@ def test_format_top_recommendation_renders_full_row() -> None:
     rendered = _format_top_recommendation({
         "mean_tcp_throughput": 2.5e9,
         "mean_udp_throughput": 1.0e9,
-        "tcp_retransmit_rate": 1e-7,
+        "tcp_retransmit_rate": 0.1,
         "udp_loss_rate": 0.01,
         "mean_udp_jitter": 5e-4,
         "mean_rps": 12345.6,
