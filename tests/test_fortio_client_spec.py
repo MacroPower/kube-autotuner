@@ -201,3 +201,101 @@ def test_node_selector_and_tolerations():
     pod_spec = doc["spec"]["template"]["spec"]
     assert pod_spec["nodeSelector"]["kubernetes.io/hostname"] == "c1"
     assert pod_spec["tolerations"][0]["operator"] == "Exists"
+
+
+def test_no_barrier_script_has_no_prologue():
+    """Without ``start_at_epoch`` the script is byte-identical to pre-feature shape."""
+    yaml_ = build_fortio_client_yaml(
+        node="c1",
+        target="t",
+        iteration=0,
+        workload="saturation",
+        qps=0,
+        connections=4,
+        duration=5,
+    )
+    script = _container(_parse(yaml_))["args"][0]
+    assert script.startswith("set -e ; fortio load")
+    assert "NOW=" not in script
+    assert "DELTA=" not in script
+    assert "sleep" not in script
+
+
+def test_barrier_prologue_sits_between_set_e_and_fortio():
+    """With ``start_at_epoch`` the prologue splices after ``set -e ;``."""
+    yaml_ = build_fortio_client_yaml(
+        node="c1",
+        target="t",
+        iteration=0,
+        workload="saturation",
+        qps=0,
+        connections=4,
+        duration=5,
+        start_at_epoch=1_700_000_000,
+    )
+    script = _container(_parse(yaml_))["args"][0]
+    assert script.startswith("set -e ; ")
+    assert "NOW=$(date +%s)" in script
+    assert "DELTA=$(( 1700000000 - NOW ))" in script
+    assert 'if [ "$DELTA" -gt 0 ]; then sleep "$DELTA"; fi' in script
+    # Prologue lands before the fortio invocation.
+    assert script.index("NOW=") < script.index("fortio load")
+    # ``set -e`` still at the very front.
+    assert script.index("set -e") == 0
+
+
+def test_barrier_does_not_exec_fortio():
+    """Fortio's trailing ``cat`` needs the shell to survive, so no ``exec``."""
+    yaml_ = build_fortio_client_yaml(
+        node="c1",
+        target="t",
+        iteration=0,
+        workload="saturation",
+        qps=0,
+        connections=4,
+        duration=5,
+        start_at_epoch=1_700_000_000,
+    )
+    script = _container(_parse(yaml_))["args"][0]
+    assert "exec fortio" not in script
+    # Script still ends with the cat of the result file.
+    assert script.rstrip().endswith("cat /tmp/fortio-result.json")
+
+
+def test_barrier_preserves_fortio_argv():
+    """The prologue does not drop or reorder any fortio flag."""
+    yaml_ = build_fortio_client_yaml(
+        node="c1",
+        target="t",
+        iteration=0,
+        workload="fixed_qps",
+        qps=1500,
+        connections=4,
+        duration=30,
+        extra_args=["-payload-size", "128"],
+        start_at_epoch=1_700_000_000,
+    )
+    argv = _fortio_argv(_parse(yaml_))
+    assert argv[:2] == ["fortio", "load"]
+    assert argv[argv.index("-qps") + 1] == "1500"
+    assert argv[argv.index("-c") + 1] == "4"
+    assert argv[argv.index("-t") + 1] == "30s"
+    assert "-payload-size" in argv
+    assert argv[-1] == "http://fortio-server-t:8080/"
+
+
+def test_no_stderr_redirection_in_fortio_script():
+    """Fortio's merged log is scanned for the result JSON, so no stray stderr."""
+    yaml_ = build_fortio_client_yaml(
+        node="c1",
+        target="t",
+        iteration=0,
+        workload="saturation",
+        qps=0,
+        connections=4,
+        duration=5,
+        start_at_epoch=1_700_000_000,
+    )
+    script = _container(_parse(yaml_))["args"][0]
+    assert "1>&2" not in script
+    assert "echo " not in script

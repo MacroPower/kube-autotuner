@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 import shutil
 import threading
 import time
@@ -84,8 +85,8 @@ def _iperf_job_mode_from_yaml(yaml_text: str) -> tuple[str, str] | None:
 
     The runner applies both TCP and UDP iperf3 client Jobs per
     iteration under the same job name, so the only way to tell them
-    apart in the mock client is to inspect the rendered args for
-    ``-u``.
+    apart in the mock client is to inspect the rendered iperf3 argv
+    (inside the ``sh -c`` script) for ``-u``.
     """
     for doc in yaml.safe_load_all(yaml_text):
         if not isinstance(doc, dict) or doc.get("kind") != "Job":
@@ -95,7 +96,10 @@ def _iperf_job_mode_from_yaml(yaml_text: str) -> tuple[str, str] | None:
             continue
         containers = doc["spec"]["template"]["spec"]["containers"]
         args = containers[0].get("args", [])
-        return name, ("udp" if "-u" in args else "tcp")
+        script = args[0] if len(args) == 1 and isinstance(args[0], str) else ""
+        tokens = shlex.split(script) if script else []
+        iperf_argv = tokens[tokens.index("iperf3") :] if "iperf3" in tokens else []
+        return name, ("udp" if "-u" in iperf_argv else "tcp")
     return None
 
 

@@ -146,3 +146,25 @@ def test_parse_raises_on_udp_zero_packets_and_zero_bps():
 def test_parse_preserves_raw():
     result = parse_iperf_json(SAMPLE_TCP_JSON, "tcp")
     assert result.raw_json == SAMPLE_TCP_JSON
+
+
+def test_json_loads_rejects_prologue_leakage():
+    """``kubectl logs`` merges stderr, so the sync-barrier prologue must be silent.
+
+    The runner feeds ``client.logs(...)`` straight into ``json.loads``
+    (``runner.py:296``). If the barrier prologue ever re-acquires a
+    diagnostic ``echo`` on stderr, the merged pod log would interleave
+    those bytes with iperf3's JSON document and parsing would fail
+    with ``Extra data`` or ``Expecting value``. This test pins that
+    failure mode: iperf3 JSON is safe on its own, contaminated stdout
+    is not.
+    """
+    import json  # noqa: PLC0415 - scoped to keep module imports tidy
+
+    clean = json.dumps(SAMPLE_TCP_JSON)
+    raw = json.loads(clean)
+    parse_iperf_json(raw, "tcp")
+
+    contaminated = f"sync-barrier: released at 2026-04-23T00:00:00+00:00\n{clean}"
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(contaminated)

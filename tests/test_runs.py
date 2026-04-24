@@ -489,3 +489,58 @@ class TestFormatMeanSem:
         out = runs._format_mean_sem(row, "throughput", scale=1e-6)
         assert "e" not in out.split(" ± ")[0]
         assert out.startswith("9400 ± ")
+
+
+class TestBenchmarkDriftExcludesSyncWindow:
+    """``sync_window_seconds`` changes must not trigger a drift flag.
+
+    The barrier sleep happens before iperf3's ``-O <omit>`` warmup and
+    does not influence any measurement, so tuning the window on resume
+    should not force ``--fresh`` on otherwise-compatible JSONLs.
+    """
+
+    @staticmethod
+    def _exp(**benchmark_overrides: object) -> ExperimentConfig:
+        return ExperimentConfig.model_validate({
+            "mode": "baseline",
+            "nodes": {"sources": ["a"], "target": "b"},
+            "benchmark": {"duration": 1, "iterations": 1, **benchmark_overrides},
+        })
+
+    @staticmethod
+    def _meta(exp: ExperimentConfig) -> ResumeMetadata:
+        return ResumeMetadata(
+            objectives=exp.objectives,
+            param_space=exp.effective_param_space(),
+            benchmark=exp.benchmark,
+            n_sobol=None,
+        )
+
+    def test_missing_sync_window_key_does_not_flag_drift(self) -> None:
+        """A pre-feature sidecar (no ``sync_window_seconds`` key) stays compatible.
+
+        The rehydrated sidecar has the field defaulted; the experiment
+        uses a different, explicit value. Without the drift-exclude,
+        the ``model_dump`` equality would flag the change.
+        """
+        exp = self._exp(sync_window_seconds=60)
+        meta = self._meta(self._exp())
+        dumped = meta.model_dump()
+        dumped["benchmark"].pop("sync_window_seconds", None)
+        rehydrated = ResumeMetadata.model_validate(dumped)
+        assert rehydrated.benchmark.sync_window_seconds == 15
+        assert exp.benchmark.sync_window_seconds == 60
+        runs._check_compatibility(rehydrated, exp)
+
+    def test_differing_sync_window_does_not_flag_drift(self) -> None:
+        """Sidecar 15s vs experiment 60s is compatible: knob is excluded."""
+        exp = self._exp(sync_window_seconds=60)
+        meta = self._meta(self._exp(sync_window_seconds=15))
+        runs._check_compatibility(meta, exp)
+
+    def test_duration_change_still_flags_drift(self) -> None:
+        """Negative-space gate: a real measurement-affecting change still drifts."""
+        exp = self._exp(duration=1, sync_window_seconds=60)
+        meta = self._meta(self._exp(duration=5, sync_window_seconds=15))
+        with pytest.raises(typer.BadParameter, match="benchmark"):
+            runs._check_compatibility(meta, exp)

@@ -12,6 +12,34 @@ _FORTIO_RESULT_FILE = "/tmp/fortio-result.json"  # noqa: S108
 Workload = Literal["saturation", "fixed_qps"]
 
 
+def _barrier_prologue(start_at_epoch: int | None) -> str:
+    """Return the sleep-until-epoch shell prologue, or ``""`` when disabled.
+
+    Emits no log output. ``kubectl logs`` merges stdout and stderr
+    line-by-line; a stray ``echo`` would leak into the fortio logger's
+    own stderr stream and interleave inside the merged log that
+    :func:`extract_fortio_result_json` scans. Operators can reconstruct
+    drift between clients from each result's ``StartTime``.
+
+    Args:
+        start_at_epoch: Absolute Unix timestamp the client should begin
+            executing fortio at. ``None`` disables the barrier and the
+            function returns ``""``.
+
+    Returns:
+        A ``;``-terminated shell fragment to splice after ``set -e ;``
+        and before the fortio argv, or ``""`` when no barrier is needed.
+    """
+    if start_at_epoch is None:
+        return ""
+    epoch = int(start_at_epoch)
+    return (
+        f"NOW=$(date +%s) ; "
+        f"DELTA=$(( {epoch} - NOW )) ; "
+        f'if [ "$DELTA" -gt 0 ]; then sleep "$DELTA"; fi ; '
+    )
+
+
 def fortio_client_job_name(node: str, workload: Workload, iteration: int) -> str:
     """Return the RFC 1123 subdomain Job name for a fortio client run.
 
@@ -42,6 +70,8 @@ def build_fortio_client_yaml(  # noqa: PLR0913, PLR0917 - fortio load flag surfa
     connections: int,
     duration: int,
     extra_args: list[str] | None = None,
+    *,
+    start_at_epoch: int | None = None,
 ) -> str:
     """Build a Job YAML that runs ``fortio load`` against the fortio server.
 
@@ -62,6 +92,10 @@ def build_fortio_client_yaml(  # noqa: PLR0913, PLR0917 - fortio load flag surfa
         extra_args: Additional fortio flags appended after the
             controlled arguments. Reserved-flag enforcement happens in
             the experiment config layer, not here.
+        start_at_epoch: Absolute Unix timestamp the client should
+            ``sleep`` until before invoking ``fortio load``. ``None``
+            disables the barrier and the container runs fortio
+            immediately.
 
     Returns:
         The fully rendered Job manifest as a multi-line YAML string.
@@ -90,8 +124,10 @@ def build_fortio_client_yaml(  # noqa: PLR0913, PLR0917 - fortio load flag surfa
     if extra_args:
         fortio_argv.extend(extra_args)
     fortio_argv.append(f"http://fortio-server-{target}:{_FORTIO_HTTP_PORT}/")
+    prologue = _barrier_prologue(start_at_epoch)
     script = (
-        f"set -e ; {shlex.join(fortio_argv)} ; cat {shlex.quote(_FORTIO_RESULT_FILE)}"
+        f"set -e ; {prologue}{shlex.join(fortio_argv)} ; "
+        f"cat {shlex.quote(_FORTIO_RESULT_FILE)}"
     )
     args_yaml = json.dumps([script])
 

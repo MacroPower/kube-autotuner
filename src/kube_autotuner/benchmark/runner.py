@@ -257,6 +257,9 @@ class BenchmarkRunner:
         mode: Literal["tcp", "udp"],
         iteration: int,
         abort: threading.Event | None = None,
+        *,
+        start_at_epoch: int | None,
+        wait_timeout_seconds: int,
     ) -> BenchmarkResult:
         """Run a single iperf3 client Job with retries.
 
@@ -271,6 +274,13 @@ class BenchmarkRunner:
             abort: Stage-level early-abort signal shared with sibling
                 threads. When set, the retry loop bails out on the next
                 iteration instead of burning its remaining budget.
+            start_at_epoch: Absolute Unix timestamp the client should
+                sleep until before exec'ing iperf3. ``None`` disables
+                the barrier (single-client stage or
+                ``sync_window_seconds == 0``).
+            wait_timeout_seconds: Per-attempt ``condition=complete`` wait
+                budget, already padded by the stage for the sync window
+                when the barrier is active.
 
         Returns:
             The parsed :class:`BenchmarkResult` for this client and
@@ -288,6 +298,7 @@ class BenchmarkRunner:
                 mode=mode,
                 window=self.config.window,
                 extra_args=self.iperf_args.client.extra_args,
+                start_at_epoch=start_at_epoch,
             ),
             self.patches,
         )
@@ -314,6 +325,7 @@ class BenchmarkRunner:
             abort=abort,
             stage_label=f"bw-{mode}",
             iteration=iteration,
+            wait_timeout_seconds=wait_timeout_seconds,
         )
 
     def _run_one_fortio_client(
@@ -322,6 +334,9 @@ class BenchmarkRunner:
         iteration: int,
         workload: Workload,
         abort: threading.Event | None = None,
+        *,
+        start_at_epoch: int | None,
+        wait_timeout_seconds: int,
     ) -> LatencyResult:
         """Run a single fortio client Job with retries.
 
@@ -335,6 +350,12 @@ class BenchmarkRunner:
             abort: Stage-level early-abort signal shared with sibling
                 threads. When set, the retry loop bails out on the next
                 iteration instead of burning its remaining budget.
+            start_at_epoch: Absolute Unix timestamp the client should
+                sleep until before invoking ``fortio load``. ``None``
+                disables the barrier.
+            wait_timeout_seconds: Per-attempt ``condition=complete``
+                wait budget, already padded by the stage for the sync
+                window when the barrier is active.
 
         Returns:
             The parsed :class:`LatencyResult` for this client,
@@ -352,6 +373,7 @@ class BenchmarkRunner:
                 connections=self.fortio_args.connections,
                 duration=self.fortio_args.duration,
                 extra_args=self.fortio_args.client.extra_args,
+                start_at_epoch=start_at_epoch,
             ),
             self.patches,
         )
@@ -377,6 +399,7 @@ class BenchmarkRunner:
             abort=abort,
             stage_label=f"fortio-{workload}",
             iteration=iteration,
+            wait_timeout_seconds=wait_timeout_seconds,
         )
 
     def _run_client_job_with_retries(  # noqa: PLR0913, PLR0915 - one cohesive retry loop with three interleaved signals
@@ -390,6 +413,7 @@ class BenchmarkRunner:
         abort: threading.Event | None,
         stage_label: str,
         iteration: int,
+        wait_timeout_seconds: int,
     ) -> _T:
         """Run one client Job with the three-signal detection + retry loop.
 
@@ -438,6 +462,11 @@ class BenchmarkRunner:
                 / ``"fortio-fixed_qps"``).
             iteration: Zero-based iteration index threaded into every
                 warning.
+            wait_timeout_seconds: Per-attempt ``condition=complete``
+                wait budget, sourced from the calling stage so
+                single-client stages retain the base
+                ``_CLIENT_WAIT_TIMEOUT_SECONDS`` budget and multi-client
+                stages pad it by ``sync_window_seconds``.
 
         Returns:
             The value produced by ``parse`` on the first successful
@@ -469,7 +498,7 @@ class BenchmarkRunner:
                         job_name,
                         "condition=complete",
                         ns,
-                        timeout=_CLIENT_WAIT_TIMEOUT_SECONDS,
+                        timeout=wait_timeout_seconds,
                         failure_condition="condition=failed",
                     )
                     log_pod = self.client._job_log_pod(job_name, ns)  # noqa: SLF001
@@ -788,6 +817,33 @@ class BenchmarkRunner:
         )
         return IterationResults(bench=all_bench, latency=all_latency)
 
+    def _stage_barrier(self) -> tuple[int | None, int]:
+        """Compute the per-stage start-time barrier and wait-timeout budget.
+
+        The barrier is active only when ``sync_window_seconds > 0`` and
+        the stage has more than one client to align. Single-client
+        stages skip the sleep entirely and retain the unpadded
+        ``_CLIENT_WAIT_TIMEOUT_SECONDS`` budget so they do not pay for
+        slack they cannot use.
+
+        Returns:
+            A tuple ``(start_at_epoch, wait_timeout_seconds)``.
+            ``start_at_epoch`` is the shared Unix timestamp every client
+            in this stage should sleep until (``None`` when the barrier
+            is inactive). ``wait_timeout_seconds`` is the
+            ``condition=complete`` budget passed to
+            :meth:`K8sClient.wait` -- base 180 s when the barrier is
+            inactive, padded by ``sync_window_seconds`` otherwise.
+        """
+        barrier_active = self.config.sync_window_seconds > 0 and len(self._clients) > 1
+        if not barrier_active:
+            return (None, _CLIENT_WAIT_TIMEOUT_SECONDS)
+        start_at_epoch = int(time.time()) + self.config.sync_window_seconds
+        wait_timeout_seconds = (
+            _CLIENT_WAIT_TIMEOUT_SECONDS + self.config.sync_window_seconds
+        )
+        return (start_at_epoch, wait_timeout_seconds)
+
     def _run_bandwidth_stage(
         self,
         mode: Literal["tcp", "udp"],
@@ -814,6 +870,7 @@ class BenchmarkRunner:
         """
         stage_label = f"bw-{mode}"
         abort = threading.Event()
+        start_at_epoch, wait_timeout_seconds = self._stage_barrier()
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=len(self._clients),
         ) as executor:
@@ -825,6 +882,8 @@ class BenchmarkRunner:
                     mode,
                     iteration,
                     abort,
+                    start_at_epoch=start_at_epoch,
+                    wait_timeout_seconds=wait_timeout_seconds,
                 ): client
                 for client in self._clients
             }
@@ -884,6 +943,7 @@ class BenchmarkRunner:
         """
         stage_label = f"fortio-{workload}"
         abort = threading.Event()
+        start_at_epoch, wait_timeout_seconds = self._stage_barrier()
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=len(self._clients),
         ) as executor:
@@ -894,6 +954,8 @@ class BenchmarkRunner:
                     iteration,
                     workload,
                     abort,
+                    start_at_epoch=start_at_epoch,
+                    wait_timeout_seconds=wait_timeout_seconds,
                 ): client
                 for client in self._clients
             }

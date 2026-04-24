@@ -285,7 +285,10 @@ def _check_compatibility(  # noqa: C901, PLR0912
         changed.append("objectives")
     if meta.param_space.model_dump() != exp.effective_param_space().model_dump():
         changed.append("param_space")
-    if meta.benchmark.model_dump() != exp.benchmark.model_dump():
+    benchmark_exclude = {"sync_window_seconds"}
+    if meta.benchmark.model_dump(exclude=benchmark_exclude) != exp.benchmark.model_dump(
+        exclude=benchmark_exclude,
+    ):
         changed.append("benchmark")
     if exp.optimize is not None and meta.n_sobol is not None:
         if meta.n_sobol != exp.optimize.n_sobol:

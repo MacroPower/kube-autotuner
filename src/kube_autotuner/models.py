@@ -146,13 +146,26 @@ class NodePair(BaseModel):
 
 
 class BenchmarkConfig(BaseModel):
-    """Configuration for a single benchmark session."""
+    """Configuration for a single benchmark session.
+
+    ``sync_window_seconds`` controls the wall-clock start-time barrier
+    that aligns multi-client stages. The orchestrator picks a shared
+    target epoch per stage and every client ``sleep``s until it before
+    exec'ing the benchmark tool, which keeps the measurement windows
+    overlapping on multi-source runs. The barrier is best-effort: a pod
+    that takes longer than the window to reach its prologue starts late
+    rather than being held back, and a single-client stage skips the
+    barrier entirely. It assumes the cluster nodes are NTP-synced; with
+    default chrony/ntp the residual skew is tens of milliseconds.
+    Setting this to ``0`` disables the barrier.
+    """
 
     duration: int = 30
     omit: int = 5
     iterations: int = 3
     parallel: int = 16
     window: str | None = None
+    sync_window_seconds: int = Field(default=15, ge=0, le=120)
 
 
 class BenchmarkResult(BaseModel):
