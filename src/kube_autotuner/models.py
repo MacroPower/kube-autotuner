@@ -162,6 +162,19 @@ STAGE_METRICS: dict[StageName, frozenset[str]] = {
 """Metrics produced by each benchmark sub-stage."""
 
 
+def metrics_for_stages(stages: frozenset[StageName]) -> frozenset[str]:
+    """Return the metric names produced by the given sub-stages.
+
+    Args:
+        stages: Benchmark sub-stages whose metrics should be unioned.
+
+    Returns:
+        The union of every metric name in :data:`STAGE_METRICS` for
+        the supplied stages. An empty input yields an empty set.
+    """
+    return frozenset().union(*(STAGE_METRICS[s] for s in stages))
+
+
 class BenchmarkConfig(BaseModel):
     """Configuration for a single benchmark session.
 

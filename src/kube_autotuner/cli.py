@@ -30,7 +30,7 @@ import typer
 from kube_autotuner import __version__, runs
 from kube_autotuner.experiment import ExperimentConfig, ExperimentConfigError
 from kube_autotuner.k8s.client import K8sClient
-from kube_autotuner.models import TrialLog
+from kube_autotuner.models import ALL_STAGES, TrialLog, metrics_for_stages
 from kube_autotuner.progress import make_observer
 from kube_autotuner.report import format_retransmit_rate
 from kube_autotuner.sysctl.setter import (
@@ -41,6 +41,7 @@ from kube_autotuner.units import format_duration
 
 if TYPE_CHECKING:
     from kube_autotuner.experiment import ObjectivesSection
+    from kube_autotuner.models import StageName
     from kube_autotuner.progress import ProgressObserver
     from kube_autotuner.sysctl.backend import SysctlBackend
     from kube_autotuner.sysctl.setter import BackendName
@@ -69,7 +70,7 @@ class AppState:
     def make_observer(
         self,
         objectives: ObjectivesSection | None = None,
-        stages_per_iteration: int | None = None,
+        stages: frozenset[StageName] | None = None,
     ) -> ProgressObserver:
         """Build a progress observer honoring the current CLI flags.
 
@@ -82,13 +83,13 @@ class AppState:
                 ``None`` keeps the legacy throughput-descending
                 fallback, which is used by flows that never call
                 ``on_trial_complete`` (``baseline`` / ``trial``).
-            stages_per_iteration: Number of enabled benchmark
-                sub-stages per iteration, forwarded so the Stage
-                bar sizes to ``100%`` at the end of the last
-                enabled stage. ``None`` keeps the default four
-                stages; callers pass
-                ``len(exp.benchmark.stages)`` when they have an
-                :class:`ExperimentConfig` on hand.
+            stages: Enabled benchmark sub-stages, forwarded so the
+                Stage bar sizes to ``100%`` at the end of the last
+                enabled stage and the ``Best so far`` table hides
+                columns whose metrics are produced only by disabled
+                stages. ``None`` (the default) falls back to the
+                full stage set; callers pass ``exp.benchmark.stages``
+                when they have an :class:`ExperimentConfig` on hand.
 
         Returns:
             A :class:`~kube_autotuner.progress.RichProgressObserver`
@@ -100,8 +101,8 @@ class AppState:
             "console": self.console,
             "objectives": objectives,
         }
-        if stages_per_iteration is not None:
-            kwargs["stages_per_iteration"] = stages_per_iteration
+        if stages is not None:
+            kwargs["stages"] = stages
         return make_observer(**kwargs)
 
 
@@ -484,7 +485,7 @@ def baseline(
     )
     observer = _app_state(ctx).make_observer(
         objectives=exp.objectives,
-        stages_per_iteration=len(exp.benchmark.stages),
+        stages=exp.benchmark.stages,
     )
     run_ctx = _build_context(
         exp,
@@ -582,7 +583,7 @@ def trial(
     )
     observer = _app_state(ctx).make_observer(
         objectives=exp.objectives,
-        stages_per_iteration=len(exp.benchmark.stages),
+        stages=exp.benchmark.stages,
     )
     run_ctx = _build_context(
         exp,
@@ -713,7 +714,7 @@ def optimize(
     )
     observer = _app_state(ctx).make_observer(
         objectives=exp.objectives,
-        stages_per_iteration=len(exp.benchmark.stages),
+        stages=exp.benchmark.stages,
     )
     run_ctx = _build_context(
         exp,
@@ -800,7 +801,7 @@ def run(
     )
     observer = _app_state(ctx).make_observer(
         objectives=exp.objectives,
-        stages_per_iteration=len(exp.benchmark.stages),
+        stages=exp.benchmark.stages,
     )
     run_ctx = runs.RunContext(
         exp=exp,
@@ -966,6 +967,7 @@ def analyze(
 
     meta = TrialLog.load_resume_metadata(input_file)
     objectives = meta.objectives if meta is not None else ObjectivesSection()
+    stages = meta.benchmark.stages if meta is not None else ALL_STAGES
 
     if hardware_class is not None:
         classes = [hardware_class]
@@ -1000,6 +1002,7 @@ def analyze(
                 analysis=analysis,
                 explicit_class=hardware_class is not None,
                 objectives=objectives,
+                stages=stages,
             )
             if section is not None:
                 sections.append(section)
@@ -1061,6 +1064,7 @@ def _analyze_one_class(
     analysis: Any,  # noqa: ANN401
     explicit_class: bool,
     objectives: ObjectivesSection,
+    stages: frozenset[StageName],
 ) -> dict[str, Any] | None:
     """Produce analysis output for a single hardware class.
 
@@ -1081,6 +1085,10 @@ def _analyze_one_class(
             log and skip.
         objectives: Effective Pareto objectives and recommendation
             weights for this run.
+        stages: Enabled benchmark sub-stages for this run. Forwarded
+            to :func:`_build_axis_payload` so the parallel-coordinates
+            chart drops axes whose metrics are only produced by
+            disabled stages.
 
     Returns:
         A section dict describing the analysis, or ``None`` when the
@@ -1155,6 +1163,7 @@ def _analyze_one_class(
         weights=objectives.recommendation_weights,
         memory_cost_weight=objectives.memory_cost_weight,
     )
+    _null_disabled_stage_metrics(pareto_rows, stages)
     recs: list[dict[str, Any]] = [
         {
             "rank": i + 1,
@@ -1167,7 +1176,7 @@ def _analyze_one_class(
     hw_dir = output_dir / hardware_class
     hw_dir.mkdir(parents=True, exist_ok=True)
 
-    all_rows, axis_columns = _build_axis_payload(df, pareto_mask)
+    all_rows, axis_columns = _build_axis_payload(df, pareto_mask, stages=stages)
 
     (hw_dir / "recommendations.json").write_text(
         json.dumps(recs, indent=2) + "\n",
@@ -1206,6 +1215,35 @@ def _analyze_one_class(
     }
 
 
+def _null_disabled_stage_metrics(
+    rows: list[dict[str, Any]],
+    stages: frozenset[StageName],
+) -> None:
+    """Replace disabled-stage metric values with ``None`` in-place.
+
+    The :class:`~kube_autotuner.models.TrialResult` accessors return
+    ``0.0`` rather than ``NaN`` when a stage did not run, so a downstream
+    ``!== null`` filter in the browser keeps disabled-stage columns
+    visible on value. Nullifying them here makes
+    ``recommendations.json`` and the ranked table match the stage-aware
+    axis chart.
+
+    Args:
+        rows: Recommendation rows produced by
+            :func:`kube_autotuner.analysis.pareto_recommendation_rows`.
+            Mutated in-place.
+        stages: Enabled benchmark sub-stages.
+    """
+    from kube_autotuner.scoring import METRIC_TO_DF_COLUMN  # noqa: PLC0415
+
+    relevant = {METRIC_TO_DF_COLUMN[m] for m in metrics_for_stages(stages)}
+    disabled = [c for c in METRIC_TO_DF_COLUMN.values() if c not in relevant]
+    for row in rows:
+        for col in disabled:
+            if col in row:
+                row[col] = None
+
+
 _AXIS_METRIC_COLUMNS: tuple[str, ...] = (
     "mean_tcp_throughput",
     "mean_udp_throughput",
@@ -1222,6 +1260,8 @@ _AXIS_METRIC_COLUMNS: tuple[str, ...] = (
 def _build_axis_payload(
     df: Any,  # noqa: ANN401
     pareto_mask: Any,  # noqa: ANN401
+    *,
+    stages: frozenset[StageName],
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """Return JSON-safe per-trial rows plus the chart's axis columns.
 
@@ -1237,19 +1277,29 @@ def _build_axis_payload(
             :func:`kube_autotuner.analysis.trials_to_dataframe`.
         pareto_mask: Boolean Series aligned with ``df``; ``True``
             marks Pareto-optimal rows.
+        stages: Enabled benchmark sub-stages. Metric columns whose
+            raw metric is not produced by one of these stages are
+            excluded from the payload, matching the objective
+            pruning applied at config-load time.
 
     Returns:
         ``(all_rows, axis_columns)`` where ``all_rows`` has one dict
         per df row with ``trial_id`` (str), ``pareto`` (bool), and
         every axis column, and ``axis_columns`` lists those metric
-        columns that have at least one non-null value in ``df``.
+        columns produced by an enabled stage that also carry at
+        least one non-null value in ``df``.
     """
     import math  # noqa: PLC0415
 
     import pandas as pd  # noqa: PLC0415
 
+    from kube_autotuner.scoring import METRIC_TO_DF_COLUMN  # noqa: PLC0415
+
+    relevant_df_cols = {METRIC_TO_DF_COLUMN[m] for m in metrics_for_stages(stages)}
     axis_columns = [
-        c for c in _AXIS_METRIC_COLUMNS if c in df.columns and df[c].notna().any()
+        c
+        for c in _AXIS_METRIC_COLUMNS
+        if c in df.columns and c in relevant_df_cols and df[c].notna().any()
     ]
     rows: list[dict[str, Any]] = []
     records = df.to_dict(orient="records")

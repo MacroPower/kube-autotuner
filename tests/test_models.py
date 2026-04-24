@@ -11,6 +11,8 @@ import pytest
 
 from kube_autotuner.experiment import ObjectivesSection, ParetoObjective
 from kube_autotuner.models import (
+    ALL_STAGES,
+    STAGE_METRICS,
     BenchmarkConfig,
     BenchmarkResult,
     IterationResults,
@@ -23,6 +25,7 @@ from kube_autotuner.models import (
     TrialLog,
     TrialResult,
     compute_sysctl_hash,
+    metrics_for_stages,
 )
 
 if TYPE_CHECKING:
@@ -136,6 +139,21 @@ def test_benchmark_config_rejects_empty_stages():
 def test_benchmark_config_rejects_unknown_stage():
     with pytest.raises(ValidationError):
         BenchmarkConfig.model_validate({"stages": ["bw-sctp"]})
+
+
+def test_metrics_for_stages_unions_stage_entries():
+    assert metrics_for_stages(ALL_STAGES) == frozenset().union(*STAGE_METRICS.values())
+    assert metrics_for_stages(frozenset({"bw-tcp"})) == frozenset(
+        {"tcp_throughput", "tcp_retransmit_rate"},
+    )
+    assert metrics_for_stages(frozenset({"bw-tcp", "fortio-fixed"})) == frozenset({
+        "tcp_throughput",
+        "tcp_retransmit_rate",
+        "latency_p50",
+        "latency_p90",
+        "latency_p99",
+    })
+    assert metrics_for_stages(frozenset()) == frozenset()
 
 
 def test_benchmark_config_silently_drops_legacy_modes_key():

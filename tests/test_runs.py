@@ -38,6 +38,8 @@ from kube_autotuner.sysctl.params import PARAM_SPACE
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from kube_autotuner.models import StageName
+
 
 def _results() -> IterationResults:
     return IterationResults(
@@ -575,6 +577,80 @@ def test_run_trial_writes_resume_meta_without_n_sobol(tmp_path: Path):
     loaded = TrialLog.load_resume_metadata(out)
     assert loaded is not None
     assert loaded.n_sobol is None
+
+
+class TestLogVerificationSummary:
+    """Column visibility in the verification summary respects enabled stages."""
+
+    @staticmethod
+    def _pair() -> list[TrialResult]:
+        """Return a primary + verification pair driving the headline metrics."""
+        node_pair = NodePair(source="a", target="b", hardware_class="10g")
+        config = BenchmarkConfig(duration=1, iterations=1)
+        iter_results = _results()
+        primary = TrialResult(
+            node_pair=node_pair,
+            sysctl_values={"net.core.rmem_max": "1048576"},
+            config=config,
+            phase="bayesian",
+            results=iter_results.bench,
+            latency_results=iter_results.latency,
+        )
+        primary.trial_id = "primary-1"
+        verif = TrialResult(
+            node_pair=node_pair,
+            sysctl_values={"net.core.rmem_max": "1048576"},
+            config=config,
+            phase="verification",
+            parent_trial_id="primary-1",
+            results=iter_results.bench,
+            latency_results=iter_results.latency,
+        )
+        return [primary, verif]
+
+    @staticmethod
+    def _render_summary(stages: frozenset[StageName]) -> str:
+        """Call ``_log_verification_summary`` under a wide console and capture output.
+
+        The function constructs its own ``rich.console.Console()``; in
+        a non-tty stdout capture that console picks a default width
+        that wraps long headers like ``tcp_throughput``. Patching in a
+        wide non-wrapping console keeps the assertions readable.
+
+        Returns:
+            The captured console text.
+        """
+        import io  # noqa: PLC0415
+
+        from rich.console import Console as RichConsole  # noqa: PLC0415
+
+        from kube_autotuner.experiment import ObjectivesSection  # noqa: PLC0415
+
+        buffer = io.StringIO()
+        wide = RichConsole(file=buffer, width=200, color_system=None)
+        with patch("kube_autotuner.runs.Console", return_value=wide):
+            runs._log_verification_summary(
+                TestLogVerificationSummary._pair(),
+                ObjectivesSection(),
+                stages,
+            )
+        return buffer.getvalue()
+
+    def test_hides_disabled_stage_columns(self) -> None:
+        """bw-tcp-only run drops the p99 column; tcp_throughput stays."""
+        out = self._render_summary(frozenset({"bw-tcp"}))
+        assert "tcp_throughput" in out
+        assert "tcp_retx_rate" in out
+        assert "p99" not in out
+
+    def test_shows_all_headline_columns_with_every_stage(self) -> None:
+        """Default stage set keeps every headline column visible."""
+        from kube_autotuner.models import ALL_STAGES  # noqa: PLC0415
+
+        out = self._render_summary(ALL_STAGES)
+        assert "tcp_throughput" in out
+        assert "tcp_retx_rate" in out
+        assert "p99" in out
 
 
 class TestFormatMeanSem:

@@ -688,10 +688,13 @@ def test_rich_observer_stage_bar_created_on_benchmark_start() -> None:
         assert task.description == "Stage"
 
 
-def test_rich_observer_stage_bar_honors_custom_stages_per_iteration() -> None:
-    """Custom ``stages_per_iteration`` sizes and clamps the Stage bar."""
+def test_rich_observer_stage_bar_honors_custom_stages() -> None:
+    """Custom ``stages`` sizes and clamps the Stage bar."""
     console = _capture_console()
-    observer = RichProgressObserver(console, stages_per_iteration=2)
+    observer = RichProgressObserver(
+        console,
+        stages=frozenset({"bw-tcp", "fortio-sat"}),
+    )
     with observer:
         observer.on_benchmark_start(1)
         task = _task_for(observer, observer._stage_task_id)
@@ -1056,6 +1059,48 @@ def test_top5_fallback_sorts_by_throughput_when_objectives_none() -> None:
     output = cast("io.StringIO", console.file).getvalue()
     assert "by tcp_throughput" in output
     assert "by weighted score" not in output
+
+
+def test_best_so_far_hides_disabled_stage_columns() -> None:
+    """Columns whose metric is only produced by a disabled stage vanish.
+
+    A bw-tcp-only run renders `Throughput` and `retx/MB`, but must
+    drop `jitter`, `RPS`, and `p99` -- those come from bw-udp,
+    fortio-sat, and fortio-fixed respectively.
+    """
+    console = _capture_console()
+    observer = RichProgressObserver(console, stages=frozenset({"bw-tcp"}))
+    with observer:
+        observer.on_trial_start(0, 1, "bayesian", {})
+        observer.on_trial_complete(
+            0,
+            _stub_trial("bayesian"),
+            {
+                "tcp_throughput": (1.5e9, 0.0),
+                "tcp_retransmit_rate": (1e-8, 0.0),
+                "udp_jitter": (math.nan, math.nan),
+                "rps": (math.nan, math.nan),
+                "latency_p99": (math.nan, math.nan),
+            },
+        )
+    output = cast("io.StringIO", console.file).getvalue()
+    assert "Throughput" in output
+    assert "retx/MB" in output
+    assert "jitter" not in output
+    assert " RPS " not in output
+    assert "p99" not in output
+
+
+def test_best_so_far_shows_all_columns_by_default() -> None:
+    """Bare construction (stages=None) keeps every column visible."""
+    console = _capture_console()
+    observer = RichProgressObserver(console, objectives=ObjectivesSection())
+    with observer:
+        observer.on_trial_start(0, 1, "bayesian", {})
+        _score_row_complete(observer, index=0, throughput=1.0e9)
+    output = cast("io.StringIO", console.file).getvalue()
+    for header in ("Throughput", "retx/MB", "jitter", "RPS", "p99"):
+        assert header in output
 
 
 # --- _TtyEchoSuppressor coverage -------------------------------------------

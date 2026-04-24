@@ -44,6 +44,7 @@ from rich.progress import (
 from rich.table import Column, Table
 from rich.text import Text
 
+from kube_autotuner.models import ALL_STAGES, metrics_for_stages
 from kube_autotuner.scoring import (
     METRIC_TO_DF_COLUMN,
     config_memory_cost,
@@ -68,14 +69,14 @@ if TYPE_CHECKING:
     from rich.progress import Task, TaskID
 
     from kube_autotuner.experiment import ObjectivesSection
-    from kube_autotuner.models import TrialResult
+    from kube_autotuner.models import StageName, TrialResult
 
 
 _TOP_N = 5
-# Default stage count: bw-tcp, bw-udp, fortio-sat, fortio-fixed; see
-# benchmark/runner.py. Callers that adopt ``BenchmarkConfig.stages``
-# override this via ``make_observer(stages_per_iteration=...)``.
-_STAGES_PER_ITERATION = 4
+# Default stage count tracks :data:`~kube_autotuner.models.ALL_STAGES`.
+# Callers that adopt ``BenchmarkConfig.stages`` override this via
+# ``make_observer(stages=...)``.
+_STAGES_PER_ITERATION = len(ALL_STAGES)
 
 
 class ProgressObserver(Protocol):
@@ -619,7 +620,7 @@ class RichProgressObserver:
         self,
         console: Console,
         objectives: ObjectivesSection | None = None,
-        stages_per_iteration: int = _STAGES_PER_ITERATION,
+        stages: frozenset[StageName] | None = None,
     ) -> None:
         """Bind the observer to a shared ``rich`` console.
 
@@ -638,17 +639,23 @@ class RichProgressObserver:
                 When ``None`` (bare construction, e.g. unit tests or
                 non-optimize flows), the panel falls back to a
                 throughput-descending sort.
-            stages_per_iteration: Number of benchmark sub-stages the
-                runner will execute each iteration. Sizes the Stage
-                bar so it always reaches ``100%`` when the full
-                configured stage set completes. Defaults to the
-                historical four-stage cadence so callers that have
-                not adopted :attr:`BenchmarkConfig.stages` keep the
-                same UI.
+            stages: Benchmark sub-stages the runner will execute
+                each iteration. Sizes the Stage bar so it always
+                reaches ``100%`` when the full configured stage set
+                completes, and filters the ``Best so far`` table so
+                columns whose metrics are produced only by disabled
+                stages are hidden. Defaults to
+                :data:`~kube_autotuner.models.ALL_STAGES` so callers
+                that have not adopted :attr:`BenchmarkConfig.stages`
+                keep the same UI.
         """
         self._console = console
         self._objectives = objectives
-        self._stages_per_iteration = stages_per_iteration
+        self._stages: frozenset[StageName] = (
+            stages if stages is not None else ALL_STAGES
+        )
+        self._stages_per_iteration = len(self._stages)
+        self._stage_metrics: frozenset[str] = metrics_for_stages(self._stages)
         self._iter_start: float | None = None
         self._iter_count: int = 0
         self._iter_total_seconds: float = 0.0
@@ -794,41 +801,64 @@ class RichProgressObserver:
             header_style="bold",
             expand=True,
         )
-        jitter_scale, jitter_suffix = pick_duration_unit_for_series(
-            r.jitter_seconds for r in self._top
-        )
-        p99_scale, p99_suffix = pick_duration_unit_for_series(
-            r.p99_seconds for r in self._top
-        )
-        table.add_column("#", justify="right", no_wrap=True)
-        table.add_column("Phase", no_wrap=True)
-        table.add_column("Throughput", justify="right")
-        table.add_column("retx/MB", justify="right")
-        table.add_column(f"jitter {jitter_suffix}", justify="right")
-        table.add_column("RPS", justify="right")
-        table.add_column(f"p99 {p99_suffix}", justify="right")
+        relevant = self._stage_metrics
+        # ``metric=None`` marks identity columns that are always shown.
+        # Duration-unit picking is gated on the owning stage so we
+        # don't run pick_duration_unit_for_series over an all-NaN series.
+        specs: list[tuple[str | None, str, Callable[[_TrialRow], str]]] = [
+            (None, "#", lambda r: str(r.index + 1)),
+            (None, "Phase", lambda r: r.phase),
+            (
+                "tcp_throughput",
+                "Throughput",
+                lambda r: f"{r.throughput_mbps:,.1f} Mbps",
+            ),
+            (
+                "tcp_retransmit_rate",
+                "retx/MB",
+                lambda r: (
+                    "n/a" if math.isnan(r.retx_per_mb) else f"{r.retx_per_mb:.2f}"
+                ),
+            ),
+        ]
+        if "udp_jitter" in relevant:
+            jitter_scale, jitter_suffix = pick_duration_unit_for_series(
+                r.jitter_seconds for r in self._top
+            )
+            specs.append((
+                "udp_jitter",
+                f"jitter {jitter_suffix}",
+                lambda r: (
+                    "n/a"
+                    if math.isnan(r.jitter_seconds)
+                    else format_coefficient(r.jitter_seconds / jitter_scale)
+                ),
+            ))
+        specs.append((
+            "rps",
+            "RPS",
+            lambda r: "n/a" if math.isnan(r.rps) else f"{r.rps:,.1f}",
+        ))
+        if "latency_p99" in relevant:
+            p99_scale, p99_suffix = pick_duration_unit_for_series(
+                r.p99_seconds for r in self._top
+            )
+            specs.append((
+                "latency_p99",
+                f"p99 {p99_suffix}",
+                lambda r: (
+                    "n/a"
+                    if math.isnan(r.p99_seconds)
+                    else format_coefficient(r.p99_seconds / p99_scale)
+                ),
+            ))
+        active = [s for s in specs if s[0] is None or s[0] in relevant]
+        for metric, header, _cell in active:
+            justify = "right" if metric is not None or header == "#" else "left"
+            no_wrap = header in {"#", "Phase"}
+            table.add_column(header, justify=justify, no_wrap=no_wrap)
         for row in self._top:
-            retx = "n/a" if math.isnan(row.retx_per_mb) else f"{row.retx_per_mb:.2f}"
-            jitter = (
-                "n/a"
-                if math.isnan(row.jitter_seconds)
-                else format_coefficient(row.jitter_seconds / jitter_scale)
-            )
-            rps = "n/a" if math.isnan(row.rps) else f"{row.rps:,.1f}"
-            p99 = (
-                "n/a"
-                if math.isnan(row.p99_seconds)
-                else format_coefficient(row.p99_seconds / p99_scale)
-            )
-            table.add_row(
-                str(row.index + 1),
-                row.phase,
-                f"{row.throughput_mbps:,.1f} Mbps",
-                retx,
-                jitter,
-                rps,
-                p99,
-            )
+            table.add_row(*(cell(row) for _metric, _header, cell in active))
         return Group(self._progress, table)
 
     def _refresh(self) -> None:
@@ -1327,7 +1357,7 @@ def make_observer(
     enabled: bool,
     console: Console,
     objectives: ObjectivesSection | None = None,
-    stages_per_iteration: int = _STAGES_PER_ITERATION,
+    stages: frozenset[StageName] | None = None,
 ) -> ProgressObserver:
     """Pick the right observer for the current run.
 
@@ -1341,10 +1371,12 @@ def make_observer(
             :class:`RichProgressObserver` so the live ``Best so far``
             panel ranks by weighted score. ``None`` (the default)
             keeps the throughput-descending fallback.
-        stages_per_iteration: Number of enabled benchmark sub-stages
-            per iteration. Sizes the Stage bar so disabled stages
-            do not leave it stranded short of ``100%``. Defaults to
-            the historical four-stage cadence.
+        stages: Enabled benchmark sub-stages. Sizes the Stage bar so
+            disabled stages do not leave it stranded short of
+            ``100%`` and hides ``Best so far`` columns whose metrics
+            are produced only by disabled stages. ``None`` (the
+            default) falls back to
+            :data:`~kube_autotuner.models.ALL_STAGES`.
 
     Returns:
         A :class:`RichProgressObserver` when ``enabled`` is true,
@@ -1354,6 +1386,6 @@ def make_observer(
         return RichProgressObserver(
             console,
             objectives=objectives,
-            stages_per_iteration=stages_per_iteration,
+            stages=stages,
         )
     return NullObserver()

@@ -27,6 +27,7 @@ from kube_autotuner.analysis import (  # noqa: E402
 from kube_autotuner.cli import _build_axis_payload, app  # noqa: E402, PLC2701
 from kube_autotuner.experiment import ObjectivesSection, ParetoObjective  # noqa: E402
 from kube_autotuner.models import (  # noqa: E402
+    ALL_STAGES,
     BenchmarkConfig,
     BenchmarkResult,
     HostStateSnapshot,
@@ -627,7 +628,7 @@ class TestBuildAxisPayload:
         )
         pareto_mask = pd.Series([True, False, True])
 
-        rows, axis_columns = _build_axis_payload(df, pareto_mask)
+        rows, axis_columns = _build_axis_payload(df, pareto_mask, stages=ALL_STAGES)
 
         assert axis_columns == [
             "mean_tcp_throughput",
@@ -666,10 +667,39 @@ class TestBuildAxisPayload:
                 },
             ],
         )
-        rows, axis_columns = _build_axis_payload(df, pd.Series([True]))
+        rows, axis_columns = _build_axis_payload(
+            df,
+            pd.Series([True]),
+            stages=ALL_STAGES,
+        )
 
         assert axis_columns == ["mean_tcp_throughput"]
         assert "udp_loss_rate" not in rows[0]
+
+    def test_filters_by_stages(self) -> None:
+        """Metric columns from disabled stages drop out of axis_columns."""
+        df = pd.DataFrame(
+            [
+                {
+                    "trial_id": "t1",
+                    "mean_tcp_throughput": 1.0e10,
+                    "tcp_retransmit_rate": 1e-6,
+                    "mean_udp_jitter": 1e-4,
+                    "udp_loss_rate": 1e-3,
+                    "mean_udp_throughput": 5e9,
+                    "mean_rps": 1000.0,
+                    "mean_latency_p50": 1.0,
+                    "mean_latency_p90": 2.0,
+                    "mean_latency_p99": 4.0,
+                },
+            ],
+        )
+        _, axis_columns = _build_axis_payload(
+            df,
+            pd.Series([True]),
+            stages=frozenset({"bw-tcp"}),
+        )
+        assert axis_columns == ["mean_tcp_throughput", "tcp_retransmit_rate"]
 
     def test_json_dumps_allow_nan_false_roundtrips(self) -> None:
         df = pd.DataFrame(
@@ -681,7 +711,7 @@ class TestBuildAxisPayload:
                 },
             ],
         )
-        rows, _ = _build_axis_payload(df, pd.Series([True]))
+        rows, _ = _build_axis_payload(df, pd.Series([True]), stages=ALL_STAGES)
 
         # The whole point of the scrubbing: json.dumps with allow_nan=False
         # must not raise ValueError on the output.

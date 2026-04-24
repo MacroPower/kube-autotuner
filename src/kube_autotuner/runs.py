@@ -61,7 +61,13 @@ import typer
 
 from kube_autotuner.benchmark.runner import BenchmarkRunner
 from kube_autotuner.k8s.lease import NodeLease
-from kube_autotuner.models import ResumeMetadata, TrialLog, TrialResult, is_primary
+from kube_autotuner.models import (
+    ResumeMetadata,
+    TrialLog,
+    TrialResult,
+    is_primary,
+    metrics_for_stages,
+)
 from kube_autotuner.progress import NullObserver
 from kube_autotuner.report import format_retransmit_rate
 from kube_autotuner.scoring import (
@@ -83,7 +89,7 @@ if TYPE_CHECKING:
 
     from kube_autotuner.experiment import ExperimentConfig, ObjectivesSection
     from kube_autotuner.k8s.client import K8sClient
-    from kube_autotuner.models import NodePair
+    from kube_autotuner.models import NodePair, StageName
     from kube_autotuner.progress import ProgressObserver
     from kube_autotuner.sysctl.backend import SysctlBackend
 
@@ -706,7 +712,11 @@ def run_optimize(  # noqa: PLR0914, PLR0915
             repeats=exp.optimize.verification_trials,
             already_done_by_parent=resume.verification_done_by_parent,
         )
-        _log_verification_summary(loop._completed, exp.objectives)  # noqa: SLF001
+        _log_verification_summary(
+            loop._completed,  # noqa: SLF001
+            exp.objectives,
+            exp.benchmark.stages,
+        )
 
     try:
         pareto = loop.pareto_front()
@@ -740,9 +750,10 @@ def run_optimize(  # noqa: PLR0914, PLR0915
         )
 
 
-def _log_verification_summary(  # noqa: PLR0914 - unit picking adds three locals
+def _log_verification_summary(  # noqa: PLR0914, PLR0915 - per-stage column gates inflate statement count
     all_trials: list[TrialResult],
     objectives: ObjectivesSection,
+    stages: frozenset[StageName],
 ) -> None:
     """Print a Rich table comparing primary vs combined scores.
 
@@ -765,11 +776,16 @@ def _log_verification_summary(  # noqa: PLR0914 - unit picking adds three locals
         objectives: The experiment's objective configuration; drives
             the weighted score used for the "primary score" /
             "combined score" comparison.
+        stages: Enabled benchmark sub-stages. Headline metric columns
+            whose stage is disabled are hidden from the rendered
+            table, matching the objective pruning applied at
+            config-load time.
     """
     verification_parents = {t.parent_trial_id for t in all_trials if t.parent_trial_id}
     if not verification_parents:
         return
 
+    relevant = metrics_for_stages(stages)
     primary_only = [t for t in all_trials if is_primary(t)]
     combined_rows = aggregate_verification(all_trials)
     primary_rows = aggregate_verification(primary_only)
@@ -815,9 +831,17 @@ def _log_verification_summary(  # noqa: PLR0914 - unit picking adds three locals
     )
 
     p99_col = METRIC_TO_DF_COLUMN["latency_p99"]
-    p99_scale, p99_suffix = pick_duration_unit_for_series(
-        _iter_rendered_means(combined_rows, ordered, verification_parents, p99_col),
-    )
+    p99_scale: float | None = None
+    p99_suffix: str | None = None
+    if "latency_p99" in relevant:
+        p99_scale, p99_suffix = pick_duration_unit_for_series(
+            _iter_rendered_means(
+                combined_rows,
+                ordered,
+                verification_parents,
+                p99_col,
+            ),
+        )
 
     table = Table(
         title="Verification summary",
@@ -831,9 +855,12 @@ def _log_verification_summary(  # noqa: PLR0914 - unit picking adds three locals
     table.add_column("primary", justify="right")
     table.add_column("combined", justify="right")
     table.add_column("Δ", justify="right")
-    table.add_column("tcp_throughput", justify="right")
-    table.add_column("tcp_retx_rate", justify="right")
-    table.add_column(f"p99 {p99_suffix}", justify="right")
+    if "tcp_throughput" in relevant:
+        table.add_column("tcp_throughput", justify="right")
+    if "tcp_retransmit_rate" in relevant:
+        table.add_column("tcp_retx_rate", justify="right")
+    if "latency_p99" in relevant:
+        table.add_column(f"p99 {p99_suffix}", justify="right")
 
     rank = 0
     for i in ordered:
@@ -845,20 +872,32 @@ def _log_verification_summary(  # noqa: PLR0914 - unit picking adds three locals
         primary = primary_score_by_id.get(trial_id, float("nan"))
         combined = combined_scores[i]
         delta = combined - primary if not math.isnan(primary) else float("nan")
-        table.add_row(
+        cells: list[str] = [
             str(rank),
             trial_id,
             "n/a" if math.isnan(primary) else f"{primary:.4f}",
             f"{combined:.4f}",
             "n/a" if math.isnan(delta) else f"{delta:+.4f}",
-            _format_mean_sem(row, METRIC_TO_DF_COLUMN["tcp_throughput"], scale=1e-6),
-            _format_mean_sem(
-                row,
-                METRIC_TO_DF_COLUMN["tcp_retransmit_rate"],
-                scale=1e6,
-            ),
-            _format_mean_sem(row, p99_col, scale=1.0 / p99_scale),
-        )
+        ]
+        if "tcp_throughput" in relevant:
+            cells.append(
+                _format_mean_sem(
+                    row,
+                    METRIC_TO_DF_COLUMN["tcp_throughput"],
+                    scale=1e-6,
+                ),
+            )
+        if "tcp_retransmit_rate" in relevant:
+            cells.append(
+                _format_mean_sem(
+                    row,
+                    METRIC_TO_DF_COLUMN["tcp_retransmit_rate"],
+                    scale=1e6,
+                ),
+            )
+        if "latency_p99" in relevant and p99_scale is not None:
+            cells.append(_format_mean_sem(row, p99_col, scale=1.0 / p99_scale))
+        table.add_row(*cells)
 
     Console().print(table)
 

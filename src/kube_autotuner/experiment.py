@@ -32,11 +32,11 @@ from pydantic.alias_generators import to_camel
 import yaml
 
 from kube_autotuner.models import (
-    STAGE_METRICS,
     BenchmarkConfig,
     NodePair,
     ParamSpace,
     SysctlParam,
+    metrics_for_stages,
 )
 from kube_autotuner.subproc import run_tool
 from kube_autotuner.sysctl.params import PARAM_SPACE
@@ -639,9 +639,7 @@ class ExperimentConfig(BaseModel):
         Raises:
             ValueError: Pruning leaves ``objectives.pareto`` empty.
         """
-        supported: set[str] = set().union(
-            *(STAGE_METRICS[s] for s in self.benchmark.stages),
-        )
+        supported = metrics_for_stages(self.benchmark.stages)
         kept_pareto = []
         for obj in self.objectives.pareto:
             if obj.metric in supported:
