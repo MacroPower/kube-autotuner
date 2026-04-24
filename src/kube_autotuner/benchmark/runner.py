@@ -736,10 +736,13 @@ class BenchmarkRunner:
     def run(self) -> IterationResults:  # noqa: PLR0915 - one cohesive iteration driver (flush + 4 sub-stages + observer fan-out)
         """Run every configured benchmark iteration.
 
-        Each iteration expands into four sub-stages executed
+        Each iteration expands into up to four sub-stages executed
         sequentially so fortio never contends with iperf3 for NIC,
         CPU, or CNI state: ``bw-tcp`` -> ``bw-udp`` -> ``fortio-sat``
-        -> ``fortio-fixed``.
+        -> ``fortio-fixed``. Sub-stages absent from
+        :attr:`BenchmarkConfig.stages` are skipped entirely; the
+        observer callbacks and stage logging only fire for enabled
+        stages.
 
         Before every iteration starts, :meth:`_flush_network_state`
         evicts cached TCP metrics and conntrack entries on every
@@ -798,82 +801,86 @@ class BenchmarkRunner:
             sat: list[LatencyResult] = []
             fixed: list[LatencyResult] = []
             try:
-                self.observer.on_stage_start("bw-tcp", i)
-                bw_tcp_t0 = time.monotonic()
-                logger.info(
-                    "Stage %s starting (iteration %d/%d)",
-                    "bw-tcp",
-                    i + 1,
-                    self.config.iterations,
-                )
-                try:
-                    bench_tcp = self._run_bandwidth_stage("tcp", i)
-                finally:
+                if "bw-tcp" in self.config.stages:
+                    self.observer.on_stage_start("bw-tcp", i)
+                    bw_tcp_t0 = time.monotonic()
                     logger.info(
-                        "Stage %s complete (iteration %d/%d, elapsed=%.1fs)",
+                        "Stage %s starting (iteration %d/%d)",
                         "bw-tcp",
                         i + 1,
                         self.config.iterations,
-                        time.monotonic() - bw_tcp_t0,
                     )
-                    self.observer.on_stage_end("bw-tcp", i)
-                self.observer.on_stage_start("bw-udp", i)
-                bw_udp_t0 = time.monotonic()
-                logger.info(
-                    "Stage %s starting (iteration %d/%d)",
-                    "bw-udp",
-                    i + 1,
-                    self.config.iterations,
-                )
-                try:
-                    bench_udp = self._run_bandwidth_stage("udp", i)
-                finally:
+                    try:
+                        bench_tcp = self._run_bandwidth_stage("tcp", i)
+                    finally:
+                        logger.info(
+                            "Stage %s complete (iteration %d/%d, elapsed=%.1fs)",
+                            "bw-tcp",
+                            i + 1,
+                            self.config.iterations,
+                            time.monotonic() - bw_tcp_t0,
+                        )
+                        self.observer.on_stage_end("bw-tcp", i)
+                if "bw-udp" in self.config.stages:
+                    self.observer.on_stage_start("bw-udp", i)
+                    bw_udp_t0 = time.monotonic()
                     logger.info(
-                        "Stage %s complete (iteration %d/%d, elapsed=%.1fs)",
+                        "Stage %s starting (iteration %d/%d)",
                         "bw-udp",
                         i + 1,
                         self.config.iterations,
-                        time.monotonic() - bw_udp_t0,
                     )
-                    self.observer.on_stage_end("bw-udp", i)
-                self.observer.on_stage_start("fortio-sat", i)
-                sat_t0 = time.monotonic()
-                logger.info(
-                    "Stage %s starting (iteration %d/%d)",
-                    "fortio-sat",
-                    i + 1,
-                    self.config.iterations,
-                )
-                try:
-                    sat = self._run_latency_stage(i, workload="saturation")
-                finally:
+                    try:
+                        bench_udp = self._run_bandwidth_stage("udp", i)
+                    finally:
+                        logger.info(
+                            "Stage %s complete (iteration %d/%d, elapsed=%.1fs)",
+                            "bw-udp",
+                            i + 1,
+                            self.config.iterations,
+                            time.monotonic() - bw_udp_t0,
+                        )
+                        self.observer.on_stage_end("bw-udp", i)
+                if "fortio-sat" in self.config.stages:
+                    self.observer.on_stage_start("fortio-sat", i)
+                    sat_t0 = time.monotonic()
                     logger.info(
-                        "Stage %s complete (iteration %d/%d, elapsed=%.1fs)",
+                        "Stage %s starting (iteration %d/%d)",
                         "fortio-sat",
                         i + 1,
                         self.config.iterations,
-                        time.monotonic() - sat_t0,
                     )
-                    self.observer.on_stage_end("fortio-sat", i)
-                self.observer.on_stage_start("fortio-fixed", i)
-                fixed_t0 = time.monotonic()
-                logger.info(
-                    "Stage %s starting (iteration %d/%d)",
-                    "fortio-fixed",
-                    i + 1,
-                    self.config.iterations,
-                )
-                try:
-                    fixed = self._run_latency_stage(i, workload="fixed_qps")
-                finally:
+                    try:
+                        sat = self._run_latency_stage(i, workload="saturation")
+                    finally:
+                        logger.info(
+                            "Stage %s complete (iteration %d/%d, elapsed=%.1fs)",
+                            "fortio-sat",
+                            i + 1,
+                            self.config.iterations,
+                            time.monotonic() - sat_t0,
+                        )
+                        self.observer.on_stage_end("fortio-sat", i)
+                if "fortio-fixed" in self.config.stages:
+                    self.observer.on_stage_start("fortio-fixed", i)
+                    fixed_t0 = time.monotonic()
                     logger.info(
-                        "Stage %s complete (iteration %d/%d, elapsed=%.1fs)",
+                        "Stage %s starting (iteration %d/%d)",
                         "fortio-fixed",
                         i + 1,
                         self.config.iterations,
-                        time.monotonic() - fixed_t0,
                     )
-                    self.observer.on_stage_end("fortio-fixed", i)
+                    try:
+                        fixed = self._run_latency_stage(i, workload="fixed_qps")
+                    finally:
+                        logger.info(
+                            "Stage %s complete (iteration %d/%d, elapsed=%.1fs)",
+                            "fortio-fixed",
+                            i + 1,
+                            self.config.iterations,
+                            time.monotonic() - fixed_t0,
+                        )
+                        self.observer.on_stage_end("fortio-fixed", i)
             finally:
                 self.observer.on_iteration_end(i)
                 self._snapshot_host_state(i, "post-iteration", snapshots)

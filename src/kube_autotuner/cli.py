@@ -69,6 +69,7 @@ class AppState:
     def make_observer(
         self,
         objectives: ObjectivesSection | None = None,
+        stages_per_iteration: int | None = None,
     ) -> ProgressObserver:
         """Build a progress observer honoring the current CLI flags.
 
@@ -81,17 +82,27 @@ class AppState:
                 ``None`` keeps the legacy throughput-descending
                 fallback, which is used by flows that never call
                 ``on_trial_complete`` (``baseline`` / ``trial``).
+            stages_per_iteration: Number of enabled benchmark
+                sub-stages per iteration, forwarded so the Stage
+                bar sizes to ``100%`` at the end of the last
+                enabled stage. ``None`` keeps the default four
+                stages; callers pass
+                ``len(exp.benchmark.stages)`` when they have an
+                :class:`ExperimentConfig` on hand.
 
         Returns:
             A :class:`~kube_autotuner.progress.RichProgressObserver`
             when :attr:`progress_enabled` is ``True``; otherwise a
             :class:`~kube_autotuner.progress.NullObserver`.
         """
-        return make_observer(
-            enabled=self.progress_enabled,
-            console=self.console,
-            objectives=objectives,
-        )
+        kwargs: dict[str, Any] = {
+            "enabled": self.progress_enabled,
+            "console": self.console,
+            "objectives": objectives,
+        }
+        if stages_per_iteration is not None:
+            kwargs["stages_per_iteration"] = stages_per_iteration
+        return make_observer(**kwargs)
 
 
 app = typer.Typer(
@@ -471,7 +482,10 @@ def baseline(
         duration=duration,
         iterations=iterations,
     )
-    observer = _app_state(ctx).make_observer(objectives=exp.objectives)
+    observer = _app_state(ctx).make_observer(
+        objectives=exp.objectives,
+        stages_per_iteration=len(exp.benchmark.stages),
+    )
     run_ctx = _build_context(
         exp,
         backend=backend,
@@ -566,7 +580,10 @@ def trial(
         iterations=iterations,
         sysctls=params,
     )
-    observer = _app_state(ctx).make_observer(objectives=exp.objectives)
+    observer = _app_state(ctx).make_observer(
+        objectives=exp.objectives,
+        stages_per_iteration=len(exp.benchmark.stages),
+    )
     run_ctx = _build_context(
         exp,
         backend=backend,
@@ -694,7 +711,10 @@ def optimize(
             "verification_top_k": verification_top_k,
         },
     )
-    observer = _app_state(ctx).make_observer(objectives=exp.objectives)
+    observer = _app_state(ctx).make_observer(
+        objectives=exp.objectives,
+        stages_per_iteration=len(exp.benchmark.stages),
+    )
     run_ctx = _build_context(
         exp,
         backend=backend,
@@ -778,7 +798,10 @@ def run(
         client=client,
         fake_state_path=fake_state_path,
     )
-    observer = _app_state(ctx).make_observer(objectives=exp.objectives)
+    observer = _app_state(ctx).make_observer(
+        objectives=exp.objectives,
+        stages_per_iteration=len(exp.benchmark.stages),
+    )
     run_ctx = runs.RunContext(
         exp=exp,
         client=client,
@@ -998,12 +1021,19 @@ def _format_top_recommendation(r: dict[str, Any]) -> str:
         A comma-separated summary covering every measured metric:
         metrics whose value is ``None`` are skipped.
     """
-    parts: list[str] = [
-        f"{r['mean_tcp_throughput'] / 1e6:.1f} Mbps TCP",
-        f"{r['mean_udp_throughput'] / 1e6:.1f} Mbps UDP",
-        f"{format_retransmit_rate(r['tcp_retransmit_rate'])} TCP retx/MB",
-        f"{r['udp_loss_rate'] * 100:.2f}% UDP loss",
-    ]
+    parts: list[str] = []
+    tcp_tp = r.get("mean_tcp_throughput")
+    if tcp_tp is not None:
+        parts.append(f"{tcp_tp / 1e6:.1f} Mbps TCP")
+    udp_tp = r.get("mean_udp_throughput")
+    if udp_tp is not None:
+        parts.append(f"{udp_tp / 1e6:.1f} Mbps UDP")
+    retx = r.get("tcp_retransmit_rate")
+    if retx is not None:
+        parts.append(f"{format_retransmit_rate(retx)} TCP retx/MB")
+    udp_loss = r.get("udp_loss_rate")
+    if udp_loss is not None:
+        parts.append(f"{udp_loss * 100:.2f}% UDP loss")
     jit = r.get("mean_udp_jitter")
     if jit is not None:
         parts.append(f"{format_duration(jit)} UDP jitter")

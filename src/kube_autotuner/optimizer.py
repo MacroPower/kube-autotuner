@@ -983,20 +983,21 @@ class OptimizationLoop:
             raw_data[name] = pair
         self.client.complete_trial(trial_index=trial_index, raw_data=raw_data)
 
-        tp = metrics["tcp_throughput"][0]
-        rate = metrics["tcp_retransmit_rate"][0]
+        tp = metrics.get("tcp_throughput", (float("nan"), 0.0))[0]
+        tp_str = "NaN" if math.isnan(tp) else f"{tp / 1e6:.1f}"
+        rate = metrics.get("tcp_retransmit_rate", (float("nan"), 0.0))[0]
         rate_str = "NaN" if math.isnan(rate) else f"{rate * 1e6:.2f}"
         rps = metrics.get("rps", (float("nan"), 0.0))[0]
         rps_str = "NaN" if math.isnan(rps) else f"{rps:.1f}"
         p99 = metrics.get("latency_p99", (float("nan"), 0.0))[0]
         p99_str = "NaN" if math.isnan(p99) else format_duration(p99)
         logger.info(
-            "Trial %d/%d [%s] tcp_throughput=%.1f Mbps "
+            "Trial %d/%d [%s] tcp_throughput=%s Mbps "
             "tcp_retransmit_rate=%s retx/MB rps=%s p99=%s",
             self.prior_count + i + 1,
             self.n_trials,
             phase,
-            tp / 1e6,
+            tp_str,
             rate_str,
             rps_str,
             p99_str,

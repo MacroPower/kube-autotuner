@@ -1617,3 +1617,35 @@ def test_seed_prior_trials_filters_stale_keys(
             objectives=ObjectivesSection(),
             prior_trials=[prior],
         )
+
+
+def test_record_log_renders_nan_when_tcp_metrics_absent(caplog) -> None:
+    """``_record`` tolerates a metrics dict missing tcp_throughput / retx."""
+    from types import SimpleNamespace  # noqa: PLC0415
+
+    fake_self = SimpleNamespace(
+        _ax_metric_names=set(),
+        client=MagicMock(),
+        prior_count=0,
+        n_trials=1,
+        observer=MagicMock(),
+    )
+    trial_result = TrialResult(
+        node_pair=NodePair(source="a", target="b", hardware_class="10g"),
+        sysctl_values={},
+        config=BenchmarkConfig(),
+    )
+    caplog.set_level("INFO", logger="kube_autotuner.optimizer")
+    OptimizationLoop._record(
+        fake_self,  # ty: ignore[invalid-argument-type]
+        0,
+        "sobol",
+        0,
+        trial_result,
+        {},
+    )
+    messages = [rec.message for rec in caplog.records]
+    assert any(
+        "tcp_throughput=NaN Mbps" in m and "tcp_retransmit_rate=NaN" in m
+        for m in messages
+    ), messages

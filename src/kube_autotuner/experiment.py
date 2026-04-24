@@ -14,6 +14,7 @@ schema validation failures surfaced by :meth:`ExperimentConfig.from_yaml`.
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 import re
@@ -30,13 +31,21 @@ from pydantic import (
 from pydantic.alias_generators import to_camel
 import yaml
 
-from kube_autotuner.models import BenchmarkConfig, NodePair, ParamSpace, SysctlParam
+from kube_autotuner.models import (
+    STAGE_METRICS,
+    BenchmarkConfig,
+    NodePair,
+    ParamSpace,
+    SysctlParam,
+)
 from kube_autotuner.subproc import run_tool
 from kube_autotuner.sysctl.params import PARAM_SPACE
 from kube_autotuner.units import NUMBER_PATTERN, SUFFIX_PATTERN, parse_quantity
 
 if TYPE_CHECKING:
     from kube_autotuner.k8s.client import K8sClient
+
+logger = logging.getLogger(__name__)
 
 Mode = Literal["baseline", "trial", "optimize"]
 
@@ -602,6 +611,77 @@ class ExperimentConfig(BaseModel):
         if self.optimize and self.optimize.n_sobol > self.optimize.n_trials:
             msg = "optimize.n_sobol must be <= optimize.n_trials"
             raise ValueError(msg)
+        return self
+
+    @model_validator(mode="after")
+    def _prune_objectives_to_enabled_stages(self) -> ExperimentConfig:
+        """Drop objectives whose metrics are not produced by enabled stages.
+
+        When ``benchmark.stages`` is a strict subset of the full stage
+        set, any metric in :attr:`ObjectivesSection.pareto`,
+        :attr:`ObjectivesSection.constraints`, or
+        :attr:`ObjectivesSection.recommendation_weights` that is only
+        produced by a disabled stage would never receive a real
+        observation. Rather than surface Ax warnings about zero-variance
+        metrics and zero-valued frontier entries, the offending entries
+        are filtered out here. The default objective set mentions every
+        metric, so users who skip a stage do not need to hand-prune
+        every objective field.
+
+        The three fields must move in lockstep:
+        :meth:`ObjectivesSection._validate_objectives` enforces that
+        every ``recommendation_weights`` key is a metric in ``pareto``,
+        so dropping a pareto metric requires dropping its weight too.
+
+        Returns:
+            ``self`` with :attr:`objectives` mutated in place.
+
+        Raises:
+            ValueError: Pruning leaves ``objectives.pareto`` empty.
+        """
+        supported: set[str] = set().union(
+            *(STAGE_METRICS[s] for s in self.benchmark.stages),
+        )
+        kept_pareto = []
+        for obj in self.objectives.pareto:
+            if obj.metric in supported:
+                kept_pareto.append(obj)
+            else:
+                logger.info(
+                    "objective %r excluded: produced only by disabled stages",
+                    obj.metric,
+                )
+        if not kept_pareto:
+            stages_listed = sorted(self.benchmark.stages)
+            msg = (
+                "objectives.pareto is empty after pruning against "
+                f"benchmark.stages={stages_listed}; enable at least one "
+                "stage whose metrics are referenced by the pareto list"
+            )
+            raise ValueError(msg)
+        kept_constraints = []
+        for constraint in self.objectives.constraints:
+            match = _CONSTRAINT_RE.match(constraint)
+            if match is not None and match.group("metric") in supported:
+                kept_constraints.append(constraint)
+            elif match is not None:
+                logger.info(
+                    "constraint %r excluded: produced only by disabled stages",
+                    constraint,
+                )
+        kept_weights: dict[str, float] = {}
+        for metric, weight in self.objectives.recommendation_weights.items():
+            if metric in supported:
+                kept_weights[metric] = weight
+            else:
+                logger.info(
+                    "recommendation_weights[%r] excluded: "
+                    "produced only by disabled stages",
+                    metric,
+                )
+        self.objectives.pareto = kept_pareto
+        self.objectives.constraints = kept_constraints
+        self.objectives.recommendation_weights = kept_weights
         return self
 
     @classmethod

@@ -357,6 +357,36 @@ def test_substages_run_sequentially_in_order():
     assert "fixed_qps" in applied_yamls[5]
 
 
+def test_disabled_bw_udp_stage_is_skipped():
+    """bw-udp stage is not invoked and fires no observer callbacks."""
+    node_pair = NodePair(source="kmain07", target="kmain08", hardware_class="10g")
+    config = BenchmarkConfig(
+        duration=1,
+        iterations=1,
+        stages=frozenset({"bw-tcp", "fortio-sat", "fortio-fixed"}),
+    )
+
+    logs = {"iperf3-client-kmain07-p5201": _fake_iperf_json(1e9)}
+
+    client = _make_client(logs)
+
+    observer = MagicMock()
+    runner = BenchmarkRunner(node_pair, config, client=client, observer=observer)
+    runner.setup_server()
+    iteration_results = runner.run()
+
+    assert all(r.mode != "udp" for r in iteration_results.bench)
+    assert len(iteration_results.bench) == 1
+    assert len(iteration_results.latency) == 2
+
+    applied_yamls = [c.args[0] for c in client.apply.call_args_list]
+    assert not any("-u" in y for y in applied_yamls if "iperf3-client-" in y)
+
+    stage_starts = [c.args[0] for c in observer.on_stage_start.call_args_list]
+    assert "bw-udp" not in stage_starts
+    assert stage_starts == ["bw-tcp", "fortio-sat", "fortio-fixed"]
+
+
 def test_fortio_failure_cleans_up_by_fortio_label():
     node_pair = NodePair(source="kmain07", target="kmain08", hardware_class="10g")
     config = BenchmarkConfig(duration=1, iterations=1)

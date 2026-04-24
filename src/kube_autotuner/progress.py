@@ -72,7 +72,9 @@ if TYPE_CHECKING:
 
 
 _TOP_N = 5
-# bw-tcp, bw-udp, fortio-sat, fortio-fixed; see benchmark/runner.py.
+# Default stage count: bw-tcp, bw-udp, fortio-sat, fortio-fixed; see
+# benchmark/runner.py. Callers that adopt ``BenchmarkConfig.stages``
+# override this via ``make_observer(stages_per_iteration=...)``.
 _STAGES_PER_ITERATION = 4
 
 
@@ -617,6 +619,7 @@ class RichProgressObserver:
         self,
         console: Console,
         objectives: ObjectivesSection | None = None,
+        stages_per_iteration: int = _STAGES_PER_ITERATION,
     ) -> None:
         """Bind the observer to a shared ``rich`` console.
 
@@ -635,9 +638,17 @@ class RichProgressObserver:
                 When ``None`` (bare construction, e.g. unit tests or
                 non-optimize flows), the panel falls back to a
                 throughput-descending sort.
+            stages_per_iteration: Number of benchmark sub-stages the
+                runner will execute each iteration. Sizes the Stage
+                bar so it always reaches ``100%`` when the full
+                configured stage set completes. Defaults to the
+                historical four-stage cadence so callers that have
+                not adopted :attr:`BenchmarkConfig.stages` keep the
+                same UI.
         """
         self._console = console
         self._objectives = objectives
+        self._stages_per_iteration = stages_per_iteration
         self._iter_start: float | None = None
         self._iter_count: int = 0
         self._iter_total_seconds: float = 0.0
@@ -1176,10 +1187,10 @@ class RichProgressObserver:
 
         Fired once per :meth:`BenchmarkRunner.run` call. The iteration
         bar spans every iteration in the trial (``total=iterations``)
-        while the stage bar is sized to the fixed four-sub-stage
-        sequence inside each iteration
-        (``total=_STAGES_PER_ITERATION``) and is re-zeroed on every
-        :meth:`on_iteration_start`. The cumulative iteration and stage
+        while the stage bar is sized to the enabled-sub-stage count
+        inside each iteration (``total=self._stages_per_iteration``)
+        and is re-zeroed on every :meth:`on_iteration_start`. The
+        cumulative iteration and stage
         histories (``_iter_count`` / ``_iter_total_seconds`` and
         ``_stage_count`` / ``_stage_total_seconds``) are deliberately
         preserved so the shared :class:`_HistoryEtaColumn` keeps
@@ -1214,13 +1225,13 @@ class RichProgressObserver:
         if self._stage_task_id is None:
             self._stage_task_id = self._progress.add_task(
                 "Stage",
-                total=_STAGES_PER_ITERATION,
+                total=self._stages_per_iteration,
                 completed=0,
             )
         else:
             self._progress.reset(
                 self._stage_task_id,
-                total=_STAGES_PER_ITERATION,
+                total=self._stages_per_iteration,
                 completed=0,
                 description="Stage",
             )
@@ -1232,19 +1243,20 @@ class RichProgressObserver:
     ) -> None:
         """Record the iteration start timestamp and re-zero the stage bar.
 
-        The stage bar is reset back to ``0/_STAGES_PER_ITERATION`` here
-        (in addition to the trial-boundary reset in
-        :meth:`on_benchmark_start`) so its ``TimeElapsedColumn`` shows
-        time-into-this-iteration -- the operator-useful scoping for a
-        per-iteration bar. A prior iteration may have aborted
-        mid-stage, so ``_stage_start`` is also cleared defensively.
+        The stage bar is reset back to
+        ``0/self._stages_per_iteration`` here (in addition to the
+        trial-boundary reset in :meth:`on_benchmark_start`) so its
+        ``TimeElapsedColumn`` shows time-into-this-iteration -- the
+        operator-useful scoping for a per-iteration bar. A prior
+        iteration may have aborted mid-stage, so ``_stage_start`` is
+        also cleared defensively.
         """
         self._iter_start = time.monotonic()
         self._stage_start = None
         if self._stage_task_id is not None:
             self._progress.reset(
                 self._stage_task_id,
-                total=_STAGES_PER_ITERATION,
+                total=self._stages_per_iteration,
                 completed=0,
                 description="Stage",
             )
@@ -1261,8 +1273,8 @@ class RichProgressObserver:
         ``_stage_total_seconds`` -- dropping aborted samples keeps the
         stage ETA honest. The stage bar itself is not reset here;
         :meth:`on_iteration_start` (or :meth:`on_benchmark_start` for
-        the next trial) owns that, and leaving the bar at ``4/4`` on
-        the final iteration of a successful trial is informative.
+        the next trial) owns that, and leaving the bar full on the
+        final iteration of a successful trial is informative.
         """
         if self._iter_start is not None:
             self._iter_total_seconds += time.monotonic() - self._iter_start
@@ -1294,9 +1306,10 @@ class RichProgressObserver:
     ) -> None:
         """Accumulate the stage sample into ETA history and advance the stage bar.
 
-        The advance is guarded so a stray fifth ``on_stage_end`` in the
-        same iteration (a future hook-pairing bug) cannot render
-        ``5/4``; Rich does not clamp ``completed`` on ``advance``.
+        The advance is guarded so a stray extra ``on_stage_end`` in
+        the same iteration (a future hook-pairing bug) cannot
+        overshoot ``self._stages_per_iteration``; Rich does not clamp
+        ``completed`` on ``advance``.
         """
         if self._stage_start is not None:
             self._stage_total_seconds += time.monotonic() - self._stage_start
@@ -1304,7 +1317,7 @@ class RichProgressObserver:
             self._stage_start = None
         if self._stage_task_id is not None:
             task = self._task_by_id(self._stage_task_id)
-            if task is not None and task.completed < _STAGES_PER_ITERATION:
+            if task is not None and task.completed < self._stages_per_iteration:
                 self._progress.update(self._stage_task_id, advance=1)
         self._refresh()
 
@@ -1314,6 +1327,7 @@ def make_observer(
     enabled: bool,
     console: Console,
     objectives: ObjectivesSection | None = None,
+    stages_per_iteration: int = _STAGES_PER_ITERATION,
 ) -> ProgressObserver:
     """Pick the right observer for the current run.
 
@@ -1327,11 +1341,19 @@ def make_observer(
             :class:`RichProgressObserver` so the live ``Best so far``
             panel ranks by weighted score. ``None`` (the default)
             keeps the throughput-descending fallback.
+        stages_per_iteration: Number of enabled benchmark sub-stages
+            per iteration. Sizes the Stage bar so disabled stages
+            do not leave it stranded short of ``100%``. Defaults to
+            the historical four-stage cadence.
 
     Returns:
         A :class:`RichProgressObserver` when ``enabled`` is true,
         otherwise a :class:`NullObserver`.
     """
     if enabled:
-        return RichProgressObserver(console, objectives=objectives)
+        return RichProgressObserver(
+            console,
+            objectives=objectives,
+            stages_per_iteration=stages_per_iteration,
+        )
     return NullObserver()

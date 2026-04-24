@@ -118,6 +118,24 @@ def test_benchmark_config_defaults():
     assert config.iterations == 3
     assert config.parallel == 16
     assert config.window is None
+    assert config.stages == frozenset(
+        {"bw-tcp", "bw-udp", "fortio-sat", "fortio-fixed"},
+    )
+
+
+def test_benchmark_config_accepts_stage_subset():
+    config = BenchmarkConfig.model_validate({"stages": ["bw-tcp", "fortio-sat"]})
+    assert config.stages == frozenset({"bw-tcp", "fortio-sat"})
+
+
+def test_benchmark_config_rejects_empty_stages():
+    with pytest.raises(ValidationError):
+        BenchmarkConfig.model_validate({"stages": []})
+
+
+def test_benchmark_config_rejects_unknown_stage():
+    with pytest.raises(ValidationError):
+        BenchmarkConfig.model_validate({"stages": ["bw-sctp"]})
 
 
 def test_benchmark_config_silently_drops_legacy_modes_key():

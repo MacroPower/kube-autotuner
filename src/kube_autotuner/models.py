@@ -145,6 +145,23 @@ class NodePair(BaseModel):
         return self.extra_source_zones.get(client, "")
 
 
+StageName = Literal["bw-tcp", "bw-udp", "fortio-sat", "fortio-fixed"]
+"""Canonical names of benchmark sub-stages run per iteration."""
+
+ALL_STAGES: frozenset[StageName] = frozenset(
+    ("bw-tcp", "bw-udp", "fortio-sat", "fortio-fixed"),
+)
+"""The full set of benchmark sub-stages executed by default."""
+
+STAGE_METRICS: dict[StageName, frozenset[str]] = {
+    "bw-tcp": frozenset({"tcp_throughput", "tcp_retransmit_rate"}),
+    "bw-udp": frozenset({"udp_throughput", "udp_loss_rate", "udp_jitter"}),
+    "fortio-sat": frozenset({"rps"}),
+    "fortio-fixed": frozenset({"latency_p50", "latency_p90", "latency_p99"}),
+}
+"""Metrics produced by each benchmark sub-stage."""
+
+
 class BenchmarkConfig(BaseModel):
     """Configuration for a single benchmark session.
 
@@ -158,6 +175,14 @@ class BenchmarkConfig(BaseModel):
     barrier entirely. It assumes the cluster nodes are NTP-synced; with
     default chrony/ntp the residual skew is tens of milliseconds.
     Setting this to ``0`` disables the barrier.
+
+    ``stages`` selects which benchmark sub-stages run per iteration.
+    Defaults to every stage in :data:`ALL_STAGES`; users who do not
+    care about a given stage's metrics can omit it to skip the
+    wall-clock cost. Disabled stages contribute no records, so their
+    downstream metrics are automatically pruned from
+    :class:`~kube_autotuner.experiment.ObjectivesSection` at config
+    load time.
     """
 
     duration: int = 30
@@ -166,6 +191,11 @@ class BenchmarkConfig(BaseModel):
     parallel: int = 16
     window: str | None = None
     sync_window_seconds: int = Field(default=15, ge=0, le=120)
+    stages: frozenset[StageName] = Field(
+        default_factory=lambda: frozenset(ALL_STAGES),
+        min_length=1,
+        description="Benchmark sub-stages to execute per iteration.",
+    )
 
 
 class BenchmarkResult(BaseModel):

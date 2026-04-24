@@ -312,6 +312,84 @@ optimize:
     assert exp.optimize.n_sobol == 5
 
 
+# --- benchmark.stages / objectives pruning ------------------------------
+
+
+def test_stages_default_keeps_every_objective(tmp_path: Path):
+    path = _write(
+        tmp_path,
+        """\
+mode: baseline
+nodes:
+  sources: [a]
+  target: b
+""",
+    )
+    exp = ExperimentConfig.from_yaml(path)
+    metrics = {obj.metric for obj in exp.objectives.pareto}
+    assert metrics == {
+        "tcp_throughput",
+        "udp_throughput",
+        "tcp_retransmit_rate",
+        "udp_loss_rate",
+        "udp_jitter",
+        "rps",
+        "latency_p50",
+        "latency_p90",
+        "latency_p99",
+    }
+
+
+def test_stages_subset_prunes_default_objectives(tmp_path: Path, caplog):
+    path = _write(
+        tmp_path,
+        """\
+mode: baseline
+nodes:
+  sources: [a]
+  target: b
+benchmark:
+  stages: ["bw-tcp"]
+""",
+    )
+    with caplog.at_level("INFO", logger="kube_autotuner.experiment"):
+        exp = ExperimentConfig.from_yaml(path)
+    metrics = {obj.metric for obj in exp.objectives.pareto}
+    assert metrics == {"tcp_throughput", "tcp_retransmit_rate"}
+    for constraint in exp.objectives.constraints:
+        metric = constraint.split()[0]
+        assert metric in {"tcp_throughput", "tcp_retransmit_rate"}
+    assert "udp_throughput" not in exp.objectives.recommendation_weights
+    assert any(
+        "produced only by disabled stages" in rec.message for rec in caplog.records
+    )
+
+
+def test_stages_prune_error_when_pareto_empties(tmp_path: Path):
+    path = _write(
+        tmp_path,
+        """\
+mode: baseline
+nodes:
+  sources: [a]
+  target: b
+benchmark:
+  stages: ["bw-tcp"]
+objectives:
+  pareto:
+    - metric: udp_throughput
+      direction: maximize
+  constraints: []
+  recommendationWeights: {}
+""",
+    )
+    with pytest.raises(
+        ExperimentConfigError,
+        match=r"objectives\.pareto is empty after pruning",
+    ):
+        ExperimentConfig.from_yaml(path)
+
+
 # --- projections ---------------------------------------------------------
 
 

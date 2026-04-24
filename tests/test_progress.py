@@ -688,6 +688,27 @@ def test_rich_observer_stage_bar_created_on_benchmark_start() -> None:
         assert task.description == "Stage"
 
 
+def test_rich_observer_stage_bar_honors_custom_stages_per_iteration() -> None:
+    """Custom ``stages_per_iteration`` sizes and clamps the Stage bar."""
+    console = _capture_console()
+    observer = RichProgressObserver(console, stages_per_iteration=2)
+    with observer:
+        observer.on_benchmark_start(1)
+        task = _task_for(observer, observer._stage_task_id)
+        assert task.total == 2
+        observer.on_iteration_start(0)
+        for stage in ("bw-tcp", "fortio-sat"):
+            observer.on_stage_start(stage, 0)
+            observer.on_stage_end(stage, 0)
+        task = _task_for(observer, observer._stage_task_id)
+        assert task.completed == 2
+        # A stray extra on_stage_end must not overshoot the smaller total.
+        observer.on_stage_start("bw-udp", 0)
+        observer.on_stage_end("bw-udp", 0)
+        task = _task_for(observer, observer._stage_task_id)
+        assert task.completed == 2
+
+
 def test_rich_observer_stage_bar_advances_per_stage_end() -> None:
     """``on_stage_end`` advances the stage bar; description tracks the label."""
     console = _capture_console()
