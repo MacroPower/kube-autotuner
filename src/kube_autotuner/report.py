@@ -608,8 +608,8 @@ def _render_host_state_chart(
         "<h3>Host state</h3>\n"
         "<p class='meta'>Per-iteration snapshots collected when "
         "<code>--collect-host-state</code> is enabled. "
-        "Baseline is plotted at iteration -0.5; phases are "
-        "distinguished by marker shape "
+        "X-axis is UTC capture timestamp; phases are distinguished by "
+        "marker shape "
         "(diamond=baseline, circle=post-flush, square=post-iteration).</p>\n"
         "<div class='axis-controls'>\n"
         f'<label>metrics <select multiple size="6" '
@@ -1343,51 +1343,40 @@ function renderHostStateChart(section) {
   const payload = section.hostState;
   if (!payload) return;
   const metrics = hostStateSelectedMetrics(section);
+  const points = payload.points;
+  const x = points.map(p => p.timestamp);
+  const symbols = points.map(
+    p => HOST_STATE_PHASE_SYMBOL[p.phase] || "circle");
+  const text = points.map(p => {
+    const iter = p.iteration !== null && p.iteration !== undefined
+      ? " iter " + p.iteration : "";
+    return `trial ${p.trial_id}<br>${p.phase}${iter}`;
+  });
   const traces = [];
-  // legendgroup/showlegend logic: one legend entry per metric, grouped
-  // across trials. First-seen trace for a metric gets showlegend=true,
-  // the rest ride the group.
-  const legendEmitted = new Set();
   for (const metric of metrics) {
-    for (const trial of payload.trials) {
-      // Baseline's iteration is null; plot it at -0.5 so it sits left
-      // of the iteration=0 pair without colliding with the axis tick.
-      const x = trial.points.map(
-        p => p.iteration === null || p.iteration === undefined ? -0.5 : p.iteration);
-      const y = trial.points.map(p => {
-        const v = p.metrics[metric];
-        return (v === null || v === undefined) ? null : v;
-      });
-      const symbols = trial.points.map(
-        p => HOST_STATE_PHASE_SYMBOL[p.phase] || "circle");
-      const text = trial.points.map(
-        p => `${p.phase}${p.iteration !== null && p.iteration !== undefined
-          ? " iter " + p.iteration : ""}`);
-      const first = !legendEmitted.has(metric);
-      legendEmitted.add(metric);
-      traces.push({
-        type: "scatter",
-        mode: "lines+markers",
-        name: metric,
-        legendgroup: metric,
-        showlegend: first,
-        x,
-        y,
-        text,
-        marker: {symbol: symbols, size: 8},
-        connectgaps: false,
-        hovertemplate:
-          `trial ${trial.trial_id}<br>metric ${metric}`
-          + `<br>%{text}<br>value=%{y}<extra></extra>`,
-      });
-    }
+    const y = points.map(p => {
+      const v = p.metrics[metric];
+      return (v === null || v === undefined) ? null : v;
+    });
+    traces.push({
+      type: "scatter",
+      mode: "lines+markers",
+      name: metric,
+      x,
+      y,
+      text,
+      marker: {symbol: symbols, size: 8},
+      connectgaps: false,
+      hovertemplate:
+        `metric ${metric}<br>%{text}<br>%{x}<br>value=%{y}<extra></extra>`,
+    });
   }
   const layout = {
     template: "plotly_dark",
     paper_bgcolor: "rgba(0,0,0,0)",
     plot_bgcolor: "rgba(0,0,0,0)",
     font: {color: "#abb2bf"},
-    xaxis: {title: "iteration"},
+    xaxis: {title: "timestamp", type: "date"},
     yaxis: {title: "counter value"},
     autosize: true,
     height: 480,

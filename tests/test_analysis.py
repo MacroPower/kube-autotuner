@@ -959,13 +959,17 @@ def _snap(
     iteration: int | None,
     phase: Literal["baseline", "post-flush", "post-iteration"],
     metrics: dict[str, int],
+    timestamp: datetime | None = None,
 ) -> HostStateSnapshot:
-    return HostStateSnapshot(
-        node="node-a",
-        iteration=iteration,
-        phase=phase,
-        metrics=metrics,
-    )
+    kwargs: dict[str, Any] = {
+        "node": "node-a",
+        "iteration": iteration,
+        "phase": phase,
+        "metrics": metrics,
+    }
+    if timestamp is not None:
+        kwargs["timestamp"] = timestamp
+    return HostStateSnapshot(**kwargs)
 
 
 def _trial_with_snapshots(
@@ -1025,8 +1029,8 @@ def test_host_state_series_filters_by_hardware_class_and_topology() -> None:
         topology="intra-az",
     )
     assert payload is not None
-    trial_ids = [t["trial_id"] for t in payload["trials"]]
-    assert trial_ids == ["keep"]
+    trial_ids = {p["trial_id"] for p in payload["points"]}
+    assert trial_ids == {"keep"}
 
 
 def test_host_state_series_preserves_baseline_iteration_none() -> None:
@@ -1034,14 +1038,29 @@ def test_host_state_series_preserves_baseline_iteration_none() -> None:
         trial_id="t1",
         hw="10g",
         snapshots=[
-            _snap(None, "baseline", {"conntrack_count": 10}),
-            _snap(0, "post-flush", {"conntrack_count": 11}),
-            _snap(0, "post-iteration", {"conntrack_count": 13}),
+            _snap(
+                None,
+                "baseline",
+                {"conntrack_count": 10},
+                timestamp=datetime(2026, 4, 24, 10, 0, 0, tzinfo=UTC),
+            ),
+            _snap(
+                0,
+                "post-flush",
+                {"conntrack_count": 11},
+                timestamp=datetime(2026, 4, 24, 10, 0, 1, tzinfo=UTC),
+            ),
+            _snap(
+                0,
+                "post-iteration",
+                {"conntrack_count": 13},
+                timestamp=datetime(2026, 4, 24, 10, 0, 2, tzinfo=UTC),
+            ),
         ],
     )
     payload = host_state_series([trial], "10g", topology=None)
     assert payload is not None
-    points = payload["trials"][0]["points"]
+    points = payload["points"]
     assert points[0]["iteration"] is None
     assert points[0]["phase"] == "baseline"
     assert points[1]["iteration"] == 0
@@ -1064,3 +1083,98 @@ def test_host_state_series_metric_union_is_sorted() -> None:
     payload = host_state_series([trial_a, trial_b], "10g", topology=None)
     assert payload is not None
     assert payload["metrics"] == ["aaa", "mmm", "zzz"]
+
+
+def test_host_state_series_points_sorted_by_timestamp() -> None:
+    # Two trials with deliberately interleaved capture times: trial_a's
+    # second snapshot lands between trial_b's two snapshots. The flat
+    # output must be monotonic in timestamp regardless of trial order.
+    trial_a = _trial_with_snapshots(
+        trial_id="a",
+        hw="10g",
+        snapshots=[
+            _snap(
+                None,
+                "baseline",
+                {"conntrack_count": 1},
+                timestamp=datetime(2026, 4, 24, 10, 0, 0, tzinfo=UTC),
+            ),
+            _snap(
+                0,
+                "post-iteration",
+                {"conntrack_count": 3},
+                timestamp=datetime(2026, 4, 24, 10, 0, 10, tzinfo=UTC),
+            ),
+        ],
+    )
+    trial_b = _trial_with_snapshots(
+        trial_id="b",
+        hw="10g",
+        snapshots=[
+            _snap(
+                None,
+                "baseline",
+                {"conntrack_count": 2},
+                timestamp=datetime(2026, 4, 24, 10, 0, 5, tzinfo=UTC),
+            ),
+            _snap(
+                0,
+                "post-iteration",
+                {"conntrack_count": 4},
+                timestamp=datetime(2026, 4, 24, 10, 0, 15, tzinfo=UTC),
+            ),
+        ],
+    )
+    # Reverse the trial order to prove sorting is on timestamp, not input.
+    payload = host_state_series([trial_b, trial_a], "10g", topology=None)
+    assert payload is not None
+    points = payload["points"]
+    timestamps = [p["timestamp"] for p in points]
+    assert timestamps == sorted(timestamps)
+    trial_ids = [p["trial_id"] for p in points]
+    assert trial_ids == ["a", "b", "a", "b"]
+
+
+def test_host_state_series_sorts_when_timestamps_mix_naive_and_aware() -> None:
+    # Replayed older JSON may carry a naive timestamp alongside the
+    # aware default. Raw `sorted` would raise TypeError; the function
+    # must normalize so the chronological order still holds.
+    trial = _trial_with_snapshots(
+        trial_id="t1",
+        hw="10g",
+        snapshots=[
+            _snap(
+                None,
+                "baseline",
+                {"conntrack_count": 1},
+                timestamp=datetime(2026, 4, 24, 10, 0, 0),  # naive  # noqa: DTZ001
+            ),
+            _snap(
+                0,
+                "post-iteration",
+                {"conntrack_count": 3},
+                timestamp=datetime(2026, 4, 24, 10, 0, 5, tzinfo=UTC),  # aware
+            ),
+        ],
+    )
+    payload = host_state_series([trial], "10g", topology=None)
+    assert payload is not None
+    phases = [p["phase"] for p in payload["points"]]
+    assert phases == ["baseline", "post-iteration"]
+
+
+def test_host_state_series_timestamp_is_iso_string() -> None:
+    source = datetime(2026, 4, 24, 17, 32, 10, 123456, tzinfo=UTC)
+    trial = _trial_with_snapshots(
+        trial_id="t1",
+        hw="10g",
+        snapshots=[_snap(None, "baseline", {"conntrack_count": 1}, timestamp=source)],
+    )
+    payload = host_state_series([trial], "10g", topology=None)
+    assert payload is not None
+    ts = payload["points"][0]["timestamp"]
+    assert isinstance(ts, str)
+    assert datetime.fromisoformat(ts) == source
+    # allow_nan=False is the report's serialization gate; a string
+    # timestamp must round-trip cleanly.
+    json.dumps(payload, allow_nan=False)

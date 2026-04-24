@@ -17,7 +17,9 @@ both rely on this). Three rules enforce the discipline:
 
 from __future__ import annotations
 
+from datetime import UTC
 import logging
+from operator import itemgetter
 from typing import TYPE_CHECKING, Any
 
 from kube_autotuner.scoring import (
@@ -31,6 +33,8 @@ from kube_autotuner.sysctl.params import PARAM_SPACE, PARAM_TO_CATEGORY
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from datetime import datetime
+
     import pandas as pd
     from sklearn.preprocessing import LabelEncoder
 
@@ -751,34 +755,34 @@ def host_state_series(
 ) -> dict[str, Any] | None:
     """Shape per-trial host-state snapshots for the analysis report.
 
-    Extracts :class:`~kube_autotuner.models.HostStateSnapshot` entries
-    off each matching :class:`~kube_autotuner.models.TrialResult` and
-    lowers them into a JSON-ready payload the HTML report embeds for
-    the browser-side time-series chart. The shape is:
+    Flattens :class:`~kube_autotuner.models.HostStateSnapshot` entries
+    from every matching :class:`~kube_autotuner.models.TrialResult`
+    into a single timestamp-ordered list so the browser-side chart
+    can render one Plotly trace per metric across the whole tuning
+    session. The shape is:
 
     .. code-block:: python
 
         {
             "metrics": [sorted union of metric keys],
-            "trials": [
+            "points": [
                 {
+                    "timestamp": str,  # snap.timestamp.isoformat()
                     "trial_id": str,
                     "sysctl_hash": str,
-                    "points": [
-                        {"iteration": int | None,
-                         "phase": str,
-                         "metrics": {str: int}},
-                        ...
-                    ],
+                    "iteration": int | None,
+                    "phase": str,
+                    "metrics": {str: int},
                 },
                 ...
             ],
         }
 
-    ``HostStateSnapshot.timestamp`` and ``HostStateSnapshot.errors``
-    are intentionally dropped -- the chart keys off ``iteration`` and
-    ``phase`` only, and errors would bloat the embedded JSON without
-    aiding the visualization.
+    Points are sorted on the raw ``datetime`` before stringification
+    so the ordering is correct even if a replayed results JSON carries
+    a naive timestamp. ``HostStateSnapshot.errors`` is intentionally
+    dropped -- it would bloat the embedded JSON without aiding the
+    visualization.
 
     Args:
         trials: The trial set to scan (caller passes the pre-filtered
@@ -807,29 +811,33 @@ def host_state_series(
         return None
 
     metric_union: set[str] = set()
-    trial_payloads: list[dict[str, Any]] = []
+    tagged: list[tuple[datetime, dict[str, Any]]] = []
     for trial in filtered:
-        points: list[dict[str, Any]] = []
         for snap in trial.host_state_snapshots:
             metrics: dict[str, int] = dict(snap.metrics)
             metric_union.update(metrics.keys())
-            points.append(
-                {
-                    "iteration": snap.iteration,
-                    "phase": snap.phase,
-                    "metrics": metrics,
-                },
+            # Normalize naive timestamps to UTC so a replayed results
+            # JSON that mixes aware and naive entries does not raise
+            # TypeError at sort time.
+            ts = snap.timestamp
+            key = ts if ts.tzinfo else ts.replace(tzinfo=UTC)
+            tagged.append(
+                (
+                    key,
+                    {
+                        "timestamp": snap.timestamp.isoformat(),
+                        "trial_id": trial.trial_id,
+                        "sysctl_hash": trial.sysctl_hash,
+                        "iteration": snap.iteration,
+                        "phase": snap.phase,
+                        "metrics": metrics,
+                    },
+                ),
             )
-        trial_payloads.append(
-            {
-                "trial_id": trial.trial_id,
-                "sysctl_hash": trial.sysctl_hash,
-                "points": points,
-            },
-        )
     if not metric_union:
         return None
+    points = [p for _, p in sorted(tagged, key=itemgetter(0))]
     return {
         "metrics": sorted(metric_union),
-        "trials": trial_payloads,
+        "points": points,
     }

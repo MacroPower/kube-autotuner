@@ -88,51 +88,54 @@ def _minimal_section(hw: str) -> dict[str, Any]:
 def _host_state_payload(
     *,
     metrics: list[str] | None = None,
-    trials: list[dict[str, Any]] | None = None,
+    points: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     default_metrics = [
         "conntrack_count",
         "slab_nf_conntrack_active_objs",
         "sockstat_tcp_inuse",
     ]
-    default_trials = [
+    default_points = [
         {
+            "timestamp": "2026-04-24T10:00:00+00:00",
             "trial_id": "t1",
             "sysctl_hash": "abc123",
-            "points": [
-                {
-                    "iteration": None,
-                    "phase": "baseline",
-                    "metrics": {
-                        "conntrack_count": 10,
-                        "slab_nf_conntrack_active_objs": 100,
-                        "sockstat_tcp_inuse": 3,
-                    },
-                },
-                {
-                    "iteration": 0,
-                    "phase": "post-flush",
-                    "metrics": {
-                        "conntrack_count": 12,
-                        "slab_nf_conntrack_active_objs": 110,
-                        "sockstat_tcp_inuse": 5,
-                    },
-                },
-                {
-                    "iteration": 0,
-                    "phase": "post-iteration",
-                    "metrics": {
-                        "conntrack_count": 18,
-                        "slab_nf_conntrack_active_objs": 130,
-                        "sockstat_tcp_inuse": 7,
-                    },
-                },
-            ],
+            "iteration": None,
+            "phase": "baseline",
+            "metrics": {
+                "conntrack_count": 10,
+                "slab_nf_conntrack_active_objs": 100,
+                "sockstat_tcp_inuse": 3,
+            },
+        },
+        {
+            "timestamp": "2026-04-24T10:00:01+00:00",
+            "trial_id": "t1",
+            "sysctl_hash": "abc123",
+            "iteration": 0,
+            "phase": "post-flush",
+            "metrics": {
+                "conntrack_count": 12,
+                "slab_nf_conntrack_active_objs": 110,
+                "sockstat_tcp_inuse": 5,
+            },
+        },
+        {
+            "timestamp": "2026-04-24T10:00:02+00:00",
+            "trial_id": "t1",
+            "sysctl_hash": "abc123",
+            "iteration": 0,
+            "phase": "post-iteration",
+            "metrics": {
+                "conntrack_count": 18,
+                "slab_nf_conntrack_active_objs": 130,
+                "sockstat_tcp_inuse": 7,
+            },
         },
     ]
     return {
         "metrics": metrics if metrics is not None else default_metrics,
-        "trials": trials if trials is not None else default_trials,
+        "points": points if points is not None else default_points,
     }
 
 
@@ -199,7 +202,7 @@ def test_host_state_payload_embedded_for_js(tmp_path: Path) -> None:
     assert payload["hostState"] is not None
     assert payload["hostState"]["metrics"] == section["host_state"]["metrics"]
     # Baseline iteration is preserved as null through the JSON embed.
-    first_point = payload["hostState"]["trials"][0]["points"][0]
+    first_point = payload["hostState"]["points"][0]
     assert first_point["iteration"] is None
     assert first_point["phase"] == "baseline"
 
@@ -222,20 +225,17 @@ def test_render_section_pre_select_falls_back_when_preferred_absent(
     section = _minimal_section("10g")
     section["host_state"] = _host_state_payload(
         metrics=["netstat_ip_InSegs", "netstat_tcp_OutSegs"],
-        trials=[
+        points=[
             {
+                "timestamp": "2026-04-24T10:00:00+00:00",
                 "trial_id": "t1",
                 "sysctl_hash": "abc123",
-                "points": [
-                    {
-                        "iteration": 0,
-                        "phase": "post-flush",
-                        "metrics": {
-                            "netstat_ip_InSegs": 1000,
-                            "netstat_tcp_OutSegs": 500,
-                        },
-                    },
-                ],
+                "iteration": 0,
+                "phase": "post-flush",
+                "metrics": {
+                    "netstat_ip_InSegs": 1000,
+                    "netstat_tcp_OutSegs": 500,
+                },
             },
         ],
     )
@@ -251,6 +251,14 @@ def test_render_section_pre_select_falls_back_when_preferred_absent(
 
 def test_js_module_wires_host_state_setup() -> None:
     # Guardrail against silent removal of the JS boot wiring.
-    assert "setupHostStateChart" in report._JS_MODULE  # type: ignore[attr-defined]
-    assert "renderHostStateChart" in report._JS_MODULE  # type: ignore[attr-defined]
-    assert "HOST_STATE_PHASE_SYMBOL" in report._JS_MODULE  # type: ignore[attr-defined]
+    js = report._JS_MODULE  # type: ignore[attr-defined]
+    assert "setupHostStateChart" in js
+    assert "renderHostStateChart" in js
+    assert "HOST_STATE_PHASE_SYMBOL" in js
+    # Flat timestamp-sorted payload shape: the JS must read payload.points
+    # with a date x-axis and must not regress to the old per-trial layout
+    # or the -0.5 baseline hack.
+    assert "payload.points" in js
+    assert 'type: "date"' in js
+    assert "payload.trials" not in js
+    assert "-0.5" not in js
