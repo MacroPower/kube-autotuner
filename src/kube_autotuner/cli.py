@@ -1148,10 +1148,9 @@ def _analyze_one_class(
         frame = analysis.parameter_importance(df, target=col)
         if not frame.empty:
             importance_by_target[col] = frame
-    importance = importance_by_target.get(
-        "mean_throughput",
-        analysis.parameter_importance(df),
-    )
+    importance = importance_by_target.get("mean_tcp_throughput")
+    if importance is None:
+        importance = analysis.parameter_importance(df)
     # One Pareto+score computation per class: ``recommend_configs`` is
     # a thin wrapper, so call ``pareto_recommendation_rows`` directly
     # and slice top-N here instead of running the pipeline twice.
