@@ -252,16 +252,33 @@ objectives:
     - { metric: latency_p50, direction: minimize }
     - { metric: latency_p90, direction: minimize }
     - { metric: latency_p99, direction: minimize }
-  constraints:                       # k8s-style quantity suffixes accepted on the threshold
-    - "tcp_throughput >= 1M"         # bits/sec; 1M (decimal mega) = 1e6
+  # k8s-style quantity suffixes accepted on the threshold. Every Pareto
+  # objective needs an explicit threshold so Ax's hypervolume geometry stays
+  # well-defined; supplying `constraints:` replaces the default list
+  # wholesale, so omit an entry only if you intend to drop that threshold.
+  constraints:
+    # bits/sec; 1M (decimal mega) = 1e6.
+    - "tcp_throughput >= 1M"
     - "udp_throughput >= 1M"
-    - "tcp_retransmit_rate <= 1u"    # retransmits per byte sent; 1u (micro) ~ 1 retx/MB
-    - "udp_loss_rate <= 0.05"        # 5% UDP packet loss cap; UDP loss naturally runs
-                                     # higher than TCP retransmit rate.
-    - "rps >= 100"                   # requests/sec; only the saturation sub-stage feeds
-                                     # rps, so this floor only fails on fortio server crash.
-    - "latency_p99 <= 1000m"         # seconds; 1000m (milli) = 1.0s ceiling from the
-                                     # fixed_qps sub-stage only.
+    # retransmits per byte sent; 1u (micro) ~ 1 retx/MB.
+    - "tcp_retransmit_rate <= 1u"
+    # 5% UDP packet loss cap; UDP loss naturally runs higher than TCP
+    # retransmit rate.
+    - "udp_loss_rate <= 0.05"
+    # seconds; 10ms jitter ceiling.
+    - "udp_jitter <= 10m"
+    # requests/sec; only the saturation sub-stage feeds rps, so this floor
+    # only fails on fortio server crash.
+    - "rps >= 100"
+    # seconds; mean-latency loose cap from the fixed_qps sub-stage. Loose
+    # caps keep hypervolume informative without dominating the
+    # recommendation score -- final ranking runs through
+    # recommendationWeights, not Ax's hypervolume.
+    - "latency_p50 <= 100m"
+    # seconds; tail-latency loose cap.
+    - "latency_p90 <= 500m"
+    # seconds; 1000m (milli) = 1.0s ceiling from the fixed_qps sub-stage only.
+    - "latency_p99 <= 1000m"
   recommendationWeights:
     tcp_retransmit_rate: 0.3
     udp_loss_rate: 0.3               # mirror tcp_retransmit_rate's weight; UDP loss pushes
