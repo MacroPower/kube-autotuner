@@ -1,9 +1,8 @@
 """Tests for :meth:`RichProgressObserver.seed_history` across mixed priors.
 
 Primary rows interleaved with verification rows must preserve file
-order in ``_all_rows``, label primaries by ``index-vs-n_sobol`` over
-the primary-only subsequence, and have ``_top`` match the aggregated
-``score_rows`` ordering.
+order in ``_all_rows``, keep each primary's stored phase label, and
+have ``_top`` match the aggregated ``score_rows`` ordering.
 """
 
 from __future__ import annotations
@@ -66,10 +65,10 @@ def test_seed_history_preserves_file_order_and_phase_labels() -> None:
         objectives=ObjectivesSection(),
     )
     # Sobol budget = 2. Primary-only subsequence: [p0, p1, p2].
-    p0 = _trial("p0", 1.0e9, phase=None)  # legacy -> sobol (idx 0 < 2)
-    p1 = _trial("p1", 1.1e9, phase=None)  # legacy -> sobol (idx 1 < 2)
+    p0 = _trial("p0", 1.0e9, phase="sobol")
+    p1 = _trial("p1", 1.1e9, phase="sobol")
     v0 = _trial("v0", 0.9e9, phase="verification", parent_trial_id="p0")
-    p2 = _trial("p2", 1.2e9, phase=None)  # legacy -> bayesian (idx 2 >= 2)
+    p2 = _trial("p2", 1.2e9, phase="bayesian")
     v1 = _trial("v1", 1.0e9, phase="verification", parent_trial_id="p0")
 
     prior = [p0, p1, v0, p2, v1]

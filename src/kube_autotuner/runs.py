@@ -256,7 +256,7 @@ def _move_prior_artifacts(output: Path) -> None:
         logger.info("moved prior results to %s", backup)
 
 
-def _check_compatibility(  # noqa: C901, PLR0912
+def _check_compatibility(
     meta: ResumeMetadata | None,
     exp: ExperimentConfig,
 ) -> None:
@@ -267,11 +267,6 @@ def _check_compatibility(  # noqa: C901, PLR0912
     ``verification_trials``, ``verification_top_k``. Node identity,
     patches, iperf/fortio args, and ``apply_source`` can change
     silently between runs.
-
-    Sidecars written by pre-feature binaries have ``verification_*``
-    fields set to ``None``. When the current run enables verification
-    against such a sidecar, no drift is flagged: the JSONL stays
-    usable and a refreshed sidecar will be written afterwards.
 
     A ``None`` sidecar alongside a non-empty JSONL signals a prior
     run that wrote no metadata (or a manually crafted JSONL); the
@@ -310,27 +305,10 @@ def _check_compatibility(  # noqa: C901, PLR0912
         logger.warning("sidecar has no n_sobol; not verified")
 
     if exp.optimize is not None:
-        legacy_verification = (
-            meta.verification_trials is None and meta.verification_top_k is None
-        )
-        if legacy_verification and (
-            exp.optimize.verification_trials > 0 or exp.optimize.verification_top_k != 3  # noqa: PLR2004 - schema default
-        ):
-            logger.info(
-                "prior sidecar has no verification record; proceeding and "
-                "rewriting sidecar",
-            )
-        else:
-            if (
-                meta.verification_trials is not None
-                and meta.verification_trials != exp.optimize.verification_trials
-            ):
-                changed.append("verification_trials")
-            if (
-                meta.verification_top_k is not None
-                and meta.verification_top_k != exp.optimize.verification_top_k
-            ):
-                changed.append("verification_top_k")
+        if meta.verification_trials != exp.optimize.verification_trials:
+            changed.append("verification_trials")
+        if meta.verification_top_k != exp.optimize.verification_top_k:
+            changed.append("verification_top_k")
 
     if changed:
         msg = (
@@ -650,11 +628,6 @@ def run_optimize(  # noqa: PLR0914, PLR0915
         raise RuntimeError(msg)
 
     resume = _prepare_resume(ctx.output, exp, fresh=fresh)
-    # Rewrite the sidecar on every run so a resume against a
-    # pre-feature sidecar (missing verification_*) picks up the new
-    # fields idempotently. _check_compatibility has already rejected
-    # any drift, so the write is either a no-op or a refresh of
-    # previously-None fields.
     TrialLog.write_resume_metadata(
         ctx.output,
         ResumeMetadata(

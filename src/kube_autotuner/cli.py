@@ -78,8 +78,8 @@ class AppState:
                 so the live ``Best so far`` panel ranks trials by
                 the same weighted score used by
                 :func:`kube_autotuner.analysis.recommend_configs`.
-                ``None`` keeps the legacy throughput-descending
-                fallback, which is used by flows that never call
+                ``None`` keeps the throughput-descending fallback,
+                which is used by flows that never call
                 ``on_trial_complete`` (``baseline`` / ``trial``).
             stages: Enabled benchmark sub-stages, forwarded so the
                 Stage bar sizes to ``100%`` at the end of the last
@@ -762,9 +762,9 @@ def _analyze_one_class(  # noqa: PLR0914 - threads many helpers into one section
             chart drops axes whose metrics are only produced by
             disabled stages.
         resume_metadata: Optional sidecar
-            :class:`~kube_autotuner.models.ResumeMetadata`; consulted
-            for ``n_sobol`` when labelling legacy primary trials via
-            :func:`~kube_autotuner.models.effective_phase`.
+            :class:`~kube_autotuner.models.ResumeMetadata`; forwarded to
+            :func:`analysis.trajectory_rows` and
+            :func:`analysis.section_metadata`.
 
     Returns:
         A section dict describing the analysis, or ``None`` when the
@@ -851,18 +851,11 @@ def _analyze_one_class(  # noqa: PLR0914 - threads many helpers into one section
     hw_dir = output_dir / hardware_class
     hw_dir.mkdir(parents=True, exist_ok=True)
 
-    n_sobol_meta = (
-        resume_metadata.n_sobol
-        if resume_metadata is not None
-        and getattr(resume_metadata, "n_sobol", None) is not None
-        else None
-    )
     all_rows, axis_columns = _build_axis_payload(
         df,
         pareto_mask,
         stages=stages,
         trials=hw_trials,
-        n_sobol=n_sobol_meta,
     )
 
     verif_stats = analysis.verification_stats(hw_trials)
@@ -976,7 +969,6 @@ def _build_axis_payload(
     *,
     stages: frozenset[StageName],
     trials: list[Any] | None = None,
-    n_sobol: int | None = None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """Return JSON-safe per-trial rows plus the chart's axis columns.
 
@@ -997,13 +989,8 @@ def _build_axis_payload(
             excluded from the payload, matching the objective
             pruning applied at config-load time.
         trials: Optional list of :class:`TrialResult` aligned with
-            ``df`` rows by ``trial_id``; used to derive the ``phase``
-            label attached to each row via
-            :func:`kube_autotuner.models.effective_phase`.
-        n_sobol: Sobol budget from the sidecar; forwarded to
-            ``effective_phase`` for legacy primary rows whose
-            ``phase`` field is ``None``. ``None`` means "unknown" —
-            raw ``t.phase`` is used and legacy rows render as
+            ``df`` rows by ``trial_id``; used to read the ``phase``
+            label attached to each row. ``None`` renders as
             ``"unknown"``.
 
     Returns:
@@ -1018,7 +1005,6 @@ def _build_axis_payload(
 
     import pandas as pd  # noqa: PLC0415
 
-    from kube_autotuner.models import effective_phase, is_primary  # noqa: PLC0415
     from kube_autotuner.scoring import METRIC_TO_DF_COLUMN  # noqa: PLC0415
 
     relevant_df_cols = {METRIC_TO_DF_COLUMN[m] for m in metrics_for_stages(stages)}
@@ -1030,20 +1016,8 @@ def _build_axis_payload(
 
     phase_by_trial: dict[str, str] = {}
     if trials:
-        primaries = sorted(
-            (t for t in trials if is_primary(t)),
-            key=lambda t: t.created_at,
-        )
-        for index, t in enumerate(primaries):
-            if n_sobol is not None:
-                phase_by_trial[t.trial_id] = effective_phase(t, index, n_sobol)
-            else:
-                phase_by_trial[t.trial_id] = (
-                    t.phase if t.phase is not None else "unknown"
-                )
         for t in trials:
-            if not is_primary(t):
-                phase_by_trial[t.trial_id] = t.phase or "unknown"
+            phase_by_trial[t.trial_id] = t.phase or "unknown"
 
     rows: list[dict[str, Any]] = []
     records = df.to_dict(orient="records")

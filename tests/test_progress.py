@@ -172,7 +172,7 @@ def test_rich_observer_handles_missing_metrics() -> None:
     assert math.isnan(observer._top[0].retx_per_mb)
 
 
-def _prior_trial(bps: float) -> Any:
+def _prior_trial(bps: float, *, phase: str | None = None) -> Any:
     from datetime import UTC, datetime  # noqa: PLC0415
 
     from kube_autotuner.models import (  # noqa: PLC0415
@@ -186,6 +186,7 @@ def _prior_trial(bps: float) -> Any:
         node_pair=NodePair(source="a", target="b", hardware_class="10g"),
         sysctl_values={"net.core.rmem_max": int(bps)},
         config=BenchmarkConfig(),
+        phase=phase,  # ty: ignore[invalid-argument-type]
         results=[
             BenchmarkResult(
                 timestamp=datetime.now(UTC),
@@ -210,9 +211,9 @@ def test_rich_seed_history_populates_top_and_phase() -> None:
     console = _capture_console()
     observer = RichProgressObserver(console)
     priors = [
-        _prior_trial(5e9),
-        _prior_trial(9e9),
-        _prior_trial(7e9),
+        _prior_trial(5e9, phase="sobol"),
+        _prior_trial(9e9, phase="sobol"),
+        _prior_trial(7e9, phase="bayesian"),
     ]
     observer.seed_history(priors, n_sobol=2)
     # Top is sorted by throughput descending and capped.
@@ -231,7 +232,7 @@ def test_rich_seed_history_infers_sobol_phase_when_under_budget() -> None:
     pytest.importorskip("ax")
     console = _capture_console()
     observer = RichProgressObserver(console)
-    observer.seed_history([_prior_trial(1e9)], n_sobol=5)
+    observer.seed_history([_prior_trial(1e9, phase="sobol")], n_sobol=5)
     assert observer._phase == "sobol"
 
 
@@ -1039,7 +1040,7 @@ def test_top5_handles_nan_metrics() -> None:
 
 
 def test_top5_fallback_sorts_by_throughput_when_objectives_none() -> None:
-    """Bare construction falls back to throughput-descending + legacy title."""
+    """Bare construction falls back to throughput-descending."""
     console = _capture_console()
     observer = RichProgressObserver(console)
     assert observer._objectives is None

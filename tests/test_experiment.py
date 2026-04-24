@@ -413,8 +413,8 @@ def test_effective_param_space_user_override_replaces_default():
     assert ps.param_names() == ["net.ipv4.udp_mem"]
 
 
-def test_legacy_benchmark_modes_key_rejected(tmp_path: Path):
-    """Pre-change YAML embedded ``modes: [tcp]``; ``extra='forbid'`` rejects it."""
+def test_benchmark_modes_key_rejected(tmp_path: Path):
+    """An unknown ``benchmark.modes`` key must be rejected at load time."""
     path = _write(
         tmp_path,
         """\
@@ -958,7 +958,7 @@ class TestObjectivesSection:
             ("latency_p99", "minimize"),
         ]
 
-    def test_legacy_memory_metric_rejected(self) -> None:
+    def test_obsolete_memory_metric_rejected(self) -> None:
         with pytest.raises(Exception, match="memory"):
             ObjectivesSection.model_validate(
                 {
@@ -1157,12 +1157,12 @@ def test_objectives_memory_cost_weight_rejects_negative() -> None:
         ObjectivesSection(memory_cost_weight=-0.1)
 
 
-def test_objectives_legacy_yaml_without_memory_cost_weight() -> None:
-    """A sidecar written before the field existed still loads cleanly."""
-    legacy = {
+def test_objectives_default_memory_cost_weight_when_omitted() -> None:
+    """``memory_cost_weight`` defaults when the YAML omits the key."""
+    data = {
         "pareto": [{"metric": "tcp_throughput", "direction": "maximize"}],
         "constraints": [],
         "recommendationWeights": {},
     }
-    section = ObjectivesSection.model_validate(legacy)
+    section = ObjectivesSection.model_validate(data)
     assert section.memory_cost_weight == pytest.approx(0.1)

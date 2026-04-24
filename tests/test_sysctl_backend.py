@@ -288,11 +288,3 @@ class TestMakeSysctlSetterFromEnv:
         monkeypatch.delenv("KUBE_AUTOTUNER_SYSCTL_BACKEND", raising=False)
         monkeypatch.delenv("KUBE_AUTOTUNER_SYSCTL_FAKE_STATE", raising=False)
         assert isinstance(make_sysctl_setter_from_env(node="node1"), SysctlSetter)
-
-    def test_legacy_env_vars_are_ignored(self, monkeypatch, tmp_path: Path):
-        # Only the ``KUBE_AUTOTUNER_*`` prefix is honoured; the bare
-        # ``AUTOTUNER_*`` prefix must not influence backend selection.
-        monkeypatch.delenv("KUBE_AUTOTUNER_SYSCTL_BACKEND", raising=False)
-        monkeypatch.setenv("AUTOTUNER_SYSCTL_BACKEND", "fake")
-        monkeypatch.setenv("AUTOTUNER_SYSCTL_FAKE_STATE", str(tmp_path / "x.json"))
-        assert isinstance(make_sysctl_setter_from_env(node="node1"), SysctlSetter)

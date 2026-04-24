@@ -204,7 +204,7 @@ def test_node_selector_and_tolerations():
 
 
 def test_no_barrier_script_has_no_prologue():
-    """Without ``start_at_epoch`` the script is byte-identical to pre-feature shape."""
+    """The script is byte-identical when ``start_at_epoch`` is omitted."""
     yaml_ = build_fortio_client_yaml(
         node="c1",
         target="t",

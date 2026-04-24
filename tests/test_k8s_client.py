@@ -341,8 +341,8 @@ def test_wait_same_event_success_wins_over_failure(monkeypatch):
     )
 
 
-def test_wait_backcompat_without_failure_condition(monkeypatch):
-    """Existing callers that omit ``failure_condition`` still work."""
+def test_wait_without_failure_condition(monkeypatch):
+    """Callers that omit ``failure_condition`` still work."""
     c = _client_with_mocks()
     job = {"status": {"conditions": [{"type": "Complete", "status": "True"}]}}
     monkeypatch.setattr(

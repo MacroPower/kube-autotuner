@@ -27,7 +27,6 @@ from typing import TYPE_CHECKING, Any
 
 from kube_autotuner.models import (
     compute_sysctl_hash,
-    effective_phase,
     is_primary,
     tcp_retransmit_rate_by_iteration,
     udp_loss_rate_by_iteration,
@@ -1195,41 +1194,31 @@ def trajectory_rows(
     """Return a per-primary-trial running-best trajectory.
 
     Primary trials (``is_primary``) are ordered by ``created_at`` and
-    emitted one row at a time. Each row carries the trial's effective
-    phase plus per-objective ``<col>_best_so_far`` values updated
-    monotonically (``cummax`` for ``maximize``, ``cummin`` for
-    ``minimize``). Phase labelling uses
-    :func:`kube_autotuner.models.effective_phase` when
-    ``resume_metadata.n_sobol`` is available; otherwise ``t.phase`` is
-    used verbatim with ``None`` bucketed as ``"unknown"``.
+    emitted one row at a time. Each row carries the trial's phase plus
+    per-objective ``<col>_best_so_far`` values updated monotonically
+    (``cummax`` for ``maximize``, ``cummin`` for ``minimize``).
+    ``t.phase`` is used verbatim with ``None`` bucketed as
+    ``"unknown"``.
 
     Args:
         trials: The full trial population (any hardware class/phase).
         objectives: Pareto objectives as
             ``ParetoObjective.model_dump(mode="json")`` dicts.
-        resume_metadata: Optional sidecar with ``n_sobol``; when
-            ``None`` or ``n_sobol is None``, the phase column uses
-            ``t.phase`` verbatim.
+        resume_metadata: Unused; kept for call-site symmetry with
+            :func:`section_metadata`.
 
     Returns:
         One row per primary trial, in ``created_at`` order.
     """
+    _ = resume_metadata
     primaries = sorted(
         (t for t in trials if is_primary(t)),
         key=lambda t: t.created_at,
     )
-    n_sobol = (
-        resume_metadata.n_sobol
-        if resume_metadata is not None and resume_metadata.n_sobol is not None
-        else None
-    )
     bests: dict[str, float | None] = {obj["metric"]: None for obj in objectives}
     rows: list[dict[str, Any]] = []
     for index, t in enumerate(primaries):
-        if n_sobol is not None:
-            phase = effective_phase(t, index, n_sobol)
-        else:
-            phase = t.phase if t.phase is not None else "unknown"
+        phase = t.phase if t.phase is not None else "unknown"
         row: dict[str, Any] = {
             "trial_index": index,
             "trial_id": t.trial_id,
@@ -1267,28 +1256,21 @@ def section_metadata(  # noqa: PLR0914 - one-pass summary over many aggregates
     sorted list when agreed.
 
     Phase counts include every trial (primary + verification);
-    primary phases use :func:`effective_phase` when ``n_sobol`` is
-    known, and fall back to raw ``t.phase`` (``None`` → ``"unknown"``)
-    otherwise.
+    primary phases use ``t.phase`` verbatim (``None`` → ``"unknown"``).
 
     Args:
         trials: The per-hardware-class trial set.
-        resume_metadata: Optional sidecar; consulted for ``n_sobol``
-            when mapping legacy primary rows to sobol/bayesian.
+        resume_metadata: Unused; retained for call-site symmetry.
 
     Returns:
         A dict with keys ``trial_count``, ``phase_counts``,
         ``kernel_version``, ``duration``, ``iterations``, ``stages``,
         ``first_created_at_iso``, ``last_created_at_iso``.
     """
+    _ = resume_metadata
     primaries = sorted(
         (t for t in trials if is_primary(t)),
         key=lambda t: t.created_at,
-    )
-    n_sobol = (
-        resume_metadata.n_sobol
-        if resume_metadata is not None and resume_metadata.n_sobol is not None
-        else None
     )
     phase_counts: dict[str, int] = {
         "sobol": 0,
@@ -1296,11 +1278,8 @@ def section_metadata(  # noqa: PLR0914 - one-pass summary over many aggregates
         "verification": 0,
         "unknown": 0,
     }
-    for index, t in enumerate(primaries):
-        if n_sobol is not None:
-            label = effective_phase(t, index, n_sobol)
-        else:
-            label = t.phase if t.phase is not None else "unknown"
+    for t in primaries:
+        label = t.phase if t.phase is not None else "unknown"
         phase_counts[label] = phase_counts.get(label, 0) + 1
     phase_counts["verification"] += sum(1 for t in trials if not is_primary(t))
 

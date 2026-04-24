@@ -236,7 +236,7 @@ class BenchmarkResult(BaseModel):
         default=None,
         description=(
             "Total bytes sent during the iperf3 run; populated from "
-            "end.sum_sent.bytes for TCP, None for UDP or legacy records."
+            "end.sum_sent.bytes for TCP, None for UDP."
         ),
     )
     jitter: float | None = Field(
@@ -471,12 +471,7 @@ def _group_latency_by_iteration(
 
 
 def is_primary(t: TrialResult) -> bool:
-    """Return ``True`` when ``t`` is a primary (sobol/bayesian/legacy) trial.
-
-    Legacy rows written before this feature have ``phase is None`` and
-    are primary by construction -- the verification loop did not exist
-    at the time they were produced, so they cannot be verification
-    repeats.
+    """Return ``True`` when ``t`` is a primary (sobol/bayesian) trial.
 
     Args:
         t: Trial record to classify.
@@ -486,27 +481,6 @@ def is_primary(t: TrialResult) -> bool:
         ``False`` for rows emitted by the verification pass.
     """
     return t.phase != "verification"
-
-
-def effective_phase(t: TrialResult, index: int, n_sobol: int) -> str:
-    """Return ``t.phase``, or infer from index for legacy primary rows.
-
-    Callers MUST filter to primary rows first (``is_primary(t)``) --
-    this helper is only valid for primary trials in file order and
-    will happily mislabel a verification row if one slips in.
-
-    Args:
-        t: Trial record whose phase label is needed.
-        index: Position of ``t`` within the primary-only subsequence.
-        n_sobol: The experiment's Sobol initialization budget.
-
-    Returns:
-        The stored ``phase`` when present; otherwise ``"sobol"`` for
-        indices below ``n_sobol`` and ``"bayesian"`` above.
-    """
-    if t.phase is not None:
-        return t.phase
-    return "sobol" if index < n_sobol else "bayesian"
 
 
 class TrialResult(BaseModel):
@@ -727,10 +701,7 @@ class ResumeMetadata(BaseModel):
     experiment. ``objectives``, ``param_space``, ``benchmark`` are the
     compatibility keys; ``n_sobol``, ``verification_trials``, and
     ``verification_top_k`` are only populated by ``optimize`` mode
-    (baseline / trial leave them ``None``). ``verification_*`` fields
-    default to ``None`` for sidecars written by pre-feature binaries;
-    the compatibility check treats that shape as tolerant rather than
-    drift.
+    (baseline / trial leave them ``None``).
     """
 
     objectives: ObjectivesSection

@@ -147,54 +147,6 @@ def test_resume_partial_verification_runs_remaining(
     assert kwargs["repeats"] == 2
 
 
-@patch("kube_autotuner.optimizer.OptimizationLoop")
-def test_resume_primary_only_jsonl_adds_verification_from_scratch(
-    mock_loop_cls: MagicMock,
-    tmp_path: Path,
-) -> None:
-    """Adding verification to a legacy primary-only JSONL skips the primary loop."""
-    out = tmp_path / "primary.jsonl"
-    # Current run enables verification for the first time.
-    exp = _optimize_exp(
-        out,
-        n_trials=2,
-        verification_trials=3,
-        verification_top_k=1,
-    )
-    priors = [_prior_trial(1048576, phase="bayesian")] * 2
-    for tr in priors:
-        TrialLog.append(out, tr)
-    # Legacy sidecar: both verification_* keys None.
-    _write_metadata(
-        out,
-        exp,
-        verification_trials=None,
-        verification_top_k=None,
-    )
-
-    loop = MagicMock()
-    loop.run.return_value = priors
-    loop.prior_count = 2
-    loop.pareto_front.return_value = []
-    loop._completed = list(priors)
-    mock_loop_cls.return_value = loop
-
-    ctx = runs.RunContext(
-        exp=exp,
-        client=_client_stub(),
-        backend=MagicMock(),
-        output=out,
-    )
-    runs.run_optimize(ctx)
-
-    # Primary loop short-circuited because the prior budget is met.
-    # Resume.remaining_trials == 0 means loop.run() is not called.
-    loop.run.assert_not_called()
-    # Verification called with an empty already-done map.
-    loop.run_verification.assert_called_once()
-    assert loop.run_verification.call_args.kwargs["already_done_by_parent"] == {}
-
-
 def test_resume_verification_trials_drift_rejects(tmp_path: Path) -> None:
     out = tmp_path / "drift.jsonl"
     exp_prior = _optimize_exp(

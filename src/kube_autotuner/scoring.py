@@ -128,8 +128,7 @@ def score_rows(
     ``memory_cost_weight * norm`` is subtracted from each row's score
     mirroring the minimize branch above. Single-row inputs collapse to
     ``norm = 0.5`` (uniform offset, no rank change); ``memory_costs``
-    omitted or ``memory_cost_weight = 0.0`` preserves the three-arg
-    legacy behaviour.
+    omitted or ``memory_cost_weight = 0.0`` yields the cost-free score.
 
     Both call sites pass their own idiomatic row shape and the helper
     is tolerant of both:

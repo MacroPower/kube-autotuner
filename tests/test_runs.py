@@ -339,6 +339,8 @@ def _seed_prior_results(
             param_space=exp.effective_param_space(),
             benchmark=exp.benchmark,
             n_sobol=n_sobol if n_sobol is not None else exp.optimize.n_sobol,
+            verification_trials=exp.optimize.verification_trials,
+            verification_top_k=exp.optimize.verification_top_k,
         ),
     )
 
@@ -705,11 +707,12 @@ class TestBenchmarkDriftExcludesSyncWindow:
         )
 
     def test_missing_sync_window_key_does_not_flag_drift(self) -> None:
-        """A pre-feature sidecar (no ``sync_window_seconds`` key) stays compatible.
+        """``sync_window_seconds`` is excluded from the compat check.
 
-        The rehydrated sidecar has the field defaulted; the experiment
-        uses a different, explicit value. Without the drift-exclude,
-        the ``model_dump`` equality would flag the change.
+        A sidecar without the key rehydrates to the defaulted value;
+        the experiment uses a different, explicit value. Without the
+        drift-exclude the ``model_dump`` equality would flag the
+        change.
         """
         exp = self._exp(sync_window_seconds=60)
         meta = self._meta(self._exp())

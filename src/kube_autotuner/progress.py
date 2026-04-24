@@ -121,8 +121,8 @@ class ProgressObserver(Protocol):
             prior: Successful :class:`TrialResult` records from the
                 prior session, in file order.
             n_sobol: The Sobol initialization budget for the
-                experiment; used to infer each seeded trial's phase
-                label from its index.
+                experiment; used to pick the live progress bar's phase
+                label on resume.
         """
         ...
 
@@ -988,14 +988,13 @@ class RichProgressObserver:
         """Pre-populate the "best so far" table from prior trials.
 
         Called once at loop-start when resuming from a prior session.
-        Primary rows get a phase from ``TrialResult.phase`` when set;
-        legacy rows without the field fall back to the index-based
-        ``n_sobol`` split. Verification rows carry
-        ``phase="verification"`` and do not shift the Sobol/Bayesian
-        index over primary rows. The two ranges are interleaved in the
-        observer's ``_all_rows`` so JSONL file order is preserved, and
-        :meth:`_rerank` routes through the aggregation path when any
-        verification row is present.
+        Primary rows carry a stored ``phase`` (``"sobol"`` or
+        ``"bayesian"``); verification rows carry ``phase="verification"``
+        and do not shift the Sobol/Bayesian index over primary rows. The
+        two ranges are interleaved in the observer's ``_all_rows`` so
+        JSONL file order is preserved, and :meth:`_rerank` routes
+        through the aggregation path when any verification row is
+        present.
 
         ``_trial_count`` / ``_trial_total_seconds`` are deliberately
         left at zero so the ETA re-learns from live wall-clock; the
@@ -1006,33 +1005,23 @@ class RichProgressObserver:
             prior: Prior successful :class:`TrialResult` records in
                 file order.
             n_sobol: The current experiment's Sobol budget; used to
-                infer the phase label per seeded primary row when the
-                row has no stored ``phase``.
+                pick the Rich progress bar's phase label on resume.
         """
         # Lazy imports: ``_compute_metrics`` lives in ``optimizer`` which
         # is reachable only when the ``optimize`` dep group is
-        # installed. Keeping both imports inside the method preserves
+        # installed. Keeping the import inside the method preserves
         # the module-level constraint that ``progress`` stays
-        # optimize-free for ``task completions``. ``is_primary`` /
-        # ``effective_phase`` are cheap stdlib helpers but live in
-        # ``models`` which imports Pydantic; importing them inside the
-        # method keeps ``progress``'s import graph tidy.
-        from kube_autotuner.models import (  # noqa: PLC0415
-            effective_phase,
-            is_primary,
-        )
+        # optimize-free for ``task completions``.
+        from kube_autotuner.models import is_primary  # noqa: PLC0415
         from kube_autotuner.optimizer import _compute_metrics  # noqa: PLC0415
 
-        primary_order: list[int] = [
-            idx for idx, tr in enumerate(prior) if is_primary(tr)
-        ]
-        primary_rank: dict[int, int] = {
-            idx: rank for rank, idx in enumerate(primary_order)
-        }
+        primary_count = 0
         for idx, tr in enumerate(prior):
             metrics = _compute_metrics(tr)
             if is_primary(tr):
-                phase = effective_phase(tr, primary_rank[idx], n_sobol)
+                primary_count += 1
+                assert tr.phase is not None  # noqa: S101 - run_optimize invariant
+                phase = tr.phase
             else:
                 phase = "verification"
             self._all_rows.append(
@@ -1046,8 +1035,8 @@ class RichProgressObserver:
                 ),
             )
         self._rerank()
-        if primary_order:
-            self._phase = "sobol" if len(primary_order) < n_sobol else "bayesian"
+        if primary_count:
+            self._phase = "sobol" if primary_count < n_sobol else "bayesian"
 
     def _rerank(self) -> None:
         """Refresh ``self._top`` from ``self._all_rows``.
@@ -1056,7 +1045,7 @@ class RichProgressObserver:
         is bound the ranking goes through
         :func:`kube_autotuner.scoring.score_rows` so the panel
         matches ``recommend_configs``. Without one (bare observer
-        construction, ``baseline`` / ``trial`` flows) the legacy
+        construction, ``baseline`` / ``trial`` flows) the
         throughput-descending sort is used.
 
         Once any ``_all_rows`` entry carries ``phase="verification"``,

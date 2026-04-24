@@ -219,7 +219,7 @@ def test_score_rows_zero_weight_on_maximize_disables_contribution() -> None:
     assert scores[2] == pytest.approx(-0.15 * 0.0)
 
 
-def test_score_rows_memory_cost_disabled_ties_legacy_call() -> None:
+def test_score_rows_memory_cost_disabled_matches_cost_free_call() -> None:
     """With weight ``0`` or missing costs, the extra term is a no-op."""
     objectives = [
         ParetoObjective(metric="tcp_throughput", direction="maximize"),
@@ -231,7 +231,7 @@ def test_score_rows_memory_cost_disabled_ties_legacy_call() -> None:
         {_col("tcp_throughput"): 1.0e9, _col("udp_jitter"): 2.0},
     ]
     weights = {"udp_jitter": 0.15}
-    legacy = score_rows(rows, objectives, weights)
+    cost_free = score_rows(rows, objectives, weights)
     with_costs_zero_weight = score_rows(
         rows,
         objectives,
@@ -246,9 +246,9 @@ def test_score_rows_memory_cost_disabled_ties_legacy_call() -> None:
         memory_costs=None,
         memory_cost_weight=0.15,
     )
-    for a, b in zip(legacy, with_costs_zero_weight, strict=True):
+    for a, b in zip(cost_free, with_costs_zero_weight, strict=True):
         assert a == pytest.approx(b)
-    for a, b in zip(legacy, without_costs, strict=True):
+    for a, b in zip(cost_free, without_costs, strict=True):
         assert a == pytest.approx(b)
 
 

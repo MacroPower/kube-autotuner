@@ -210,7 +210,7 @@ def test_write_index_html_axis_chart_degenerates_below_two_columns(
     assert 'class="axis-select-y"' not in html_text
 
 
-def test_write_index_html_no_legacy_pareto_labels(tmp_path: Path) -> None:
+def test_write_index_html_pareto_labels(tmp_path: Path) -> None:
     section = _minimal_section("10g")
     path = report.write_index_html(tmp_path, [section])
     html_text = path.read_text()

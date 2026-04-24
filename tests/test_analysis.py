@@ -1409,25 +1409,6 @@ def test_trajectory_rows_skips_verification_repeats() -> None:
     assert [r["trial_id"] for r in rows] == ["p1"]
 
 
-def test_trajectory_rows_with_metadata_labels_legacy_primaries() -> None:
-    t1 = _trial(hw="10g", bps=5e9, trial_id="t1")
-    t2 = _trial(hw="10g", bps=6e9, trial_id="t2")
-    # Both have phase == None (legacy)
-    meta = ResumeMetadata(
-        objectives=ObjectivesSection(),
-        param_space=ParamSpace(params=[]),
-        benchmark=BenchmarkConfig(duration=10, iterations=1),
-        n_sobol=1,
-    )
-    rows = trajectory_rows(
-        [t1, t2],
-        [{"metric": "tcp_throughput", "direction": "maximize"}],
-        resume_metadata=meta,
-    )
-    phases = [r["phase_effective"] for r in rows]
-    assert phases == ["sobol", "bayesian"]
-
-
 # --- section_metadata ----------------------------------------------------
 
 

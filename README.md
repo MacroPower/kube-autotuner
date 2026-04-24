@@ -334,10 +334,7 @@ A few rules govern how the `objectives:` block is interpreted:
   parallel bytes table.
 - Every iteration runs both iperf3 bandwidth stages (TCP then UDP)
   and both fortio sub-stages, so every metric below is always
-  observable. Sidecar metadata files (`<results.jsonl>.meta.json`)
-  from earlier versions that set `benchmark.modes: [tcp]` still
-  load: the `modes:` key is silently dropped at parse time, so a
-  resume will rerun against the new always-both semantics.
+  observable.
 
 ## Metric catalog
 

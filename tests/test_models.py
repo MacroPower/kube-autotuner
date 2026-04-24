@@ -25,6 +25,7 @@ from kube_autotuner.models import (
     TrialLog,
     TrialResult,
     compute_sysctl_hash,
+    is_primary,
     metrics_for_stages,
 )
 
@@ -156,15 +157,38 @@ def test_metrics_for_stages_unions_stage_entries():
     assert metrics_for_stages(frozenset()) == frozenset()
 
 
-def test_benchmark_config_rejects_legacy_modes_key():
-    # Pre-change YAML embedded `modes: [tcp]`; ``extra="forbid"`` now
-    # rejects it instead of silently dropping the stale key.
-    import pytest  # noqa: PLC0415
-
-    with pytest.raises(ValueError, match="modes"):
+def test_benchmark_config_rejects_unknown_keys():
+    with pytest.raises(ValidationError):
         BenchmarkConfig.model_validate(
             {"duration": 10, "iterations": 1, "modes": ["tcp"]},
         )
+
+
+def _make_phase_trial(
+    *,
+    phase: str | None = None,
+    parent_trial_id: str | None = None,
+) -> TrialResult:
+    return TrialResult(
+        node_pair=NodePair(source="a", target="b", hardware_class="10g"),
+        sysctl_values={},
+        config=BenchmarkConfig(),
+        phase=phase,  # ty: ignore[invalid-argument-type]
+        parent_trial_id=parent_trial_id,
+    )
+
+
+def test_is_primary_treats_phaseless_rows_as_primary() -> None:
+    assert is_primary(_make_phase_trial()) is True
+
+
+def test_is_primary_rejects_verification_rows() -> None:
+    assert is_primary(_make_phase_trial(phase="verification")) is False
+
+
+def test_is_primary_accepts_sobol_and_bayesian() -> None:
+    assert is_primary(_make_phase_trial(phase="sobol")) is True
+    assert is_primary(_make_phase_trial(phase="bayesian")) is True
 
 
 def test_node_pair_defaults():
@@ -1011,11 +1035,11 @@ class TestResumeMetadata:
         with pytest.raises(ValidationError):
             TrialLog.load_resume_metadata(path)
 
-    def test_load_resume_metadata_rejects_old_objectives_only_file(
+    def test_load_resume_metadata_rejects_objectives_only_file(
         self,
         tmp_path: Path,
     ) -> None:
-        # Write an objectives-only sidecar — the old format.
+        # Write an objectives-only sidecar; load must raise.
         path = tmp_path / "results.jsonl"
         meta_path = path.parent / f"{path.name}.meta.json"
         meta_path.write_text(

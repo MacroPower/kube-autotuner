@@ -619,7 +619,7 @@ class OptimizationLoop:
     def _seed_prior_trials(self, prior: list[TrialResult]) -> None:
         """Replay ``prior`` into the Ax client and the completion list.
 
-        Primary rows (sobol / bayesian / legacy) are replayed through
+        Primary rows (sobol / bayesian) are replayed through
         Ax via ``attach_trial`` + ``complete_trial`` so the surrogate
         sees the full history, using the same metric aggregation the
         live loop would produce (:func:`_compute_metrics`) and the
