@@ -80,6 +80,8 @@ if TYPE_CHECKING:
     from kube_autotuner.models import (
         BenchmarkConfig,
         BenchmarkResult,
+        HostStatePhase,
+        HostStateSnapshot,
         LatencyResult,
         NodePair,
     )
@@ -175,6 +177,8 @@ class BenchmarkRunner:
         fortio_args: FortioSection | None = None,
         observer: ProgressObserver | None = None,
         flush_backends: list[SysctlBackend] | None = None,
+        snapshot_backends: list[SysctlBackend] | None = None,
+        collect_host_state: bool = False,
     ) -> None:
         """Wire the runner to a node pair and benchmark config.
 
@@ -203,6 +207,19 @@ class BenchmarkRunner:
                 non-optimizer callers (``run_benchmark`` /
                 ``run_trial``) and unit tests that do not need the
                 per-iteration flush.
+            snapshot_backends: Optional sysctl backends whose
+                :meth:`~kube_autotuner.sysctl.backend.SysctlBackend.collect_host_state`
+                is invoked three times per iteration (baseline /
+                post-flush / post-iteration) when
+                ``collect_host_state`` is ``True``. Kept separate from
+                ``flush_backends`` so future callers can opt into one
+                without the other. Ignored entirely when
+                ``collect_host_state`` is ``False``.
+            collect_host_state: When ``True``, schedule the
+                host-state snapshot calls above and return them on
+                :attr:`IterationResults.host_state_snapshots`. Off
+                by default because each snapshot is an extra
+                privileged-pod schedule.
         """
         self.node_pair = node_pair
         self.config = config
@@ -212,6 +229,9 @@ class BenchmarkRunner:
         self.patches = patches or []
         self.observer: ProgressObserver = observer or NullObserver()
         self._flush_backends: list[SysctlBackend] = flush_backends or []
+        self._snapshot_backends: list[SysctlBackend] = snapshot_backends or []
+        self._collect_host_state: bool = collect_host_state
+        self._no_op_warned: bool = False
         self._server_name = f"iperf3-server-{node_pair.target}"
         self._fortio_server_name = f"fortio-server-{node_pair.target}"
         self._clients = list(node_pair.all_sources)
@@ -678,6 +698,41 @@ class BenchmarkRunner:
                 time.monotonic() - flush_t0,
             )
 
+    def _snapshot_host_state(
+        self,
+        iteration: int | None,
+        phase: HostStatePhase,
+        out: list[HostStateSnapshot],
+    ) -> None:
+        """Collect one snapshot per snapshot backend, skipping ``None`` returns.
+
+        Guarded by :attr:`_collect_host_state`; no-ops cleanly when the
+        flag is off. When all backends return ``None`` for the
+        ``"baseline"`` phase (Talos-only deployment), logs a single
+        warning so operators know the flag is a no-op.
+
+        Args:
+            iteration: Iteration index; ``None`` for baseline.
+            phase: Which collection point is firing.
+            out: List to append collected snapshots to.
+        """
+        if not self._collect_host_state:
+            return
+        collected_any = False
+        for backend in self._snapshot_backends:
+            snapshot = backend.collect_host_state(iteration, phase)
+            if snapshot is None:
+                continue
+            collected_any = True
+            out.append(snapshot)
+        if phase == "baseline" and not collected_any and not self._no_op_warned:
+            logger.warning(
+                "collect_host_state=True but every snapshot backend returned "
+                "None on baseline (Talos-only deployment?); no snapshots "
+                "will be recorded this run",
+            )
+            self._no_op_warned = True
+
     def run(self) -> IterationResults:  # noqa: PLR0915 - one cohesive iteration driver (flush + 4 sub-stages + observer fan-out)
         """Run every configured benchmark iteration.
 
@@ -714,8 +769,22 @@ class BenchmarkRunner:
         )
         all_bench: list[BenchmarkResult] = []
         all_latency: list[LatencyResult] = []
+        snapshots: list[HostStateSnapshot] = []
+        # Reset so each run() re-evaluates the no-op triggers. The runner
+        # is reused across trials in OptimizationLoop; without this reset
+        # operators would miss the second+ warning when the condition
+        # still holds.
+        self._no_op_warned = False
+        if self._collect_host_state and not self._snapshot_backends:
+            logger.warning(
+                "collect_host_state=True but snapshot_backends is empty; "
+                "no host-state snapshots will be recorded",
+            )
+            self._no_op_warned = True
+        self._snapshot_host_state(None, "baseline", snapshots)
         for i in range(self.config.iterations):
             self._flush_network_state(i)
+            self._snapshot_host_state(i, "post-flush", snapshots)
             logger.info(
                 "Running iteration %d/%d: %s -> %s",
                 i + 1,
@@ -807,6 +876,7 @@ class BenchmarkRunner:
                     self.observer.on_stage_end("fortio-fixed", i)
             finally:
                 self.observer.on_iteration_end(i)
+                self._snapshot_host_state(i, "post-iteration", snapshots)
             all_bench.extend([*bench_tcp, *bench_udp])
             all_latency.extend([*sat, *fixed])
         logger.info(
@@ -815,7 +885,11 @@ class BenchmarkRunner:
             len(all_bench),
             len(all_latency),
         )
-        return IterationResults(bench=all_bench, latency=all_latency)
+        return IterationResults(
+            bench=all_bench,
+            latency=all_latency,
+            host_state_snapshots=snapshots,
+        )
 
     def _stage_barrier(self) -> tuple[int | None, int]:
         """Compute the per-stage start-time barrier and wait-timeout budget.

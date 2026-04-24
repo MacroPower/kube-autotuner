@@ -350,6 +350,7 @@ def _build_context(
     backend: str | None,
     fake_state_path: Path | None,
     observer: ProgressObserver,
+    collect_host_state: bool = False,
 ) -> runs.RunContext:
     """Build a :class:`~kube_autotuner.runs.RunContext` for a run mode.
 
@@ -360,6 +361,9 @@ def _build_context(
         fake_state_path: JSON state file when ``backend="fake"``.
         observer: Progress observer for the run. Passed verbatim into
             the returned :class:`RunContext`.
+        collect_host_state: Forwarded to
+            :attr:`RunContext.collect_host_state`. Defaults to
+            ``False``.
 
     Returns:
         A :class:`RunContext` with a freshly constructed
@@ -379,6 +383,7 @@ def _build_context(
         backend=sysctl_backend,
         output=Path(exp.output),
         observer=observer,
+        collect_host_state=collect_host_state,
     )
 
 
@@ -442,6 +447,17 @@ def baseline(
             help="JSON state file for the fake backend.",
         ),
     ] = None,
+    collect_host_state: Annotated[
+        bool,
+        typer.Option(
+            "--collect-host-state/--no-collect-host-state",
+            "-H",
+            help=(
+                "Record per-iteration host-state snapshots (conntrack, "
+                "sockets, slab, etc.) on each TrialResult."
+            ),
+        ),
+    ] = False,
 ) -> None:
     """Run a baseline iperf3 benchmark with current sysctls."""
     exp = _apply_overrides(
@@ -461,6 +477,7 @@ def baseline(
         backend=backend,
         fake_state_path=fake_state_path,
         observer=observer,
+        collect_host_state=collect_host_state,
     )
     with observer:
         runs.run_baseline(run_ctx)
@@ -523,6 +540,17 @@ def trial(
             help="JSON state file for the fake backend.",
         ),
     ] = None,
+    collect_host_state: Annotated[
+        bool,
+        typer.Option(
+            "--collect-host-state/--no-collect-host-state",
+            "-H",
+            help=(
+                "Record per-iteration host-state snapshots (conntrack, "
+                "sockets, slab, etc.) on each TrialResult."
+            ),
+        ),
+    ] = False,
 ) -> None:
     """Run a single optimization trial: snapshot, apply, benchmark, restore."""
     params = _parse_params(param)
@@ -544,6 +572,7 @@ def trial(
         backend=backend,
         fake_state_path=fake_state_path,
         observer=observer,
+        collect_host_state=collect_host_state,
     )
     with observer:
         runs.run_trial(run_ctx)
@@ -634,6 +663,17 @@ def optimize(
             help="Number of top configs to verify.",
         ),
     ] = 3,
+    collect_host_state: Annotated[
+        bool,
+        typer.Option(
+            "--collect-host-state/--no-collect-host-state",
+            "-H",
+            help=(
+                "Record per-iteration host-state snapshots (conntrack, "
+                "sockets, slab, etc.) on each TrialResult."
+            ),
+        ),
+    ] = False,
 ) -> None:
     """Run the Bayesian optimization loop (requires the optimize group)."""
     exp = _apply_overrides(
@@ -660,6 +700,7 @@ def optimize(
         backend=backend,
         fake_state_path=fake_state_path,
         observer=observer,
+        collect_host_state=collect_host_state,
     )
     with observer:
         runs.run_optimize(run_ctx, fresh=fresh)
@@ -702,6 +743,18 @@ def run(
             ),
         ),
     ] = False,
+    collect_host_state: Annotated[
+        bool,
+        typer.Option(
+            "--collect-host-state/--no-collect-host-state",
+            "-H",
+            help=(
+                "Record per-iteration host-state snapshots (conntrack, "
+                "sockets, slab, etc.) on each TrialResult. Diagnostic "
+                "overlay; not part of the experiment YAML."
+            ),
+        ),
+    ] = False,
 ) -> None:
     """Run an experiment defined by a YAML config file.
 
@@ -732,6 +785,7 @@ def run(
         backend=sysctl_backend,
         output=Path(exp.output),
         observer=observer,
+        collect_host_state=collect_host_state,
     )
     with observer:
         if exp.mode == "baseline":

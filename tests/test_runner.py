@@ -30,10 +30,16 @@ from kube_autotuner.experiment import (
     Patch,
     PatchTarget,
 )
-from kube_autotuner.models import BenchmarkConfig, NodePair
+from kube_autotuner.models import (
+    BenchmarkConfig,
+    HostStateSnapshot,
+    NodePair,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+    from kube_autotuner.models import HostStatePhase
 
 
 def _fake_iperf_json(
@@ -792,3 +798,167 @@ def test_run_flush_starting_logged_even_when_backend_raises(caplog):
     assert any("Network flush starting on kmain08" in m for m in messages)
     # "complete" must NOT be logged when the backend propagated.
     assert not any("Network flush complete on kmain08" in m for m in messages)
+
+
+def _stub_snapshot_backend(node: str) -> MagicMock:
+    # Plain MagicMock() auto-returns a MagicMock from collect_host_state,
+    # which slips past the runner's `if snapshot is None: continue` guard
+    # and fails Pydantic validation on IterationResults. Every test that
+    # passes collect_host_state=True must set .return_value explicitly.
+    backend = MagicMock()
+
+    def _collect(iteration: int | None, phase: HostStatePhase) -> HostStateSnapshot:
+        return HostStateSnapshot(
+            node=node,
+            iteration=iteration,
+            phase=phase,
+            metrics={"conntrack_count": 0},
+        )
+
+    backend.collect_host_state.side_effect = _collect
+    return backend
+
+
+def test_run_collects_host_state_snapshots_per_phase():
+    """Each iteration produces exactly one post-flush + one post-iteration snapshot."""
+    node_pair = NodePair(source="kmain07", target="kmain08", hardware_class="10g")
+    iterations = 3
+    config = BenchmarkConfig(duration=1, iterations=iterations)
+
+    logs = {"iperf3-client-kmain07-p5201": _fake_iperf_json(9e9)}
+    client = _make_client(logs)
+
+    target_backend = _stub_snapshot_backend("kmain08")
+
+    runner = BenchmarkRunner(
+        node_pair,
+        config,
+        client=client,
+        snapshot_backends=[target_backend],
+        collect_host_state=True,
+    )
+    runner.setup_server()
+    results = runner.run()
+
+    # (1 baseline + 2 * iterations) * 1 backend
+    assert len(results.host_state_snapshots) == 1 + 2 * iterations
+
+    phases = [s.phase for s in results.host_state_snapshots]
+    assert phases[0] == "baseline"
+    # Baseline then interleaved post-flush / post-iteration.
+    for i in range(iterations):
+        assert phases[1 + 2 * i] == "post-flush"
+        assert phases[2 + 2 * i] == "post-iteration"
+
+    # Iteration field on baseline is None; iteration N on the per-iter pair.
+    assert results.host_state_snapshots[0].iteration is None
+    for i in range(iterations):
+        assert results.host_state_snapshots[1 + 2 * i].iteration == i
+        assert results.host_state_snapshots[2 + 2 * i].iteration == i
+
+
+def test_run_collect_host_state_off_is_no_op_even_with_backends():
+    """The flag is required; passing backends alone never fires collection."""
+    node_pair = NodePair(source="kmain07", target="kmain08", hardware_class="10g")
+    config = BenchmarkConfig(duration=1, iterations=2)
+
+    logs = {"iperf3-client-kmain07-p5201": _fake_iperf_json(9e9)}
+    client = _make_client(logs)
+
+    backend = _stub_snapshot_backend("kmain08")
+    runner = BenchmarkRunner(
+        node_pair,
+        config,
+        client=client,
+        snapshot_backends=[backend],
+        collect_host_state=False,
+    )
+    runner.setup_server()
+    results = runner.run()
+
+    assert results.host_state_snapshots == []
+    backend.collect_host_state.assert_not_called()
+
+
+def test_run_warns_when_flag_on_but_no_snapshot_backends(caplog):
+    """Flag on + empty snapshot list must emit a single warning per run()."""
+    node_pair = NodePair(source="kmain07", target="kmain08", hardware_class="10g")
+    config = BenchmarkConfig(duration=1, iterations=2)
+
+    logs = {"iperf3-client-kmain07-p5201": _fake_iperf_json(9e9)}
+    client = _make_client(logs)
+
+    runner = BenchmarkRunner(
+        node_pair,
+        config,
+        client=client,
+        collect_host_state=True,
+    )
+    runner.setup_server()
+    with caplog.at_level("WARNING"):
+        results = runner.run()
+
+    assert results.host_state_snapshots == []
+    matching = [r for r in caplog.records if "snapshot_backends is empty" in r.message]
+    assert len(matching) == 1
+
+
+def test_run_warns_when_every_backend_returns_none_for_baseline(caplog):
+    """Talos-only deployment case: every backend returns None."""
+    node_pair = NodePair(source="kmain07", target="kmain08", hardware_class="10g")
+    config = BenchmarkConfig(duration=1, iterations=2)
+
+    logs = {"iperf3-client-kmain07-p5201": _fake_iperf_json(9e9)}
+    client = _make_client(logs)
+
+    no_exec_backend = MagicMock()
+    no_exec_backend.collect_host_state.return_value = None
+
+    runner = BenchmarkRunner(
+        node_pair,
+        config,
+        client=client,
+        snapshot_backends=[no_exec_backend],
+        collect_host_state=True,
+    )
+    runner.setup_server()
+    with caplog.at_level("WARNING"):
+        results = runner.run()
+
+    assert results.host_state_snapshots == []
+    matching = [
+        r for r in caplog.records if "every snapshot backend returned" in r.message
+    ]
+    assert len(matching) == 1
+
+
+def test_run_partial_none_backend_does_not_warn(caplog):
+    """Mixed real + Talos backends is a legitimate config; must stay silent."""
+    node_pair = NodePair(source="kmain07", target="kmain08", hardware_class="10g")
+    config = BenchmarkConfig(duration=1, iterations=1)
+
+    logs = {"iperf3-client-kmain07-p5201": _fake_iperf_json(9e9)}
+    client = _make_client(logs)
+
+    real = _stub_snapshot_backend("kmain08")
+    talos = MagicMock()
+    talos.collect_host_state.return_value = None
+
+    runner = BenchmarkRunner(
+        node_pair,
+        config,
+        client=client,
+        snapshot_backends=[real, talos],
+        collect_host_state=True,
+    )
+    runner.setup_server()
+    with caplog.at_level("WARNING"):
+        results = runner.run()
+
+    # 1 baseline + 2 per iteration, only from the real backend.
+    assert len(results.host_state_snapshots) == 3
+    assert not any(
+        "every snapshot backend returned" in r.message
+        or "snapshot_backends is empty" in r.message
+        for r in caplog.records
+    )

@@ -247,6 +247,46 @@ class LatencyResult(BaseModel):
     raw_json: dict[str, Any] = Field(default_factory=dict)
 
 
+HostStatePhase = Literal["baseline", "post-flush", "post-iteration"]
+"""When during a benchmark iteration a :class:`HostStateSnapshot` was taken.
+
+``"baseline"`` fires once per ``BenchmarkRunner.run`` before iteration 0's
+flush; ``"post-flush"`` fires immediately after ``flush_network_state``
+each iteration; ``"post-iteration"`` fires at the tail of the iteration's
+``finally`` block.
+"""
+
+
+class HostStateSnapshot(BaseModel):
+    """One host-kernel-state snapshot taken at a specific iteration phase.
+
+    Captured from a privileged pod on the target node; carries a flat
+    dict of scalar counters parsed from ``/proc`` and ``conntrack``
+    tools. Drift between consecutive ``"post-flush"`` snapshots is the
+    primary signal that the per-iteration reset is leaking state.
+
+    Attributes:
+        node: Node the snapshot was collected from.
+        iteration: Iteration index the snapshot belongs to, or ``None``
+            for the per-run baseline.
+        phase: Which of the three per-iteration collection points this
+            snapshot was taken at.
+        timestamp: When the snapshot was captured (UTC).
+        metrics: Flat ``name -> int`` map of scalar counters. A key is
+            absent from the map when its source was unparseable (no
+            sentinel zero).
+        errors: Human-readable notes about keys that failed to parse;
+            empty on a clean run.
+    """
+
+    node: str
+    iteration: int | None = None
+    phase: HostStatePhase
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    metrics: dict[str, int] = Field(default_factory=dict)
+    errors: list[str] = Field(default_factory=list)
+
+
 class IterationResults(BaseModel):
     """Container for the two record streams produced by a single run.
 
@@ -258,6 +298,7 @@ class IterationResults(BaseModel):
 
     bench: list[BenchmarkResult] = Field(default_factory=list)
     latency: list[LatencyResult] = Field(default_factory=list)
+    host_state_snapshots: list[HostStateSnapshot] = Field(default_factory=list)
 
 
 def compute_sysctl_hash(sysctl_values: Mapping[str, str | int]) -> str:
@@ -423,6 +464,7 @@ class TrialResult(BaseModel):
     config: BenchmarkConfig
     results: list[BenchmarkResult] = Field(default_factory=list)
     latency_results: list[LatencyResult] = Field(default_factory=list)
+    host_state_snapshots: list[HostStateSnapshot] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     phase: Literal["sobol", "bayesian", "verification"] | None = None
     parent_trial_id: str | None = None

@@ -295,6 +295,15 @@ class TestEndpointResolution:
             _ = backend.endpoint
 
 
+class TestTalosHostStateNoOp:
+    def test_collect_host_state_returns_none(self):
+        """Talos has no arbitrary-exec path; ``collect_host_state`` is a no-op."""
+        backend = _make_backend()
+        assert backend.collect_host_state(None, "baseline") is None
+        assert backend.collect_host_state(0, "post-flush") is None
+        assert backend.collect_host_state(0, "post-iteration") is None
+
+
 class TestTalosctlErrors:
     def test_missing_talosctl_raises_runtime_error(self):
         backend = _make_backend()

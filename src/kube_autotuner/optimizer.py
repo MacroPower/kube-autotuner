@@ -498,6 +498,7 @@ class OptimizationLoop:
         objectives: ObjectivesSection,
         observer: ProgressObserver | None = None,
         prior_trials: list[TrialResult] | None = None,
+        collect_host_state: bool = False,
     ) -> None:
         """Wire up the Ax client, benchmark runner, and sysctl setters.
 
@@ -534,6 +535,10 @@ class OptimizationLoop:
                 history. ``n_trials`` remains the total budget across
                 sessions; the live loop runs
                 ``max(0, n_trials - len(prior_trials))`` more attempts.
+            collect_host_state: Forwarded to
+                :class:`~kube_autotuner.benchmark.runner.BenchmarkRunner`
+                to opt into per-iteration host-state snapshots
+                (target plus every client setter). Off by default.
         """
         self.node_pair: NodePair = node_pair
         self.config: BenchmarkConfig = config
@@ -583,6 +588,11 @@ class OptimizationLoop:
                     namespace=node_pair.namespace,
                     client=self.k8s_client,
                 )
+        self.collect_host_state: bool = collect_host_state
+        snapshot_backends: list[SysctlBackend] = [
+            self.target_setter,
+            *self.client_setters.values(),
+        ]
         self.runner: BenchmarkRunner = BenchmarkRunner(
             node_pair,
             config,
@@ -592,6 +602,8 @@ class OptimizationLoop:
             fortio_args=fortio_args,
             observer=self.observer,
             flush_backends=[self.target_setter, *self.client_setters.values()],
+            snapshot_backends=snapshot_backends,
+            collect_host_state=collect_host_state,
         )
         self._completed: list[TrialResult] = []
         self.prior_count: int = sum(1 for t in (prior_trials or []) if is_primary(t))
@@ -811,6 +823,7 @@ class OptimizationLoop:
             config=self.config,
             results=iteration_results.bench,
             latency_results=iteration_results.latency,
+            host_state_snapshots=iteration_results.host_state_snapshots,
             phase=phase,  # ty: ignore[invalid-argument-type]
             parent_trial_id=parent_trial_id,
         )

@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Literal, cast
 from kube_autotuner.k8s.client import K8sApiError, K8sClient
 from kube_autotuner.k8s.lease import NodeLease
 from kube_autotuner.k8s.templates import render_template
+from kube_autotuner.models import HostStateSnapshot
 from kube_autotuner.sysctl.backend import (
     _validate_sysctl_key,
     _validate_sysctl_value,
@@ -35,12 +36,421 @@ from kube_autotuner.sysctl.talos import TalosSysctlBackend
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
+    from kube_autotuner.models import HostStatePhase
     from kube_autotuner.sysctl.backend import SysctlBackend
 
 logger = logging.getLogger(__name__)
 
 _POD_READY_TIMEOUT_SECONDS = 60
 _LOG_TAIL_LINES = 20
+
+_HOST_STATE_COMMANDS: tuple[str, ...] = (
+    "echo '===conntrack_count==='",
+    "conntrack -C 2>/dev/null || echo NA",
+    "echo '===conntrack_stats==='",
+    "conntrack -S 2>/dev/null || echo NA",
+    "echo '===sockstat==='",
+    "cat /proc/net/sockstat 2>/dev/null || echo NA",
+    "echo '===sockstat6==='",
+    "cat /proc/net/sockstat6 2>/dev/null || echo NA",
+    "echo '===netstat==='",
+    "cat /proc/net/netstat 2>/dev/null || echo NA",
+    "echo '===snmp==='",
+    "cat /proc/net/snmp 2>/dev/null || echo NA",
+    "echo '===tcp_metrics==='",
+    "wc -l < /proc/net/tcp_metrics 2>/dev/null || echo NA",
+    "echo '===route==='",
+    "wc -l < /proc/net/route 2>/dev/null || echo NA",
+    "echo '===arp==='",
+    "wc -l < /proc/net/arp 2>/dev/null || echo NA",
+    "echo '===meminfo==='",
+    "cat /proc/meminfo 2>/dev/null || echo NA",
+    "echo '===slabinfo==='",
+    "grep nf_conntrack /proc/slabinfo 2>/dev/null || echo NA",
+    "echo '===file_nr==='",
+    "cat /proc/sys/fs/file-nr 2>/dev/null || echo NA",
+    "echo '===end==='",
+)
+
+_HOST_STATE_SCRIPT = "; ".join(_HOST_STATE_COMMANDS)
+"""Shell script that dumps labelled host-state sections to stdout.
+
+Read by :func:`_parse_host_state_output`. Must stay on a single line
+so the rendered setter-pod YAML scalar round-trips cleanly, and must
+avoid ``$NODE`` / ``$POD_NAME`` / ``$SYSCTL_COMMANDS`` / ``$$`` /
+``"`` / ``\\`` tokens -- the template substitutes ``${SYSCTL_COMMANDS}``
+via :func:`string.Template.safe_substitute`, and the target YAML
+scalar is double-quoted which would interpret ``\\`` as an escape.
+"""
+
+_TCPEXT_KEYS = frozenset({
+    "TCPTimeWaitOverflow",
+    "TW",
+    "TWRecycled",
+    "TCPOrphanQueued",
+    "ListenDrops",
+    "ListenOverflows",
+    "DelayedACKs",
+    "TCPAbortOnData",
+    "TCPAbortOnClose",
+    "TCPKeepAlive",
+})
+
+_SNMP_KEYS = frozenset({
+    "InSegs",
+    "OutSegs",
+    "RetransSegs",
+    "OutRsts",
+    "CurrEstab",
+    "InDatagrams",
+    "OutDatagrams",
+    "RcvbufErrors",
+    "SndbufErrors",
+})
+
+_CONNTRACK_STATS_KEYS = frozenset({
+    "found",
+    "invalid",
+    "insert",
+    "insert_failed",
+    "drop",
+    "early_drop",
+    "error",
+    "search_restart",
+})
+
+_MEMINFO_KEYS = {
+    "Slab": "slab_kb",
+    "SReclaimable": "sreclaimable_kb",
+    "SUnreclaim": "sunreclaim_kb",
+}
+
+_SECTION_MARKER_MIN_LEN = 7
+"""Minimum length of a ``===name===`` marker line (two non-empty names)."""
+
+_SLABINFO_MIN_COLUMNS = 3
+"""``name active_objs num_objs`` -- the minimum we need to record."""
+
+_FILE_NR_COLUMNS = 3
+"""``/proc/sys/fs/file-nr`` always emits ``allocated unused max``."""
+
+
+def _split_sections(text: str) -> dict[str, str]:
+    """Split ``_HOST_STATE_SCRIPT`` stdout into ``name -> body`` sections.
+
+    Sections are delimited by ``===name===`` marker lines; the trailing
+    ``===end===`` marker is discarded.
+
+    Args:
+        text: Raw stdout captured from a successful script run.
+
+    Returns:
+        Mapping of section name to the joined body text with
+        surrounding whitespace stripped.
+    """
+    sections: dict[str, str] = {}
+    current: str | None = None
+    buffer: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if (
+            stripped.startswith("===")
+            and stripped.endswith("===")
+            and len(stripped) >= _SECTION_MARKER_MIN_LEN
+        ):
+            if current is not None and current != "end":
+                sections[current] = "\n".join(buffer).strip()
+            current = stripped[3:-3]
+            buffer = []
+            continue
+        buffer.append(line)
+    if current is not None and current != "end":
+        sections[current] = "\n".join(buffer).strip()
+    return sections
+
+
+def _parse_int(
+    raw: str,
+    *,
+    section: str,
+    key: str,
+    metrics: dict[str, int],
+    errors: list[str],
+) -> None:
+    """Parse ``raw`` as an int and write to ``metrics`` or ``errors``."""
+    try:
+        metrics[key] = int(raw)
+    except ValueError:
+        errors.append(f"{section}: {key} unparseable value {raw!r}")
+
+
+def _parse_conntrack_stats(
+    block: str,
+    metrics: dict[str, int],
+    errors: list[str],
+) -> None:
+    """Sum ``conntrack -S`` per-cpu counters into total metrics."""
+    totals: dict[str, int] = dict.fromkeys(_CONNTRACK_STATS_KEYS, 0)
+    seen: set[str] = set()
+    for line in block.splitlines():
+        for part in line.split():
+            k, sep, v = part.partition("=")
+            if not sep or k not in _CONNTRACK_STATS_KEYS:
+                continue
+            try:
+                totals[k] += int(v)
+            except ValueError:
+                continue
+            seen.add(k)
+    for k in seen:
+        metrics[f"conntrack_{k}"] = totals[k]
+    errors.extend(f"conntrack_stats: missing {k}" for k in _CONNTRACK_STATS_KEYS - seen)
+
+
+def _parse_sockstat(
+    block: str,
+    *,
+    prefix: str,
+    section: str,
+    metrics: dict[str, int],
+    errors: list[str],
+) -> None:
+    """Parse ``/proc/net/sockstat``-style ``Proto: key val key val`` lines.
+
+    Captures *every* key the kernel emits (TCP, UDP, UDPLITE, RAW,
+    FRAG, sockets, etc.) rather than a curated subset. ``/proc/net/
+    sockstat`` is small and cheap to ingest, and the extra protocols
+    are occasionally useful leak signals (e.g. FRAG memory growth).
+    The plan's named keys (tcp_inuse, tcp_tw, tcp_mem, udp_inuse,
+    udp_mem, ...) are the documented *minimum*, not a hard filter.
+    """
+    for line in block.splitlines():
+        head, sep, tail = line.partition(":")
+        if not sep:
+            continue
+        proto = head.strip().lower().replace(" ", "_")
+        if not proto:
+            continue
+        tokens = tail.split()
+        for i in range(0, len(tokens) - 1, 2):
+            key = f"{prefix}{proto}_{tokens[i].lower()}"
+            _parse_int(
+                tokens[i + 1],
+                section=section,
+                key=key,
+                metrics=metrics,
+                errors=errors,
+            )
+
+
+def _parse_netstat_like(
+    block: str,
+    *,
+    prefix: str,
+    wanted: frozenset[str],
+    section: str,
+    metrics: dict[str, int],
+    errors: list[str],
+) -> None:
+    """Parse paired header/values lines from ``/proc/net/{netstat,snmp}``.
+
+    Any key in ``wanted`` that doesn't appear in any header row is
+    recorded in ``errors`` so a reader diffing two snapshots can tell
+    "kernel didn't emit it" apart from "we didn't look".
+    """
+    lines = block.splitlines()
+    seen: set[str] = set()
+    for i in range(0, len(lines), 2):
+        if i + 1 >= len(lines):
+            break
+        header = lines[i]
+        values = lines[i + 1]
+        h_name, h_sep, h_rest = header.partition(":")
+        v_name, v_sep, v_rest = values.partition(":")
+        if not h_sep or not v_sep or h_name != v_name:
+            continue
+        keys = h_rest.split()
+        vals = v_rest.split()
+        for k, v in zip(keys, vals, strict=False):
+            if k not in wanted:
+                continue
+            metric_key = f"{prefix}{h_name.lower()}_{k}"
+            _parse_int(
+                v,
+                section=section,
+                key=metric_key,
+                metrics=metrics,
+                errors=errors,
+            )
+            seen.add(k)
+    errors.extend(f"{section}: missing {k}" for k in wanted - seen)
+
+
+def _parse_meminfo(block: str, metrics: dict[str, int], errors: list[str]) -> None:
+    """Parse the curated subset of ``/proc/meminfo``, stripping ``kB`` suffixes."""
+    seen: set[str] = set()
+    for line in block.splitlines():
+        name, sep, rest = line.partition(":")
+        name = name.strip()
+        if not sep or name not in _MEMINFO_KEYS:
+            continue
+        parts = rest.split()
+        if not parts:
+            errors.append(f"meminfo: empty value for {name}")
+            continue
+        _parse_int(
+            parts[0],
+            section="meminfo",
+            key=_MEMINFO_KEYS[name],
+            metrics=metrics,
+            errors=errors,
+        )
+        seen.add(name)
+    errors.extend(f"meminfo: missing {name}" for name in set(_MEMINFO_KEYS) - seen)
+
+
+def _parse_slabinfo(block: str, metrics: dict[str, int], errors: list[str]) -> None:
+    """Extract ``active_objs`` / ``num_objs`` for the ``nf_conntrack`` slab."""
+    for line in block.splitlines():
+        parts = line.split()
+        if not parts or parts[0] != "nf_conntrack":
+            continue
+        if len(parts) < _SLABINFO_MIN_COLUMNS:
+            errors.append("slabinfo: nf_conntrack row malformed")
+            return
+        _parse_int(
+            parts[1],
+            section="slabinfo",
+            key="slab_nf_conntrack_active_objs",
+            metrics=metrics,
+            errors=errors,
+        )
+        _parse_int(
+            parts[2],
+            section="slabinfo",
+            key="slab_nf_conntrack_num_objs",
+            metrics=metrics,
+            errors=errors,
+        )
+        return
+    errors.append("slabinfo: nf_conntrack row not found")
+
+
+def _parse_file_nr(block: str, metrics: dict[str, int], errors: list[str]) -> None:
+    """Parse ``/proc/sys/fs/file-nr``: ``allocated  unused  max``."""
+    parts = block.split()
+    if len(parts) < _FILE_NR_COLUMNS:
+        errors.append(f"file_nr: malformed {block!r}")
+        return
+    for raw, key in zip(
+        parts[:_FILE_NR_COLUMNS],
+        ("file_nr_allocated", "file_nr_unused", "file_nr_max"),
+        strict=True,
+    ):
+        _parse_int(raw, section="file_nr", key=key, metrics=metrics, errors=errors)
+
+
+def _parse_host_state_output(  # noqa: C901 - dispatcher across many /proc sources
+    text: str,
+) -> tuple[dict[str, int], list[str]]:
+    """Turn ``_HOST_STATE_SCRIPT`` stdout into ``(metrics, errors)``.
+
+    A source whose command emitted the literal ``NA`` fallback routes
+    to ``errors`` and contributes no entry to ``metrics`` -- sentinel
+    zeros would defeat the leak-detection signal by being
+    indistinguishable from a true zero reading.
+
+    Args:
+        text: Raw stdout from a successful ``_HOST_STATE_SCRIPT`` run.
+
+    Returns:
+        ``(metrics, errors)``: a flat ``dict[str, int]`` of scalar
+        counters, plus a list of human-readable parse notes (empty on
+        a clean run).
+    """
+    sections = _split_sections(text)
+    metrics: dict[str, int] = {}
+    errors: list[str] = []
+
+    def section_or_na(name: str) -> str | None:
+        block = sections.get(name)
+        if block is None:
+            errors.append(f"{name}: section missing")
+            return None
+        if block == "NA":
+            errors.append(f"{name}: NA")
+            return None
+        return block
+
+    block = section_or_na("conntrack_count")
+    if block is not None:
+        _parse_int(
+            block.strip(),
+            section="conntrack_count",
+            key="conntrack_count",
+            metrics=metrics,
+            errors=errors,
+        )
+
+    block = section_or_na("conntrack_stats")
+    if block is not None:
+        _parse_conntrack_stats(block, metrics, errors)
+
+    for name, prefix in (("sockstat", "sockstat_"), ("sockstat6", "sockstat6_")):
+        block = section_or_na(name)
+        if block is not None:
+            _parse_sockstat(
+                block,
+                prefix=prefix,
+                section=name,
+                metrics=metrics,
+                errors=errors,
+            )
+
+    for name, prefix, wanted in (
+        ("netstat", "netstat_", _TCPEXT_KEYS),
+        ("snmp", "snmp_", _SNMP_KEYS),
+    ):
+        block = section_or_na(name)
+        if block is not None:
+            _parse_netstat_like(
+                block,
+                prefix=prefix,
+                wanted=wanted,
+                section=name,
+                metrics=metrics,
+                errors=errors,
+            )
+
+    for name, key in (
+        ("tcp_metrics", "tcp_metrics_rows"),
+        ("route", "route_rows"),
+        ("arp", "arp_rows"),
+    ):
+        block = section_or_na(name)
+        if block is not None:
+            _parse_int(
+                block.strip(),
+                section=name,
+                key=key,
+                metrics=metrics,
+                errors=errors,
+            )
+
+    block = section_or_na("meminfo")
+    if block is not None:
+        _parse_meminfo(block, metrics, errors)
+
+    block = section_or_na("slabinfo")
+    if block is not None:
+        _parse_slabinfo(block, metrics, errors)
+
+    block = section_or_na("file_nr")
+    if block is not None:
+        _parse_file_nr(block, metrics, errors)
+
+    return metrics, errors
+
 
 BackendName = Literal["fake", "real", "talos"]
 """Names accepted by :func:`make_sysctl_setter`'s ``backend`` argument."""
@@ -273,6 +683,57 @@ class SysctlSetter:
                 self.node,
                 e,
             )
+
+    def collect_host_state(
+        self,
+        iteration: int | None,
+        phase: HostStatePhase,
+    ) -> HostStateSnapshot | None:
+        """Snapshot cheap-to-read host kernel counters via a privileged pod.
+
+        Runs :data:`_HOST_STATE_SCRIPT` in one ``sh -c`` invocation on
+        the target node, parses the labelled sections into scalar
+        counters, and returns a :class:`HostStateSnapshot`. Pod
+        failures are logged and surfaced as a snapshot with empty
+        ``metrics`` and a single entry in ``errors`` so the caller
+        still records that a collection attempt was made.
+
+        Args:
+            iteration: Iteration index; ``None`` for the per-run
+                baseline.
+            phase: Collection point label; used in the pod name so
+                parallel ``apply``/``flush``/``snapshot`` pods on the
+                same node cannot collide.
+
+        Returns:
+            A populated :class:`HostStateSnapshot`. Never ``None``
+            for this backend.
+        """
+        pod_name = f"host-snap-{self.node}-{phase}"
+        try:
+            output = self._run_pod(pod_name, _HOST_STATE_SCRIPT)
+        except Exception as e:  # noqa: BLE001 - instrumentation must never fail the trial
+            logger.warning(
+                "host-state snapshot pod failed on %s phase=%s (continuing): %s",
+                self.node,
+                phase,
+                e,
+            )
+            return HostStateSnapshot(
+                node=self.node,
+                iteration=iteration,
+                phase=phase,
+                metrics={},
+                errors=[f"pod failed: {e}"],
+            )
+        metrics, errors = _parse_host_state_output(output)
+        return HostStateSnapshot(
+            node=self.node,
+            iteration=iteration,
+            phase=phase,
+            metrics=metrics,
+            errors=errors,
+        )
 
     def lock(self) -> NodeLease:
         """Return a :class:`NodeLease` guarding exclusive node access."""

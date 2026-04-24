@@ -45,6 +45,8 @@ from kube_autotuner.sysctl.backend import (
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
+    from kube_autotuner.models import HostStatePhase, HostStateSnapshot
+
 logger = logging.getLogger(__name__)
 
 _APPLY_PROPAGATION_TIMEOUT_SECONDS = 120
@@ -289,6 +291,21 @@ class TalosSysctlBackend:
             "network-state flush skipped on %s (Talos backend has no exec path)",
             self.node,
         )
+
+    def collect_host_state(  # noqa: PLR6301 - protocol conformance requires instance method
+        self,
+        iteration: int | None,  # noqa: ARG002
+        phase: HostStatePhase,  # noqa: ARG002
+    ) -> HostStateSnapshot | None:
+        """No-op on Talos: there is no arbitrary-exec path to ``/proc``.
+
+        The runner skips ``None`` returns and emits a single warning
+        per ``run()`` when every configured backend returns ``None``.
+
+        Returns:
+            Always ``None``.
+        """
+        return None
 
     def lock(self) -> NodeLease:
         """Return a :class:`NodeLease` guarding exclusive node access."""

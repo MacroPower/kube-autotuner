@@ -111,6 +111,22 @@ def test_legacy_sidecar_enables_verification_with_info_log(
     assert refreshed.verification_top_k == 1
 
 
+def test_trial_result_without_host_state_snapshots_round_trips() -> None:
+    """Pre-feature JSONL rows rehydrate with ``host_state_snapshots=[]``.
+
+    Older binaries wrote :class:`TrialResult` JSON without
+    ``host_state_snapshots``. Pydantic's ``default_factory=list`` fills
+    the empty list on reload so resume flows never choke on legacy
+    trial rows.
+    """
+    import json  # noqa: PLC0415
+
+    row = _prior_trial().model_dump(mode="json")
+    row.pop("host_state_snapshots", None)
+    rehydrated = TrialResult.model_validate_json(json.dumps(row))
+    assert rehydrated.host_state_snapshots == []
+
+
 def test_legacy_sidecar_without_memory_cost_weight_round_trips() -> None:
     """A sidecar dump dropping ``memoryCostWeight`` rehydrates at the default.
 

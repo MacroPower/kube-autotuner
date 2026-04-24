@@ -122,6 +122,12 @@ class RunContext:
             Defaults to :class:`NullObserver` so library consumers
             and tests get zero output side-effects; the CLI overrides
             it with a :class:`RichProgressObserver` under a TTY.
+        collect_host_state: When ``True``, forward through to the
+            runner / optimizer so each iteration records a
+            :class:`~kube_autotuner.models.HostStateSnapshot` on the
+            resulting :class:`TrialResult`. ``baseline`` and
+            ``trial`` paths get target-only coverage (one backend);
+            ``optimize`` covers the target plus every client setter.
     """
 
     exp: ExperimentConfig
@@ -129,6 +135,7 @@ class RunContext:
     backend: SysctlBackend
     output: Path
     observer: ProgressObserver = field(default_factory=NullObserver)
+    collect_host_state: bool = False
 
 
 def _resolve_zones(node_pair: NodePair, client: K8sClient) -> NodePair:
@@ -437,6 +444,8 @@ def run_baseline(ctx: RunContext) -> None:
             patches=exp.patches,
             fortio_args=exp.fortio,
             observer=ctx.observer,
+            snapshot_backends=[ctx.backend],
+            collect_host_state=ctx.collect_host_state,
         )
         try:
             runner.setup_server()
@@ -451,6 +460,7 @@ def run_baseline(ctx: RunContext) -> None:
         config=config,
         results=results.bench,
         latency_results=results.latency,
+        host_state_snapshots=results.host_state_snapshots,
     )
     TrialLog.append(ctx.output, trial)
     logger.info(
@@ -533,6 +543,8 @@ def run_trial(ctx: RunContext) -> None:
             patches=exp.patches,
             fortio_args=exp.fortio,
             observer=ctx.observer,
+            snapshot_backends=[ctx.backend],
+            collect_host_state=ctx.collect_host_state,
         )
         try:
             runner.setup_server()
@@ -549,6 +561,7 @@ def run_trial(ctx: RunContext) -> None:
         config=config,
         results=results.bench,
         latency_results=results.latency,
+        host_state_snapshots=results.host_state_snapshots,
     )
     TrialLog.append(ctx.output, trial_result)
     logger.info(
@@ -665,6 +678,7 @@ def run_optimize(  # noqa: PLR0914, PLR0915
         objectives=exp.objectives,
         observer=ctx.observer,
         prior_trials=resume.prior_trials,
+        collect_host_state=ctx.collect_host_state,
     )
     if resume.remaining_trials == 0:
         logger.info(

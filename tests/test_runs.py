@@ -24,6 +24,7 @@ from kube_autotuner.experiment import ExperimentConfig
 from kube_autotuner.models import (
     BenchmarkConfig,
     BenchmarkResult,
+    HostStateSnapshot,
     IterationResults,
     NodePair,
     ParamSpace,
@@ -140,6 +141,127 @@ def test_run_trial_snapshots_only_applied_keys(
     backend.apply.assert_called_once_with({"net.core.rmem_max": "16777216"})
     backend.restore.assert_called_once_with({"net.core.rmem_max": "67108864"})
     assert mock_lease_cls.call_count == 2
+
+
+def _results_with_snapshot(node: str = "b") -> IterationResults:
+    base = _results()
+    base.host_state_snapshots = [
+        HostStateSnapshot(
+            node=node,
+            iteration=None,
+            phase="baseline",
+            metrics={"conntrack_count": 0},
+        ),
+    ]
+    return base
+
+
+@patch("kube_autotuner.runs.NodeLease")
+@patch("kube_autotuner.runs.BenchmarkRunner")
+def test_run_baseline_threads_collect_host_state_and_snapshots(
+    mock_runner_cls,
+    mock_lease_cls,  # noqa: ARG001
+    tmp_path: Path,
+):
+    """``ctx.collect_host_state`` must reach the runner + survive on the trial row."""
+    backend = MagicMock()
+    backend.snapshot.side_effect = _snapshot
+    mock_runner_cls.return_value.run.return_value = _results_with_snapshot()
+
+    out = tmp_path / "r.jsonl"
+    exp = ExperimentConfig.model_validate({
+        "mode": "baseline",
+        "nodes": {"sources": ["a"], "target": "b"},
+        "benchmark": {"duration": 1, "iterations": 1},
+        "output": str(out),
+    })
+    ctx = runs.RunContext(
+        exp=exp,
+        client=_client_stub(),
+        backend=backend,
+        output=out,
+        collect_host_state=True,
+    )
+    runs.run_baseline(ctx)
+
+    kwargs = mock_runner_cls.call_args.kwargs
+    assert kwargs["collect_host_state"] is True
+    assert kwargs["snapshot_backends"] == [backend]
+
+    trial = json.loads(out.read_text().strip())
+    assert len(trial["host_state_snapshots"]) == 1
+    assert trial["host_state_snapshots"][0]["phase"] == "baseline"
+
+
+@patch("kube_autotuner.runs.NodeLease")
+@patch("kube_autotuner.runs.BenchmarkRunner")
+def test_run_trial_threads_collect_host_state_and_snapshots(
+    mock_runner_cls,
+    mock_lease_cls,  # noqa: ARG001
+    tmp_path: Path,
+):
+    """``run_trial`` propagates the flag + recorded snapshots the same way."""
+    backend = MagicMock()
+    backend.snapshot.return_value = {
+        "net.core.rmem_max": "67108864",
+        "kernel.osrelease": "6.1.0",
+    }
+    mock_runner_cls.return_value.run.return_value = _results_with_snapshot()
+
+    out = tmp_path / "r.jsonl"
+    exp = ExperimentConfig.model_validate({
+        "mode": "trial",
+        "nodes": {"sources": ["a"], "target": "b"},
+        "benchmark": {"duration": 1, "iterations": 1},
+        "trial": {"sysctls": {"net.core.rmem_max": "16777216"}},
+        "output": str(out),
+    })
+    ctx = runs.RunContext(
+        exp=exp,
+        client=_client_stub(),
+        backend=backend,
+        output=out,
+        collect_host_state=True,
+    )
+    runs.run_trial(ctx)
+
+    kwargs = mock_runner_cls.call_args.kwargs
+    assert kwargs["collect_host_state"] is True
+    assert kwargs["snapshot_backends"] == [backend]
+
+    trial = json.loads(out.read_text().strip())
+    assert len(trial["host_state_snapshots"]) == 1
+
+
+@patch("kube_autotuner.runs.NodeLease")
+@patch("kube_autotuner.runs.BenchmarkRunner")
+def test_run_baseline_default_collect_host_state_is_false(
+    mock_runner_cls,
+    mock_lease_cls,  # noqa: ARG001
+    tmp_path: Path,
+):
+    """Opt-in default: the runner sees ``collect_host_state=False`` when unset."""
+    backend = MagicMock()
+    backend.snapshot.side_effect = _snapshot
+    mock_runner_cls.return_value.run.return_value = _results()
+
+    out = tmp_path / "r.jsonl"
+    exp = ExperimentConfig.model_validate({
+        "mode": "baseline",
+        "nodes": {"sources": ["a"], "target": "b"},
+        "benchmark": {"duration": 1, "iterations": 1},
+        "output": str(out),
+    })
+    ctx = runs.RunContext(
+        exp=exp,
+        client=_client_stub(),
+        backend=backend,
+        output=out,
+    )
+    runs.run_baseline(ctx)
+
+    kwargs = mock_runner_cls.call_args.kwargs
+    assert kwargs["collect_host_state"] is False
 
 
 @patch("kube_autotuner.runs.NodeLease")

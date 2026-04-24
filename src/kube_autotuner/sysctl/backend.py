@@ -14,6 +14,8 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
     from contextlib import AbstractContextManager
 
+    from kube_autotuner.models import HostStatePhase, HostStateSnapshot
+
 _SYSCTL_KEY_RE = re.compile(r"^[a-z0-9_.]+$")
 _SYSCTL_VALUE_RE = re.compile(r"^[a-zA-Z0-9_ .-]+$")
 
@@ -99,6 +101,35 @@ class SysctlBackend(Protocol):
             unrelated traffic (SSH, CNI control plane, sidecars) this
             briefly disrupts those in-flight connections. Dedicated
             benchmark nodes are the documented deployment model.
+        """
+        ...
+
+    def collect_host_state(
+        self,
+        iteration: int | None,
+        phase: HostStatePhase,
+    ) -> HostStateSnapshot | None:
+        """Snapshot cheap-to-read host kernel counters on the target node.
+
+        Used by :class:`kube_autotuner.benchmark.runner.BenchmarkRunner`
+        when the operator opts in via ``--collect-host-state`` so
+        drift between iterations (residual conntrack, TIME_WAIT
+        sockets, cached routes, slab pressure) is visible in the
+        trial record. Every individual parse failure routes to
+        :attr:`HostStateSnapshot.errors`; the method never raises.
+
+        Implementations that cannot execute arbitrary commands on the
+        node (Talos, the in-memory fake) return ``None``; the runner
+        skips ``None`` returns silently.
+
+        Args:
+            iteration: Iteration index the snapshot belongs to;
+                ``None`` for the per-run baseline.
+            phase: Which collection point this snapshot is for.
+
+        Returns:
+            A populated :class:`HostStateSnapshot`, or ``None`` when
+            this backend has no execution path.
         """
         ...
 

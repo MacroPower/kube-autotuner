@@ -24,6 +24,8 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
     from pathlib import Path
 
+    from kube_autotuner.models import HostStatePhase, HostStateSnapshot
+
 logger = logging.getLogger(__name__)
 
 
@@ -99,6 +101,18 @@ class FakeSysctlBackend:
         logger.debug(
             "FakeSysctlBackend network-state flush is a no-op on %s", self.node
         )
+
+    def collect_host_state(  # noqa: PLR6301 - protocol conformance requires instance method
+        self,
+        iteration: int | None,  # noqa: ARG002
+        phase: HostStatePhase,  # noqa: ARG002
+    ) -> HostStateSnapshot | None:
+        """No-op: fake backend has no host kernel state to snapshot.
+
+        Returns:
+            Always ``None``.
+        """
+        return None
 
     def lock(self) -> contextlib.AbstractContextManager[None]:  # noqa: PLR6301
         """Return a no-op context manager; serialisation is unnecessary in-memory."""
