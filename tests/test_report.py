@@ -527,6 +527,199 @@ def test_write_index_html_emits_decomposition_wrapper(
     assert "decomposition-table" in html_text
 
 
+def test_baseline_card_omitted_when_no_comparison(tmp_path: Path) -> None:
+    section = _minimal_section("10g")
+    # No baseline_comparison key
+    path = report.write_index_html(tmp_path, [section])
+    html_text = path.read_text()
+    assert "<h3>Baseline comparison</h3>" not in html_text
+
+
+def test_baseline_card_renders_when_present(tmp_path: Path) -> None:
+    section = _minimal_section("10g")
+    section["baseline_comparison"] = [
+        {
+            "metric": "tcp_throughput",
+            "direction": "maximize",
+            "baseline": 5e9,
+            "recommended": 1e10,
+            "abs_delta": 5e9,
+            "pct_delta": 1.0,
+        },
+    ]
+    path = report.write_index_html(tmp_path, [section])
+    html_text = path.read_text()
+    assert "<h3>Baseline comparison</h3>" in html_text
+    # Positive delta on a maximize metric renders with the positive class.
+    assert "num-pos" in html_text
+
+
+def test_metadata_header_renders_mixed_and_omits_empty_kernel(
+    tmp_path: Path,
+) -> None:
+    section = _minimal_section("10g")
+    section["metadata"] = {
+        "trial_count": 5,
+        "phase_counts": {"sobol": 2, "bayesian": 3, "verification": 0, "unknown": 0},
+        "kernel_version": None,  # empty -> omit entirely
+        "duration": "mixed",
+        "iterations": 3,
+        "stages": ["bw-tcp", "bw-udp"],
+        "first_created_at_iso": "2026-04-24T10:00:00+00:00",
+        "last_created_at_iso": "2026-04-24T11:00:00+00:00",
+    }
+    path = report.write_index_html(tmp_path, [section])
+    html_text = path.read_text()
+    assert "section-metadata" in html_text
+    assert "mixed" in html_text
+    # Extract just the metadata header block and check that the
+    # kernel label did not render (None -> omitted).
+    match = re.search(
+        r"<div class='section-metadata'>(.*?)</div>",
+        html_text,
+        re.DOTALL,
+    )
+    assert match is not None
+    header_fragment = match.group(1)
+    assert "kernel" not in header_fragment
+
+
+def test_stability_boundary_unverified_when_zero_mean(tmp_path: Path) -> None:
+    section = _minimal_section("10g", n_pareto_rows=1)
+    section["pareto_rows"][0]["stability_badge"] = "unverified"
+    path = report.write_index_html(tmp_path, [section])
+    # Payload must embed stability_badge for consumption by the JS.
+    payload = _section_payload_from_html(path.read_text(), "10g")
+    assert payload["paretoRows"][0]["stability_badge"] == "unverified"
+
+
+def test_trajectory_payload_shape(tmp_path: Path) -> None:
+    section = _minimal_section("10g")
+    section["trajectory_rows"] = [
+        {
+            "trial_index": 0,
+            "trial_id": "t1",
+            "created_at_iso": "2026-04-24T10:00:00+00:00",
+            "phase_effective": "sobol",
+            "mean_tcp_throughput_best_so_far": 5e9,
+        },
+        {
+            "trial_index": 1,
+            "trial_id": "t2",
+            "created_at_iso": "2026-04-24T10:05:00+00:00",
+            "phase_effective": "bayesian",
+            "mean_tcp_throughput_best_so_far": 6e9,
+        },
+    ]
+    path = report.write_index_html(tmp_path, [section])
+    html_text = path.read_text()
+    assert "Optimization trajectory" in html_text
+    assert 'id="trajectory-chart-10g"' in html_text
+    payload = _section_payload_from_html(html_text, "10g")
+    assert payload["trajectoryChartId"] == "trajectory-chart-10g"
+    assert len(payload["trajectoryRows"]) == 2
+
+
+def test_correlation_heatmap_payload_omits_pairs_below_floor(
+    tmp_path: Path,
+) -> None:
+    section = _minimal_section("10g")
+    # Simulate a matrix with a None cell (below floor).
+    dummy_df = pd.DataFrame(
+        {
+            "a": [1.0, None],
+            "b": [None, 1.0],
+        },
+        index=["a", "b"],
+    )
+    section["correlation_matrix"] = dummy_df
+    path = report.write_index_html(tmp_path, [section])
+    html_text = path.read_text()
+    assert "correlation heatmap" in html_text
+    payload = _section_payload_from_html(html_text, "10g")
+    matrix = payload["correlationMatrix"]
+    assert matrix is not None
+    assert matrix["columns"] == ["a", "b"]
+    # The None cells must have been scrubbed.
+    assert matrix["values"][0][1] is None
+    assert matrix["values"][1][0] is None
+
+
+def test_category_importance_payload_embedded(tmp_path: Path) -> None:
+    section = _minimal_section("10g")
+    section["importance_category_rollup"] = {
+        "mean_tcp_throughput": [
+            {"category": "tcp_buffer", "rf_sum": 0.6},
+            {"category": "congestion", "rf_sum": 0.1},
+        ],
+    }
+    path = report.write_index_html(tmp_path, [section])
+    html_text = path.read_text()
+    assert 'id="category-bar-10g"' in html_text
+    payload = _section_payload_from_html(html_text, "10g")
+    rollup = payload["importanceCategoryRollup"]
+    assert "mean_tcp_throughput" in rollup
+    assert rollup["mean_tcp_throughput"][0]["category"] == "tcp_buffer"
+
+
+def test_host_state_issues_omitted_when_empty(tmp_path: Path) -> None:
+    section = _minimal_section("10g")
+    section["host_state_issues"] = []
+    path = report.write_index_html(tmp_path, [section])
+    html_text = path.read_text()
+    assert "Data-collection issues" not in html_text
+
+
+def test_host_state_issues_present_and_truncated(tmp_path: Path) -> None:
+    section = _minimal_section("10g")
+    long_err = "x" * 250 + "…"
+    section["host_state_issues"] = [
+        {
+            "trial_id": "t1",
+            "node": "node-a",
+            "phase": "post-iteration",
+            "iteration": 0,
+            "error_text": long_err,
+        },
+    ]
+    path = report.write_index_html(tmp_path, [section])
+    html_text = path.read_text()
+    assert "Data-collection issues (1 snapshots affected)" in html_text
+    assert long_err in html_text
+
+
+def test_single_iteration_survives_allow_nan_false(tmp_path: Path) -> None:
+    """A single-iteration trial with stdev None must survive the JSON gate."""
+    section = _minimal_section("10g", n_pareto_rows=1)
+    # Simulate axis payload with _std columns set to None (single-iteration).
+    section["all_rows"][0]["mean_tcp_throughput_std"] = None
+    section["all_rows"][0]["tcp_retransmit_rate_std"] = None
+    # No exception should be raised (allow_nan=False).
+    path = report.write_index_html(tmp_path, [section])
+    assert path.exists()
+
+
+def test_correlation_matrix_payload_handles_none() -> None:
+    section: dict[str, Any] = {"correlation_matrix": None}
+    assert report._correlation_matrix_payload(section["correlation_matrix"]) is None
+
+
+def test_axis_chart_uses_x_not_multiplication_sign() -> None:
+    """Guard against regressing to the ambiguous multiplication character."""
+    multiplication_sign = chr(0xD7)
+    assert multiplication_sign not in report._JS_MODULE
+
+
+def test_js_module_has_new_renderers() -> None:
+    """Regression guard: new JS renderers must remain wired."""
+    js = report._JS_MODULE
+    assert "renderTrajectoryChart" in js
+    assert "renderCorrelationHeatmap" in js
+    assert "renderCategoryRollup" in js
+    assert "PHASE_SYMBOL" in js
+    assert "axisStd" in js
+
+
 def test_js_score_rows_port_matches_python(tmp_path: Path) -> None:  # noqa: PLR0914 - parity replay needs both JS and Python bookkeeping
     """Replay the JS ``scoreRows`` arithmetic and check it matches Python.
 

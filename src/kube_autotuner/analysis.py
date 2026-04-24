@@ -17,18 +17,32 @@ both rely on this). Three rules enforce the discipline:
 
 from __future__ import annotations
 
+from collections import defaultdict
 from datetime import UTC
 import logging
+import math
 from operator import itemgetter
+import statistics
 from typing import TYPE_CHECKING, Any
 
+from kube_autotuner.models import (
+    compute_sysctl_hash,
+    effective_phase,
+    is_primary,
+    tcp_retransmit_rate_by_iteration,
+    udp_loss_rate_by_iteration,
+)
 from kube_autotuner.scoring import (
     METRIC_TO_DF_COLUMN,
     aggregate_verification,
     config_memory_cost,
     score_rows,
 )
-from kube_autotuner.sysctl.params import PARAM_SPACE, PARAM_TO_CATEGORY
+from kube_autotuner.sysctl.params import (
+    PARAM_SPACE,
+    PARAM_TO_CATEGORY,
+    RECOMMENDED_DEFAULTS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +53,7 @@ if TYPE_CHECKING:
     from sklearn.preprocessing import LabelEncoder
 
     from kube_autotuner.experiment import ParetoObjective
-    from kube_autotuner.models import TrialResult
+    from kube_autotuner.models import ResumeMetadata, TrialResult
 
 _ANALYSIS_HINT = "install analysis group: uv sync --group analysis"
 
@@ -76,6 +90,145 @@ _FRAME_BASE_COLUMNS: list[str] = [
 ]
 
 _MIN_SPEARMAN_SAMPLES = 3
+
+_STABILITY_GREEN_MAX = 0.05
+_STABILITY_AMBER_MAX = 0.15
+_ZERO_MEAN_EPSILON = 1e-12
+_HOST_STATE_ERROR_MAX_LEN = 240
+
+_METRIC_COL_TO_TRIAL_ATTR: dict[str, str] = {
+    "mean_tcp_throughput": "mean_tcp_throughput",
+    "mean_udp_throughput": "mean_udp_throughput",
+    "tcp_retransmit_rate": "tcp_retransmit_rate",
+    "udp_loss_rate": "udp_loss_rate",
+    "mean_udp_jitter": "mean_udp_jitter",
+    "mean_rps": "mean_rps",
+    "mean_latency_p50": "mean_latency_p50",
+    "mean_latency_p90": "mean_latency_p90",
+    "mean_latency_p99": "mean_latency_p99",
+}
+
+
+def _trial_metric_value(t: TrialResult, col: str) -> float | None:
+    """Return a trial's aggregated per-trial value for the given metric column.
+
+    Returns ``None`` when the metric is unmeasured (the trial accessor
+    returned ``None``) or non-finite.
+    """
+    attr = _METRIC_COL_TO_TRIAL_ATTR.get(col)
+    if attr is None:
+        return None
+    raw = getattr(t, attr)()
+    if raw is None:
+        return None
+    try:
+        v = float(raw)
+    except TypeError, ValueError:
+        return None
+    return v if math.isfinite(v) else None
+
+
+def _per_iteration_throughput(t: TrialResult, mode: str) -> list[float]:
+    """Return per-iteration summed ``bits_per_second`` for a TCP/UDP mode."""
+    grouped: dict[int, list[float]] = defaultdict(list)
+    for r in t.results:
+        if r.mode == mode:
+            grouped[r.iteration].append(r.bits_per_second)
+    return [sum(vs) for vs in grouped.values() if vs]
+
+
+def _per_iteration_jitter(t: TrialResult) -> list[float]:
+    """Return per-iteration mean UDP jitter across clients."""
+    grouped: dict[int, list[float]] = defaultdict(list)
+    for r in t.results:
+        if r.jitter is not None:
+            grouped[r.iteration].append(r.jitter)
+    return [sum(vs) / len(vs) for vs in grouped.values() if vs]
+
+
+def _per_iteration_rps(t: TrialResult) -> list[float]:
+    """Return per-iteration summed RPS from fortio saturation."""
+    grouped: dict[int, list[float]] = defaultdict(list)
+    for r in t.latency_results:
+        if r.workload == "saturation":
+            grouped[r.iteration].append(r.rps)
+    return [sum(vs) for vs in grouped.values() if vs]
+
+
+def _per_iteration_latency(t: TrialResult, attr: str) -> list[float]:
+    """Return per-iteration mean of fortio fixed-QPS ``attr`` across clients."""
+    grouped: dict[int, list[float]] = defaultdict(list)
+    for r in t.latency_results:
+        if r.workload == "fixed_qps":
+            v = getattr(r, attr)
+            if v is not None:
+                grouped[r.iteration].append(v)
+    return [sum(vs) / len(vs) for vs in grouped.values() if vs]
+
+
+_PER_ITERATION_DISPATCH: dict[str, Any] = {
+    "mean_tcp_throughput": lambda t: _per_iteration_throughput(t, "tcp"),
+    "mean_udp_throughput": lambda t: _per_iteration_throughput(t, "udp"),
+    "tcp_retransmit_rate": lambda t: list(tcp_retransmit_rate_by_iteration(t.results)),
+    "udp_loss_rate": lambda t: list(udp_loss_rate_by_iteration(t.results)),
+    "mean_udp_jitter": _per_iteration_jitter,
+    "mean_rps": _per_iteration_rps,
+    "mean_latency_p50": lambda t: _per_iteration_latency(t, "latency_p50"),
+    "mean_latency_p90": lambda t: _per_iteration_latency(t, "latency_p90"),
+    "mean_latency_p99": lambda t: _per_iteration_latency(t, "latency_p99"),
+}
+
+
+def _per_iteration_metric_values(t: TrialResult, col: str) -> list[float]:
+    """Return per-iteration values for a metric column.
+
+    Mirrors the aggregation semantics used by
+    :class:`~kube_autotuner.models.TrialResult` accessors: throughput
+    and RPS are summed across clients within an iteration, jitter and
+    latency percentiles are averaged across clients, and rate metrics
+    are per-iteration ratios-of-sums. Iterations with no contributing
+    record are dropped; every surviving value is finite.
+    """
+    dispatcher = _PER_ITERATION_DISPATCH.get(col)
+    if dispatcher is None:
+        return []
+    return dispatcher(t)
+
+
+def _trial_metric_std(t: TrialResult, col: str) -> float | None:
+    """Return the per-iteration stdev for a metric column, or ``None``.
+
+    ``None`` when fewer than two finite per-iteration samples exist or
+    when the computed stdev is non-finite.
+    """
+    values = [v for v in _per_iteration_metric_values(t, col) if math.isfinite(v)]
+    if len(values) < 2:  # noqa: PLR2004 - stdev needs >= 2
+        return None
+    stdev = statistics.stdev(values)
+    return stdev if math.isfinite(stdev) else None
+
+
+def _finite_or_none(v: object) -> float | None:
+    """Coerce a numeric value to a finite float or ``None``.
+
+    Mirrors the guard in ``_build_axis_payload`` so new payload fields
+    never contain ``NaN`` / ``Infinity`` tokens that would break
+    ``json.dumps(allow_nan=False)``.
+
+    Args:
+        v: Any value; ``None``, non-numeric, and non-finite inputs all
+            map to ``None``.
+
+    Returns:
+        A finite ``float`` or ``None``.
+    """
+    if v is None:
+        return None
+    try:
+        f = float(v)  # ty: ignore[invalid-argument-type]
+    except TypeError, ValueError:
+        return None
+    return f if math.isfinite(f) else None
 
 
 def _require_pandas() -> Any:  # noqa: ANN401
@@ -222,12 +375,18 @@ def trials_to_dataframe(
             "mean_latency_p90": t.mean_latency_p90(),
             "mean_latency_p99": t.mean_latency_p99(),
         }
+        for metric_col in METRIC_TO_DF_COLUMN.values():
+            row[f"{metric_col}_std"] = _trial_metric_std(t, metric_col)
         for key in _SYSCTL_COLUMNS:
             row[key] = t.sysctl_values.get(key)
         rows.append(row)
 
     if not rows:
-        return pd.DataFrame(columns=_FRAME_BASE_COLUMNS + _SYSCTL_COLUMNS), {}
+        std_cols = [f"{c}_std" for c in METRIC_TO_DF_COLUMN.values()]
+        return (
+            pd.DataFrame(columns=_FRAME_BASE_COLUMNS + std_cols + _SYSCTL_COLUMNS),
+            {},
+        )
 
     df = pd.DataFrame(rows)
     for col in METRIC_TO_DF_COLUMN.values():
@@ -841,3 +1000,476 @@ def host_state_series(
         "metrics": sorted(metric_union),
         "points": points,
     }
+
+
+def baseline_comparison(  # noqa: PLR0914 - one-pass aggregation over many intermediates
+    trials: list[TrialResult],
+    objectives: list[dict[str, str]],
+    top_row: dict[str, Any] | None,
+) -> list[dict[str, Any]] | None:
+    """Return a per-objective delta vs the :data:`RECOMMENDED_DEFAULTS` baseline.
+
+    The baseline is the set of primary trials whose sysctl hash matches
+    :data:`kube_autotuner.sysctl.params.RECOMMENDED_DEFAULTS`. Matches
+    are aggregated with verification children via
+    :func:`kube_autotuner.scoring.aggregate_verification`; the
+    per-metric mean across matches forms the baseline value. Returns
+    ``None`` when no primary trial matches the defaults.
+
+    Args:
+        trials: The per-hardware-class trial set.
+        objectives: Pareto objectives as
+            ``ParetoObjective.model_dump(mode="json")`` dicts (keys
+            ``metric`` and ``direction``).
+        top_row: The top recommendation row (first row returned by
+            :func:`pareto_recommendation_rows`), or ``None`` when no
+            recommendation is available. Metric keys are DataFrame
+            column names.
+
+    Returns:
+        One dict per objective with ``metric``, ``direction``,
+        ``baseline``, ``recommended``, ``abs_delta``, ``pct_delta``;
+        or ``None`` when the baseline card should be suppressed
+        entirely (no matching trial).
+    """
+    defaults_hash = compute_sysctl_hash(RECOMMENDED_DEFAULTS)
+    primary_matches = [
+        t
+        for t in trials
+        if is_primary(t) and compute_sysctl_hash(t.sysctl_values) == defaults_hash
+    ]
+    if not primary_matches:
+        return None
+    match_ids = {t.trial_id for t in primary_matches}
+    related = [
+        t
+        for t in trials
+        if (is_primary(t) and t.trial_id in match_ids)
+        or (not is_primary(t) and t.parent_trial_id in match_ids)
+    ]
+    agg_rows = aggregate_verification(related)
+    if not agg_rows:
+        return None
+
+    per_metric_baseline: dict[str, float | None] = {}
+    for col in METRIC_TO_DF_COLUMN.values():
+        raw_values: list[float] = []
+        for row in agg_rows:
+            v = row.get(col)
+            if isinstance(v, (int, float)) and math.isfinite(float(v)):
+                raw_values.append(float(v))
+        per_metric_baseline[col] = (
+            sum(raw_values) / len(raw_values) if raw_values else None
+        )
+
+    out: list[dict[str, Any]] = []
+    for obj in objectives:
+        metric = obj["metric"]
+        direction = obj["direction"]
+        col = METRIC_TO_DF_COLUMN[metric]
+        baseline = per_metric_baseline.get(col)
+        recommended = _finite_or_none(
+            top_row.get(col) if top_row is not None else None,
+        )
+        if baseline is None or recommended is None:
+            abs_delta: float | None = None
+            pct_delta: float | None = None
+        else:
+            abs_delta = recommended - baseline
+            pct_delta = (
+                abs_delta / baseline if abs(baseline) >= _ZERO_MEAN_EPSILON else None
+            )
+        out.append(
+            {
+                "metric": metric,
+                "direction": direction,
+                "baseline": _finite_or_none(baseline),
+                "recommended": recommended,
+                "abs_delta": _finite_or_none(abs_delta),
+                "pct_delta": _finite_or_none(pct_delta),
+            },
+        )
+    return out
+
+
+def verification_stats(
+    trials: list[TrialResult],
+) -> dict[str, dict[str, dict[str, float | None]]]:
+    """Return per-parent mean/stdev/cv across verification children.
+
+    Groups verification rows by ``parent_trial_id`` and projects each
+    child's per-trial metric means (from
+    :meth:`TrialResult.mean_tcp_throughput` and friends). Per-metric
+    ``mean`` is the mean across finite samples, ``stdev`` is
+    :func:`statistics.stdev` across finite samples (skipped when
+    fewer than two remain), and ``cv`` is ``stdev / abs(mean)`` with
+    ``None`` when ``abs(mean) < 1e-12``.
+
+    Args:
+        trials: The combined primary + verification population.
+
+    Returns:
+        A dict keyed by parent trial id, mapping to a dict keyed by
+        metric column name, mapping to a ``{mean, stdev, cv}`` dict.
+        Parents with no qualifying metric are omitted.
+    """
+    groups: dict[str, list[TrialResult]] = defaultdict(list)
+    for t in trials:
+        if is_primary(t):
+            continue
+        if t.parent_trial_id is None:
+            continue
+        groups[t.parent_trial_id].append(t)
+
+    out: dict[str, dict[str, dict[str, float | None]]] = {}
+    for parent_id, children in groups.items():
+        per_metric: dict[str, dict[str, float | None]] = {}
+        for col in METRIC_TO_DF_COLUMN.values():
+            samples = [_trial_metric_value(c, col) for c in children]
+            finite = [s for s in samples if s is not None]
+            if len(finite) < 2:  # noqa: PLR2004 - stdev needs >= 2
+                continue
+            mean = statistics.mean(finite)
+            stdev = statistics.stdev(finite)
+            if not math.isfinite(mean) or not math.isfinite(stdev):
+                continue
+            if abs(mean) < _ZERO_MEAN_EPSILON:
+                cv: float | None = None
+            else:
+                cv = stdev / abs(mean)
+                if not math.isfinite(cv):
+                    cv = None
+            per_metric[col] = {
+                "mean": _finite_or_none(mean),
+                "stdev": _finite_or_none(stdev),
+                "cv": cv,
+            }
+        if per_metric:
+            out[parent_id] = per_metric
+    return out
+
+
+def stability_badge(
+    verif_row: dict[str, dict[str, float | None]] | None,
+) -> str:
+    """Classify a recommendation row's stability from its verification CVs.
+
+    Thresholds match the plan's interpretation aid:
+
+    * ``"green"``   — max CV < 5%
+    * ``"amber"``   — 5% ≤ max CV < 15%
+    * ``"red"``     — max CV ≥ 15%
+    * ``"unverified"`` — no verification children, or every CV is
+      ``None`` (zero-mean guard).
+
+    Args:
+        verif_row: One value of :func:`verification_stats`, i.e. the
+            per-metric ``{mean, stdev, cv}`` dict for a single parent;
+            ``None`` when the parent has no verification children.
+
+    Returns:
+        The badge label.
+    """
+    if not verif_row:
+        return "unverified"
+    cvs = [
+        entry["cv"]
+        for entry in verif_row.values()
+        if entry.get("cv") is not None and math.isfinite(float(entry["cv"] or 0.0))
+    ]
+    if not cvs:
+        return "unverified"
+    max_cv = max(abs(cv) for cv in cvs if cv is not None)
+    if max_cv < _STABILITY_GREEN_MAX:
+        return "green"
+    if max_cv < _STABILITY_AMBER_MAX:
+        return "amber"
+    return "red"
+
+
+def trajectory_rows(
+    trials: list[TrialResult],
+    objectives: list[dict[str, str]],
+    resume_metadata: ResumeMetadata | None,
+) -> list[dict[str, Any]]:
+    """Return a per-primary-trial running-best trajectory.
+
+    Primary trials (``is_primary``) are ordered by ``created_at`` and
+    emitted one row at a time. Each row carries the trial's effective
+    phase plus per-objective ``<col>_best_so_far`` values updated
+    monotonically (``cummax`` for ``maximize``, ``cummin`` for
+    ``minimize``). Phase labelling uses
+    :func:`kube_autotuner.models.effective_phase` when
+    ``resume_metadata.n_sobol`` is available; otherwise ``t.phase`` is
+    used verbatim with ``None`` bucketed as ``"unknown"``.
+
+    Args:
+        trials: The full trial population (any hardware class/phase).
+        objectives: Pareto objectives as
+            ``ParetoObjective.model_dump(mode="json")`` dicts.
+        resume_metadata: Optional sidecar with ``n_sobol``; when
+            ``None`` or ``n_sobol is None``, the phase column uses
+            ``t.phase`` verbatim.
+
+    Returns:
+        One row per primary trial, in ``created_at`` order.
+    """
+    primaries = sorted(
+        (t for t in trials if is_primary(t)),
+        key=lambda t: t.created_at,
+    )
+    n_sobol = (
+        resume_metadata.n_sobol
+        if resume_metadata is not None and resume_metadata.n_sobol is not None
+        else None
+    )
+    bests: dict[str, float | None] = {obj["metric"]: None for obj in objectives}
+    rows: list[dict[str, Any]] = []
+    for index, t in enumerate(primaries):
+        if n_sobol is not None:
+            phase = effective_phase(t, index, n_sobol)
+        else:
+            phase = t.phase if t.phase is not None else "unknown"
+        row: dict[str, Any] = {
+            "trial_index": index,
+            "trial_id": t.trial_id,
+            "created_at_iso": t.created_at.isoformat(),
+            "phase_effective": phase,
+        }
+        for obj in objectives:
+            metric = obj["metric"]
+            direction = obj["direction"]
+            col = METRIC_TO_DF_COLUMN[metric]
+            v = _trial_metric_value(t, col)
+            current = bests[metric]
+            if v is not None:
+                if current is None:
+                    bests[metric] = v
+                elif direction == "maximize":
+                    bests[metric] = max(current, v)
+                else:
+                    bests[metric] = min(current, v)
+            row[f"{col}_best_so_far"] = _finite_or_none(bests[metric])
+        rows.append(row)
+    return rows
+
+
+def section_metadata(  # noqa: PLR0914 - one-pass summary over many aggregates
+    trials: list[TrialResult],
+    resume_metadata: ResumeMetadata | None,
+) -> dict[str, Any]:
+    """Return an experimental-setup summary for a hardware-class section.
+
+    Fields that agree across every primary trial render that value;
+    otherwise render the literal string ``"mixed"``. An all-empty
+    ``kernel_version`` is coerced to ``None`` so the header can omit
+    the field rather than print a blank. ``stages`` is rendered as a
+    sorted list when agreed.
+
+    Phase counts include every trial (primary + verification);
+    primary phases use :func:`effective_phase` when ``n_sobol`` is
+    known, and fall back to raw ``t.phase`` (``None`` → ``"unknown"``)
+    otherwise.
+
+    Args:
+        trials: The per-hardware-class trial set.
+        resume_metadata: Optional sidecar; consulted for ``n_sobol``
+            when mapping legacy primary rows to sobol/bayesian.
+
+    Returns:
+        A dict with keys ``trial_count``, ``phase_counts``,
+        ``kernel_version``, ``duration``, ``iterations``, ``stages``,
+        ``first_created_at_iso``, ``last_created_at_iso``.
+    """
+    primaries = sorted(
+        (t for t in trials if is_primary(t)),
+        key=lambda t: t.created_at,
+    )
+    n_sobol = (
+        resume_metadata.n_sobol
+        if resume_metadata is not None and resume_metadata.n_sobol is not None
+        else None
+    )
+    phase_counts: dict[str, int] = {
+        "sobol": 0,
+        "bayesian": 0,
+        "verification": 0,
+        "unknown": 0,
+    }
+    for index, t in enumerate(primaries):
+        if n_sobol is not None:
+            label = effective_phase(t, index, n_sobol)
+        else:
+            label = t.phase if t.phase is not None else "unknown"
+        phase_counts[label] = phase_counts.get(label, 0) + 1
+    phase_counts["verification"] += sum(1 for t in trials if not is_primary(t))
+
+    def _unique_or_mixed(values: list[Any]) -> Any:  # noqa: ANN401
+        unique = []
+        seen: set[Any] = set()
+        for v in values:
+            marker = v
+            if marker in seen:
+                continue
+            seen.add(marker)
+            unique.append(v)
+        if len(unique) == 1:
+            return unique[0]
+        return "mixed"
+
+    kernel_vals = [t.kernel_version for t in primaries]
+    resolved_kernel = _unique_or_mixed(kernel_vals)
+    kernel_version: str | None = resolved_kernel or None
+
+    duration_vals = [t.config.duration for t in primaries]
+    duration = _unique_or_mixed(duration_vals)
+    iterations_vals = [t.config.iterations for t in primaries]
+    iterations = _unique_or_mixed(iterations_vals)
+
+    stages_vals = [frozenset(t.config.stages) for t in primaries]
+    stages_raw = _unique_or_mixed(stages_vals)
+    stages: list[str] | str = (
+        sorted(stages_raw) if isinstance(stages_raw, frozenset) else stages_raw
+    )
+
+    if primaries:
+        first_iso: str | None = min(t.created_at for t in primaries).isoformat()
+        last_iso: str | None = max(t.created_at for t in primaries).isoformat()
+    else:
+        first_iso = None
+        last_iso = None
+
+    return {
+        "trial_count": len(primaries),
+        "phase_counts": phase_counts,
+        "kernel_version": kernel_version,
+        "duration": duration,
+        "iterations": iterations,
+        "stages": stages,
+        "first_created_at_iso": first_iso,
+        "last_created_at_iso": last_iso,
+    }
+
+
+def sysctl_correlation_matrix(
+    df: pd.DataFrame,
+    importance_frames: dict[str, pd.DataFrame],
+) -> pd.DataFrame | None:
+    """Return a pairwise Spearman matrix over the importance-block params.
+
+    Restricts the column set to the union of params mentioned in any
+    ``importance_by_target`` frame, drops constant columns, and
+    computes pairwise Spearman. Cells with fewer than
+    :data:`_MIN_SPEARMAN_SAMPLES` non-null paired samples are marked
+    as ``NaN`` so the serialization layer renders them as ``None``.
+
+    Args:
+        df: Per-trial frame from :func:`trials_to_dataframe` with
+            sysctl columns already numerically encoded.
+        importance_frames: Per-target importance frames; a column is
+            included when any frame lists it.
+
+    Returns:
+        A square :class:`pandas.DataFrame` indexed and columned by
+        parameter name, or ``None`` when fewer than two qualifying
+        columns remain after constant-column pruning.
+    """
+    pd = _require_pandas()
+
+    wanted: set[str] = set()
+    for frame in importance_frames.values():
+        if frame is None or frame.empty:
+            continue
+        wanted.update(frame["param"].astype(str).tolist())
+    if len(wanted) < 2:  # noqa: PLR2004 - matrix needs at least 2 axes
+        return None
+    present = [c for c in wanted if c in df.columns]
+    if len(present) < 2:  # noqa: PLR2004 - matrix needs at least 2 axes
+        return None
+
+    numeric = df[present].apply(pd.to_numeric, errors="coerce")
+    varied = [c for c in present if len(numeric[c].dropna().unique()) > 1]
+    if len(varied) < 2:  # noqa: PLR2004 - matrix needs at least 2 axes
+        return None
+
+    matrix = pd.DataFrame(
+        float("nan"),
+        index=varied,
+        columns=varied,
+        dtype=float,
+    )
+    for i, a in enumerate(varied):
+        matrix.loc[a, a] = 1.0
+        for b in varied[i + 1 :]:
+            pair = numeric[[a, b]].dropna()
+            if len(pair) < _MIN_SPEARMAN_SAMPLES:
+                continue
+            r = pair[a].corr(pair[b], method="spearman")
+            if r is None or not math.isfinite(float(r)):
+                continue
+            matrix.loc[a, b] = float(r)
+            matrix.loc[b, a] = float(r)
+    return matrix
+
+
+def host_state_issues(trials: list[TrialResult]) -> list[dict[str, Any]]:
+    """Flatten :attr:`HostStateSnapshot.errors` across every trial.
+
+    Error strings longer than :data:`_HOST_STATE_ERROR_MAX_LEN`
+    characters are truncated with a trailing ellipsis so the rendered
+    ``<details>`` does not blow up horizontally.
+
+    Args:
+        trials: The per-hardware-class trial set.
+
+    Returns:
+        One row per snapshot error, in trial + snapshot order. Empty
+        list when no snapshot carries any errors.
+    """
+    out: list[dict[str, Any]] = []
+    for t in trials:
+        for snap in t.host_state_snapshots:
+            for err in snap.errors:
+                if len(err) > _HOST_STATE_ERROR_MAX_LEN:
+                    text = err[:_HOST_STATE_ERROR_MAX_LEN] + "…"
+                else:
+                    text = err
+                out.append(
+                    {
+                        "trial_id": t.trial_id,
+                        "node": snap.node,
+                        "phase": snap.phase,
+                        "iteration": snap.iteration,
+                        "error_text": text,
+                    },
+                )
+    return out
+
+
+def category_importance_rollup(
+    importance_frames: dict[str, pd.DataFrame],
+) -> dict[str, list[dict[str, Any]]]:
+    """Sum Random Forest importances by category per target metric.
+
+    Args:
+        importance_frames: Per-target frames from
+            :func:`parameter_importance`; each frame contains
+            ``param``, ``category``, ``spearman_r``, ``rf_importance``.
+
+    Returns:
+        ``{target: [{category, rf_sum}, ...]}`` with categories sorted
+        by ``rf_sum`` descending. Empty or ``None`` frames are
+        skipped.
+    """
+    out: dict[str, list[dict[str, Any]]] = {}
+    for target, frame in importance_frames.items():
+        if frame is None or frame.empty:
+            continue
+        rollup = frame.groupby("category", sort=False)["rf_importance"].sum()
+        pairs = [(str(cat), float(val)) for cat, val in rollup.items()]
+        pairs.sort(key=lambda kv: (-kv[1], kv[0]))
+        out[target] = [
+            {"category": cat, "rf_sum": _finite_or_none(val) or 0.0}
+            for cat, val in pairs
+        ]
+    return out

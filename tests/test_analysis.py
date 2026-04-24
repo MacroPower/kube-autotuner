@@ -17,12 +17,20 @@ from typer.testing import CliRunner  # noqa: E402
 from kube_autotuner.analysis import (  # noqa: E402
     DEFAULT_OBJECTIVES,
     METRIC_TO_DF_COLUMN,
+    baseline_comparison,
+    category_importance_rollup,
+    host_state_issues,
     host_state_series,
     parameter_importance,
     pareto_front,
     recommend_configs,
+    section_metadata,
     split_trials_by_hardware_class,
+    stability_badge,
+    sysctl_correlation_matrix,
+    trajectory_rows,
     trials_to_dataframe,
+    verification_stats,
 )
 from kube_autotuner.cli import _build_axis_payload, app  # noqa: E402, PLC2701
 from kube_autotuner.experiment import ObjectivesSection, ParetoObjective  # noqa: E402
@@ -638,23 +646,35 @@ class TestBuildAxisPayload:
         assert rows[0] == {
             "trial_id": "1",
             "pareto": True,
+            "phase": "unknown",
             "mean_tcp_throughput": 4.2e10,
+            "mean_tcp_throughput_std": None,
             "tcp_retransmit_rate": 1e-6,
+            "tcp_retransmit_rate_std": None,
             "mean_udp_jitter": 0.001,
+            "mean_udp_jitter_std": None,
         }
         assert rows[1] == {
             "trial_id": "2",
             "pareto": False,
+            "phase": "unknown",
             "mean_tcp_throughput": None,
+            "mean_tcp_throughput_std": None,
             "tcp_retransmit_rate": None,
+            "tcp_retransmit_rate_std": None,
             "mean_udp_jitter": None,
+            "mean_udp_jitter_std": None,
         }
         assert rows[2] == {
             "trial_id": "3",
             "pareto": True,
+            "phase": "unknown",
             "mean_tcp_throughput": None,
+            "mean_tcp_throughput_std": None,
             "tcp_retransmit_rate": 2e-6,
+            "tcp_retransmit_rate_std": None,
             "mean_udp_jitter": None,
+            "mean_udp_jitter_std": None,
         }
 
     def test_drops_all_null_columns_from_axis_columns(self) -> None:
@@ -1178,3 +1198,473 @@ def test_host_state_series_timestamp_is_iso_string() -> None:
     # allow_nan=False is the report's serialization gate; a string
     # timestamp must round-trip cleanly.
     json.dumps(payload, allow_nan=False)
+
+
+# --- baseline_comparison -------------------------------------------------
+
+
+def _defaults_trial(
+    *,
+    bps: float = 1e10,
+    trial_id: str = "baseline",
+    phase: Literal["sobol", "bayesian", "verification"] | None = None,
+    parent_trial_id: str | None = None,
+) -> TrialResult:
+    from kube_autotuner.sysctl.params import RECOMMENDED_DEFAULTS  # noqa: PLC0415
+
+    kwargs: dict[str, Any] = {
+        "trial_id": trial_id,
+        "node_pair": NodePair(source="a", target="b", hardware_class="10g"),
+        "sysctl_values": dict(RECOMMENDED_DEFAULTS),
+        "config": BenchmarkConfig(duration=10, iterations=2),
+        "results": [_result(bps)],
+    }
+    if phase is not None:
+        kwargs["phase"] = phase
+    if parent_trial_id is not None:
+        kwargs["parent_trial_id"] = parent_trial_id
+    return TrialResult(**kwargs)
+
+
+_SIMPLE_OBJECTIVES: list[dict[str, str]] = [
+    {"metric": "tcp_throughput", "direction": "maximize"},
+    {"metric": "tcp_retransmit_rate", "direction": "minimize"},
+]
+
+
+def test_baseline_comparison_returns_none_when_no_match() -> None:
+    trials = [_trial(hw="10g", bps=5e9, rmem_max=212992)]
+    top_row = {"mean_tcp_throughput": 6e9, "tcp_retransmit_rate": 1e-7}
+    assert baseline_comparison(trials, _SIMPLE_OBJECTIVES, top_row) is None
+
+
+def test_baseline_comparison_single_match_emits_deltas() -> None:
+    baseline = _defaults_trial(bps=5e9, trial_id="b1")
+    candidate = _trial(hw="10g", bps=1e10, rmem_max=212992)
+    top_row = {"mean_tcp_throughput": 1e10, "tcp_retransmit_rate": 0.0}
+    entries = baseline_comparison(
+        [baseline, candidate],
+        _SIMPLE_OBJECTIVES,
+        top_row,
+    )
+    assert entries is not None
+    by_metric = {e["metric"]: e for e in entries}
+    assert by_metric["tcp_throughput"]["baseline"] == pytest.approx(5e9)
+    assert by_metric["tcp_throughput"]["recommended"] == pytest.approx(1e10)
+    assert by_metric["tcp_throughput"]["abs_delta"] == pytest.approx(5e9)
+    assert by_metric["tcp_throughput"]["pct_delta"] == pytest.approx(1.0)
+
+
+def test_baseline_comparison_multi_match_means_across_primaries() -> None:
+    b1 = _defaults_trial(bps=4e9, trial_id="b1")
+    b2 = _defaults_trial(bps=6e9, trial_id="b2")
+    top_row = {"mean_tcp_throughput": 1e10, "tcp_retransmit_rate": 0.0}
+    entries = baseline_comparison([b1, b2], _SIMPLE_OBJECTIVES, top_row)
+    assert entries is not None
+    assert entries[0]["metric"] == "tcp_throughput"
+    assert entries[0]["baseline"] == pytest.approx(5e9)
+
+
+def test_baseline_comparison_folds_verification_children() -> None:
+    b1 = _defaults_trial(bps=4e9, trial_id="b1", phase="bayesian")
+    v1 = _defaults_trial(
+        bps=6e9,
+        trial_id="b1-v1",
+        phase="verification",
+        parent_trial_id="b1",
+    )
+    v2 = _defaults_trial(
+        bps=8e9,
+        trial_id="b1-v2",
+        phase="verification",
+        parent_trial_id="b1",
+    )
+    top_row = {"mean_tcp_throughput": 1e10, "tcp_retransmit_rate": 0.0}
+    entries = baseline_comparison([b1, v1, v2], _SIMPLE_OBJECTIVES, top_row)
+    assert entries is not None
+    # Aggregated verification-adjusted baseline: mean(4e9, 6e9, 8e9) = 6e9
+    assert entries[0]["baseline"] == pytest.approx(6e9)
+
+
+# --- verification_stats --------------------------------------------------
+
+
+def test_verification_stats_skips_groups_under_two_children() -> None:
+    parent = _trial(hw="10g", bps=5e9, trial_id="p1")
+    child = _trial(
+        hw="10g",
+        bps=6e9,
+        trial_id="c1",
+    )
+    # Manually mark child as verification of p1
+    child = child.model_copy(
+        update={"phase": "verification", "parent_trial_id": "p1"},
+    )
+    stats = verification_stats([parent, child])
+    assert stats == {}
+
+
+def test_verification_stats_computes_mean_stdev_cv() -> None:
+    parent = _trial(hw="10g", bps=5e9, trial_id="p1")
+    verifications = [
+        _trial(hw="10g", bps=bps, trial_id=f"c{i}").model_copy(
+            update={"phase": "verification", "parent_trial_id": "p1"},
+        )
+        for i, bps in enumerate([6e9, 8e9, 10e9])
+    ]
+    stats = verification_stats([parent, *verifications])
+    assert "p1" in stats
+    tp = stats["p1"]["mean_tcp_throughput"]
+    assert tp["mean"] == pytest.approx(8e9)
+    # stdev of [6e9, 8e9, 10e9] == 2e9
+    assert tp["stdev"] == pytest.approx(2e9)
+    assert tp["cv"] == pytest.approx(0.25)
+
+
+def test_verification_stats_zero_mean_cv_is_none() -> None:
+    parent = _trial(hw="10g", bps=5e9, trial_id="p1")
+    # Retransmit rate is 0 in all children -> mean 0, cv should be None.
+    verifications = [
+        _trial(
+            hw="10g",
+            bps=5e9,
+            retransmits=0,
+            trial_id=f"c{i}",
+            bytes_sent=_DEFAULT_BYTES_SENT,
+        ).model_copy(update={"phase": "verification", "parent_trial_id": "p1"})
+        for i in range(3)
+    ]
+    stats = verification_stats([parent, *verifications])
+    assert stats["p1"]["tcp_retransmit_rate"]["mean"] == pytest.approx(0.0)
+    assert stats["p1"]["tcp_retransmit_rate"]["cv"] is None
+
+
+# --- stability_badge -----------------------------------------------------
+
+
+def test_stability_badge_unverified_when_no_stats() -> None:
+    assert stability_badge(None) == "unverified"
+    assert stability_badge({}) == "unverified"
+
+
+def test_stability_badge_unverified_when_all_cvs_none() -> None:
+    entry = {"tcp_throughput": {"mean": 0.0, "stdev": 0.0, "cv": None}}
+    assert stability_badge(entry) == "unverified"
+
+
+@pytest.mark.parametrize(
+    ("cv", "expected"),
+    [
+        (0.04, "green"),
+        (0.0499, "green"),
+        (0.05, "amber"),
+        (0.149, "amber"),
+        (0.15, "red"),
+        (0.5, "red"),
+    ],
+)
+def test_stability_badge_thresholds(cv: float, expected: str) -> None:
+    entry: dict[str, dict[str, float | None]] = {
+        "tcp_throughput": {"mean": 1.0, "stdev": cv, "cv": cv},
+    }
+    assert stability_badge(entry) == expected
+
+
+# --- trajectory_rows -----------------------------------------------------
+
+
+def test_trajectory_rows_running_best_cummax() -> None:
+    t1 = _trial(hw="10g", bps=5e9, trial_id="t1")
+    t2 = _trial(hw="10g", bps=3e9, trial_id="t2")
+    t3 = _trial(hw="10g", bps=7e9, trial_id="t3")
+    t1 = t1.model_copy(update={"created_at": datetime(2026, 1, 1, tzinfo=UTC)})
+    t2 = t2.model_copy(update={"created_at": datetime(2026, 1, 2, tzinfo=UTC)})
+    t3 = t3.model_copy(update={"created_at": datetime(2026, 1, 3, tzinfo=UTC)})
+    rows = trajectory_rows(
+        [t2, t1, t3],
+        [{"metric": "tcp_throughput", "direction": "maximize"}],
+        resume_metadata=None,
+    )
+    assert [r["trial_id"] for r in rows] == ["t1", "t2", "t3"]
+    bests = [r["mean_tcp_throughput_best_so_far"] for r in rows]
+    assert bests == pytest.approx([5e9, 5e9, 7e9])
+
+
+def test_trajectory_rows_phase_fallback_to_unknown_without_metadata() -> None:
+    t = _trial(hw="10g", bps=5e9, trial_id="t1")
+    rows = trajectory_rows(
+        [t],
+        [{"metric": "tcp_throughput", "direction": "maximize"}],
+        resume_metadata=None,
+    )
+    assert rows[0]["phase_effective"] == "unknown"
+
+
+def test_trajectory_rows_skips_verification_repeats() -> None:
+    primary = _trial(hw="10g", bps=5e9, trial_id="p1")
+    verif = _trial(hw="10g", bps=6e9, trial_id="v1").model_copy(
+        update={"phase": "verification", "parent_trial_id": "p1"},
+    )
+    rows = trajectory_rows(
+        [primary, verif],
+        [{"metric": "tcp_throughput", "direction": "maximize"}],
+        resume_metadata=None,
+    )
+    assert [r["trial_id"] for r in rows] == ["p1"]
+
+
+def test_trajectory_rows_with_metadata_labels_legacy_primaries() -> None:
+    t1 = _trial(hw="10g", bps=5e9, trial_id="t1")
+    t2 = _trial(hw="10g", bps=6e9, trial_id="t2")
+    # Both have phase == None (legacy)
+    meta = ResumeMetadata(
+        objectives=ObjectivesSection(),
+        param_space=ParamSpace(params=[]),
+        benchmark=BenchmarkConfig(duration=10, iterations=1),
+        n_sobol=1,
+    )
+    rows = trajectory_rows(
+        [t1, t2],
+        [{"metric": "tcp_throughput", "direction": "maximize"}],
+        resume_metadata=meta,
+    )
+    phases = [r["phase_effective"] for r in rows]
+    assert phases == ["sobol", "bayesian"]
+
+
+# --- section_metadata ----------------------------------------------------
+
+
+def test_section_metadata_uniform_fields() -> None:
+    t1 = _trial(hw="10g", bps=5e9, trial_id="t1")
+    t2 = _trial(hw="10g", bps=6e9, trial_id="t2")
+    md = section_metadata([t1, t2], resume_metadata=None)
+    assert md["trial_count"] == 2
+    assert md["duration"] == 10
+    assert md["iterations"] == 1
+    assert isinstance(md["stages"], list)
+    assert md["kernel_version"] is None  # default "" -> None
+
+
+def test_section_metadata_mixed_fields_render_mixed() -> None:
+    t1 = _trial(hw="10g", bps=5e9, trial_id="t1")
+    t2 = _trial(hw="10g", bps=6e9, trial_id="t2")
+    t2 = t2.model_copy(
+        update={
+            "config": BenchmarkConfig(duration=30, iterations=5),
+        },
+    )
+    md = section_metadata([t1, t2], resume_metadata=None)
+    assert md["duration"] == "mixed"
+    assert md["iterations"] == "mixed"
+
+
+def test_section_metadata_mixed_kernel_renders_mixed() -> None:
+    t1 = _trial(hw="10g", bps=5e9, trial_id="t1").model_copy(
+        update={"kernel_version": "6.1.0"},
+    )
+    t2 = _trial(hw="10g", bps=6e9, trial_id="t2").model_copy(
+        update={"kernel_version": "6.2.0"},
+    )
+    md = section_metadata([t1, t2], resume_metadata=None)
+    assert md["kernel_version"] == "mixed"
+
+
+def test_section_metadata_all_empty_kernel_is_none() -> None:
+    t1 = _trial(hw="10g", bps=5e9, trial_id="t1")
+    md = section_metadata([t1], resume_metadata=None)
+    assert md["kernel_version"] is None
+
+
+def test_section_metadata_counts_verification_separately() -> None:
+    p1 = _trial(hw="10g", bps=5e9, trial_id="p1")
+    v1 = _trial(hw="10g", bps=6e9, trial_id="v1").model_copy(
+        update={"phase": "verification", "parent_trial_id": "p1"},
+    )
+    md = section_metadata([p1, v1], resume_metadata=None)
+    assert md["trial_count"] == 1
+    assert md["phase_counts"]["verification"] == 1
+
+
+# --- sysctl_correlation_matrix ------------------------------------------
+
+
+def test_sysctl_correlation_matrix_returns_none_below_two_cols(
+    mixed_trials: list[TrialResult],
+) -> None:
+    df, _ = trials_to_dataframe(mixed_trials, hardware_class="10g")
+    # Empty importance frames -> None
+    assert sysctl_correlation_matrix(df, {}) is None
+
+
+def test_sysctl_correlation_matrix_drops_constant_cols(
+    mixed_trials: list[TrialResult],
+) -> None:
+    df, _ = trials_to_dataframe(mixed_trials, hardware_class="10g")
+    # Make one column constant
+    df = df.copy()
+    df["net.core.rmem_max"] = 212992
+    imp_frame = pd.DataFrame(
+        [
+            {
+                "param": "net.core.rmem_max",
+                "category": "tcp_buffer",
+                "spearman_r": 0.0,
+                "rf_importance": 0.0,
+            },
+            {
+                "param": "net.ipv4.tcp_congestion_control",
+                "category": "congestion",
+                "spearman_r": 0.0,
+                "rf_importance": 0.0,
+            },
+        ],
+    )
+    assert sysctl_correlation_matrix(df, {"mean_tcp_throughput": imp_frame}) is None
+
+
+def test_sysctl_correlation_matrix_shape(
+    mixed_trials: list[TrialResult],
+) -> None:
+    df, _ = trials_to_dataframe(mixed_trials, hardware_class="10g")
+    imp_frame = pd.DataFrame(
+        [
+            {
+                "param": "net.core.rmem_max",
+                "category": "tcp_buffer",
+                "spearman_r": 0.0,
+                "rf_importance": 0.0,
+            },
+            {
+                "param": "net.ipv4.tcp_congestion_control",
+                "category": "congestion",
+                "spearman_r": 0.0,
+                "rf_importance": 0.0,
+            },
+        ],
+    )
+    matrix = sysctl_correlation_matrix(df, {"mean_tcp_throughput": imp_frame})
+    assert matrix is not None
+    assert list(matrix.columns) == list(matrix.index)
+    # Diagonal is 1.0
+    for c in matrix.columns:
+        assert matrix.loc[c, c] == pytest.approx(1.0)
+
+
+# --- host_state_issues ---------------------------------------------------
+
+
+def test_host_state_issues_empty_when_no_errors() -> None:
+    t = _trial_with_snapshots(
+        trial_id="t1",
+        hw="10g",
+        snapshots=[_snap(None, "baseline", {"conntrack_count": 1})],
+    )
+    assert host_state_issues([t]) == []
+
+
+def test_host_state_issues_flattens_errors() -> None:
+    snap = HostStateSnapshot(
+        node="node-a",
+        iteration=0,
+        phase="post-iteration",
+        metrics={},
+        errors=["conntrack parse failed", "sockstat missing key"],
+    )
+    t = _trial_with_snapshots(trial_id="t1", hw="10g", snapshots=[snap])
+    issues = host_state_issues([t])
+    assert len(issues) == 2
+    assert issues[0]["trial_id"] == "t1"
+    assert issues[0]["phase"] == "post-iteration"
+    assert issues[0]["error_text"] == "conntrack parse failed"
+
+
+def test_host_state_issues_truncates_long_lines() -> None:
+    long_err = "x" * 500
+    snap = HostStateSnapshot(
+        node="node-a",
+        iteration=0,
+        phase="post-iteration",
+        metrics={},
+        errors=[long_err],
+    )
+    t = _trial_with_snapshots(trial_id="t1", hw="10g", snapshots=[snap])
+    issues = host_state_issues([t])
+    assert len(issues[0]["error_text"]) == 241
+    assert issues[0]["error_text"].endswith("…")
+
+
+# --- category_importance_rollup -----------------------------------------
+
+
+def test_category_importance_rollup_sums_by_category() -> None:
+    frame = pd.DataFrame(
+        [
+            {
+                "param": "net.core.rmem_max",
+                "category": "tcp_buffer",
+                "spearman_r": 0.5,
+                "rf_importance": 0.4,
+            },
+            {
+                "param": "net.ipv4.tcp_wmem",
+                "category": "tcp_buffer",
+                "spearman_r": 0.3,
+                "rf_importance": 0.2,
+            },
+            {
+                "param": "net.ipv4.tcp_congestion_control",
+                "category": "congestion",
+                "spearman_r": 0.1,
+                "rf_importance": 0.05,
+            },
+        ],
+    )
+    rollup = category_importance_rollup({"mean_tcp_throughput": frame})
+    assert "mean_tcp_throughput" in rollup
+    entries = rollup["mean_tcp_throughput"]
+    assert entries[0]["category"] == "tcp_buffer"
+    assert entries[0]["rf_sum"] == pytest.approx(0.6)
+    assert entries[1]["category"] == "congestion"
+    assert entries[1]["rf_sum"] == pytest.approx(0.05)
+
+
+def test_category_importance_rollup_skips_empty_frames() -> None:
+    frame = pd.DataFrame()
+    rollup = category_importance_rollup({"mean_tcp_throughput": frame})
+    assert rollup == {}
+
+
+# --- trials_to_dataframe std columns ------------------------------------
+
+
+def test_trials_to_dataframe_emits_std_columns_when_multi_iteration() -> None:
+    trial = TrialResult(
+        trial_id="t1",
+        node_pair=NodePair(source="a", target="b", hardware_class="10g"),
+        sysctl_values={"net.core.rmem_max": 212992},
+        config=BenchmarkConfig(duration=10, iterations=3),
+        results=[
+            BenchmarkResult(
+                timestamp=datetime.now(UTC),
+                mode="tcp",
+                bits_per_second=bps,
+                retransmits=0,
+                bytes_sent=1_000_000_000,
+                iteration=i,
+            )
+            for i, bps in enumerate([5e9, 7e9, 9e9])
+        ],
+    )
+    df, _ = trials_to_dataframe([trial], hardware_class="10g")
+    assert "mean_tcp_throughput_std" in df.columns
+    # stdev of [5e9, 7e9, 9e9] is 2e9
+    assert df.iloc[0]["mean_tcp_throughput_std"] == pytest.approx(2e9)
+
+
+def test_trials_to_dataframe_single_iteration_std_is_none() -> None:
+    trial = _trial(hw="10g", bps=5e9, trial_id="t1")  # iterations=1
+    df, _ = trials_to_dataframe([trial], hardware_class="10g")
+    assert df.iloc[0]["mean_tcp_throughput_std"] is None or math.isnan(
+        df.iloc[0]["mean_tcp_throughput_std"],
+    )

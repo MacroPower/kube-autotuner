@@ -968,6 +968,7 @@ def analyze(
     meta = TrialLog.load_resume_metadata(input_file)
     objectives = meta.objectives if meta is not None else ObjectivesSection()
     stages = meta.benchmark.stages if meta is not None else ALL_STAGES
+    resume_metadata = meta
 
     if hardware_class is not None:
         classes = [hardware_class]
@@ -1003,6 +1004,7 @@ def analyze(
                 explicit_class=hardware_class is not None,
                 objectives=objectives,
                 stages=stages,
+                resume_metadata=resume_metadata,
             )
             if section is not None:
                 sections.append(section)
@@ -1054,7 +1056,7 @@ def _format_top_recommendation(r: dict[str, Any]) -> str:
     return ", ".join(parts)
 
 
-def _analyze_one_class(
+def _analyze_one_class(  # noqa: PLR0914 - threads many helpers into one section dict
     trials: list[Any],
     *,
     hardware_class: str,
@@ -1065,6 +1067,7 @@ def _analyze_one_class(
     explicit_class: bool,
     objectives: ObjectivesSection,
     stages: frozenset[StageName],
+    resume_metadata: Any = None,  # noqa: ANN401
 ) -> dict[str, Any] | None:
     """Produce analysis output for a single hardware class.
 
@@ -1089,6 +1092,10 @@ def _analyze_one_class(
             to :func:`_build_axis_payload` so the parallel-coordinates
             chart drops axes whose metrics are only produced by
             disabled stages.
+        resume_metadata: Optional sidecar
+            :class:`~kube_autotuner.models.ResumeMetadata`; consulted
+            for ``n_sobol`` when labelling legacy primary trials via
+            :func:`~kube_autotuner.models.effective_phase`.
 
     Returns:
         A section dict describing the analysis, or ``None`` when the
@@ -1175,7 +1182,38 @@ def _analyze_one_class(
     hw_dir = output_dir / hardware_class
     hw_dir.mkdir(parents=True, exist_ok=True)
 
-    all_rows, axis_columns = _build_axis_payload(df, pareto_mask, stages=stages)
+    n_sobol_meta = (
+        resume_metadata.n_sobol
+        if resume_metadata is not None
+        and getattr(resume_metadata, "n_sobol", None) is not None
+        else None
+    )
+    all_rows, axis_columns = _build_axis_payload(
+        df,
+        pareto_mask,
+        stages=stages,
+        trials=hw_trials,
+        n_sobol=n_sobol_meta,
+    )
+
+    verif_stats = analysis.verification_stats(hw_trials)
+    for row in pareto_rows:
+        row["stability_badge"] = analysis.stability_badge(
+            verif_stats.get(row["trial_id"]),
+        )
+
+    objective_dicts = [obj.model_dump(mode="json") for obj in objectives.pareto]
+    top_row = pareto_rows[0] if pareto_rows else None
+    baseline = analysis.baseline_comparison(hw_trials, objective_dicts, top_row)
+    trajectory = analysis.trajectory_rows(
+        hw_trials,
+        objective_dicts,
+        resume_metadata,
+    )
+    metadata = analysis.section_metadata(hw_trials, resume_metadata)
+    correlation = analysis.sysctl_correlation_matrix(df, importance_by_target)
+    category_rollup = analysis.category_importance_rollup(importance_by_target)
+    host_issues = analysis.host_state_issues(hw_trials)
 
     (hw_dir / "recommendations.json").write_text(
         json.dumps(recs, indent=2) + "\n",
@@ -1198,7 +1236,7 @@ def _analyze_one_class(
         "topology": topology,
         "recommendations": recs,
         "pareto_rows": pareto_rows,
-        "objectives": [obj.model_dump(mode="json") for obj in objectives.pareto],
+        "objectives": objective_dicts,
         "default_weights": dict(objectives.recommendation_weights),
         "memory_cost_weight": objectives.memory_cost_weight,
         "top_n": top_n,
@@ -1211,6 +1249,13 @@ def _analyze_one_class(
             hardware_class,
             topology,
         ),
+        "baseline_comparison": baseline,
+        "verification_stats": verif_stats,
+        "trajectory_rows": trajectory,
+        "metadata": metadata,
+        "correlation_matrix": correlation,
+        "importance_category_rollup": category_rollup,
+        "host_state_issues": host_issues,
     }
 
 
@@ -1261,6 +1306,8 @@ def _build_axis_payload(
     pareto_mask: Any,  # noqa: ANN401
     *,
     stages: frozenset[StageName],
+    trials: list[Any] | None = None,
+    n_sobol: int | None = None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """Return JSON-safe per-trial rows plus the chart's axis columns.
 
@@ -1280,11 +1327,21 @@ def _build_axis_payload(
             raw metric is not produced by one of these stages are
             excluded from the payload, matching the objective
             pruning applied at config-load time.
+        trials: Optional list of :class:`TrialResult` aligned with
+            ``df`` rows by ``trial_id``; used to derive the ``phase``
+            label attached to each row via
+            :func:`kube_autotuner.models.effective_phase`.
+        n_sobol: Sobol budget from the sidecar; forwarded to
+            ``effective_phase`` for legacy primary rows whose
+            ``phase`` field is ``None``. ``None`` means "unknown" —
+            raw ``t.phase`` is used and legacy rows render as
+            ``"unknown"``.
 
     Returns:
         ``(all_rows, axis_columns)`` where ``all_rows`` has one dict
-        per df row with ``trial_id`` (str), ``pareto`` (bool), and
-        every axis column, and ``axis_columns`` lists those metric
+        per df row with ``trial_id`` (str), ``pareto`` (bool),
+        ``phase`` (str), every axis column, and every
+        ``<col>_std`` column, and ``axis_columns`` lists those metric
         columns produced by an enabled stage that also carry at
         least one non-null value in ``df``.
     """
@@ -1292,6 +1349,7 @@ def _build_axis_payload(
 
     import pandas as pd  # noqa: PLC0415
 
+    from kube_autotuner.models import effective_phase, is_primary  # noqa: PLC0415
     from kube_autotuner.scoring import METRIC_TO_DF_COLUMN  # noqa: PLC0415
 
     relevant_df_cols = {METRIC_TO_DF_COLUMN[m] for m in metrics_for_stages(stages)}
@@ -1300,12 +1358,32 @@ def _build_axis_payload(
         for c in _AXIS_METRIC_COLUMNS
         if c in df.columns and c in relevant_df_cols and df[c].notna().any()
     ]
+
+    phase_by_trial: dict[str, str] = {}
+    if trials:
+        primaries = sorted(
+            (t for t in trials if is_primary(t)),
+            key=lambda t: t.created_at,
+        )
+        for index, t in enumerate(primaries):
+            if n_sobol is not None:
+                phase_by_trial[t.trial_id] = effective_phase(t, index, n_sobol)
+            else:
+                phase_by_trial[t.trial_id] = (
+                    t.phase if t.phase is not None else "unknown"
+                )
+        for t in trials:
+            if not is_primary(t):
+                phase_by_trial[t.trial_id] = t.phase or "unknown"
+
     rows: list[dict[str, Any]] = []
     records = df.to_dict(orient="records")
     for record, is_pareto in zip(records, pareto_mask, strict=True):
+        tid = str(record["trial_id"])
         out: dict[str, Any] = {
-            "trial_id": str(record["trial_id"]),
+            "trial_id": tid,
             "pareto": bool(is_pareto),
+            "phase": phase_by_trial.get(tid, "unknown"),
         }
         for col in axis_columns:
             v = record.get(col)
@@ -1313,5 +1391,11 @@ def _build_axis_payload(
                 out[col] = None
             else:
                 out[col] = float(v)
+            std_key = f"{col}_std"
+            sv = record.get(std_key)
+            if sv is None or pd.isna(sv) or not math.isfinite(float(sv)):
+                out[std_key] = None
+            else:
+                out[std_key] = float(sv)
         rows.append(out)
     return rows, axis_columns

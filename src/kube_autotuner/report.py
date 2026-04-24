@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import html
 import json
+import math
 from pathlib import Path
 import re
 from typing import TYPE_CHECKING, Any
@@ -179,6 +180,28 @@ table.importance-table col.corr-w { width: 20%; }
 table.importance-table col.imp-w { width: 20%; }
 .num-pos { color: var(--pos); }
 .num-neg { color: var(--neg); }
+.section-metadata { margin: 0.25rem 0 0.75rem; font-size: 0.85rem;
+    color: var(--fg-muted); display: flex; flex-wrap: wrap;
+    gap: 0.25rem 1rem; }
+.section-metadata .field { white-space: nowrap; }
+.section-metadata .field.mixed { color: var(--neg); }
+.section-metadata .field .label { color: var(--fg-dim); margin-right: 0.3em; }
+.baseline-card table { width: 100%; }
+.baseline-card td.numeric { text-align: right; font-variant-numeric: tabular-nums; }
+.stability-dot { display: inline-block; width: 0.7em; height: 0.7em;
+    border-radius: 50%; margin-right: 0.3em;
+    vertical-align: middle; }
+.stability-dot.green { background: var(--pos); }
+.stability-dot.amber { background: #e5c07b; }
+.stability-dot.red { background: var(--neg); }
+.stability-dot.unverified { background: var(--fg-dim); }
+.trajectory-chart { width: 100%; min-height: 320px; }
+.correlation-chart { width: 100%; min-height: 420px; }
+.category-bar-chart { width: 100%; min-height: 200px; }
+.host-state-issues ul { margin: 0.25rem 0; padding-left: 1.25rem;
+    font-size: 0.85rem; }
+.host-state-issues code { background: var(--panel-2);
+    padding: 0.1rem 0.3rem; border-radius: 3px; }
 """
 
 
@@ -209,6 +232,29 @@ def _slug(s: str) -> str:
         a single dash, with leading and trailing dashes stripped.
     """
     return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")
+
+
+def _finite_or_none(v: Any) -> float | None:  # noqa: ANN401
+    """Coerce a numeric value to a finite float or ``None``.
+
+    Mirrors the guard applied inside
+    :func:`kube_autotuner.cli._build_axis_payload` so every new
+    payload field survives ``json.dumps(allow_nan=False)``.
+
+    Args:
+        v: Any value; ``None``, non-numeric, and non-finite inputs
+            all map to ``None``.
+
+    Returns:
+        A finite float, or ``None``.
+    """
+    if v is None:
+        return None
+    try:
+        f = float(v)
+    except TypeError, ValueError:
+        return None
+    return f if math.isfinite(f) else None
 
 
 _TARGET_METRIC_LABELS: dict[str, str] = {
@@ -404,6 +450,166 @@ the generic ``/proc/net/sockstat`` parser (``sockstat_<proto>_<key>``).
 """
 
 
+def _trajectory_chart_id(hw_slug: str) -> str:
+    """Return the stable div id for the per-hardware-class trajectory chart."""
+    return f"trajectory-chart-{hw_slug}"
+
+
+def _correlation_chart_id(hw_slug: str) -> str:
+    """Return the stable div id for the per-hardware-class correlation heatmap."""
+    return f"correlation-chart-{hw_slug}"
+
+
+def _category_bar_chart_id(hw_slug: str) -> str:
+    """Return the stable div id for the per-hardware-class category bar."""
+    return f"category-bar-{hw_slug}"
+
+
+def _correlation_matrix_payload(matrix: pd.DataFrame | None) -> dict[str, Any] | None:
+    """Lower a Spearman correlation DataFrame into a JSON-safe payload.
+
+    Args:
+        matrix: Square DataFrame produced by
+            :func:`kube_autotuner.analysis.sysctl_correlation_matrix`,
+            or ``None`` when there was not enough variance.
+
+    Returns:
+        ``{"columns": [...], "values": [[...]]}`` with non-finite
+        cells coerced to ``None``, or ``None`` when the input was
+        ``None``.
+    """
+    if matrix is None:
+        return None
+    pd_mod = _require_pandas()
+    columns = [str(c) for c in matrix.columns]
+    values: list[list[float | None]] = []
+    for _, row in matrix.iterrows():
+        row_out: list[float | None] = []
+        for v in row:
+            if v is None or pd_mod.isna(v):
+                row_out.append(None)
+            else:
+                row_out.append(_finite_or_none(v))
+        values.append(row_out)
+    return {"columns": columns, "values": values}
+
+
+def _clean_verification_stats(
+    stats: dict[str, dict[str, dict[str, float | None]]] | None,
+) -> dict[str, dict[str, dict[str, float | None]]]:
+    """Coerce every numeric cell in ``stats`` to a finite float or ``None``.
+
+    Returns:
+        A copy of ``stats`` with ``mean``/``stdev``/``cv`` scrubbed.
+    """
+    if not stats:
+        return {}
+    out: dict[str, dict[str, dict[str, float | None]]] = {}
+    for parent, per_metric in stats.items():
+        cleaned_metrics: dict[str, dict[str, float | None]] = {}
+        for metric, entry in per_metric.items():
+            cleaned_metrics[metric] = {
+                "mean": _finite_or_none(entry.get("mean")),
+                "stdev": _finite_or_none(entry.get("stdev")),
+                "cv": _finite_or_none(entry.get("cv")),
+            }
+        out[parent] = cleaned_metrics
+    return out
+
+
+def _clean_baseline_comparison(
+    entries: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]] | None:
+    """Coerce numeric fields in ``entries`` to finite-or-``None``.
+
+    Returns:
+        A scrubbed list of per-objective comparison dicts, or ``None``
+        when ``entries`` is ``None``.
+    """
+    if entries is None:
+        return None
+    return [
+        {
+            "metric": e["metric"],
+            "direction": e["direction"],
+            "baseline": _finite_or_none(e.get("baseline")),
+            "recommended": _finite_or_none(e.get("recommended")),
+            "abs_delta": _finite_or_none(e.get("abs_delta")),
+            "pct_delta": _finite_or_none(e.get("pct_delta")),
+        }
+        for e in entries
+    ]
+
+
+def _clean_trajectory_rows(
+    rows: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Coerce every ``<col>_best_so_far`` field to finite-or-``None``.
+
+    Returns:
+        The scrubbed trajectory rows; empty list when ``rows`` is
+        falsy.
+    """
+    if not rows:
+        return []
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        cleaned: dict[str, Any] = {}
+        for k, v in r.items():
+            if k.endswith("_best_so_far"):
+                cleaned[k] = _finite_or_none(v)
+            else:
+                cleaned[k] = v
+        out.append(cleaned)
+    return out
+
+
+def _clean_metadata(md: dict[str, Any] | None) -> dict[str, Any]:
+    """Coerce numeric fields in section metadata to finite-or-``None``.
+
+    Returns:
+        A scrubbed copy of ``md``; empty dict when ``md`` is falsy.
+    """
+    if not md:
+        return {}
+    result: dict[str, Any] = dict(md)
+    trial_count = md.get("trial_count")
+    if isinstance(trial_count, int):
+        result["trial_count"] = trial_count
+    for key in ("duration", "iterations"):
+        v = md.get(key)
+        if isinstance(v, (int, float)) and math.isfinite(float(v)):
+            result[key] = float(v) if isinstance(v, float) else int(v)
+        elif isinstance(v, str):
+            result[key] = v
+        else:
+            result[key] = None
+    return result
+
+
+def _clean_category_rollup(
+    rollup: dict[str, list[dict[str, Any]]] | None,
+) -> dict[str, list[dict[str, Any]]]:
+    """Coerce ``rf_sum`` cells to finite-or-``None``.
+
+    Returns:
+        A scrubbed copy of ``rollup``; empty dict when ``rollup`` is
+        falsy.
+    """
+    if not rollup:
+        return {}
+    out: dict[str, list[dict[str, Any]]] = {}
+    for target, entries in rollup.items():
+        out[target] = [
+            {
+                "category": e["category"],
+                "rf_sum": _finite_or_none(e.get("rf_sum")) or 0.0,
+            }
+            for e in entries
+        ]
+    return out
+
+
 def _section_payload(section: dict[str, Any]) -> dict[str, Any]:
     """Return the JSON-serializable payload for one hardware-class section.
 
@@ -441,6 +647,26 @@ def _section_payload(section: dict[str, Any]) -> dict[str, Any]:
         "hostState": section.get("host_state"),
         "hostStateChartId": _host_state_chart_id(hw_slug),
         "hostStatePreferredMetrics": list(_HOST_STATE_PREFERRED_METRICS),
+        "baselineComparison": _clean_baseline_comparison(
+            section.get("baseline_comparison"),
+        ),
+        "verificationStats": _clean_verification_stats(
+            section.get("verification_stats"),
+        ),
+        "trajectoryRows": _clean_trajectory_rows(
+            section.get("trajectory_rows"),
+        ),
+        "trajectoryChartId": _trajectory_chart_id(hw_slug),
+        "metadata": _clean_metadata(section.get("metadata")),
+        "correlationMatrix": _correlation_matrix_payload(
+            section.get("correlation_matrix"),
+        ),
+        "correlationChartId": _correlation_chart_id(hw_slug),
+        "importanceCategoryRollup": _clean_category_rollup(
+            section.get("importance_category_rollup"),
+        ),
+        "categoryBarChartId": _category_bar_chart_id(hw_slug),
+        "hostStateIssues": section.get("host_state_issues") or [],
     }
 
 
@@ -621,7 +847,274 @@ def _render_host_state_chart(
     )
 
 
-def _render_section(section: dict[str, Any]) -> str:
+_METRIC_LABEL_BY_SHORT: dict[str, str] = {
+    "tcp_throughput": "TCP throughput",
+    "udp_throughput": "UDP throughput",
+    "tcp_retransmit_rate": "TCP retransmit rate",
+    "udp_loss_rate": "UDP loss rate",
+    "udp_jitter": "UDP jitter",
+    "rps": "RPS",
+    "latency_p50": "latency p50",
+    "latency_p90": "latency p90",
+    "latency_p99": "latency p99",
+}
+
+
+def _render_baseline_card(section: dict[str, Any]) -> str:
+    """Render the baseline-vs-recommended comparison card.
+
+    Emits the empty string when ``section["baseline_comparison"]`` is
+    ``None`` (no defaults-match trial exists).
+
+    Args:
+        section: Section dict; consults ``baseline_comparison``.
+
+    Returns:
+        An HTML ``<section>`` fragment, or the empty string.
+    """
+    entries = section.get("baseline_comparison")
+    if not entries:
+        return ""
+    rows_html: list[str] = []
+    for e in entries:
+        metric = str(e["metric"])
+        direction = str(e["direction"])
+        label = _METRIC_LABEL_BY_SHORT.get(metric, metric)
+        baseline = e.get("baseline")
+        recommended = e.get("recommended")
+        abs_delta = e.get("abs_delta")
+        pct_delta = e.get("pct_delta")
+
+        def _fmt(v: float | None) -> str:
+            if v is None:
+                return "-"
+            return f"{v:.4g}"
+
+        if abs_delta is None:
+            cls = ""
+            abs_text = "-"
+            pct_text = "-"
+        else:
+            improving = (direction == "maximize" and abs_delta > 0) or (
+                direction == "minimize" and abs_delta < 0
+            )
+            cls = "num-pos" if improving else ("num-neg" if abs_delta != 0 else "")
+            sign = "+" if abs_delta > 0 else ""
+            abs_text = f"{sign}{abs_delta:.4g}"
+            pct_text = f"{sign}{pct_delta * 100:.2f}%" if pct_delta is not None else "-"
+        rows_html.append(
+            "<tr>"
+            f"<td>{html.escape(label)} "
+            f"<span class='meta'>({html.escape(direction)})</span></td>"
+            f"<td class='numeric'>{_fmt(baseline)}</td>"
+            f"<td class='numeric'>{_fmt(recommended)}</td>"
+            f"<td class='numeric'><span class='{cls}'>{abs_text}</span></td>"
+            f"<td class='numeric'><span class='{cls}'>{pct_text}</span></td>"
+            "</tr>",
+        )
+    return (
+        "<section class='fig baseline-card'>\n"
+        "<h3>Baseline comparison</h3>\n"
+        "<p class='meta'>Top recommendation vs the "
+        "<code>RECOMMENDED_DEFAULTS</code> baseline (per objective).</p>\n"
+        "<table class='report-table'>\n"
+        "<thead><tr><th>metric</th><th>baseline</th><th>recommended</th>"
+        "<th>delta</th><th>%</th></tr></thead>\n"
+        f"<tbody>{''.join(rows_html)}</tbody>\n"
+        "</table>\n"
+        "</section>"
+    )
+
+
+def _render_metadata_header(section: dict[str, Any]) -> str:
+    """Render the experiment-metadata strip above the hardware-class heading.
+
+    Fields that are ``None`` are omitted; fields whose value is the
+    string ``"mixed"`` render with a muted visual weight so the
+    inconsistency is visible.
+
+    Args:
+        section: Section dict; consults ``metadata``.
+
+    Returns:
+        An HTML fragment with one ``<span>`` per field, or the empty
+        string when no field survives.
+    """
+    md = section.get("metadata") or {}
+    if not md:
+        return ""
+    parts: list[str] = []
+
+    def _field(label: str, value: Any, *, always_str: bool = False) -> None:  # noqa: ANN401
+        if value is None:
+            return
+        mixed = value == "mixed"
+        text = value if always_str or isinstance(value, str) else str(value)
+        cls = "field mixed" if mixed else "field"
+        parts.append(
+            f"<span class='{cls}'><span class='label'>{html.escape(label)}</span>"
+            f"{html.escape(str(text))}</span>",
+        )
+
+    trial_count = md.get("trial_count")
+    if isinstance(trial_count, int) and trial_count > 0:
+        _field("trials", trial_count)
+    phase_counts = md.get("phase_counts") or {}
+    phase_chunks = [
+        f"{label}={count}" for label, count in phase_counts.items() if count
+    ]
+    if phase_chunks:
+        parts.append(
+            "<span class='field'><span class='label'>phases</span>"
+            f"{html.escape(', '.join(phase_chunks))}</span>",
+        )
+    _field("kernel", md.get("kernel_version"))
+    _field("duration", md.get("duration"))
+    _field("iterations", md.get("iterations"))
+    stages = md.get("stages")
+    if stages is not None:
+        if isinstance(stages, list):
+            _field("stages", ", ".join(stages))
+        else:
+            _field("stages", stages)
+    first = md.get("first_created_at_iso")
+    last = md.get("last_created_at_iso")
+    if first:
+        _field("first", first)
+    if last and last != first:
+        _field("last", last)
+    if not parts:
+        return ""
+    return f"<div class='section-metadata'>{''.join(parts)}</div>"
+
+
+def _render_trajectory_chart(hw_slug: str, rows: list[dict[str, Any]]) -> str:
+    """Render the skeleton for the optimization-trajectory chart.
+
+    Args:
+        hw_slug: Slugified hardware-class label.
+        rows: Trajectory rows; the fragment is omitted when empty.
+
+    Returns:
+        An HTML ``<section>`` fragment, or the empty string.
+    """
+    if not rows:
+        return ""
+    chart_id = _trajectory_chart_id(hw_slug)
+    return (
+        "<section class='fig'>\n"
+        "<h3>Optimization trajectory</h3>\n"
+        "<p class='meta'>Running best-so-far per objective over the "
+        "primary-trial sequence (ordered by <code>created_at</code>). "
+        "Markers are colored by phase.</p>\n"
+        f'<div class="trajectory-chart" id="{html.escape(chart_id)}"></div>\n'
+        "</section>"
+    )
+
+
+def _render_correlation_heatmap(
+    hw_slug: str,
+    payload: dict[str, Any] | None,
+) -> str:
+    """Render the skeleton for the sysctl-correlation heatmap.
+
+    Wrapped in a collapsed ``<details>`` so the heatmap does not
+    dominate the page by default.
+
+    Args:
+        hw_slug: Slugified hardware-class label.
+        payload: Correlation payload from
+            :func:`_correlation_matrix_payload`, or ``None``.
+
+    Returns:
+        An HTML ``<section>`` fragment, or the empty string when
+        ``payload`` is ``None``.
+    """
+    if payload is None:
+        return ""
+    chart_id = _correlation_chart_id(hw_slug)
+    return (
+        "<section class='fig'>\n"
+        "<details>\n"
+        "<summary>Sysctl-sysctl correlation heatmap</summary>\n"
+        "<p class='meta'>Strong off-diagonal correlations mean these "
+        "knobs moved together; attribution to a single knob is less "
+        "reliable.</p>\n"
+        f'<div class="correlation-chart" id="{html.escape(chart_id)}"></div>\n'
+        "</details>\n"
+        "</section>"
+    )
+
+
+def _render_category_bar(
+    hw_slug: str,
+    rollup: dict[str, list[dict[str, Any]]] | None,
+) -> str:
+    """Render the skeleton for the per-target category-importance bar.
+
+    Args:
+        hw_slug: Slugified hardware-class label.
+        rollup: Per-target category rollup; the fragment is omitted
+            when ``rollup`` is empty.
+
+    Returns:
+        An HTML ``<section>`` fragment, or the empty string.
+    """
+    if not rollup:
+        return ""
+    chart_id = _category_bar_chart_id(hw_slug)
+    return (
+        "<section class='fig importance-category'>\n"
+        "<h3>Importance by category</h3>\n"
+        "<p class='meta'>Random Forest importance summed by sysctl "
+        "category for the active target metric.</p>\n"
+        f'<div class="category-bar-chart" id="{html.escape(chart_id)}"></div>\n'
+        "</section>"
+    )
+
+
+def _render_host_state_issues(section: dict[str, Any]) -> str:
+    """Render a ``<details>`` listing :attr:`HostStateSnapshot.errors` lines.
+
+    Args:
+        section: Section dict; consults ``host_state_issues``.
+
+    Returns:
+        An HTML ``<section>`` fragment, or the empty string when no
+        snapshot carries any errors.
+    """
+    issues = section.get("host_state_issues") or []
+    if not issues:
+        return ""
+    items: list[str] = []
+    for it in issues:
+        trial_id = html.escape(str(it.get("trial_id", "")))
+        node = html.escape(str(it.get("node", "")))
+        phase = html.escape(str(it.get("phase", "")))
+        iteration = it.get("iteration")
+        iter_str = f" iter {int(iteration)}" if isinstance(iteration, int) else ""
+        text = html.escape(str(it.get("error_text", "")))
+        items.append(
+            "<li>"
+            f"<code>{trial_id}</code> "
+            f"<span class='meta'>{node} / {phase}{html.escape(iter_str)}</span>: "
+            f"{text}"
+            "</li>",
+        )
+    return (
+        "<section class='fig host-state-issues'>\n"
+        "<details>\n"
+        f"<summary>Data-collection issues ({len(issues)} snapshots affected)"
+        "</summary>\n"
+        f"<ul>{''.join(items)}</ul>\n"
+        "</details>\n"
+        "</section>"
+    )
+
+
+def _render_section(  # noqa: PLR0914 - one-pass composer of independent fragments
+    section: dict[str, Any],
+) -> str:
     """Render one per-hardware-class section.
 
     Args:
@@ -655,19 +1148,40 @@ def _render_section(section: dict[str, Any]) -> str:
         section["importance"],
     )
 
+    metadata_header = _render_metadata_header(section)
+    baseline_card = _render_baseline_card(section)
     axis_chart = _render_axis_chart(hw_slug, section["axis_columns"])
+    trajectory_chart = _render_trajectory_chart(
+        hw_slug,
+        section.get("trajectory_rows") or [],
+    )
     host_state_chart = _render_host_state_chart(hw_slug, section.get("host_state"))
+    correlation_heatmap = _render_correlation_heatmap(
+        hw_slug,
+        _correlation_matrix_payload(section.get("correlation_matrix")),
+    )
+    category_bar = _render_category_bar(
+        hw_slug,
+        section.get("importance_category_rollup"),
+    )
+    host_state_issues = _render_host_state_issues(section)
 
     return (
         f"<section class='hw' id='hw-{hw_slug}'>\n"
         f"<h2>Hardware class: {html.escape(hw)}</h2>\n"
+        f"{metadata_header}\n"
         f"{meta}\n"
+        f"{baseline_card}\n"
         f"{_render_interactive_panel(hw_slug)}\n"
         f"{data_script}\n"
         f"<h3>Parameter importance (top {_TOP_IMPORTANCE_ROWS})</h3>\n"
         f"{importance_block}\n"
+        f"{category_bar}\n"
         f"{axis_chart}\n"
+        f"{trajectory_chart}\n"
+        f"{correlation_heatmap}\n"
         f"{host_state_chart}\n"
+        f"{host_state_issues}\n"
         f"</section>"
     )
 
@@ -987,7 +1501,12 @@ function buildRankedTable(wrapper, state, visibleCols) {
     const rankTd = document.createElement("td");
     tr.appendChild(rankTd);
     const trialTd = document.createElement("td");
-    trialTd.textContent = row.trial_id;
+    const badge = row.stability_badge || "unverified";
+    const dot = document.createElement("span");
+    dot.className = "stability-dot " + badge;
+    dot.title = "stability: " + badge;
+    trialTd.appendChild(dot);
+    trialTd.appendChild(document.createTextNode(row.trial_id));
     tr.appendChild(trialTd);
     const metricTds = {};
     for (const col of visibleCols) {
@@ -1017,6 +1536,37 @@ function buildRankedTable(wrapper, state, visibleCols) {
     table.id = "decomp-" + state.section.hwSlug + "-" + i;
     wrapper.appendChild(table);
     details.appendChild(wrapper);
+
+    const verifStats = (state.section.verificationStats || {})[row.trial_id];
+    if (verifStats) {
+      const verifDetails = document.createElement("details");
+      const verifSummary = document.createElement("summary");
+      verifSummary.textContent = "verification stability";
+      verifDetails.appendChild(verifSummary);
+      const verifWrapper = document.createElement("div");
+      verifWrapper.className = "decomposition-wrapper";
+      const verifTable = document.createElement("table");
+      verifTable.className = "report-table decomposition-table";
+      let verifBody = "<thead><tr><th>metric</th>"
+        + "<th>mean</th><th>± stdev</th><th>CV</th></tr></thead><tbody>";
+      for (const [metric, entry] of Object.entries(verifStats)) {
+        const mean = entry.mean === null || entry.mean === undefined
+          ? "-" : Number(entry.mean).toPrecision(4);
+        const sd = entry.stdev === null || entry.stdev === undefined
+          ? "-" : Number(entry.stdev).toPrecision(3);
+        const cv = entry.cv === null || entry.cv === undefined
+          ? "—" : (Number(entry.cv) * 100).toFixed(2) + "%";
+        verifBody += `<tr><td class="metric-col">${metric}</td>`
+          + `<td class="numeric">${mean}</td>`
+          + `<td class="numeric">${sd}</td>`
+          + `<td class="numeric">${cv}</td></tr>`;
+      }
+      verifBody += "</tbody>";
+      verifTable.innerHTML = verifBody;
+      verifWrapper.appendChild(verifTable);
+      verifDetails.appendChild(verifWrapper);
+      details.appendChild(verifDetails);
+    }
 
     const sysctlDetails = document.createElement("details");
     const sysctlSummary = document.createElement("summary");
@@ -1153,43 +1703,115 @@ function highlightInPlots(figureDivIds, topTrialIds) {
   }
 }
 
-// Build the two traces (non-pareto grey + pareto red) for the
-// interactive axis chart and hand them to Plotly. Preserves the
-// top-N marker-size highlight across axis swaps by re-applying
-// ``highlightInPlots`` with ``state.lastTopIds`` after every render.
+const PHASE_SYMBOL = {
+  sobol: "circle",
+  bayesian: "square",
+  verification: "diamond",
+  unknown: "triangle-up",
+};
+
+const PHASE_COLOR = {
+  sobol: "#BABBBD",
+  bayesian: "#5B9BD5",
+  verification: "#98C379",
+  unknown: "#828997",
+};
+
+function axisStd(row, col) {
+  const v = row[col + "_std"];
+  if (v === null || v === undefined) return null;
+  return MS_SCALED.has(col) ? v * 1000 : v;
+}
+
+// Build phase-split non-pareto traces plus a single pareto trace for
+// the interactive axis chart and hand them to Plotly. Error bars are
+// keyed off the per-row <col>_std arrays (null disables the bar for
+// that point). Preserves the top-N marker-size highlight across axis
+// swaps by re-applying ``highlightInPlots`` with ``state.lastTopIds``
+// after every render.
 function renderAxisChart(state) {
   const section = state.section;
   const div = document.getElementById("axis-chart-" + section.hwSlug);
   if (!div) return;
   const x = state.axisX;
   const y = state.axisY;
-  const others = [];
+  const byPhase = {};
   const paretos = [];
   for (const row of section.allRows) {
-    (row.pareto ? paretos : others).push(row);
+    if (row.pareto) {
+      paretos.push(row);
+    } else {
+      const phase = row.phase || "unknown";
+      (byPhase[phase] = byPhase[phase] || []).push(row);
+    }
   }
-  const traces = [
-    {
-      type: "scatter", mode: "markers", name: "other",
-      x: others.map(r => axisValue(r, x)),
-      y: others.map(r => axisValue(r, y)),
-      customdata: others.map(r => r.trial_id),
-      marker: {color: "#BABBBD", size: 6},
+  const traces = [];
+  const phaseOrder = ["sobol", "bayesian", "verification", "unknown"]
+    .filter(p => byPhase[p] && byPhase[p].length);
+  for (const p of Object.keys(byPhase).sort()) {
+    if (!phaseOrder.includes(p)) phaseOrder.push(p);
+  }
+  for (const phase of phaseOrder) {
+    const rows = byPhase[phase];
+    if (!rows.length) continue;
+    traces.push({
+      type: "scatter", mode: "markers", name: phase,
+      x: rows.map(r => axisValue(r, x)),
+      y: rows.map(r => axisValue(r, y)),
+      customdata: rows.map(r => r.trial_id),
+      error_x: {
+        type: "data",
+        array: rows.map(r => axisStd(r, x)),
+        visible: true,
+        color: "rgba(170,170,170,0.35)",
+        thickness: 1,
+        width: 2,
+      },
+      error_y: {
+        type: "data",
+        array: rows.map(r => axisStd(r, y)),
+        visible: true,
+        color: "rgba(170,170,170,0.35)",
+        thickness: 1,
+        width: 2,
+      },
+      marker: {
+        color: PHASE_COLOR[phase] || "#BABBBD",
+        symbol: PHASE_SYMBOL[phase] || "circle",
+        size: 6,
+      },
       hovertemplate:
-        `trial %{customdata}<br>${axisLabel(x)}=%{x:.3g}<br>`
+        `trial %{customdata}<br>phase ${phase}<br>`
+        + `${axisLabel(x)}=%{x:.3g}<br>`
         + `${axisLabel(y)}=%{y:.3g}<extra></extra>`,
+    });
+  }
+  traces.push({
+    type: "scatter", mode: "markers", name: "pareto",
+    x: paretos.map(r => axisValue(r, x)),
+    y: paretos.map(r => axisValue(r, y)),
+    customdata: paretos.map(r => r.trial_id),
+    error_x: {
+      type: "data",
+      array: paretos.map(r => axisStd(r, x)),
+      visible: true,
+      color: "rgba(239,85,59,0.4)",
+      thickness: 1,
+      width: 2,
     },
-    {
-      type: "scatter", mode: "markers", name: "pareto",
-      x: paretos.map(r => axisValue(r, x)),
-      y: paretos.map(r => axisValue(r, y)),
-      customdata: paretos.map(r => r.trial_id),
-      marker: {color: "#EF553B", size: 9},
-      hovertemplate:
-        `trial %{customdata}<br>${axisLabel(x)}=%{x:.3g}<br>`
-        + `${axisLabel(y)}=%{y:.3g}<extra></extra>`,
+    error_y: {
+      type: "data",
+      array: paretos.map(r => axisStd(r, y)),
+      visible: true,
+      color: "rgba(239,85,59,0.4)",
+      thickness: 1,
+      width: 2,
     },
-  ];
+    marker: {color: "#EF553B", size: 9},
+    hovertemplate:
+      `trial %{customdata}<br>${axisLabel(x)}=%{x:.3g}<br>`
+      + `${axisLabel(y)}=%{y:.3g}<extra></extra>`,
+  });
   const layout = {
     template: "plotly_dark",
     paper_bgcolor: "rgba(0,0,0,0)",
@@ -1414,8 +2036,167 @@ function wireImportanceSelectors() {
           `.importance-panel[data-hw-slug="${hwSlug}"]`)) {
         panel.hidden = panel.dataset.target !== target;
       }
+      const section = SECTIONS[hwSlug];
+      if (section) renderCategoryRollup(section, target);
     });
   }
+}
+
+const SECTIONS = {};
+
+// One subplot per objective so each series keeps its own natural
+// units (bits/sec vs retx-rate vs ms latency), which makes the
+// running-best curves readable — a single shared y-axis would squash
+// every series against the bits/sec one.
+function renderTrajectoryChart(section) {
+  const div = document.getElementById(section.trajectoryChartId);
+  if (!div) return;
+  const rows = section.trajectoryRows || [];
+  if (!rows.length) return;
+  const objectives = section.objectives || [];
+  if (!objectives.length) return;
+  const x = rows.map(r => r.created_at_iso);
+  const phases = rows.map(r => r.phase_effective || "unknown");
+  const symbols = phases.map(p => PHASE_SYMBOL[p] || "circle");
+  const colors = phases.map(p => PHASE_COLOR[p] || "#BABBBD");
+  const text = rows.map(r => `trial ${r.trial_id}<br>${r.phase_effective}`);
+  const traces = [];
+  const layout = {
+    template: "plotly_dark",
+    paper_bgcolor: "rgba(0,0,0,0)",
+    plot_bgcolor: "rgba(0,0,0,0)",
+    font: {color: "#abb2bf"},
+    autosize: true,
+    height: Math.max(220, objectives.length * 170),
+    margin: {l: 70, r: 20, t: 28, b: 50},
+    showlegend: false,
+    grid: {rows: objectives.length, columns: 1, pattern: "independent"},
+    annotations: [],
+  };
+  for (let i = 0; i < objectives.length; i++) {
+    const obj = objectives[i];
+    const col = METRIC_TO_DF_COLUMN[obj.metric];
+    const key = col + "_best_so_far";
+    const y = rows.map(r => {
+      const v = r[key];
+      if (v === null || v === undefined) return null;
+      return MS_SCALED.has(col) ? v * 1000 : v;
+    });
+    const xaxis = i === 0 ? "x" : "x" + (i + 1);
+    const yaxis = i === 0 ? "y" : "y" + (i + 1);
+    const xaxisKey = i === 0 ? "xaxis" : "xaxis" + (i + 1);
+    const yaxisKey = i === 0 ? "yaxis" : "yaxis" + (i + 1);
+    layout[xaxisKey] = {
+      type: "date",
+      title: i === objectives.length - 1 ? "trial timestamp" : "",
+      showticklabels: i === objectives.length - 1,
+    };
+    layout[yaxisKey] = {title: axisLabel(col)};
+    traces.push({
+      type: "scatter",
+      mode: "lines+markers",
+      name: axisLabel(col),
+      x,
+      y,
+      xaxis,
+      yaxis,
+      text,
+      marker: {symbol: symbols, color: colors, size: 7},
+      line: {width: 1.2, color: "rgba(97,175,239,0.45)"},
+      connectgaps: true,
+      hovertemplate: `%{text}<br>%{x}<br>best=%{y:.3g}<extra>${axisLabel(col)}</extra>`,
+    });
+  }
+  const config = {responsive: true, displayModeBar: false};
+  if (div._fullLayout) {
+    Plotly.react(div, traces, layout, config);
+  } else {
+    Plotly.newPlot(div, traces, layout, config);
+  }
+}
+
+function renderCorrelationHeatmap(section) {
+  const div = document.getElementById(section.correlationChartId);
+  if (!div) return;
+  const payload = section.correlationMatrix;
+  if (!payload) return;
+  const z = payload.values.map(row => row.map(v => v === null ? null : v));
+  const traces = [{
+    type: "heatmap",
+    z,
+    x: payload.columns,
+    y: payload.columns,
+    colorscale: [
+      [0, "#e06c75"], [0.5, "#2c313a"], [1, "#98c379"],
+    ],
+    zmin: -1,
+    zmax: 1,
+    zauto: false,
+    hoverongaps: false,
+    hovertemplate: "%{y} x %{x}<br>r=%{z:.2f}<extra></extra>",
+  }];
+  const layout = {
+    template: "plotly_dark",
+    paper_bgcolor: "rgba(0,0,0,0)",
+    plot_bgcolor: "rgba(0,0,0,0)",
+    font: {color: "#abb2bf", size: 10},
+    xaxis: {automargin: true, tickangle: -45},
+    yaxis: {automargin: true},
+    autosize: true,
+    height: Math.max(360, payload.columns.length * 28),
+    margin: {l: 140, r: 20, t: 20, b: 120},
+  };
+  const config = {responsive: true, displayModeBar: false};
+  if (div._fullLayout) {
+    Plotly.react(div, traces, layout, config);
+  } else {
+    Plotly.newPlot(div, traces, layout, config);
+  }
+}
+
+function renderCategoryRollup(section, target) {
+  const div = document.getElementById(section.categoryBarChartId);
+  if (!div) return;
+  const rollup = section.importanceCategoryRollup || {};
+  const entries = rollup[target] || rollup[Object.keys(rollup)[0]];
+  if (!entries) {
+    Plotly.purge(div);
+    return;
+  }
+  const cats = entries.map(e => e.category);
+  const vals = entries.map(e => e.rf_sum);
+  const traces = [{
+    type: "bar",
+    orientation: "h",
+    x: vals,
+    y: cats,
+    marker: {color: "#61afef"},
+    hovertemplate: "%{y}: %{x:.3f}<extra></extra>",
+  }];
+  const layout = {
+    template: "plotly_dark",
+    paper_bgcolor: "rgba(0,0,0,0)",
+    plot_bgcolor: "rgba(0,0,0,0)",
+    font: {color: "#abb2bf"},
+    xaxis: {title: "Σ rf_importance", rangemode: "tozero"},
+    yaxis: {automargin: true, autorange: "reversed"},
+    autosize: true,
+    height: Math.max(180, cats.length * 32),
+    margin: {l: 120, r: 20, t: 10, b: 40},
+  };
+  const config = {responsive: true, displayModeBar: false};
+  if (div._fullLayout) {
+    Plotly.react(div, traces, layout, config);
+  } else {
+    Plotly.newPlot(div, traces, layout, config);
+  }
+}
+
+function defaultCategoryTarget(section) {
+  const rollup = section.importanceCategoryRollup || {};
+  if ("mean_tcp_throughput" in rollup) return "mean_tcp_throughput";
+  const keys = Object.keys(rollup);
+  return keys.length ? keys[0] : null;
 }
 
 function boot() {
@@ -1423,13 +2204,20 @@ function boot() {
     'script[type="application/json"][id^="section-data-"]');
   for (const dataEl of dataScripts) {
     const section = JSON.parse(dataEl.textContent);
+    SECTIONS[section.hwSlug] = section;
     const panel = document.querySelector(
       `.panel[data-hw-slug="${section.hwSlug}"]`);
-    if (!panel) continue;
-    // Host state is wired independently of Pareto-row availability:
-    // a hardware class without a usable frontier can still have
-    // per-iteration snapshots worth inspecting.
+    // Host state, trajectory, correlation, and category-rollup are
+    // wired independently of Pareto-row availability: a hardware
+    // class without a usable frontier can still have per-iteration
+    // snapshots, a trajectory, or an importance rollup worth
+    // inspecting.
     setupHostStateChart(section);
+    renderTrajectoryChart(section);
+    renderCorrelationHeatmap(section);
+    const catTarget = defaultCategoryTarget(section);
+    if (catTarget) renderCategoryRollup(section, catTarget);
+    if (!panel) continue;
     if (!section.paretoRows || section.paretoRows.length === 0) {
       panel.querySelector(".ranked-table-wrapper").innerHTML =
         "<p class='meta'>No Pareto-frontier rows.</p>";
