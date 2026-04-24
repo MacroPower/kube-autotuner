@@ -742,3 +742,94 @@ def recommend_configs(
             },
         )
     return results
+
+
+def host_state_series(
+    trials: list[TrialResult],
+    hardware_class: str,
+    topology: str | None,
+) -> dict[str, Any] | None:
+    """Shape per-trial host-state snapshots for the analysis report.
+
+    Extracts :class:`~kube_autotuner.models.HostStateSnapshot` entries
+    off each matching :class:`~kube_autotuner.models.TrialResult` and
+    lowers them into a JSON-ready payload the HTML report embeds for
+    the browser-side time-series chart. The shape is:
+
+    .. code-block:: python
+
+        {
+            "metrics": [sorted union of metric keys],
+            "trials": [
+                {
+                    "trial_id": str,
+                    "sysctl_hash": str,
+                    "points": [
+                        {"iteration": int | None,
+                         "phase": str,
+                         "metrics": {str: int}},
+                        ...
+                    ],
+                },
+                ...
+            ],
+        }
+
+    ``HostStateSnapshot.timestamp`` and ``HostStateSnapshot.errors``
+    are intentionally dropped -- the chart keys off ``iteration`` and
+    ``phase`` only, and errors would bloat the embedded JSON without
+    aiding the visualization.
+
+    Args:
+        trials: The trial set to scan (caller passes the pre-filtered
+            hardware-class list in practice, but this function also
+            filters defensively so stray topology-mixed inputs do not
+            silently leak).
+        hardware_class: The hardware-class label to keep.
+        topology: When set, keep only trials whose ``topology``
+            matches; when ``None``, keep all topologies.
+
+    Returns:
+        The payload described above, or ``None`` when no trial in
+        the filtered set carries any host-state snapshots, or when
+        every snapshot's ``metrics`` dict is empty (so the metric
+        union is empty and the multi-select would render with zero
+        options).
+    """
+    filtered = [
+        t
+        for t in trials
+        if t.node_pair.hardware_class == hardware_class
+        and (topology is None or t.topology == topology)
+        and t.host_state_snapshots
+    ]
+    if not filtered:
+        return None
+
+    metric_union: set[str] = set()
+    trial_payloads: list[dict[str, Any]] = []
+    for trial in filtered:
+        points: list[dict[str, Any]] = []
+        for snap in trial.host_state_snapshots:
+            metrics: dict[str, int] = dict(snap.metrics)
+            metric_union.update(metrics.keys())
+            points.append(
+                {
+                    "iteration": snap.iteration,
+                    "phase": snap.phase,
+                    "metrics": metrics,
+                },
+            )
+        trial_payloads.append(
+            {
+                "trial_id": trial.trial_id,
+                "sysctl_hash": trial.sysctl_hash,
+                "points": points,
+            },
+        )
+    if not metric_union:
+        return None
+    return {
+        "metrics": sorted(metric_union),
+        "trials": trial_payloads,
+    }

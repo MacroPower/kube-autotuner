@@ -1168,6 +1168,11 @@ def _analyze_one_class(
         "importance_by_target": importance_by_target,
         "all_rows": all_rows,
         "axis_columns": axis_columns,
+        "host_state": analysis.host_state_series(
+            hw_trials,
+            hardware_class,
+            topology,
+        ),
     }
 
 

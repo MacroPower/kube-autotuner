@@ -385,6 +385,25 @@ def _axis_chart_id(hw_slug: str) -> str:
     return f"axis-chart-{hw_slug}"
 
 
+def _host_state_chart_id(hw_slug: str) -> str:
+    """Return the stable div id for a per-hardware-class host-state chart."""
+    return f"host-state-chart-{hw_slug}"
+
+
+_HOST_STATE_PREFERRED_METRICS: tuple[str, ...] = (
+    "conntrack_count",
+    "slab_nf_conntrack_active_objs",
+    "sockstat_tcp_inuse",
+)
+"""Metric keys pre-selected in the host-state multi-select when present.
+
+All three come from :mod:`kube_autotuner.sysctl.setter`: ``conntrack_count``
+and the ``slab_nf_conntrack_*`` pair are written by the conntrack and
+slabinfo parsers; ``sockstat_tcp_inuse`` is one of the keys emitted by
+the generic ``/proc/net/sockstat`` parser (``sockstat_<proto>_<key>``).
+"""
+
+
 def _section_payload(section: dict[str, Any]) -> dict[str, Any]:
     """Return the JSON-serializable payload for one hardware-class section.
 
@@ -414,7 +433,14 @@ def _section_payload(section: dict[str, Any]) -> dict[str, Any]:
         "paretoRows": section["pareto_rows"],
         "allRows": section["all_rows"],
         "axisColumns": section["axis_columns"],
+        # figureDivIds is consumed by highlightInPlots to restyle the
+        # Pareto top-N on charts that carry trial_id customdata; the
+        # host-state chart deliberately has none, so keep it out of this
+        # list to avoid a misaimed Plotly.restyle loop.
         "figureDivIds": [_axis_chart_id(hw_slug)],
+        "hostState": section.get("host_state"),
+        "hostStateChartId": _host_state_chart_id(hw_slug),
+        "hostStatePreferredMetrics": list(_HOST_STATE_PREFERRED_METRICS),
     }
 
 
@@ -529,6 +555,72 @@ def _render_axis_chart(hw_slug: str, axis_columns: list[str]) -> str:
     )
 
 
+def _render_host_state_chart(
+    hw_slug: str,
+    payload: dict[str, Any] | None,
+) -> str:
+    """Render the skeleton for the interactive host-state chart.
+
+    Mirrors :func:`_render_axis_chart`: emit a stable DOM with a
+    multi-select and an empty chart div, let the JS module fill in
+    traces via Plotly on load.
+
+    The skeleton is omitted entirely when ``payload`` is ``None`` --
+    i.e. when no trial in the hardware class carries any
+    :class:`~kube_autotuner.models.HostStateSnapshot`, or every
+    snapshot's ``metrics`` dict was empty. In that case there is
+    nothing meaningful to chart, and rendering an empty section
+    would just clutter the page.
+
+    Args:
+        hw_slug: Slugified hardware-class label; used to namespace
+            ids and data attributes.
+        payload: The host-state payload produced by
+            :func:`kube_autotuner.analysis.host_state_series`, or
+            ``None``.
+
+    Returns:
+        An HTML ``<section>`` fragment, or the empty string when
+        ``payload`` is ``None``.
+    """
+    if payload is None:
+        return ""
+
+    metrics = list(payload.get("metrics", []))
+    if not metrics:
+        return ""
+
+    preferred = [m for m in _HOST_STATE_PREFERRED_METRICS if m in metrics]
+    preselected = set(preferred) if preferred else {metrics[0]}
+
+    options: list[str] = []
+    for metric in metrics:
+        sel = " selected" if metric in preselected else ""
+        options.append(
+            f'<option value="{html.escape(metric)}"{sel}>'
+            f"{html.escape(metric)}</option>",
+        )
+
+    slug_attr = html.escape(hw_slug)
+    chart_id = _host_state_chart_id(hw_slug)
+    return (
+        "<section class='fig'>\n"
+        "<h3>Host state</h3>\n"
+        "<p class='meta'>Per-iteration snapshots collected when "
+        "<code>--collect-host-state</code> is enabled. "
+        "Baseline is plotted at iteration -0.5; phases are "
+        "distinguished by marker shape "
+        "(diamond=baseline, circle=post-flush, square=post-iteration).</p>\n"
+        "<div class='axis-controls'>\n"
+        f'<label>metrics <select multiple size="6" '
+        f'class="host-state-metric-select" data-hw-slug="{slug_attr}">'
+        f"{''.join(options)}</select></label>\n"
+        "</div>\n"
+        f'<div class="axis-chart" id="{html.escape(chart_id)}"></div>\n'
+        "</section>"
+    )
+
+
 def _render_section(section: dict[str, Any]) -> str:
     """Render one per-hardware-class section.
 
@@ -564,6 +656,7 @@ def _render_section(section: dict[str, Any]) -> str:
     )
 
     axis_chart = _render_axis_chart(hw_slug, section["axis_columns"])
+    host_state_chart = _render_host_state_chart(hw_slug, section.get("host_state"))
 
     return (
         f"<section class='hw' id='hw-{hw_slug}'>\n"
@@ -574,6 +667,7 @@ def _render_section(section: dict[str, Any]) -> str:
         f"<h3>Parameter importance (top {_TOP_IMPORTANCE_ROWS})</h3>\n"
         f"{importance_block}\n"
         f"{axis_chart}\n"
+        f"{host_state_chart}\n"
         f"</section>"
     )
 
@@ -1223,6 +1317,101 @@ function renderSection(panel, section) {
   if (firstRef) firstRef.details.open = true;
 }
 
+// Plotly marker symbol per HostStatePhase; any phase not listed here
+// would fall back to "circle" (which also happens to be Plotly's
+// default), but the model's Literal type keeps this set closed.
+const HOST_STATE_PHASE_SYMBOL = {
+  "baseline": "diamond",
+  "post-flush": "circle",
+  "post-iteration": "square",
+};
+
+function hostStateSelectedMetrics(section) {
+  const sel = document.querySelector(
+    `select.host-state-metric-select[data-hw-slug="${section.hwSlug}"]`);
+  if (!sel) return [];
+  const out = [];
+  for (const opt of sel.options) {
+    if (opt.selected) out.push(opt.value);
+  }
+  return out;
+}
+
+function renderHostStateChart(section) {
+  const div = document.getElementById(section.hostStateChartId);
+  if (!div) return;
+  const payload = section.hostState;
+  if (!payload) return;
+  const metrics = hostStateSelectedMetrics(section);
+  const traces = [];
+  // legendgroup/showlegend logic: one legend entry per metric, grouped
+  // across trials. First-seen trace for a metric gets showlegend=true,
+  // the rest ride the group.
+  const legendEmitted = new Set();
+  for (const metric of metrics) {
+    for (const trial of payload.trials) {
+      // Baseline's iteration is null; plot it at -0.5 so it sits left
+      // of the iteration=0 pair without colliding with the axis tick.
+      const x = trial.points.map(
+        p => p.iteration === null || p.iteration === undefined ? -0.5 : p.iteration);
+      const y = trial.points.map(p => {
+        const v = p.metrics[metric];
+        return (v === null || v === undefined) ? null : v;
+      });
+      const symbols = trial.points.map(
+        p => HOST_STATE_PHASE_SYMBOL[p.phase] || "circle");
+      const text = trial.points.map(
+        p => `${p.phase}${p.iteration !== null && p.iteration !== undefined
+          ? " iter " + p.iteration : ""}`);
+      const first = !legendEmitted.has(metric);
+      legendEmitted.add(metric);
+      traces.push({
+        type: "scatter",
+        mode: "lines+markers",
+        name: metric,
+        legendgroup: metric,
+        showlegend: first,
+        x,
+        y,
+        text,
+        marker: {symbol: symbols, size: 8},
+        connectgaps: false,
+        hovertemplate:
+          `trial ${trial.trial_id}<br>metric ${metric}`
+          + `<br>%{text}<br>value=%{y}<extra></extra>`,
+      });
+    }
+  }
+  const layout = {
+    template: "plotly_dark",
+    paper_bgcolor: "rgba(0,0,0,0)",
+    plot_bgcolor: "rgba(0,0,0,0)",
+    font: {color: "#abb2bf"},
+    xaxis: {title: "iteration"},
+    yaxis: {title: "counter value"},
+    autosize: true,
+    height: 480,
+    margin: {l: 70, r: 20, t: 10, b: 50},
+    showlegend: true,
+    legend: {orientation: "h", y: -0.2},
+  };
+  const config = {responsive: true, displayModeBar: false};
+  if (div._fullLayout) {
+    Plotly.react(div, traces, layout, config);
+  } else {
+    Plotly.newPlot(div, traces, layout, config);
+  }
+}
+
+function setupHostStateChart(section) {
+  if (!section.hostState) return;
+  const sel = document.querySelector(
+    `select.host-state-metric-select[data-hw-slug="${section.hwSlug}"]`);
+  if (!sel) return;
+  sel.addEventListener("change", () => renderHostStateChart(section));
+  renderHostStateChart(section);
+}
+
 function wireImportanceSelectors() {
   for (const btn of document.querySelectorAll(".target-btn")) {
     btn.addEventListener("click", () => {
@@ -1248,6 +1437,10 @@ function boot() {
     const panel = document.querySelector(
       `.panel[data-hw-slug="${section.hwSlug}"]`);
     if (!panel) continue;
+    // Host state is wired independently of Pareto-row availability:
+    // a hardware class without a usable frontier can still have
+    // per-iteration snapshots worth inspecting.
+    setupHostStateChart(section);
     if (!section.paretoRows || section.paretoRows.length === 0) {
       panel.querySelector(".ranked-table-wrapper").innerHTML =
         "<p class='meta'>No Pareto-frontier rows.</p>";

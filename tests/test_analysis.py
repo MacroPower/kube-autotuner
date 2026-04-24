@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 import json
 import math
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import pytest
 
@@ -17,6 +17,7 @@ from typer.testing import CliRunner  # noqa: E402
 from kube_autotuner.analysis import (  # noqa: E402
     DEFAULT_OBJECTIVES,
     METRIC_TO_DF_COLUMN,
+    host_state_series,
     parameter_importance,
     pareto_front,
     recommend_configs,
@@ -28,6 +29,7 @@ from kube_autotuner.experiment import ObjectivesSection, ParetoObjective  # noqa
 from kube_autotuner.models import (  # noqa: E402
     BenchmarkConfig,
     BenchmarkResult,
+    HostStateSnapshot,
     NodePair,
     ParamSpace,
     ResumeMetadata,
@@ -918,3 +920,117 @@ def test_pareto_recommendation_rows_flips_tied_configs_by_memory_cost() -> None:
     # Every row carries a ``memory_cost`` field for downstream consumers.
     assert rows_enabled[0]["memory_cost"] == pytest.approx(212992)
     assert rows_enabled[1]["memory_cost"] == pytest.approx(67108864)
+
+
+# --- host_state_series ---------------------------------------------------
+
+
+def _snap(
+    iteration: int | None,
+    phase: Literal["baseline", "post-flush", "post-iteration"],
+    metrics: dict[str, int],
+) -> HostStateSnapshot:
+    return HostStateSnapshot(
+        node="node-a",
+        iteration=iteration,
+        phase=phase,
+        metrics=metrics,
+    )
+
+
+def _trial_with_snapshots(
+    *,
+    trial_id: str,
+    hw: str,
+    snapshots: list[HostStateSnapshot],
+    topology: Literal["intra-az", "inter-az", "unknown"] = "unknown",
+) -> TrialResult:
+    return TrialResult(
+        trial_id=trial_id,
+        node_pair=NodePair(source="a", target="b", hardware_class=hw),
+        sysctl_values={"net.core.rmem_max": 212992},
+        topology=topology,
+        config=BenchmarkConfig(duration=1, iterations=1),
+        results=[_result(1e9)],
+        host_state_snapshots=snapshots,
+    )
+
+
+def test_host_state_series_returns_none_when_no_snapshots() -> None:
+    trials = [_trial(hw="10g", trial_id="t1")]
+    assert host_state_series(trials, "10g", topology=None) is None
+
+
+def test_host_state_series_returns_none_when_metric_union_is_empty() -> None:
+    trial = _trial_with_snapshots(
+        trial_id="empty",
+        hw="10g",
+        snapshots=[_snap(None, "baseline", {})],
+    )
+    assert host_state_series([trial], "10g", topology=None) is None
+
+
+def test_host_state_series_filters_by_hardware_class_and_topology() -> None:
+    snaps = [_snap(None, "baseline", {"conntrack_count": 10})]
+    in_class = _trial_with_snapshots(
+        trial_id="keep",
+        hw="10g",
+        snapshots=snaps,
+        topology="intra-az",
+    )
+    other_class = _trial_with_snapshots(
+        trial_id="drop-hw",
+        hw="1g",
+        snapshots=snaps,
+    )
+    other_topo = _trial_with_snapshots(
+        trial_id="drop-topo",
+        hw="10g",
+        snapshots=snaps,
+        topology="inter-az",
+    )
+    payload = host_state_series(
+        [in_class, other_class, other_topo],
+        "10g",
+        topology="intra-az",
+    )
+    assert payload is not None
+    trial_ids = [t["trial_id"] for t in payload["trials"]]
+    assert trial_ids == ["keep"]
+
+
+def test_host_state_series_preserves_baseline_iteration_none() -> None:
+    trial = _trial_with_snapshots(
+        trial_id="t1",
+        hw="10g",
+        snapshots=[
+            _snap(None, "baseline", {"conntrack_count": 10}),
+            _snap(0, "post-flush", {"conntrack_count": 11}),
+            _snap(0, "post-iteration", {"conntrack_count": 13}),
+        ],
+    )
+    payload = host_state_series([trial], "10g", topology=None)
+    assert payload is not None
+    points = payload["trials"][0]["points"]
+    assert points[0]["iteration"] is None
+    assert points[0]["phase"] == "baseline"
+    assert points[1]["iteration"] == 0
+    # JSON round-trip keeps the None as null and survives allow_nan=False.
+    dumped = json.dumps(payload, allow_nan=False)
+    assert '"iteration": null' in dumped or '"iteration":null' in dumped
+
+
+def test_host_state_series_metric_union_is_sorted() -> None:
+    trial_a = _trial_with_snapshots(
+        trial_id="a",
+        hw="10g",
+        snapshots=[_snap(None, "baseline", {"zzz": 1, "aaa": 2})],
+    )
+    trial_b = _trial_with_snapshots(
+        trial_id="b",
+        hw="10g",
+        snapshots=[_snap(0, "post-flush", {"mmm": 3, "aaa": 4})],
+    )
+    payload = host_state_series([trial_a, trial_b], "10g", topology=None)
+    assert payload is not None
+    assert payload["metrics"] == ["aaa", "mmm", "zzz"]
