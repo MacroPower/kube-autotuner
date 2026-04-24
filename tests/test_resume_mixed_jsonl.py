@@ -56,7 +56,6 @@ def _optimize_exp(
     verification_top_k: int = 3,
 ) -> ExperimentConfig:
     return ExperimentConfig.model_validate({
-        "mode": "optimize",
         "nodes": {"sources": ["a"], "target": "b"},
         "benchmark": {"duration": 1, "iterations": 1},
         "optimize": {

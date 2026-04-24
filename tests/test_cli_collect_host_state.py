@@ -1,4 +1,4 @@
-"""Tests for ``--collect-host-state`` plumbing through the four CLI commands."""
+"""Tests for ``benchmark.collectHostState`` plumbing through the CLI."""
 
 from __future__ import annotations
 
@@ -24,191 +24,124 @@ def _fake_backend(tmp_path: Path) -> FakeSysctlBackend:
     return FakeSysctlBackend("node-a", tmp_path / "sysctl_state.json")
 
 
-def _common_patches(tmp_path: Path):
-    """Return (patch pair, fake backend) for the CLI command boundary.
-
-    Returns:
-        A ``((client_patch, resolve_patch), fake_backend)`` tuple: two
-        uncommitted ``unittest.mock.patch`` objects that the caller
-        enters in a ``with`` block, plus a pre-built
-        :class:`FakeSysctlBackend` the ``_resolve_backend`` patch can
-        return.
-    """
-    return (
-        patch("kube_autotuner.cli.K8sClient"),
-        patch("kube_autotuner.cli._resolve_backend"),
-    ), _fake_backend(tmp_path)
+def _baseline_yaml(out: Path, *, collect_host_state: bool | None) -> str:
+    body: dict[str, object] = {
+        "nodes": {"sources": ["a"], "target": "b"},
+        "benchmark": {"duration": 1, "iterations": 1},
+        "output": str(out),
+    }
+    if collect_host_state is not None:
+        body["benchmark"] = dict(body["benchmark"])  # type: ignore[arg-type]
+        body["benchmark"]["collectHostState"] = collect_host_state  # type: ignore[index]
+    return yaml.safe_dump(body)
 
 
-def test_baseline_flag_threaded_into_context(tmp_path: Path) -> None:
-    out = tmp_path / "r.jsonl"
-    (client_patch, resolve_patch), fake = _common_patches(tmp_path)
-    with (
-        client_patch as client_cls,
-        resolve_patch as resolve,
-        patch("kube_autotuner.cli.runs.run_baseline") as run_baseline,
-    ):
-        client_cls.return_value = MagicMock()
-        resolve.return_value = fake
-
-        result = runner.invoke(
-            app,
-            [
-                "baseline",
-                "--source",
-                "a",
-                "--target",
-                "b",
-                "--duration",
-                "1",
-                "--iterations",
-                "1",
-                "--output",
-                str(out),
-                "--collect-host-state",
-            ],
-        )
-    assert result.exit_code == 0, result.output
-    ctx = run_baseline.call_args.args[0]
-    assert ctx.collect_host_state is True
+def _trial_yaml(out: Path, *, collect_host_state: bool) -> str:
+    body = {
+        "nodes": {"sources": ["a"], "target": "b"},
+        "benchmark": {
+            "duration": 1,
+            "iterations": 1,
+            "collectHostState": collect_host_state,
+        },
+        "trial": {"sysctls": {"net.core.rmem_max": "16777216"}},
+        "output": str(out),
+    }
+    return yaml.safe_dump(body)
 
 
-def test_trial_flag_threaded_into_context(tmp_path: Path) -> None:
-    out = tmp_path / "r.jsonl"
-    (client_patch, resolve_patch), fake = _common_patches(tmp_path)
-    with (
-        client_patch as client_cls,
-        resolve_patch as resolve,
-        patch("kube_autotuner.cli.runs.run_trial") as run_trial,
-    ):
-        client_cls.return_value = MagicMock()
-        resolve.return_value = fake
-
-        result = runner.invoke(
-            app,
-            [
-                "trial",
-                "--source",
-                "a",
-                "--target",
-                "b",
-                "-p",
-                "net.core.rmem_max=16777216",
-                "--duration",
-                "1",
-                "--iterations",
-                "1",
-                "--output",
-                str(out),
-                "-H",
-            ],
-        )
-    assert result.exit_code == 0, result.output
-    ctx = run_trial.call_args.args[0]
-    assert ctx.collect_host_state is True
+def _optimize_yaml(out: Path, *, collect_host_state: bool) -> str:
+    body = {
+        "nodes": {"sources": ["a"], "target": "b"},
+        "benchmark": {
+            "duration": 1,
+            "iterations": 1,
+            "collectHostState": collect_host_state,
+        },
+        "optimize": {"nTrials": 1, "nSobol": 1},
+        "output": str(out),
+    }
+    return yaml.safe_dump(body)
 
 
-def test_optimize_flag_threaded_into_context(tmp_path: Path) -> None:
-    out = tmp_path / "r.jsonl"
-    (client_patch, resolve_patch), fake = _common_patches(tmp_path)
-    with (
-        client_patch as client_cls,
-        resolve_patch as resolve,
-        patch("kube_autotuner.cli.runs.run_optimize") as run_optimize,
-    ):
-        client_cls.return_value = MagicMock()
-        resolve.return_value = fake
-
-        result = runner.invoke(
-            app,
-            [
-                "optimize",
-                "--source",
-                "a",
-                "--target",
-                "b",
-                "--duration",
-                "1",
-                "--iterations",
-                "1",
-                "--output",
-                str(out),
-                "--n-trials",
-                "1",
-                "--n-sobol",
-                "1",
-                "--collect-host-state",
-            ],
-        )
-    assert result.exit_code == 0, result.output
-    ctx = run_optimize.call_args.args[0]
-    assert ctx.collect_host_state is True
-
-
-def test_run_yaml_flag_threaded_into_context(tmp_path: Path) -> None:
-    """The YAML-driven ``run`` command also accepts the flag."""
+@pytest.mark.parametrize(
+    ("subcommand", "yaml_factory", "run_target"),
+    [
+        ("baseline", _baseline_yaml, "kube_autotuner.cli.runs.run_baseline"),
+        ("trial", _trial_yaml, "kube_autotuner.cli.runs.run_trial"),
+        ("optimize", _optimize_yaml, "kube_autotuner.cli.runs.run_optimize"),
+    ],
+)
+def test_collect_host_state_yaml_threads_into_context(
+    tmp_path: Path,
+    subcommand: str,
+    yaml_factory,
+    run_target: str,
+) -> None:
+    """``benchmark.collectHostState: true`` reaches ``RunContext``."""
     out = tmp_path / "r.jsonl"
     config = tmp_path / "exp.yaml"
-    config.write_text(
-        yaml.safe_dump({
-            "mode": "baseline",
-            "nodes": {"sources": ["a"], "target": "b"},
-            "benchmark": {"duration": 1, "iterations": 1},
-            "output": str(out),
-        })
-    )
-    client_mock = MagicMock()
-    client_mock.preflight = MagicMock(return_value=[])
-    (client_patch, resolve_patch), fake = _common_patches(tmp_path)
+    if subcommand == "baseline":
+        config.write_text(yaml_factory(out, collect_host_state=True))
+    else:
+        config.write_text(yaml_factory(out, collect_host_state=True))
     with (
-        client_patch as client_cls,
-        resolve_patch as resolve,
-        patch("kube_autotuner.cli.runs.run_baseline") as run_baseline,
+        patch("kube_autotuner.cli.K8sClient") as client_cls,
+        patch("kube_autotuner.cli._resolve_backend") as resolve,
+        patch(run_target) as run_fn,
+        patch(
+            "kube_autotuner.cli.ExperimentConfig.preflight",
+            return_value=[],
+        ),
     ):
-        client_cls.return_value = client_mock
-        resolve.return_value = fake
+        client_cls.return_value = MagicMock()
+        resolve.return_value = _fake_backend(tmp_path)
 
-        result = runner.invoke(
-            app,
-            [
-                "run",
-                "-c",
-                str(config),
-                "--collect-host-state",
-            ],
-        )
+        result = runner.invoke(app, [subcommand, str(config)])
     assert result.exit_code == 0, result.output
-    ctx = run_baseline.call_args.args[0]
+    ctx = run_fn.call_args.args[0]
     assert ctx.collect_host_state is True
 
 
-def test_baseline_default_is_false(tmp_path: Path) -> None:
+def test_baseline_collect_host_state_default_is_false(tmp_path: Path) -> None:
     out = tmp_path / "r.jsonl"
-    (client_patch, resolve_patch), fake = _common_patches(tmp_path)
+    config = tmp_path / "exp.yaml"
+    config.write_text(_baseline_yaml(out, collect_host_state=None))
     with (
-        client_patch as client_cls,
-        resolve_patch as resolve,
+        patch("kube_autotuner.cli.K8sClient") as client_cls,
+        patch("kube_autotuner.cli._resolve_backend") as resolve,
         patch("kube_autotuner.cli.runs.run_baseline") as run_baseline,
+        patch(
+            "kube_autotuner.cli.ExperimentConfig.preflight",
+            return_value=[],
+        ),
     ):
         client_cls.return_value = MagicMock()
-        resolve.return_value = fake
+        resolve.return_value = _fake_backend(tmp_path)
 
-        result = runner.invoke(
-            app,
-            [
-                "baseline",
-                "--source",
-                "a",
-                "--target",
-                "b",
-                "--duration",
-                "1",
-                "--iterations",
-                "1",
-                "--output",
-                str(out),
-            ],
-        )
+        result = runner.invoke(app, ["baseline", str(config)])
+    assert result.exit_code == 0, result.output
+    ctx = run_baseline.call_args.args[0]
+    assert ctx.collect_host_state is False
+
+
+def test_baseline_explicit_false_threads_through(tmp_path: Path) -> None:
+    out = tmp_path / "r.jsonl"
+    config = tmp_path / "exp.yaml"
+    config.write_text(_baseline_yaml(out, collect_host_state=False))
+    with (
+        patch("kube_autotuner.cli.K8sClient") as client_cls,
+        patch("kube_autotuner.cli._resolve_backend") as resolve,
+        patch("kube_autotuner.cli.runs.run_baseline") as run_baseline,
+        patch(
+            "kube_autotuner.cli.ExperimentConfig.preflight",
+            return_value=[],
+        ),
+    ):
+        client_cls.return_value = MagicMock()
+        resolve.return_value = _fake_backend(tmp_path)
+
+        result = runner.invoke(app, ["baseline", str(config)])
     assert result.exit_code == 0, result.output
     ctx = run_baseline.call_args.args[0]
     assert ctx.collect_host_state is False
@@ -337,7 +270,6 @@ def test_analyze_renders_host_state_section_when_snapshots_present(
         app,
         [
             "analyze",
-            "--input",
             str(jsonl),
             "--output-dir",
             str(output_dir),
@@ -381,7 +313,6 @@ def test_analyze_omits_host_state_section_without_snapshots(
         app,
         [
             "analyze",
-            "--input",
             str(jsonl),
             "--output-dir",
             str(output_dir),

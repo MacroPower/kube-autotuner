@@ -80,7 +80,6 @@ def test_run_baseline_threads_iperf_args_and_patches(
 
     out = tmp_path / "r.jsonl"
     exp = ExperimentConfig.model_validate({
-        "mode": "baseline",
         "nodes": {"sources": ["a"], "target": "b"},
         "benchmark": {"duration": 1, "iterations": 1},
         "iperf": {"client": {"extra_args": ["-Z"]}},
@@ -123,7 +122,6 @@ def test_run_trial_snapshots_only_applied_keys(
 
     out = tmp_path / "r.jsonl"
     exp = ExperimentConfig.model_validate({
-        "mode": "trial",
         "nodes": {"sources": ["a"], "target": "b"},
         "benchmark": {"duration": 1, "iterations": 1},
         "trial": {"sysctls": {"net.core.rmem_max": "16777216"}},
@@ -172,7 +170,6 @@ def test_run_baseline_threads_collect_host_state_and_snapshots(
 
     out = tmp_path / "r.jsonl"
     exp = ExperimentConfig.model_validate({
-        "mode": "baseline",
         "nodes": {"sources": ["a"], "target": "b"},
         "benchmark": {"duration": 1, "iterations": 1},
         "output": str(out),
@@ -212,7 +209,6 @@ def test_run_trial_threads_collect_host_state_and_snapshots(
 
     out = tmp_path / "r.jsonl"
     exp = ExperimentConfig.model_validate({
-        "mode": "trial",
         "nodes": {"sources": ["a"], "target": "b"},
         "benchmark": {"duration": 1, "iterations": 1},
         "trial": {"sysctls": {"net.core.rmem_max": "16777216"}},
@@ -249,7 +245,6 @@ def test_run_baseline_default_collect_host_state_is_false(
 
     out = tmp_path / "r.jsonl"
     exp = ExperimentConfig.model_validate({
-        "mode": "baseline",
         "nodes": {"sources": ["a"], "target": "b"},
         "benchmark": {"duration": 1, "iterations": 1},
         "output": str(out),
@@ -279,7 +274,6 @@ def test_run_baseline_snapshots_full_param_space(
 
     out = tmp_path / "r.jsonl"
     exp = ExperimentConfig.model_validate({
-        "mode": "baseline",
         "nodes": {"sources": ["a"], "target": "b"},
         "benchmark": {"duration": 1, "iterations": 1},
         "output": str(out),
@@ -321,7 +315,6 @@ def _prior_trial(sysctl_value: int = 1048576) -> TrialResult:
 
 def _optimize_exp(out: Path, n_trials: int = 5) -> ExperimentConfig:
     return ExperimentConfig.model_validate({
-        "mode": "optimize",
         "nodes": {"sources": ["a"], "target": "b"},
         "benchmark": {"duration": 1, "iterations": 1},
         "optimize": {"n_trials": n_trials, "n_sobol": 2},
@@ -518,7 +511,6 @@ def test_run_optimize_missing_sidecar_raises(tmp_path: Path):
 def test_run_baseline_writes_resume_meta_without_n_sobol(tmp_path: Path):
     out = tmp_path / "r.jsonl"
     exp = ExperimentConfig.model_validate({
-        "mode": "baseline",
         "nodes": {"sources": ["a"], "target": "b"},
         "benchmark": {"duration": 1, "iterations": 1},
         "output": str(out),
@@ -548,7 +540,6 @@ def test_run_baseline_writes_resume_meta_without_n_sobol(tmp_path: Path):
 def test_run_trial_writes_resume_meta_without_n_sobol(tmp_path: Path):
     out = tmp_path / "r.jsonl"
     exp = ExperimentConfig.model_validate({
-        "mode": "trial",
         "nodes": {"sources": ["a"], "target": "b"},
         "benchmark": {"duration": 1, "iterations": 1},
         "trial": {"sysctls": {"net.core.rmem_max": "16777216"}},
@@ -700,7 +691,6 @@ class TestBenchmarkDriftExcludesSyncWindow:
     @staticmethod
     def _exp(**benchmark_overrides: object) -> ExperimentConfig:
         return ExperimentConfig.model_validate({
-            "mode": "baseline",
             "nodes": {"sources": ["a"], "target": "b"},
             "benchmark": {"duration": 1, "iterations": 1, **benchmark_overrides},
         })

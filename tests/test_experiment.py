@@ -50,25 +50,24 @@ def test_minimal_baseline_roundtrips(tmp_path: Path):
     path = _write(
         tmp_path,
         """\
-mode: baseline
 nodes:
   sources: [kmain07]
   target: kmain08
 """,
     )
     exp = ExperimentConfig.from_yaml(path)
-    assert exp.mode == "baseline"
     assert exp.nodes.sources == ["kmain07"]
     assert exp.nodes.target == "kmain08"
     assert exp.iperf.client.extra_args == []
     assert exp.patches == []
+    assert exp.optimize is None
+    assert exp.trial is None
 
 
 def test_full_optimize_roundtrips(tmp_path: Path):
     path = _write(
         tmp_path,
         """\
-mode: optimize
 nodes:
   sources: [kmain07, kmain09]
   target: kmain08
@@ -120,7 +119,6 @@ def test_custom_hardware_class_roundtrips(tmp_path: Path):
     path = _write(
         tmp_path,
         """\
-mode: baseline
 nodes:
   sources: [kmain07]
   target: kmain08
@@ -135,7 +133,6 @@ def test_empty_hardware_class_raises(tmp_path: Path):
     path = _write(
         tmp_path,
         """\
-mode: baseline
 nodes:
   sources: [kmain07]
   target: kmain08
@@ -149,7 +146,6 @@ nodes:
 def test_fixture_yaml_roundtrips():
     """The shipped fixture must load cleanly and survive model validation."""
     exp = ExperimentConfig.from_yaml(FIXTURE_YAML)
-    assert exp.mode == "optimize"
     assert exp.nodes.sources == ["kmain07", "kmain09"]
     assert exp.nodes.target == "kmain08"
     assert exp.nodes.hardware_class == "10g"
@@ -173,12 +169,13 @@ def test_multi_doc_yaml_raises(tmp_path: Path):
     path = _write(
         tmp_path,
         """\
-mode: baseline
 nodes:
   sources: [a]
   target: b
 ---
-mode: baseline
+nodes:
+  sources: [c]
+  target: d
 """,
     )
     with pytest.raises(ExperimentConfigError, match="multi-document YAML"):
@@ -190,7 +187,6 @@ def test_typo_field_raises(tmp_path: Path):
     path = _write(
         tmp_path,
         """\
-mode: baseline
 nodes:
   sources: [a]
   target: b
@@ -204,47 +200,41 @@ iperf:
 
 
 def test_invalid_yaml_raises(tmp_path: Path):
-    path = _write(tmp_path, "mode: baseline\n  sources: oops\n: : :\n")
+    path = _write(tmp_path, "nodes:\n  sources: oops\n: : :\n")
     with pytest.raises(ExperimentConfigError, match="invalid YAML"):
         ExperimentConfig.from_yaml(path)
 
 
-# --- mode-specific validators -------------------------------------------
+# --- section-level validators -------------------------------------------
 
 
-def test_optimize_without_section_raises(tmp_path: Path):
+def test_legacy_mode_field_in_yaml_rejected(tmp_path: Path):
+    """A legacy YAML carrying ``mode:`` fails fast with ``mode`` in the message."""
     path = _write(
         tmp_path,
         """\
 mode: optimize
 nodes:
-  sources: [kmain07]
-  target: kmain08
+  sources: [a]
+  target: b
 """,
     )
-    with pytest.raises(ExperimentConfigError, match="requires `optimize:`"):
+    with pytest.raises(ExperimentConfigError, match="mode"):
         ExperimentConfig.from_yaml(path)
 
 
-def test_trial_without_sysctls_raises(tmp_path: Path):
+def test_trial_section_rejects_empty_sysctls():
+    """``TrialSection`` itself rejects an empty sysctls map at construction."""
+    from kube_autotuner.experiment import TrialSection  # noqa: PLC0415
+
+    with pytest.raises(ValueError, match="at least one entry"):
+        TrialSection.model_validate({"sysctls": {}})
+
+
+def test_trial_with_empty_sysctls_in_yaml_raises(tmp_path: Path):
     path = _write(
         tmp_path,
         """\
-mode: trial
-nodes:
-  sources: [kmain07]
-  target: kmain08
-""",
-    )
-    with pytest.raises(ExperimentConfigError, match="requires a `trial:` section"):
-        ExperimentConfig.from_yaml(path)
-
-
-def test_trial_with_empty_sysctls_raises(tmp_path: Path):
-    path = _write(
-        tmp_path,
-        """\
-mode: trial
 nodes:
   sources: [a]
   target: b
@@ -252,16 +242,15 @@ trial:
   sysctls: {}
 """,
     )
-    with pytest.raises(ExperimentConfigError, match="non-empty"):
+    with pytest.raises(ExperimentConfigError, match="at least one entry"):
         ExperimentConfig.from_yaml(path)
 
 
 def test_trial_with_sysctls_accepted(tmp_path: Path):
-    """Regression guard for mode=trial happy path."""
+    """Regression guard for the trial happy path."""
     path = _write(
         tmp_path,
         """\
-mode: trial
 nodes:
   sources: [a]
   target: b
@@ -275,11 +264,18 @@ trial:
     assert exp.trial.sysctls == {"net.core.rmem_max": 67108864}
 
 
+def test_optimize_section_rejects_n_sobol_above_n_trials():
+    """``OptimizeSection`` itself rejects ``n_sobol > n_trials``."""
+    from kube_autotuner.experiment import OptimizeSection  # noqa: PLC0415
+
+    with pytest.raises(ValueError, match="n_sobol must be <="):
+        OptimizeSection.model_validate({"nTrials": 5, "nSobol": 10})
+
+
 def test_n_sobol_greater_than_n_trials_raises(tmp_path: Path):
     path = _write(
         tmp_path,
         """\
-mode: optimize
 nodes:
   sources: [a]
   target: b
@@ -297,7 +293,6 @@ def test_n_sobol_equal_to_n_trials_accepted(tmp_path: Path):
     path = _write(
         tmp_path,
         """\
-mode: optimize
 nodes:
   sources: [a]
   target: b
@@ -319,7 +314,6 @@ def test_stages_default_keeps_every_objective(tmp_path: Path):
     path = _write(
         tmp_path,
         """\
-mode: baseline
 nodes:
   sources: [a]
   target: b
@@ -344,7 +338,6 @@ def test_stages_subset_prunes_default_objectives(tmp_path: Path, caplog):
     path = _write(
         tmp_path,
         """\
-mode: baseline
 nodes:
   sources: [a]
   target: b
@@ -369,7 +362,6 @@ def test_stages_prune_error_when_pareto_empties(tmp_path: Path):
     path = _write(
         tmp_path,
         """\
-mode: baseline
 nodes:
   sources: [a]
   target: b
@@ -396,7 +388,6 @@ objectives:
 def test_effective_param_space_default_returns_full_param_space():
     """With no optimize override, the canonical full PARAM_SPACE is returned."""
     exp = ExperimentConfig.model_validate({
-        "mode": "baseline",
         "nodes": {"sources": ["a"], "target": "b"},
     })
     assert exp.effective_param_space() is PARAM_SPACE
@@ -405,7 +396,6 @@ def test_effective_param_space_default_returns_full_param_space():
 def test_effective_param_space_user_override_replaces_default():
     """A user-supplied param_space is returned verbatim."""
     exp = ExperimentConfig.model_validate({
-        "mode": "optimize",
         "nodes": {"sources": ["a"], "target": "b"},
         "optimize": {
             "nTrials": 2,
@@ -423,12 +413,11 @@ def test_effective_param_space_user_override_replaces_default():
     assert ps.param_names() == ["net.ipv4.udp_mem"]
 
 
-def test_legacy_benchmark_modes_key_silently_dropped(tmp_path: Path):
-    """Pre-change YAML embedded `modes: [tcp]`; the loader must accept and drop it."""
+def test_legacy_benchmark_modes_key_rejected(tmp_path: Path):
+    """Pre-change YAML embedded ``modes: [tcp]``; ``extra='forbid'`` rejects it."""
     path = _write(
         tmp_path,
         """\
-mode: baseline
 nodes:
   sources: [a]
   target: b
@@ -438,15 +427,12 @@ benchmark:
   modes: [tcp]
 """,
     )
-    exp = ExperimentConfig.from_yaml(path)
-    assert exp.benchmark.duration == 10
-    assert exp.benchmark.iterations == 1
-    assert not hasattr(exp.benchmark, "modes")
+    with pytest.raises(ExperimentConfigError):
+        ExperimentConfig.from_yaml(path)
 
 
 def test_effective_param_space_override():
     exp = ExperimentConfig.model_validate({
-        "mode": "optimize",
         "nodes": {"sources": ["a"], "target": "b"},
         "optimize": {
             "nTrials": 2,
@@ -462,7 +448,6 @@ def test_effective_param_space_override():
 
 def test_to_node_pair_multi_source():
     exp = ExperimentConfig.model_validate({
-        "mode": "baseline",
         "nodes": {"sources": ["primary", "extra1", "extra2"], "target": "t"},
     })
     np = exp.to_node_pair()
@@ -479,7 +464,6 @@ def test_smp_dict_without_kind_rejected(tmp_path: Path):
     path = _write(
         tmp_path,
         """\
-mode: baseline
 nodes:
   sources: [a]
   target: b
@@ -500,7 +484,6 @@ def test_smp_dict_with_body_kind_accepted(tmp_path: Path):
     path = _write(
         tmp_path,
         """\
-mode: baseline
 nodes:
   sources: [a]
   target: b
@@ -528,7 +511,6 @@ def test_client_denylist(tmp_path: Path, flag: str):
     path = _write(
         tmp_path,
         f"""\
-mode: baseline
 nodes:
   sources: [a]
   target: b
@@ -549,7 +531,6 @@ def test_client_denylist_whole_token(tmp_path: Path):
     path = _write(
         tmp_path,
         """\
-mode: baseline
 nodes:
   sources: [a]
   target: b
@@ -566,7 +547,6 @@ def test_server_denylist(tmp_path: Path):
     path = _write(
         tmp_path,
         """\
-mode: baseline
 nodes:
   sources: [a]
   target: b
@@ -583,7 +563,6 @@ iperf:
 
 def test_sysctl_name_regex():
     exp = ExperimentConfig.model_validate({
-        "mode": "trial",
         "nodes": {"sources": ["a"], "target": "b"},
         "trial": {"sysctls": {"NOT-VALID": "1"}},
     })
@@ -594,7 +573,6 @@ def test_sysctl_name_regex():
 
 def test_sysctl_name_regex_happy_path():
     exp = ExperimentConfig.model_validate({
-        "mode": "trial",
         "nodes": {"sources": ["a"], "target": "b"},
         "trial": {"sysctls": {"net.core.rmem_max": 67108864}},
     })
@@ -605,7 +583,6 @@ def test_patch_metadata_namespace_rejected(tmp_path: Path):
     path = _write(
         tmp_path,
         """\
-mode: baseline
 nodes:
   sources: [a]
   target: b
@@ -626,7 +603,6 @@ def test_patch_jsonpatch_namespace_op_rejected(tmp_path: Path):
     path = _write(
         tmp_path,
         """\
-mode: baseline
 nodes:
   sources: [a]
   target: b
@@ -648,7 +624,6 @@ def test_target_namespace_rejected(tmp_path: Path):
     path = _write(
         tmp_path,
         """\
-mode: baseline
 nodes:
   sources: [a]
   target: b
@@ -670,7 +645,6 @@ def test_patches_shape_clean_passes(tmp_path: Path):
     path = _write(
         tmp_path,
         """\
-mode: baseline
 nodes:
   sources: [a]
   target: b
@@ -686,7 +660,6 @@ patches:
 
 def test_check_kustomize_available_missing(monkeypatch):
     exp = ExperimentConfig.model_validate({
-        "mode": "baseline",
         "nodes": {"sources": ["a"], "target": "b"},
         "patches": [
             {"target": {"kind": "Deployment"}, "patch": {"spec": {}}},
@@ -702,7 +675,6 @@ def test_check_kustomize_available_missing(monkeypatch):
 def test_check_kustomize_available_skips_when_no_patches():
     """No patches -> kustomize not required."""
     exp = ExperimentConfig.model_validate({
-        "mode": "baseline",
         "nodes": {"sources": ["a"], "target": "b"},
     })
     result = exp._check_kustomize_available()
@@ -713,7 +685,6 @@ def test_check_kustomize_available_skips_when_no_patches():
 def test_check_kustomize_available_routes_through_run_tool(monkeypatch):
     """The probe routes through kube_autotuner.subproc.run_tool, not bare subprocess."""
     exp = ExperimentConfig.model_validate({
-        "mode": "baseline",
         "nodes": {"sources": ["a"], "target": "b"},
         "patches": [
             {"target": {"kind": "Deployment"}, "patch": {"spec": {}}},
@@ -744,7 +715,6 @@ def test_check_kustomize_available_routes_through_run_tool(monkeypatch):
 
 def test_check_kustomize_available_nonzero_rc(monkeypatch):
     exp = ExperimentConfig.model_validate({
-        "mode": "baseline",
         "nodes": {"sources": ["a"], "target": "b"},
         "patches": [
             {"target": {"kind": "Deployment"}, "patch": {"spec": {}}},
@@ -769,7 +739,6 @@ def test_check_kustomize_available_nonzero_rc(monkeypatch):
 
 def test_check_nodes_exist_surfaces_api_failure():
     exp = ExperimentConfig.model_validate({
-        "mode": "baseline",
         "nodes": {"sources": ["a"], "target": "b"},
     })
     client = MagicMock()
@@ -781,7 +750,6 @@ def test_check_nodes_exist_surfaces_api_failure():
 
 def test_check_nodes_exist_happy_path():
     exp = ExperimentConfig.model_validate({
-        "mode": "baseline",
         "nodes": {"sources": ["a", "extra"], "target": "b"},
     })
     client = MagicMock()
@@ -793,7 +761,6 @@ def test_check_nodes_exist_happy_path():
 def test_output_path_creates_parent_dir(tmp_path: Path):
     out = tmp_path / "subdir" / "results.jsonl"
     exp = ExperimentConfig.model_validate({
-        "mode": "baseline",
         "nodes": {"sources": ["a"], "target": "b"},
         "output": str(out),
     })
@@ -808,7 +775,6 @@ def test_output_path_creates_parent_dir(tmp_path: Path):
 def test_output_path_parent_not_writable(tmp_path: Path, monkeypatch):
     out = tmp_path / "results.jsonl"
     exp = ExperimentConfig.model_validate({
-        "mode": "baseline",
         "nodes": {"sources": ["a"], "target": "b"},
         "output": str(out),
     })
@@ -824,7 +790,6 @@ def test_output_path_parent_not_writable(tmp_path: Path, monkeypatch):
 def test_preflight_orchestration_smoke():
     """preflight() runs every check in order and returns all results."""
     exp = ExperimentConfig.model_validate({
-        "mode": "baseline",
         "nodes": {"sources": ["a"], "target": "b"},
     })
     client = MagicMock()
@@ -847,7 +812,6 @@ def test_preflight_collects_multiple_failures(tmp_path: Path):
     """preflight() does not fail fast -- every failing check is returned."""
     out = tmp_path / "results.jsonl"
     exp = ExperimentConfig.model_validate({
-        "mode": "baseline",
         "nodes": {"sources": ["a"], "target": "b"},
         "iperf": {"client": {"extraArgs": ["-c"]}},
         "output": str(out),
@@ -872,7 +836,6 @@ def test_strict_patch_with_zero_matches_fails():
         pytest.skip("kustomize binary required on PATH")
 
     exp = ExperimentConfig.model_validate({
-        "mode": "baseline",
         "nodes": {"sources": ["a"], "target": "b"},
         "patches": [
             {
@@ -893,7 +856,6 @@ def test_non_strict_patch_with_zero_matches_allowed():
         pytest.skip("kustomize binary required on PATH")
 
     exp = ExperimentConfig.model_validate({
-        "mode": "baseline",
         "nodes": {"sources": ["a"], "target": "b"},
         "patches": [
             {
@@ -911,7 +873,6 @@ def test_non_strict_patch_with_zero_matches_allowed():
 def test_dry_render_skipped_when_no_patches():
     """No patches -> dry-render is a no-op."""
     exp = ExperimentConfig.model_validate({
-        "mode": "baseline",
         "nodes": {"sources": ["a"], "target": "b"},
     })
     result = exp._dry_render_patches()
@@ -936,7 +897,6 @@ def test_fortio_client_denylist_flags_every_entry(tmp_path: Path, flag: str):
     path = _write(
         tmp_path,
         f"""\
-mode: baseline
 nodes:
   sources: [a]
   target: b
@@ -956,7 +916,6 @@ def test_fortio_server_denylist(tmp_path: Path):
     path = _write(
         tmp_path,
         """\
-mode: baseline
 nodes:
   sources: [a]
   target: b
@@ -1173,7 +1132,6 @@ class TestObjectivesSectionConstraintUnits:
 
 def test_experiment_config_default_objectives() -> None:
     config = ExperimentConfig.model_validate({
-        "mode": "baseline",
         "nodes": {"sources": ["kmain07"], "target": "kmain08"},
     })
     assert config.objectives == ObjectivesSection()

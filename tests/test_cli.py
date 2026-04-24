@@ -20,6 +20,54 @@ if TYPE_CHECKING:
 runner = CliRunner()
 
 
+_BASELINE_YAML = """\
+nodes:
+  sources: [a]
+  target: b
+benchmark:
+  duration: 1
+  iterations: 1
+output: {output}
+"""
+
+_TRIAL_YAML = """\
+nodes:
+  sources: [a]
+  target: b
+benchmark:
+  duration: 1
+  iterations: 1
+trial:
+  sysctls:
+    net.core.rmem_max: "16777216"
+    net.core.wmem_max: "16777216"
+output: {output}
+"""
+
+_OPTIMIZE_YAML = """\
+nodes:
+  sources: [a]
+  target: b
+benchmark:
+  duration: 1
+  iterations: 1
+optimize:
+  nTrials: 4
+  nSobol: 2
+output: {output}
+"""
+
+
+def _write_yaml(tmp_path: Path, body: str) -> Path:
+    config = tmp_path / "exp.yaml"
+    config.write_text(body)
+    return config
+
+
+def _fake_backend(tmp_path: Path) -> FakeSysctlBackend:
+    return FakeSysctlBackend("node-a", tmp_path / "sysctl_state.json")
+
+
 # --- help / version ------------------------------------------------------
 
 
@@ -27,9 +75,16 @@ def test_root_help() -> None:
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
     assert result.stdout.strip()
-    for sub in ("baseline", "trial", "optimize", "run", "sysctl"):
+    for sub in ("baseline", "trial", "optimize", "analyze", "sysctl"):
         assert sub in result.stdout
+    assert "run " not in result.stdout
     assert "--no-progress" in result.stdout
+
+
+def test_run_command_no_longer_exists() -> None:
+    """The deprecated ``run`` command must be gone after the refactor."""
+    result = runner.invoke(app, ["run", "--help"])
+    assert result.exit_code != 0
 
 
 def test_version_flag() -> None:
@@ -38,32 +93,32 @@ def test_version_flag() -> None:
     assert __version__ in result.stdout
 
 
-def test_baseline_help() -> None:
+def test_baseline_help_shows_only_runtime_flags(tmp_path: Path) -> None:  # noqa: ARG001
     result = runner.invoke(app, ["baseline", "--help"])
     assert result.exit_code == 0
-    assert result.stdout.strip()
-    assert "--source" in result.stdout
+    assert "CONFIG_PATH" in result.stdout.upper() or "config_path" in result.stdout
+    assert "--backend" in result.stdout
+    assert "--fake-state-path" in result.stdout
+    assert "--source" not in result.stdout
+    assert "--duration" not in result.stdout
 
 
-def test_trial_help() -> None:
+def test_trial_help_shows_only_runtime_flags(tmp_path: Path) -> None:  # noqa: ARG001
     result = runner.invoke(app, ["trial", "--help"])
     assert result.exit_code == 0
-    assert result.stdout.strip()
-    assert "--param" in result.stdout
+    assert "--backend" in result.stdout
+    assert "--param" not in result.stdout
 
 
-def test_optimize_help() -> None:
+def test_optimize_help_shows_fresh_and_runtime_flags(
+    tmp_path: Path,  # noqa: ARG001
+) -> None:
     result = runner.invoke(app, ["optimize", "--help"])
     assert result.exit_code == 0
-    assert result.stdout.strip()
-    assert "--n-trials" in result.stdout
-
-
-def test_run_help() -> None:
-    result = runner.invoke(app, ["run", "--help"])
-    assert result.exit_code == 0
-    assert result.stdout.strip()
-    assert "--config" in result.stdout
+    assert "--fresh" in result.stdout
+    assert "--backend" in result.stdout
+    assert "--n-trials" not in result.stdout
+    assert "--verification-trials" not in result.stdout
 
 
 def test_sysctl_help() -> None:
@@ -91,16 +146,17 @@ def test_sysctl_set_help() -> None:
 # --- positive invocations ------------------------------------------------
 
 
-def _fake_backend(tmp_path: Path) -> FakeSysctlBackend:
-    return FakeSysctlBackend("node-a", tmp_path / "sysctl_state.json")
-
-
 def test_no_progress_yields_null_observer(tmp_path: Path) -> None:
     out = tmp_path / "results.jsonl"
+    config = _write_yaml(tmp_path, _BASELINE_YAML.format(output=out))
     with (
         patch("kube_autotuner.cli.K8sClient") as client_cls,
         patch("kube_autotuner.cli._resolve_backend") as resolve,
         patch("kube_autotuner.cli.runs.run_baseline") as run_baseline,
+        patch(
+            "kube_autotuner.cli.ExperimentConfig.preflight",
+            return_value=[],
+        ),
     ):
         client_cls.return_value = MagicMock()
         resolve.return_value = _fake_backend(tmp_path)
@@ -110,16 +166,7 @@ def test_no_progress_yields_null_observer(tmp_path: Path) -> None:
             [
                 "--no-progress",
                 "baseline",
-                "--source",
-                "a",
-                "--target",
-                "b",
-                "--duration",
-                "1",
-                "--iterations",
-                "1",
-                "--output",
-                str(out),
+                str(config),
                 "--backend",
                 "fake",
                 "--fake-state-path",
@@ -135,13 +182,16 @@ def test_no_progress_yields_null_observer(tmp_path: Path) -> None:
 
 def test_progress_enabled_under_forced_terminal(tmp_path: Path) -> None:
     out = tmp_path / "results.jsonl"
-    # Force the shared Console to report is_terminal=True so the CLI
-    # selects the rich observer branch under ``CliRunner``.
+    config = _write_yaml(tmp_path, _BASELINE_YAML.format(output=out))
     with (
         patch("kube_autotuner.cli.K8sClient") as client_cls,
         patch("kube_autotuner.cli._resolve_backend") as resolve,
         patch("kube_autotuner.cli.runs.run_baseline") as run_baseline,
         patch("kube_autotuner.cli.Console") as console_cls,
+        patch(
+            "kube_autotuner.cli.ExperimentConfig.preflight",
+            return_value=[],
+        ),
     ):
         client_cls.return_value = MagicMock()
         resolve.return_value = _fake_backend(tmp_path)
@@ -153,16 +203,7 @@ def test_progress_enabled_under_forced_terminal(tmp_path: Path) -> None:
             app,
             [
                 "baseline",
-                "--source",
-                "a",
-                "--target",
-                "b",
-                "--duration",
-                "1",
-                "--iterations",
-                "1",
-                "--output",
-                str(out),
+                str(config),
                 "--backend",
                 "fake",
                 "--fake-state-path",
@@ -176,161 +217,7 @@ def test_progress_enabled_under_forced_terminal(tmp_path: Path) -> None:
 
 def test_baseline_invokes_run_baseline(tmp_path: Path) -> None:
     out = tmp_path / "results.jsonl"
-    with (
-        patch("kube_autotuner.cli.K8sClient") as client_cls,
-        patch("kube_autotuner.cli._resolve_backend") as resolve,
-        patch("kube_autotuner.cli.runs.run_baseline") as run_baseline,
-    ):
-        client_cls.return_value = MagicMock()
-        resolve.return_value = _fake_backend(tmp_path)
-
-        result = runner.invoke(
-            app,
-            [
-                "baseline",
-                "--source",
-                "a",
-                "--target",
-                "b",
-                "--duration",
-                "1",
-                "--iterations",
-                "1",
-                "--output",
-                str(out),
-                "--backend",
-                "fake",
-                "--fake-state-path",
-                str(tmp_path / "sysctl_state.json"),
-            ],
-        )
-    assert result.exit_code == 0, result.output
-    run_baseline.assert_called_once()
-    ctx = run_baseline.call_args.args[0]
-    assert ctx.exp.mode == "baseline"
-    assert ctx.exp.nodes.sources == ["a"]
-    assert ctx.exp.nodes.target == "b"
-    assert ctx.output == out
-
-
-def test_trial_parses_params_and_invokes_run_trial(tmp_path: Path) -> None:
-    out = tmp_path / "results.jsonl"
-    with (
-        patch("kube_autotuner.cli.K8sClient") as client_cls,
-        patch("kube_autotuner.cli._resolve_backend") as resolve,
-        patch("kube_autotuner.cli.runs.run_trial") as run_trial,
-    ):
-        client_cls.return_value = MagicMock()
-        resolve.return_value = _fake_backend(tmp_path)
-
-        result = runner.invoke(
-            app,
-            [
-                "trial",
-                "--source",
-                "a",
-                "--target",
-                "b",
-                "--duration",
-                "1",
-                "--iterations",
-                "1",
-                "--output",
-                str(out),
-                "-p",
-                "net.core.rmem_max=16777216",
-                "-p",
-                "net.core.wmem_max=16777216",
-            ],
-        )
-    assert result.exit_code == 0, result.output
-    run_trial.assert_called_once()
-    ctx = run_trial.call_args.args[0]
-    assert ctx.exp.mode == "trial"
-    assert ctx.exp.trial is not None
-    assert ctx.exp.trial.sysctls == {
-        "net.core.rmem_max": "16777216",
-        "net.core.wmem_max": "16777216",
-    }
-
-
-def test_trial_rejects_malformed_param(tmp_path: Path) -> None:
-    with (
-        patch("kube_autotuner.cli.K8sClient"),
-        patch("kube_autotuner.cli._resolve_backend"),
-        patch("kube_autotuner.cli.runs.run_trial") as run_trial,
-    ):
-        result = runner.invoke(
-            app,
-            [
-                "trial",
-                "--source",
-                "a",
-                "--target",
-                "b",
-                "--output",
-                str(tmp_path / "r.jsonl"),
-                "-p",
-                "no-equals-sign",
-            ],
-        )
-    assert result.exit_code == 1
-    assert "Invalid param format" in result.output
-    run_trial.assert_not_called()
-
-
-def test_optimize_invokes_run_optimize(tmp_path: Path) -> None:
-    out = tmp_path / "opt.jsonl"
-    with (
-        patch("kube_autotuner.cli.K8sClient") as client_cls,
-        patch("kube_autotuner.cli._resolve_backend") as resolve,
-        patch("kube_autotuner.cli.runs.run_optimize") as run_optimize,
-    ):
-        client_cls.return_value = MagicMock()
-        resolve.return_value = _fake_backend(tmp_path)
-
-        result = runner.invoke(
-            app,
-            [
-                "optimize",
-                "--source",
-                "a",
-                "--target",
-                "b",
-                "--duration",
-                "1",
-                "--iterations",
-                "1",
-                "--output",
-                str(out),
-                "--n-trials",
-                "4",
-                "--n-sobol",
-                "2",
-            ],
-        )
-    assert result.exit_code == 0, result.output
-    run_optimize.assert_called_once()
-    ctx = run_optimize.call_args.args[0]
-    assert ctx.exp.mode == "optimize"
-    assert ctx.exp.optimize is not None
-    assert ctx.exp.optimize.n_trials == 4
-    assert ctx.exp.optimize.n_sobol == 2
-
-
-def test_run_loads_yaml_and_dispatches_to_run_baseline(tmp_path: Path) -> None:
-    config = tmp_path / "exp.yaml"
-    out = tmp_path / "results.jsonl"
-    config.write_text(
-        f"mode: baseline\n"
-        f"nodes:\n"
-        f"  sources: [a]\n"
-        f"  target: b\n"
-        f"benchmark:\n"
-        f"  duration: 1\n"
-        f"  iterations: 1\n"
-        f"output: {out}\n",
-    )
+    config = _write_yaml(tmp_path, _BASELINE_YAML.format(output=out))
     with (
         patch("kube_autotuner.cli.K8sClient") as client_cls,
         patch("kube_autotuner.cli._resolve_backend") as resolve,
@@ -343,22 +230,108 @@ def test_run_loads_yaml_and_dispatches_to_run_baseline(tmp_path: Path) -> None:
         client_cls.return_value = MagicMock()
         resolve.return_value = _fake_backend(tmp_path)
 
-        result = runner.invoke(app, ["run", "--config", str(config)])
+        result = runner.invoke(
+            app,
+            [
+                "baseline",
+                str(config),
+                "--backend",
+                "fake",
+                "--fake-state-path",
+                str(tmp_path / "sysctl_state.json"),
+            ],
+        )
     assert result.exit_code == 0, result.output
     run_baseline.assert_called_once()
+    ctx = run_baseline.call_args.args[0]
+    assert ctx.exp.nodes.sources == ["a"]
+    assert ctx.exp.nodes.target == "b"
+    assert ctx.output == out
 
 
-def test_run_reports_preflight_failures(tmp_path: Path) -> None:
-    config = tmp_path / "exp.yaml"
-    config.write_text(
-        "mode: baseline\n"
-        "nodes:\n"
-        "  sources: [a]\n"
-        "  target: b\n"
-        "benchmark:\n"
-        "  duration: 1\n"
-        "  iterations: 1\n",
-    )
+def test_trial_loads_yaml_and_invokes_run_trial(tmp_path: Path) -> None:
+    out = tmp_path / "results.jsonl"
+    config = _write_yaml(tmp_path, _TRIAL_YAML.format(output=out))
+    with (
+        patch("kube_autotuner.cli.K8sClient") as client_cls,
+        patch("kube_autotuner.cli._resolve_backend") as resolve,
+        patch("kube_autotuner.cli.runs.run_trial") as run_trial,
+        patch(
+            "kube_autotuner.cli.ExperimentConfig.preflight",
+            return_value=[],
+        ),
+    ):
+        client_cls.return_value = MagicMock()
+        resolve.return_value = _fake_backend(tmp_path)
+
+        result = runner.invoke(app, ["trial", str(config)])
+    assert result.exit_code == 0, result.output
+    run_trial.assert_called_once()
+    ctx = run_trial.call_args.args[0]
+    assert ctx.exp.trial is not None
+    assert ctx.exp.trial.sysctls == {
+        "net.core.rmem_max": "16777216",
+        "net.core.wmem_max": "16777216",
+    }
+
+
+def test_trial_without_trial_section_errors(tmp_path: Path) -> None:
+    """``trial`` rejects a YAML lacking a ``trial:`` section."""
+    out = tmp_path / "results.jsonl"
+    config = _write_yaml(tmp_path, _BASELINE_YAML.format(output=out))
+    with (
+        patch("kube_autotuner.cli.K8sClient"),
+        patch("kube_autotuner.cli._resolve_backend"),
+        patch("kube_autotuner.cli.runs.run_trial") as run_trial,
+    ):
+        result = runner.invoke(app, ["trial", str(config)])
+    assert result.exit_code == 2
+    assert "trial" in result.output.lower()
+    run_trial.assert_not_called()
+
+
+def test_optimize_invokes_run_optimize(tmp_path: Path) -> None:
+    out = tmp_path / "opt.jsonl"
+    config = _write_yaml(tmp_path, _OPTIMIZE_YAML.format(output=out))
+    with (
+        patch("kube_autotuner.cli.K8sClient") as client_cls,
+        patch("kube_autotuner.cli._resolve_backend") as resolve,
+        patch("kube_autotuner.cli.runs.run_optimize") as run_optimize,
+        patch(
+            "kube_autotuner.cli.ExperimentConfig.preflight",
+            return_value=[],
+        ),
+    ):
+        client_cls.return_value = MagicMock()
+        resolve.return_value = _fake_backend(tmp_path)
+
+        result = runner.invoke(app, ["optimize", str(config)])
+    assert result.exit_code == 0, result.output
+    run_optimize.assert_called_once()
+    ctx = run_optimize.call_args.args[0]
+    assert ctx.exp.optimize is not None
+    assert ctx.exp.optimize.n_trials == 4
+    assert ctx.exp.optimize.n_sobol == 2
+
+
+def test_optimize_without_optimize_section_errors(tmp_path: Path) -> None:
+    """``optimize`` rejects a YAML lacking an ``optimize:`` section."""
+    out = tmp_path / "opt.jsonl"
+    config = _write_yaml(tmp_path, _BASELINE_YAML.format(output=out))
+    with (
+        patch("kube_autotuner.cli.K8sClient"),
+        patch("kube_autotuner.cli._resolve_backend"),
+        patch("kube_autotuner.cli.runs.run_optimize") as run_optimize,
+    ):
+        result = runner.invoke(app, ["optimize", str(config)])
+    assert result.exit_code == 2
+    assert "optimize" in result.output.lower()
+    run_optimize.assert_not_called()
+
+
+def test_baseline_reports_preflight_failures(tmp_path: Path) -> None:
+    out = tmp_path / "results.jsonl"
+    config = _write_yaml(tmp_path, _BASELINE_YAML.format(output=out))
     failing = PreflightResult(
         name="nodes-exist",
         passed=False,
@@ -372,11 +345,32 @@ def test_run_reports_preflight_failures(tmp_path: Path) -> None:
         ),
         patch("kube_autotuner.cli.runs.run_baseline") as run_baseline,
     ):
-        result = runner.invoke(app, ["run", "--config", str(config)])
+        result = runner.invoke(app, ["baseline", str(config)])
     assert result.exit_code == 2
     assert "nodes-exist" in result.output
     assert "node 'a' missing" in result.output
     run_baseline.assert_not_called()
+
+
+def test_optimize_forwards_fresh_flag(tmp_path: Path) -> None:
+    out = tmp_path / "opt.jsonl"
+    config = _write_yaml(tmp_path, _OPTIMIZE_YAML.format(output=out))
+    with (
+        patch("kube_autotuner.cli.K8sClient") as client_cls,
+        patch("kube_autotuner.cli._resolve_backend") as resolve,
+        patch("kube_autotuner.cli.runs.run_optimize") as run_optimize,
+        patch(
+            "kube_autotuner.cli.ExperimentConfig.preflight",
+            return_value=[],
+        ),
+    ):
+        client_cls.return_value = MagicMock()
+        resolve.return_value = _fake_backend(tmp_path)
+
+        result = runner.invoke(app, ["optimize", str(config), "--fresh"])
+    assert result.exit_code == 0, result.output
+    run_optimize.assert_called_once()
+    assert run_optimize.call_args.kwargs == {"fresh": True}
 
 
 # --- sysctl get / set with the fake backend ------------------------------
@@ -403,79 +397,6 @@ def test_sysctl_set_apply_roundtrip(tmp_path: Path) -> None:
     assert "Applied 1 sysctl(s) on node-a" in result.output
     persisted = json.loads(state.read_text())
     assert persisted == {"net.core.rmem_max": "16777216"}
-
-
-def test_optimize_forwards_fresh_flag(tmp_path: Path) -> None:
-    out = tmp_path / "opt.jsonl"
-    with (
-        patch("kube_autotuner.cli.K8sClient") as client_cls,
-        patch("kube_autotuner.cli._resolve_backend") as resolve,
-        patch("kube_autotuner.cli.runs.run_optimize") as run_optimize,
-    ):
-        client_cls.return_value = MagicMock()
-        resolve.return_value = _fake_backend(tmp_path)
-
-        result = runner.invoke(
-            app,
-            [
-                "optimize",
-                "--source",
-                "a",
-                "--target",
-                "b",
-                "--duration",
-                "1",
-                "--iterations",
-                "1",
-                "--output",
-                str(out),
-                "--n-trials",
-                "4",
-                "--n-sobol",
-                "2",
-                "--fresh",
-            ],
-        )
-    assert result.exit_code == 0, result.output
-    run_optimize.assert_called_once()
-    assert run_optimize.call_args.kwargs == {"fresh": True}
-
-
-def test_run_command_forwards_fresh_flag_to_optimize(tmp_path: Path) -> None:
-    config = tmp_path / "exp.yaml"
-    out = tmp_path / "opt.jsonl"
-    config.write_text(
-        f"mode: optimize\n"
-        f"nodes:\n"
-        f"  sources: [a]\n"
-        f"  target: b\n"
-        f"benchmark:\n"
-        f"  duration: 1\n"
-        f"  iterations: 1\n"
-        f"optimize:\n"
-        f"  n_trials: 2\n"
-        f"  n_sobol: 2\n"
-        f"output: {out}\n",
-    )
-    with (
-        patch("kube_autotuner.cli.K8sClient") as client_cls,
-        patch("kube_autotuner.cli._resolve_backend") as resolve,
-        patch("kube_autotuner.cli.runs.run_optimize") as run_optimize,
-        patch(
-            "kube_autotuner.cli.ExperimentConfig.preflight",
-            return_value=[],
-        ),
-    ):
-        client_cls.return_value = MagicMock()
-        resolve.return_value = _fake_backend(tmp_path)
-
-        result = runner.invoke(
-            app,
-            ["run", "--config", str(config), "--fresh"],
-        )
-    assert result.exit_code == 0, result.output
-    run_optimize.assert_called_once()
-    assert run_optimize.call_args.kwargs == {"fresh": True}
 
 
 def test_sysctl_get_reads_persisted_state(tmp_path: Path) -> None:

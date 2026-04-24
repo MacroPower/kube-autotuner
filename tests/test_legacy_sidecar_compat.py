@@ -57,7 +57,6 @@ def test_legacy_sidecar_enables_verification_with_info_log(
 ) -> None:
     out = tmp_path / "legacy.jsonl"
     exp = ExperimentConfig.model_validate({
-        "mode": "optimize",
         "nodes": {"sources": ["a"], "target": "b"},
         "benchmark": {"duration": 1, "iterations": 1},
         "optimize": {
@@ -139,7 +138,6 @@ def test_legacy_sidecar_without_memory_cost_weight_round_trips() -> None:
     from kube_autotuner import runs  # noqa: PLC0415
 
     exp = ExperimentConfig.model_validate({
-        "mode": "baseline",
         "nodes": {"sources": ["a"], "target": "b"},
     })
     meta = ResumeMetadata(

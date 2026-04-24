@@ -198,6 +198,12 @@ class BenchmarkConfig(BaseModel):
     load time.
     """
 
+    model_config = ConfigDict(
+        extra="forbid",
+        alias_generator=to_camel,
+        populate_by_name=True,
+    )
+
     duration: int = 30
     omit: int = 5
     iterations: int = 3
@@ -208,6 +214,14 @@ class BenchmarkConfig(BaseModel):
         default_factory=lambda: frozenset(ALL_STAGES),
         min_length=1,
         description="Benchmark sub-stages to execute per iteration.",
+    )
+    collect_host_state: bool = Field(
+        default=False,
+        description=(
+            "Record per-iteration host-state snapshots (conntrack, sockets, "
+            "slab, etc.) on each TrialResult. Diagnostic overlay; costs a "
+            "kubectl round-trip per iteration and enlarges the JSONL."
+        ),
     )
 
 

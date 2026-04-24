@@ -73,8 +73,9 @@ percentiles in one pass.
 ## How it works
 
 1. You write an `experiment.yaml`.
-2. `kube-autotuner run` resolves the sysctl backend and runs preflight
-   checks against the live cluster.
+2. `kube-autotuner baseline|trial|optimize <experiment.yaml>` resolves
+   the sysctl backend and runs preflight checks against the live
+   cluster.
 3. An iperf3 server Deployment and a fortio server Deployment land on
    the target node. Each iteration then drives four sub-stages
    sequentially: an iperf3 TCP bandwidth fan-out, an iperf3 UDP
@@ -83,7 +84,7 @@ percentiles in one pass.
    (latency percentiles). Sub-stages run one at a time so fortio
    never contends with iperf3 for NIC, CPU, or CNI state; within
    each sub-stage the source nodes still fan out in parallel.
-4. In `optimize` mode the Ax loop proposes trials, applies sysctls,
+4. In `optimize` the Ax loop proposes trials, applies sysctls,
    benchmarks, and appends one JSONL record per trial.
 5. Every run writes the resolved `objectives` block alongside the JSONL
    as `<output>.meta.json`, so `kube-autotuner analyze` picks up the
@@ -132,8 +133,9 @@ Two shapes of customisation:
   `experiment.yaml` (see the example under [Quick start](#quick-start)).
   Both `int` (range) and `choice` (explicit list) types are accepted;
   `int` params must have `min < max`.
-- Use `mode: trial` with a fixed `sysctls:` map to benchmark one
-  configuration without invoking the optimizer.
+- Use the `trial` subcommand on a YAML with a `trial:` section
+  (`sysctls:` map) to benchmark one configuration without invoking
+  the optimizer.
 
 ## Install
 
@@ -151,14 +153,12 @@ Python >= 3.14 is required. For a managed uv + Nix dev environment, see
 ## Quick start
 
 A full `experiment.yaml` covering every field the loader accepts. Every
-section except `mode` and `nodes` is optional; the defaults shown below
-are what you get when you omit them.
+section except `nodes` is optional; the defaults shown below are what
+you get when you omit them. The subcommand picks the execution flow
+(`baseline | trial | optimize`); the YAML must carry an `optimize:`
+section to run `optimize`, and a `trial:` section to run `trial`.
 
 ```yaml
-# mode selects the command branch: baseline | trial | optimize.
-# `optimize:` is required when mode=optimize; `trial:` when mode=trial.
-mode: optimize
-
 nodes:
   sources: [nodeA]               # >=1 source node; first entry is primary
   target: nodeB
@@ -173,8 +173,9 @@ benchmark:
   parallel: 16                   # iperf3 -P streams per client
   window: null                   # iperf3 -w hint; e.g. "256K" to pin it
 
-# Required when mode: optimize. Ax Bayesian loop knobs plus the search
-# space. Omit paramSpace to use the built-in canonical sysctl set.
+# Required for the `optimize` subcommand. Ax Bayesian loop knobs plus
+# the search space. Omit paramSpace to use the built-in canonical sysctl
+# set.
 optimize:
   nTrials: 50
   nSobol: 15                     # quasi-random exploration trials; <= nTrials
@@ -187,7 +188,8 @@ optimize:
       paramType: choice          # discrete set; values are strings or ints
       values: [cubic, bbr]
 
-# Required when mode: trial. Apply a fixed sysctl set for one benchmark.
+# Required for the `trial` subcommand. Apply a fixed sysctl set for one
+# benchmark.
 # trial:
 #   sysctls:
 #     net.core.rmem_max: 67108864
@@ -364,24 +366,20 @@ for the canonical executable fixture.
 Run it:
 
 ```sh
-# YAML-driven (recommended): one config drives baseline, trial, or optimize.
-kube-autotuner run --config experiment.yaml
-
-# Or ad-hoc, no YAML:
-kube-autotuner baseline --source nodeA --target nodeB --output out/results.jsonl
-kube-autotuner analyze --input out/results.jsonl --output-dir out/analysis
+# YAML drives every flow; the subcommand picks the execution path.
+kube-autotuner optimize experiment.yaml
+kube-autotuner analyze out/results.jsonl --output-dir out/analysis
 ```
 
 ## Commands
 
-| Command          | Purpose                                                      |
-|------------------|--------------------------------------------------------------|
-| `baseline`       | iperf3 with the current sysctls; reference measurement.      |
-| `trial`          | One benchmark with a fixed `--param key=value` set.          |
-| `optimize`       | Ax Bayesian tuning loop (requires `[optimize]`).             |
-| `run`            | Dispatch the mode declared in `experiment.yaml`.             |
-| `analyze`        | Pareto, importance, recommendations (requires `[analysis]`). |
-| `sysctl get/set` | Low-level read/write against the selected backend.           |
+| Command                     | Purpose                                                      |
+|-----------------------------|--------------------------------------------------------------|
+| `baseline <experiment.yaml>` | iperf3 with the current sysctls; reference measurement.     |
+| `trial <experiment.yaml>`    | One benchmark with the YAML's `trial.sysctls` map applied.  |
+| `optimize <experiment.yaml>` | Ax Bayesian tuning loop (requires `[optimize]`).            |
+| `analyze <results.jsonl>`    | Pareto, importance, recommendations (requires `[analysis]`).|
+| `sysctl get/set`            | Low-level read/write against the selected backend.           |
 
 Per-command flags: `kube-autotuner <command> --help`.
 

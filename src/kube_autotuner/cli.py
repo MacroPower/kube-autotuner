@@ -46,8 +46,6 @@ if TYPE_CHECKING:
     from kube_autotuner.sysctl.backend import SysctlBackend
     from kube_autotuner.sysctl.setter import BackendName
 
-logger = logging.getLogger(__name__)
-
 
 @dataclass
 class AppState:
@@ -248,68 +246,6 @@ def _load_experiment_yaml(path: Path) -> ExperimentConfig:
         raise typer.Exit(code=2) from e
 
 
-def _apply_overrides(
-    *,
-    mode: Literal["baseline", "trial", "optimize"],
-    sources: list[str],
-    target: str,
-    hardware_class: str,
-    namespace: str,
-    ip_family_policy: str,
-    output: str,
-    duration: int,
-    iterations: int,
-    sysctls: dict[str, str] | None = None,
-    optimize: dict[str, Any] | None = None,
-) -> ExperimentConfig:
-    """Assemble a validated :class:`ExperimentConfig` from CLI overrides.
-
-    Args:
-        mode: Experiment mode.
-        sources: Source node names; must be non-empty.
-        target: Target node name.
-        hardware_class: Hardware class selector.
-        namespace: Kubernetes namespace.
-        ip_family_policy: Service ``ipFamilyPolicy``.
-        output: JSONL destination path.
-        duration: iperf3 test duration in seconds.
-        iterations: Iterations per benchmark (each iteration runs
-            both TCP and UDP bandwidth stages plus both fortio
-            sub-stages).
-        sysctls: Fixed sysctl map for ``mode="trial"``.
-        optimize: ``optimize:`` section for ``mode="optimize"``.
-
-    Returns:
-        A validated :class:`ExperimentConfig`.
-
-    Raises:
-        typer.Exit: ``sources`` is empty.
-    """
-    if not sources:
-        typer.echo("At least one --source is required.", err=True)
-        raise typer.Exit(code=1)
-    data: dict[str, Any] = {
-        "mode": mode,
-        "nodes": {
-            "sources": list(sources),
-            "target": target,
-            "hardware_class": hardware_class,
-            "namespace": namespace,
-            "ip_family_policy": ip_family_policy,
-        },
-        "benchmark": {
-            "duration": duration,
-            "iterations": iterations,
-        },
-        "output": output,
-    }
-    if sysctls is not None:
-        data["trial"] = {"sysctls": sysctls}
-    if optimize is not None:
-        data["optimize"] = optimize
-    return ExperimentConfig.model_validate(data)
-
-
 def _resolve_backend(
     *,
     node: str,
@@ -356,32 +292,53 @@ def _resolve_backend(
     )
 
 
-def _build_context(
-    exp: ExperimentConfig,
+def _run_experiment(
+    ctx: typer.Context,
     *,
+    config_path: Path,
     backend: str | None,
     fake_state_path: Path | None,
-    observer: ProgressObserver,
-    collect_host_state: bool = False,
-) -> runs.RunContext:
-    """Build a :class:`~kube_autotuner.runs.RunContext` for a run mode.
+    mode: Literal["baseline", "trial", "optimize"],
+    fresh: bool = False,
+) -> None:
+    """Load ``config_path``, run preflight, and dispatch into ``runs``.
 
     Args:
-        exp: Validated experiment configuration.
+        ctx: Typer context carrying the shared :class:`AppState`.
+        config_path: Path to the experiment YAML.
         backend: Explicit backend override, or ``None`` for env-driven
             resolution.
         fake_state_path: JSON state file when ``backend="fake"``.
-        observer: Progress observer for the run. Passed verbatim into
-            the returned :class:`RunContext`.
-        collect_host_state: Forwarded to
-            :attr:`RunContext.collect_host_state`. Defaults to
-            ``False``.
+        mode: Which ``runs`` entry point to dispatch into.
+        fresh: Forwarded to :func:`runs.run_optimize`. Ignored for
+            ``baseline`` and ``trial``.
 
-    Returns:
-        A :class:`RunContext` with a freshly constructed
-        :class:`K8sClient` and backend targeting ``exp.nodes.target``.
+    Raises:
+        typer.Exit: The YAML lacks the section required by ``mode``,
+            or :meth:`ExperimentConfig.preflight` reports any failure.
     """
+    exp = _load_experiment_yaml(config_path)
+
+    if mode == "optimize" and exp.optimize is None:
+        typer.echo(
+            "`optimize` requires an `optimize:` section in the YAML.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    if mode == "trial" and exp.trial is None:
+        typer.echo(
+            "`trial` requires a `trial:` section in the YAML.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
     client = K8sClient()
+    failures = [r for r in exp.preflight(client) if not r.passed]
+    if failures:
+        for r in failures:
+            typer.echo(f"preflight [{r.name}] FAIL: {r.detail}", err=True)
+        raise typer.Exit(code=2)
+
     sysctl_backend = _resolve_backend(
         node=exp.nodes.target,
         namespace=exp.nodes.namespace,
@@ -389,14 +346,25 @@ def _build_context(
         client=client,
         fake_state_path=fake_state_path,
     )
-    return runs.RunContext(
+    observer = _app_state(ctx).make_observer(
+        objectives=exp.objectives,
+        stages=exp.benchmark.stages,
+    )
+    run_ctx = runs.RunContext(
         exp=exp,
         client=client,
         backend=sysctl_backend,
         output=Path(exp.output),
         observer=observer,
-        collect_host_state=collect_host_state,
+        collect_host_state=exp.benchmark.collect_host_state,
     )
+    with observer:
+        if mode == "baseline":
+            runs.run_baseline(run_ctx)
+        elif mode == "trial":
+            runs.run_trial(run_ctx)
+        else:
+            runs.run_optimize(run_ctx, fresh=fresh)
 
 
 def _app_state(ctx: typer.Context) -> AppState:
@@ -410,41 +378,15 @@ def _app_state(ctx: typer.Context) -> AppState:
 @app.command()
 def baseline(
     ctx: typer.Context,
-    sources: Annotated[
-        list[str],
-        typer.Option(
-            "--source",
-            help="Source node hostname (repeatable for multi-client benchmarks).",
+    config_path: Annotated[
+        Path,
+        typer.Argument(
+            ...,
+            exists=True,
+            dir_okay=False,
+            help="Path to experiment YAML.",
         ),
     ],
-    target: Annotated[str, typer.Option("--target", help="Target node hostname.")],
-    hardware_class: Annotated[
-        str,
-        typer.Option(
-            "--hardware-class",
-            help="Hardware class label (free-form; used to stratify results).",
-        ),
-    ] = "10g",
-    namespace: Annotated[
-        str,
-        typer.Option("--namespace", help="Kubernetes namespace."),
-    ] = "default",
-    ip_family_policy: Annotated[
-        str,
-        typer.Option("--ip-family-policy", help="Service ipFamilyPolicy."),
-    ] = "RequireDualStack",
-    output: Annotated[
-        str,
-        typer.Option("--output", help="Output JSONL file."),
-    ] = "results.jsonl",
-    duration: Annotated[
-        int,
-        typer.Option("--duration", help="Test duration in seconds."),
-    ] = 30,
-    iterations: Annotated[
-        int,
-        typer.Option("--iterations", help="Iterations per benchmark."),
-    ] = 3,
     backend: Annotated[
         str | None,
         typer.Option(
@@ -459,88 +401,29 @@ def baseline(
             help="JSON state file for the fake backend.",
         ),
     ] = None,
-    collect_host_state: Annotated[
-        bool,
-        typer.Option(
-            "--collect-host-state/--no-collect-host-state",
-            "-H",
-            help=(
-                "Record per-iteration host-state snapshots (conntrack, "
-                "sockets, slab, etc.) on each TrialResult."
-            ),
-        ),
-    ] = False,
 ) -> None:
     """Run a baseline iperf3 benchmark with current sysctls."""
-    exp = _apply_overrides(
-        mode="baseline",
-        sources=sources,
-        target=target,
-        hardware_class=hardware_class,
-        namespace=namespace,
-        ip_family_policy=ip_family_policy,
-        output=output,
-        duration=duration,
-        iterations=iterations,
-    )
-    observer = _app_state(ctx).make_observer(
-        objectives=exp.objectives,
-        stages=exp.benchmark.stages,
-    )
-    run_ctx = _build_context(
-        exp,
+    _run_experiment(
+        ctx,
+        config_path=config_path,
         backend=backend,
         fake_state_path=fake_state_path,
-        observer=observer,
-        collect_host_state=collect_host_state,
+        mode="baseline",
     )
-    with observer:
-        runs.run_baseline(run_ctx)
 
 
 @app.command()
 def trial(
     ctx: typer.Context,
-    sources: Annotated[
-        list[str],
-        typer.Option("--source", help="Source node hostname (repeatable)."),
-    ],
-    target: Annotated[str, typer.Option("--target", help="Target node hostname.")],
-    param: Annotated[
-        list[str],
-        typer.Option(
-            "-p",
-            "--param",
-            help="Sysctl parameter as key=value (repeatable).",
+    config_path: Annotated[
+        Path,
+        typer.Argument(
+            ...,
+            exists=True,
+            dir_okay=False,
+            help="Path to experiment YAML.",
         ),
     ],
-    hardware_class: Annotated[
-        str,
-        typer.Option(
-            "--hardware-class",
-            help="Hardware class label (free-form; used to stratify results).",
-        ),
-    ] = "10g",
-    namespace: Annotated[
-        str,
-        typer.Option("--namespace", help="Kubernetes namespace."),
-    ] = "default",
-    ip_family_policy: Annotated[
-        str,
-        typer.Option("--ip-family-policy", help="Service ipFamilyPolicy."),
-    ] = "RequireDualStack",
-    output: Annotated[
-        str,
-        typer.Option("--output", help="Output JSONL file."),
-    ] = "results.jsonl",
-    duration: Annotated[
-        int,
-        typer.Option("--duration", help="Test duration in seconds."),
-    ] = 30,
-    iterations: Annotated[
-        int,
-        typer.Option("--iterations", help="Iterations per benchmark."),
-    ] = 3,
     backend: Annotated[
         str | None,
         typer.Option(
@@ -555,186 +438,24 @@ def trial(
             help="JSON state file for the fake backend.",
         ),
     ] = None,
-    collect_host_state: Annotated[
-        bool,
-        typer.Option(
-            "--collect-host-state/--no-collect-host-state",
-            "-H",
-            help=(
-                "Record per-iteration host-state snapshots (conntrack, "
-                "sockets, slab, etc.) on each TrialResult."
-            ),
-        ),
-    ] = False,
 ) -> None:
-    """Run a single optimization trial: snapshot, apply, benchmark, restore."""
-    params = _parse_params(param)
-    exp = _apply_overrides(
-        mode="trial",
-        sources=sources,
-        target=target,
-        hardware_class=hardware_class,
-        namespace=namespace,
-        ip_family_policy=ip_family_policy,
-        output=output,
-        duration=duration,
-        iterations=iterations,
-        sysctls=params,
-    )
-    observer = _app_state(ctx).make_observer(
-        objectives=exp.objectives,
-        stages=exp.benchmark.stages,
-    )
-    run_ctx = _build_context(
-        exp,
+    """Run a single trial: snapshot, apply, benchmark, restore."""
+    _run_experiment(
+        ctx,
+        config_path=config_path,
         backend=backend,
         fake_state_path=fake_state_path,
-        observer=observer,
-        collect_host_state=collect_host_state,
+        mode="trial",
     )
-    with observer:
-        runs.run_trial(run_ctx)
 
 
 @app.command()
 def optimize(
     ctx: typer.Context,
-    sources: Annotated[
-        list[str],
-        typer.Option("--source", help="Source node hostname (repeatable)."),
-    ],
-    target: Annotated[str, typer.Option("--target", help="Target node hostname.")],
-    hardware_class: Annotated[
-        str,
-        typer.Option(
-            "--hardware-class",
-            help="Hardware class label (free-form; used to stratify results).",
-        ),
-    ] = "10g",
-    namespace: Annotated[
-        str,
-        typer.Option("--namespace", help="Kubernetes namespace."),
-    ] = "default",
-    ip_family_policy: Annotated[
-        str,
-        typer.Option("--ip-family-policy", help="Service ipFamilyPolicy."),
-    ] = "RequireDualStack",
-    output: Annotated[
-        str,
-        typer.Option("--output", help="Output file for trial results."),
-    ] = "optimize_results.jsonl",
-    duration: Annotated[
-        int,
-        typer.Option("--duration", help="Test duration in seconds."),
-    ] = 30,
-    iterations: Annotated[
-        int,
-        typer.Option("--iterations", help="Iterations per benchmark."),
-    ] = 3,
-    n_trials: Annotated[
-        int,
-        typer.Option("--n-trials", help="Total optimization trials."),
-    ] = 50,
-    n_sobol: Annotated[
-        int,
-        typer.Option("--n-sobol", help="Sobol initialization trials."),
-    ] = 15,
-    apply_source: Annotated[
-        bool,
-        typer.Option(
-            "--apply-source",
-            help="Also apply sysctls on every client node.",
-        ),
-    ] = False,
-    backend: Annotated[
-        str | None,
-        typer.Option(
-            "--backend",
-            help="Sysctl backend override (real, talos, fake); defaults to env.",
-        ),
-    ] = None,
-    fake_state_path: Annotated[
-        Path | None,
-        typer.Option(
-            "--fake-state-path",
-            help="JSON state file for the fake backend.",
-        ),
-    ] = None,
-    fresh: Annotated[
-        bool,
-        typer.Option(
-            "--fresh",
-            help="Ignore prior results; move them aside before starting.",
-        ),
-    ] = False,
-    verification_trials: Annotated[
-        int,
-        typer.Option(
-            "--verification-trials",
-            help="Re-runs per top config after the primary loop. 0 disables.",
-        ),
-    ] = 0,
-    verification_top_k: Annotated[
-        int,
-        typer.Option(
-            "--verification-top-k",
-            help="Number of top configs to verify.",
-        ),
-    ] = 3,
-    collect_host_state: Annotated[
-        bool,
-        typer.Option(
-            "--collect-host-state/--no-collect-host-state",
-            "-H",
-            help=(
-                "Record per-iteration host-state snapshots (conntrack, "
-                "sockets, slab, etc.) on each TrialResult."
-            ),
-        ),
-    ] = False,
-) -> None:
-    """Run the Bayesian optimization loop (requires the optimize group)."""
-    exp = _apply_overrides(
-        mode="optimize",
-        sources=sources,
-        target=target,
-        hardware_class=hardware_class,
-        namespace=namespace,
-        ip_family_policy=ip_family_policy,
-        output=output,
-        duration=duration,
-        iterations=iterations,
-        optimize={
-            "n_trials": n_trials,
-            "n_sobol": n_sobol,
-            "apply_source": apply_source,
-            "verification_trials": verification_trials,
-            "verification_top_k": verification_top_k,
-        },
-    )
-    observer = _app_state(ctx).make_observer(
-        objectives=exp.objectives,
-        stages=exp.benchmark.stages,
-    )
-    run_ctx = _build_context(
-        exp,
-        backend=backend,
-        fake_state_path=fake_state_path,
-        observer=observer,
-        collect_host_state=collect_host_state,
-    )
-    with observer:
-        runs.run_optimize(run_ctx, fresh=fresh)
-
-
-@app.command()
-def run(
-    ctx: typer.Context,
     config_path: Annotated[
         Path,
-        typer.Option(
-            "-c",
-            "--config",
+        typer.Argument(
+            ...,
             exists=True,
             dir_okay=False,
             help="Path to experiment YAML.",
@@ -758,70 +479,19 @@ def run(
         bool,
         typer.Option(
             "--fresh",
-            help=(
-                "Ignore prior results; move them aside before starting "
-                "(optimize mode only)."
-            ),
-        ),
-    ] = False,
-    collect_host_state: Annotated[
-        bool,
-        typer.Option(
-            "--collect-host-state/--no-collect-host-state",
-            "-H",
-            help=(
-                "Record per-iteration host-state snapshots (conntrack, "
-                "sockets, slab, etc.) on each TrialResult. Diagnostic "
-                "overlay; not part of the experiment YAML."
-            ),
+            help="Ignore prior results; move them aside before starting.",
         ),
     ] = False,
 ) -> None:
-    """Run an experiment defined by a YAML config file.
-
-    Raises:
-        typer.Exit: ``exp.preflight`` reports any failure.
-    """
-    exp = _load_experiment_yaml(config_path)
-
-    client = K8sClient()
-    preflight = exp.preflight(client)
-    failures = [r for r in preflight if not r.passed]
-    if failures:
-        for r in failures:
-            typer.echo(f"preflight [{r.name}] FAIL: {r.detail}", err=True)
-        raise typer.Exit(code=2)
-
-    sysctl_backend = _resolve_backend(
-        node=exp.nodes.target,
-        namespace=exp.nodes.namespace,
+    """Run the Bayesian optimization loop (requires the optimize group)."""
+    _run_experiment(
+        ctx,
+        config_path=config_path,
         backend=backend,
-        client=client,
         fake_state_path=fake_state_path,
+        mode="optimize",
+        fresh=fresh,
     )
-    observer = _app_state(ctx).make_observer(
-        objectives=exp.objectives,
-        stages=exp.benchmark.stages,
-    )
-    run_ctx = runs.RunContext(
-        exp=exp,
-        client=client,
-        backend=sysctl_backend,
-        output=Path(exp.output),
-        observer=observer,
-        collect_host_state=collect_host_state,
-    )
-    with observer:
-        if exp.mode == "baseline":
-            if fresh:
-                logger.info("--fresh has no effect in mode=%s", exp.mode)
-            runs.run_baseline(run_ctx)
-        elif exp.mode == "trial":
-            if fresh:
-                logger.info("--fresh has no effect in mode=%s", exp.mode)
-            runs.run_trial(run_ctx)
-        else:
-            runs.run_optimize(run_ctx, fresh=fresh)
 
 
 @sysctl_app.command("set")
@@ -916,9 +586,8 @@ def analyze(
     ctx: typer.Context,
     input_file: Annotated[
         Path,
-        typer.Option(
-            "-i",
-            "--input",
+        typer.Argument(
+            ...,
             exists=True,
             dir_okay=False,
             help="Path to the JSONL trial data file.",

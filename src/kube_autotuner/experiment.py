@@ -47,8 +47,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-Mode = Literal["baseline", "trial", "optimize"]
-
 
 # iperf3 flags the tool controls. Users cannot pass these through
 # ``extra_args`` because either :class:`BenchmarkConfig` owns them or
@@ -305,7 +303,7 @@ class NodesSection(BaseModel):
 
 
 class OptimizeSection(BaseModel):
-    """Ax Bayesian-loop configuration for ``mode=optimize``."""
+    """Ax Bayesian-loop configuration for the ``optimize`` subcommand."""
 
     model_config = ConfigDict(
         extra="forbid",
@@ -320,13 +318,43 @@ class OptimizeSection(BaseModel):
     verification_trials: int = Field(default=0, ge=0)
     verification_top_k: int = Field(default=3, ge=1)
 
+    @model_validator(mode="after")
+    def _n_sobol_le_n_trials(self) -> OptimizeSection:
+        """Reject Sobol budgets that exceed the total trial budget.
+
+        Returns:
+            ``self`` when ``n_sobol <= n_trials``.
+
+        Raises:
+            ValueError: ``n_sobol`` exceeds ``n_trials``.
+        """
+        if self.n_sobol > self.n_trials:
+            msg = "optimize.n_sobol must be <= optimize.n_trials"
+            raise ValueError(msg)
+        return self
+
 
 class TrialSection(BaseModel):
-    """Fixed sysctl set for ``mode=trial``."""
+    """Fixed sysctl set for the ``trial`` subcommand."""
 
     model_config = ConfigDict(extra="forbid")
 
     sysctls: dict[str, str | int] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _sysctls_non_empty(self) -> TrialSection:
+        """Reject an empty sysctls map.
+
+        Returns:
+            ``self`` when ``sysctls`` carries at least one entry.
+
+        Raises:
+            ValueError: ``sysctls`` is empty.
+        """
+        if not self.sysctls:
+            msg = "trial.sysctls must contain at least one entry"
+            raise ValueError(msg)
+        return self
 
 
 Metric = Literal[
@@ -574,7 +602,6 @@ class ExperimentConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    mode: Mode
     nodes: NodesSection
     benchmark: BenchmarkConfig = Field(default_factory=BenchmarkConfig)
     optimize: OptimizeSection | None = None
@@ -584,34 +611,6 @@ class ExperimentConfig(BaseModel):
     patches: list[Patch] = Field(default_factory=list)
     objectives: ObjectivesSection = Field(default_factory=ObjectivesSection)
     output: str = "results.jsonl"
-
-    @model_validator(mode="after")
-    def _mode_requirements(self) -> ExperimentConfig:
-        """Enforce mode-specific structural invariants.
-
-        * ``mode=optimize`` requires an ``optimize:`` section.
-        * ``mode=trial`` requires a ``trial:`` section with at least one
-          entry in ``sysctls``.
-        * ``optimize.n_sobol`` must not exceed ``optimize.n_trials``.
-
-        Returns:
-            ``self`` when every invariant holds.
-
-        Raises:
-            ValueError: One of the invariants above is violated.
-        """
-        if self.mode == "optimize" and self.optimize is None:
-            msg = "mode=optimize requires `optimize:` section"
-            raise ValueError(msg)
-        if self.mode == "trial" and (self.trial is None or not self.trial.sysctls):
-            msg = (
-                "mode=trial requires a `trial:` section with a non-empty `sysctls:` map"
-            )
-            raise ValueError(msg)
-        if self.optimize and self.optimize.n_sobol > self.optimize.n_trials:
-            msg = "optimize.n_sobol must be <= optimize.n_trials"
-            raise ValueError(msg)
-        return self
 
     @model_validator(mode="after")
     def _prune_objectives_to_enabled_stages(self) -> ExperimentConfig:

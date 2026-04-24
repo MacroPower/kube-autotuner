@@ -758,7 +758,6 @@ class TestCLIAnalyze:
             app,
             [
                 "analyze",
-                "-i",
                 str(jsonl),
                 "-o",
                 str(out_dir),
@@ -788,7 +787,7 @@ class TestCLIAnalyze:
         runner = CliRunner()
         result = runner.invoke(
             app,
-            ["analyze", "-i", str(jsonl), "-o", str(out_dir)],
+            ["analyze", str(jsonl), "-o", str(out_dir)],
         )
         assert result.exit_code == 0, result.output
 
@@ -826,7 +825,6 @@ class TestCLIAnalyze:
             app,
             [
                 "analyze",
-                "-i",
                 str(jsonl),
                 "-o",
                 str(out_dir),
@@ -898,7 +896,6 @@ class TestCLIAnalyze:
             app,
             [
                 "analyze",
-                "-i",
                 str(jsonl),
                 "-o",
                 str(out_dir),
@@ -920,7 +917,6 @@ class TestCLIAnalyze:
             app,
             [
                 "analyze",
-                "-i",
                 str(empty),
                 "-o",
                 str(tmp_path / "out"),

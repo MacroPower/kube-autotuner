@@ -1,9 +1,8 @@
 # Example experiment config exercising the YAML loader end-to-end.
 #
-# Shape: mode=optimize, multi-source node pair, user-supplied param space,
-# iperf3 client/server extraArgs, both SMP and JSON6902 patches, custom
-# output path. Consumed by tests/test_experiment.py.
-mode: optimize
+# Shape: optimize subcommand, multi-source node pair, user-supplied
+# param space, iperf3 client/server extraArgs, both SMP and JSON6902
+# patches, custom output path. Consumed by tests/test_experiment.py.
 nodes:
   sources: [kmain07, kmain09]
   target: kmain08

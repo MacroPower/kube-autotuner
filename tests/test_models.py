@@ -156,16 +156,15 @@ def test_metrics_for_stages_unions_stage_entries():
     assert metrics_for_stages(frozenset()) == frozenset()
 
 
-def test_benchmark_config_silently_drops_legacy_modes_key():
-    # Pre-change YAML embedded `modes: [tcp]`; Pydantic's default
-    # extra="ignore" must drop the stale key so resume-sidecar
-    # comparisons still succeed.
-    config = BenchmarkConfig.model_validate(
-        {"duration": 10, "iterations": 1, "modes": ["tcp"]},
-    )
-    assert config.duration == 10
-    assert config.iterations == 1
-    assert not hasattr(config, "modes")
+def test_benchmark_config_rejects_legacy_modes_key():
+    # Pre-change YAML embedded `modes: [tcp]`; ``extra="forbid"`` now
+    # rejects it instead of silently dropping the stale key.
+    import pytest  # noqa: PLC0415
+
+    with pytest.raises(ValueError, match="modes"):
+        BenchmarkConfig.model_validate(
+            {"duration": 10, "iterations": 1, "modes": ["tcp"]},
+        )
 
 
 def test_node_pair_defaults():
