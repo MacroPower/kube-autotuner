@@ -22,6 +22,7 @@ from kube_autotuner.progress import (
 )
 
 _HistoryEtaColumn = progress_module._HistoryEtaColumn
+_STAGES_PER_ITERATION = progress_module._STAGES_PER_ITERATION
 
 _TtyEchoSuppressor = progress_module._TtyEchoSuppressor
 
@@ -566,13 +567,16 @@ def test_rich_observer_iteration_bar_spans_whole_trial(
         for i in range(4):
             _do_iter(i)
         # Mid-trial: open the bw-udp stage of iteration 4 without
-        # closing it, so the description reflects the active stage.
+        # closing it. The stage label lives on the stage bar now;
+        # the iteration bar keeps the plain "Current" description.
         observer.on_iteration_start(4)
         observer.on_stage_start("bw-udp", 4)
         task = _task_for(observer, observer._iter_task_id)
         assert task.total == 6
         assert task.completed == 4
-        assert "[bw-udp]" in task.description
+        assert task.description == "Current"
+        stage_task = _task_for(observer, observer._stage_task_id)
+        assert stage_task.description == "Stage [bw-udp]"
 
 
 def test_rich_observer_iteration_bar_resets_between_trials(
@@ -669,6 +673,191 @@ def test_rich_observer_iteration_bar_resets_after_mid_trial_failure(
         assert task.completed == 0
         # History survives the failed trial.
         assert observer._iter_count == 2
+
+
+def test_rich_observer_stage_bar_created_on_benchmark_start() -> None:
+    """``on_benchmark_start`` adds a ``Stage`` task sized to 4 sub-stages."""
+    console = _capture_console()
+    observer = RichProgressObserver(console)
+    with observer:
+        observer.on_benchmark_start(2)
+        assert observer._stage_task_id is not None
+        task = _task_for(observer, observer._stage_task_id)
+        assert task.total == _STAGES_PER_ITERATION
+        assert task.completed == 0
+        assert task.description == "Stage"
+
+
+def test_rich_observer_stage_bar_advances_per_stage_end() -> None:
+    """``on_stage_end`` advances the stage bar; description tracks the label."""
+    console = _capture_console()
+    observer = RichProgressObserver(console)
+    with observer:
+        observer.on_benchmark_start(1)
+        observer.on_iteration_start(0)
+        for index, stage in enumerate(
+            ("bw-tcp", "bw-udp", "fortio-sat", "fortio-fixed"),
+        ):
+            observer.on_stage_start(stage, 0)
+            task = _task_for(observer, observer._stage_task_id)
+            assert task.description == f"Stage [{stage}]"
+            observer.on_stage_end(stage, 0)
+            task = _task_for(observer, observer._stage_task_id)
+            assert task.completed == index + 1
+
+
+def test_rich_observer_stage_bar_resets_per_iteration() -> None:
+    """``on_iteration_start`` zeros the stage bar back to 0/4."""
+    console = _capture_console()
+    observer = RichProgressObserver(console)
+    with observer:
+        observer.on_benchmark_start(2)
+        observer.on_iteration_start(0)
+        for stage in ("bw-tcp", "bw-udp", "fortio-sat", "fortio-fixed"):
+            observer.on_stage_start(stage, 0)
+            observer.on_stage_end(stage, 0)
+        observer.on_iteration_end(0)
+        observer.on_iteration_start(1)
+        task = _task_for(observer, observer._stage_task_id)
+        assert task.completed == 0
+        assert task.description == "Stage"
+        # Partial iteration: 2/4 after two stage ends.
+        for stage in ("bw-tcp", "bw-udp"):
+            observer.on_stage_start(stage, 1)
+            observer.on_stage_end(stage, 1)
+        task = _task_for(observer, observer._stage_task_id)
+        assert task.completed == 2
+
+
+def test_rich_observer_stage_eta_accumulates_across_iterations_and_trials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stage ETA history carries across iterations and across trial boundaries."""
+    console = _capture_console()
+    observer = RichProgressObserver(console)
+    clock = {"t": 0.0}
+
+    def _fake() -> float:
+        return clock["t"]
+
+    monkeypatch.setattr(observer._progress, "get_time", _fake)
+    monkeypatch.setattr(progress_module.time, "monotonic", _fake)
+
+    def _do_stage(stage: str, iteration: int, duration: float) -> None:
+        observer.on_stage_start(stage, iteration)
+        clock["t"] += duration
+        observer.on_stage_end(stage, iteration)
+
+    def _do_iter(iteration: int) -> None:
+        observer.on_iteration_start(iteration)
+        for stage in ("bw-tcp", "bw-udp", "fortio-sat", "fortio-fixed"):
+            _do_stage(stage, iteration, 30.0)
+        observer.on_iteration_end(iteration)
+
+    with observer:
+        # Trial 1: 1 iteration (4 stages at 30s each).
+        observer.on_benchmark_start(2)
+        _do_iter(0)
+        # Trial 2: open iteration 0 so the stage bar is ready for ETA rendering.
+        observer.on_benchmark_start(2)
+        observer.on_iteration_start(0)
+        assert observer._stage_count == 4
+        assert observer._stage_total_seconds == pytest.approx(120.0)
+        column = _find_eta_column(observer)
+        stage_task = _task_for(observer, observer._stage_task_id)
+        # 4 remaining stages in the fresh iteration * 30s mean = 0:02:00.
+        assert column.render(stage_task).plain == "0:02:00"
+
+
+def test_rich_observer_aborted_stage_does_not_pollute_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A started-but-never-ended stage is dropped at the iteration boundary."""
+    console = _capture_console()
+    observer = RichProgressObserver(console)
+    clock = {"t": 0.0}
+
+    def _fake() -> float:
+        return clock["t"]
+
+    monkeypatch.setattr(observer._progress, "get_time", _fake)
+    monkeypatch.setattr(progress_module.time, "monotonic", _fake)
+    with observer:
+        observer.on_benchmark_start(1)
+        observer.on_iteration_start(0)
+        observer.on_stage_start("bw-tcp", 0)
+        clock["t"] += 10.0
+        # Runner raised before the inner try/finally could call on_stage_end;
+        # the outer try/finally still fires on_iteration_end.
+        observer.on_iteration_end(0)
+    assert observer._stage_count == 0
+    assert observer._stage_total_seconds == pytest.approx(0.0)
+    assert observer._stage_start is None
+
+
+def test_rich_observer_stage_bar_survives_trial_boundary() -> None:
+    """Stage history carries across trials while the bar resets to 0/4."""
+    console = _capture_console()
+    observer = RichProgressObserver(console)
+    with observer:
+        observer.on_benchmark_start(1)
+        observer.on_iteration_start(0)
+        for stage in ("bw-tcp", "bw-udp", "fortio-sat", "fortio-fixed"):
+            observer.on_stage_start(stage, 0)
+            observer.on_stage_end(stage, 0)
+        observer.on_iteration_end(0)
+        assert observer._stage_count == 4
+        # Trial 2 begins.
+        observer.on_benchmark_start(3)
+        task = _task_for(observer, observer._stage_task_id)
+        assert task.total == _STAGES_PER_ITERATION
+        assert task.completed == 0
+        assert task.description == "Stage"
+        # History preserved across the trial boundary.
+        assert observer._stage_count == 4
+
+
+def test_rich_observer_iteration_description_stays_current_across_stages() -> None:
+    """``on_stage_start`` leaves the iteration bar's description untouched."""
+    console = _capture_console()
+    observer = RichProgressObserver(console)
+    with observer:
+        observer.on_benchmark_start(1)
+        observer.on_iteration_start(0)
+        observer.on_stage_start("bw-tcp", 0)
+        observer.on_stage_end("bw-tcp", 0)
+        observer.on_stage_start("bw-udp", 0)
+        iter_task = _task_for(observer, observer._iter_task_id)
+        stage_task = _task_for(observer, observer._stage_task_id)
+        assert iter_task.description == "Current"
+        assert stage_task.description == "Stage [bw-udp]"
+
+
+def test_rich_observer_render_order_is_trials_iteration_stage() -> None:
+    """Rich renders the bars top-to-bottom as trials -> iteration -> stage."""
+    console = _capture_console()
+    observer = RichProgressObserver(console)
+    with observer:
+        observer.on_trial_start(0, 3, "sobol", {"net.core.rmem_max": "1048576"})
+        observer.on_benchmark_start(2)
+        descriptions = [t.description for t in observer._progress.tasks]
+        assert descriptions == ["Trials [sobol]", "Current", "Stage"]
+
+
+def test_rich_observer_stage_bar_advance_clamped_at_total() -> None:
+    """A stray fifth ``on_stage_end`` cannot drive the bar past 4/4."""
+    console = _capture_console()
+    observer = RichProgressObserver(console)
+    with observer:
+        observer.on_benchmark_start(1)
+        observer.on_iteration_start(0)
+        for stage in ("bw-tcp", "bw-udp", "fortio-sat", "fortio-fixed"):
+            observer.on_stage_start(stage, 0)
+            observer.on_stage_end(stage, 0)
+        # Simulate a hook-pairing bug: a fifth end call in the same iteration.
+        observer.on_stage_end("fortio-fixed", 0)
+        task = _task_for(observer, observer._stage_task_id)
+        assert task.completed == _STAGES_PER_ITERATION
 
 
 def test_make_observer_enabled_returns_rich_implementation() -> None:

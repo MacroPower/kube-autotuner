@@ -72,6 +72,8 @@ if TYPE_CHECKING:
 
 
 _TOP_N = 5
+# bw-tcp, bw-udp, fortio-sat, fortio-fixed; see benchmark/runner.py.
+_STAGES_PER_ITERATION = 4
 
 
 class ProgressObserver(Protocol):
@@ -639,11 +641,15 @@ class RichProgressObserver:
         self._iter_start: float | None = None
         self._iter_count: int = 0
         self._iter_total_seconds: float = 0.0
+        self._stage_start: float | None = None
+        self._stage_count: int = 0
+        self._stage_total_seconds: float = 0.0
         self._trial_start: float | None = None
         self._trial_count: int = 0
         self._trial_total_seconds: float = 0.0
         self._trial_task_id: TaskID | None = None
         self._iter_task_id: TaskID | None = None
+        self._stage_task_id: TaskID | None = None
         self._verify_task_id: TaskID | None = None
         self._progress: Progress = Progress(
             TextColumn("[bold]{task.description}[/bold]"),
@@ -658,7 +664,6 @@ class RichProgressObserver:
         self._all_rows: list[_TrialRow] = []
         self._top: list[_TrialRow] = []
         self._phase: str = "sobol"
-        self._current_stage: str = ""
         self._live: Live | None = None
         self._echo: _TtyEchoSuppressor | None = None
 
@@ -677,6 +682,28 @@ class RichProgressObserver:
             time.monotonic() - self._iter_start if self._iter_start is not None else 0.0
         )
         return (self._iter_count, self._iter_total_seconds, in_flight)
+
+    def _stage_history(self) -> tuple[int, float, float]:
+        """Return the observer's cumulative sub-stage history.
+
+        Stages average tens of seconds while iterations average
+        minutes, so the stage bar keeps its own history rather than
+        sharing :meth:`_iter_history` -- reusing iteration samples
+        would overshoot the stage ETA by ~4x.
+
+        Returns:
+            A ``(count, total_seconds, in_flight_seconds)`` snapshot
+            aggregated across every completed sub-stage since the
+            observer was constructed. ``in_flight_seconds`` is the
+            elapsed time of the currently running stage (``0.0`` when
+            none is active).
+        """
+        in_flight = (
+            time.monotonic() - self._stage_start
+            if self._stage_start is not None
+            else 0.0
+        )
+        return (self._stage_count, self._stage_total_seconds, in_flight)
 
     def _trial_history(self) -> tuple[int, float, float]:
         """Return the observer's cumulative trial history.
@@ -723,6 +750,8 @@ class RichProgressObserver:
             return self._trial_history()
         if task_id == self._iter_task_id:
             return self._iter_history()
+        if self._stage_task_id is not None and task_id == self._stage_task_id:
+            return self._stage_history()
         return (0, 0.0, 0.0)
 
     def _render(self) -> Group:
@@ -795,6 +824,22 @@ class RichProgressObserver:
         """Stage the current renderable for the next auto-refresh tick."""
         if self._live is not None:
             self._live.update(self._render())
+
+    def _task_by_id(self, task_id: TaskID) -> Task | None:
+        """Return the Rich ``Task`` for ``task_id`` or ``None`` if absent.
+
+        Rich does not expose a public dict lookup, so this linear scan
+        over ``self._progress.tasks`` (at most four entries -- trials,
+        iteration, stage, verify) is the cheapest stable API.
+
+        Args:
+            task_id: The Rich ``TaskID`` to resolve.
+
+        Returns:
+            The matching task, or ``None`` when no task with the given
+            id is registered.
+        """
+        return next((t for t in self._progress.tasks if t.id == task_id), None)
 
     def __enter__(self) -> Self:
         """Start the ``rich.live.Live`` display on the bound console.
@@ -1127,20 +1172,32 @@ class RichProgressObserver:
         self._refresh()
 
     def on_benchmark_start(self, total_iterations: int) -> None:
-        """Size the iteration bar for the trial's full iteration budget.
+        """Size the iteration and stage bars for the trial's iteration budget.
 
         Fired once per :meth:`BenchmarkRunner.run` call. The iteration
-        bar spans every iteration in the trial, so its ``total`` is
-        set to ``iterations`` and its ``completed`` starts at zero.
-        The cumulative iteration history (``_iter_count`` /
-        ``_iter_total_seconds``) is deliberately preserved so the
-        custom :class:`_IterEtaColumn` can keep producing a real ETA
-        across trial boundaries. Only the transient
-        start-of-iteration timestamp is cleared, covering the case
-        where a prior iteration was aborted before
-        :meth:`on_iteration_end` fired.
+        bar spans every iteration in the trial (``total=iterations``)
+        while the stage bar is sized to the fixed four-sub-stage
+        sequence inside each iteration
+        (``total=_STAGES_PER_ITERATION``) and is re-zeroed on every
+        :meth:`on_iteration_start`. The cumulative iteration and stage
+        histories (``_iter_count`` / ``_iter_total_seconds`` and
+        ``_stage_count`` / ``_stage_total_seconds``) are deliberately
+        preserved so the shared :class:`_HistoryEtaColumn` keeps
+        producing a real ETA across trial boundaries. Only the
+        transient start timestamps are cleared, covering the case
+        where a prior iteration or stage was aborted before its
+        matching end hook fired.
+
+        The stage task is added **after** the iteration task on the
+        first benchmark so Rich renders trials -> iteration -> stage
+        top-to-bottom. On subsequent trials the ``reset`` branch
+        preserves the original insertion index, so ordering is not
+        re-established per trial; it relies on the protocol invariant
+        that ``on_benchmark_start`` fires after ``on_trial_start`` (see
+        :class:`ProgressObserver` docstring).
         """
         self._iter_start = None
+        self._stage_start = None
         if self._iter_task_id is None:
             self._iter_task_id = self._progress.add_task(
                 "Current",
@@ -1154,32 +1211,66 @@ class RichProgressObserver:
                 completed=0,
                 description="Current",
             )
+        if self._stage_task_id is None:
+            self._stage_task_id = self._progress.add_task(
+                "Stage",
+                total=_STAGES_PER_ITERATION,
+                completed=0,
+            )
+        else:
+            self._progress.reset(
+                self._stage_task_id,
+                total=_STAGES_PER_ITERATION,
+                completed=0,
+                description="Stage",
+            )
         self._refresh()
 
     def on_iteration_start(
         self,
         iteration: int,  # noqa: ARG002 start timestamp is the signal
     ) -> None:
-        """Record the iteration start timestamp for ETA tracking.
+        """Record the iteration start timestamp and re-zero the stage bar.
 
-        The iteration-bar description is repainted by the immediately
-        following :meth:`on_stage_start`, so no description update
-        happens here.
+        The stage bar is reset back to ``0/_STAGES_PER_ITERATION`` here
+        (in addition to the trial-boundary reset in
+        :meth:`on_benchmark_start`) so its ``TimeElapsedColumn`` shows
+        time-into-this-iteration -- the operator-useful scoping for a
+        per-iteration bar. A prior iteration may have aborted
+        mid-stage, so ``_stage_start`` is also cleared defensively.
         """
         self._iter_start = time.monotonic()
+        self._stage_start = None
+        if self._stage_task_id is not None:
+            self._progress.reset(
+                self._stage_task_id,
+                total=_STAGES_PER_ITERATION,
+                completed=0,
+                description="Stage",
+            )
+        self._refresh()
 
     def on_iteration_end(
         self,
         iteration: int,  # noqa: ARG002 advance is the signal
     ) -> None:
-        """Advance the iteration bar by one completed iteration."""
+        """Advance the iteration bar by one completed iteration.
+
+        ``_stage_start`` is cleared defensively in case the iteration
+        aborted mid-stage: a half-run stage is **not** accumulated into
+        ``_stage_total_seconds`` -- dropping aborted samples keeps the
+        stage ETA honest. The stage bar itself is not reset here;
+        :meth:`on_iteration_start` (or :meth:`on_benchmark_start` for
+        the next trial) owns that, and leaving the bar at ``4/4`` on
+        the final iteration of a successful trial is informative.
+        """
         if self._iter_start is not None:
             self._iter_total_seconds += time.monotonic() - self._iter_start
             self._iter_count += 1
             self._iter_start = None
+        self._stage_start = None
         if self._iter_task_id is not None:
             self._progress.update(self._iter_task_id, advance=1)
-        self._current_stage = ""
         self._refresh()
 
     def on_stage_start(
@@ -1187,12 +1278,12 @@ class RichProgressObserver:
         stage: str,
         iteration: int,  # noqa: ARG002 stage carries the signal
     ) -> None:
-        """Update the iteration-bar description to reflect the active sub-stage."""
-        self._current_stage = stage
-        if self._iter_task_id is not None:
+        """Paint the stage label on the stage bar and seed its ETA timer."""
+        self._stage_start = time.monotonic()
+        if self._stage_task_id is not None:
             self._progress.update(
-                self._iter_task_id,
-                description=f"Current [{stage}]",
+                self._stage_task_id,
+                description=f"Stage [{stage}]",
             )
         self._refresh()
 
@@ -1201,8 +1292,20 @@ class RichProgressObserver:
         stage: str,  # noqa: ARG002 description rolls back on next start
         iteration: int,  # noqa: ARG002
     ) -> None:
-        """Clear the sub-stage label; kept as a hook for future extensions."""
-        self._current_stage = ""
+        """Accumulate the stage sample into ETA history and advance the stage bar.
+
+        The advance is guarded so a stray fifth ``on_stage_end`` in the
+        same iteration (a future hook-pairing bug) cannot render
+        ``5/4``; Rich does not clamp ``completed`` on ``advance``.
+        """
+        if self._stage_start is not None:
+            self._stage_total_seconds += time.monotonic() - self._stage_start
+            self._stage_count += 1
+            self._stage_start = None
+        if self._stage_task_id is not None:
+            task = self._task_by_id(self._stage_task_id)
+            if task is not None and task.completed < _STAGES_PER_ITERATION:
+                self._progress.update(self._stage_task_id, advance=1)
         self._refresh()
 
 
