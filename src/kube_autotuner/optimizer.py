@@ -38,7 +38,6 @@ from kube_autotuner.benchmark.runner import BenchmarkRunner
 from kube_autotuner.k8s.client import K8sClient
 from kube_autotuner.k8s.lease import NodeLease
 from kube_autotuner.models import (
-    TrialLog,
     TrialResult,
     is_primary,
     tcp_retransmit_rate_by_iteration,
@@ -47,6 +46,7 @@ from kube_autotuner.models import (
 from kube_autotuner.progress import NullObserver
 from kube_autotuner.sysctl.params import RECOMMENDED_DEFAULTS
 from kube_autotuner.sysctl.setter import make_sysctl_setter_from_env
+from kube_autotuner.trial_log import TrialLog
 from kube_autotuner.units import format_duration
 
 if TYPE_CHECKING:
@@ -506,8 +506,9 @@ class OptimizationLoop:
             node_pair: Source/target nodes for the benchmark.
             config: Benchmark session configuration.
             param_space: Sysctl search space to optimize over.
-            output: JSONL path receiving one :class:`TrialResult` per
-                completed trial.
+            output: Trial-log directory receiving one
+                :class:`TrialResult` per completed trial (plus a
+                ``failures/`` subdirectory for failed-trial dumps).
             n_trials: Total number of trials to propose.
             n_sobol: Number of Sobol (quasi-random) initialization
                 trials before Ax switches to its Bayesian surrogate.
@@ -763,10 +764,10 @@ class OptimizationLoop:
         """Run one trial end-to-end: lock, snapshot, apply, benchmark, restore.
 
         The returned :class:`TrialResult` carries ``phase`` and
-        ``parent_trial_id`` so the observer and the JSONL row agree on
-        which population the sample belongs to. Primary call sites pass
-        the Ax phase label with ``parent_trial_id=None``; the
-        verification pass passes ``phase="verification"`` and the
+        ``parent_trial_id`` so the observer and the persisted row
+        agree on which population the sample belongs to. Primary call
+        sites pass the Ax phase label with ``parent_trial_id=None``;
+        the verification pass passes ``phase="verification"`` and the
         primary's ``trial_id``.
 
         Args:
@@ -840,16 +841,16 @@ class OptimizationLoop:
         parameterization: dict[str, str],
         exc: BaseException,
     ) -> None:
-        """Persist a per-trial failure dump next to :attr:`output`.
+        """Persist a per-trial failure dump inside :attr:`output`.
 
         Best-effort: wraps the write in ``try/except Exception`` so a
         disk failure never masks the primary trial failure the dump is
         describing.
 
-        ``self.output`` is the JSONL trial-log path; its ``parent``
-        (even when bare, ``Path(".")``) is used as the base so a
-        bare-filename ``output`` lands the dump under
-        ``./failures/trial-<idx>.json``.
+        ``self.output`` is the trial-log directory; the dump lands at
+        ``<output>/failures/trial-<idx>.json`` so it travels with the
+        rest of the dataset (including through ``--fresh`` archive
+        renames).
 
         Args:
             trial_index: Zero-based trial index as logged by the
@@ -878,7 +879,7 @@ class OptimizationLoop:
                 payload["iteration"] = exc.iteration
                 payload["attempt_diagnostics"] = exc.attempt_diagnostics
                 payload["server_snapshots"] = exc.server_snapshots
-            failures_dir = self.output.parent / "failures"
+            failures_dir = self.output / "failures"
             failures_dir.mkdir(parents=True, exist_ok=True)
             (failures_dir / f"trial-{trial_index}.json").write_text(
                 json.dumps(payload, indent=2, default=repr),

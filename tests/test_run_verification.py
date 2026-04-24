@@ -22,11 +22,11 @@ from kube_autotuner.models import (
     IterationResults,
     LatencyResult,
     NodePair,
-    TrialLog,
     is_primary,
 )
 from kube_autotuner.optimizer import OptimizationLoop
 from kube_autotuner.sysctl.params import PARAM_SPACE
+from kube_autotuner.trial_log import TrialLog
 
 
 def _mock_snapshot(param_names: list[str]) -> dict[str, str]:
@@ -99,7 +99,7 @@ def test_run_verification_emits_phase_parent_rows_and_no_new_complete_trial_call
         hardware_class="10g",
         namespace="default",
     )
-    output = tmp_path / "results.jsonl"
+    output = tmp_path / "results"
 
     # Use n_sobol == n_trials so the test does not depend on Ax's
     # Sobol->Bayesian transition criteria (identical-metric mocks can
@@ -132,7 +132,7 @@ def test_run_verification_emits_phase_parent_rows_and_no_new_complete_trial_call
     assert all(tr.phase == "verification" for tr in created)
     primary_ids = {tr.trial_id for tr in loop._completed if is_primary(tr)}
     assert all(tr.parent_trial_id in primary_ids for tr in created)
-    # JSONL got 4 primary + 4 verification rows.
+    # Dataset got 4 primary + 4 verification rows.
     persisted = TrialLog.load(output)
     assert len(persisted) == 4 + 4
     # Verification does not call complete_trial -- Ax never sees the repeats.
@@ -164,7 +164,7 @@ def test_run_verification_skips_done_work(
         node_pair=NodePair(source="a", target="b", hardware_class="10g"),
         config=BenchmarkConfig(duration=5, iterations=1),
         param_space=PARAM_SPACE,
-        output=tmp_path / "out.jsonl",
+        output=tmp_path / "out",
         n_trials=4,
         n_sobol=4,
         objectives=ObjectivesSection(),

@@ -9,31 +9,30 @@ optimizer. They are the single source of truth for run behaviour; the
 Typer CLI delegates into them rather than reimplementing the
 lease/snapshot/apply/restore dance.
 
-Run-mode JSONL output
----------------------
+Run-mode trial-dataset output
+-----------------------------
 
 Every mode appends :class:`~kube_autotuner.models.TrialResult` records
-to ``ctx.output`` via :meth:`~kube_autotuner.models.TrialLog.append`.
-Readers tailing the file see one JSON object per line whose field
-names and nesting mirror the Pydantic models in
-:mod:`kube_autotuner.models` (``TrialResult`` → ``BenchmarkResult`` →
-``NodePair``). Downstream analysers revalidate against the Pydantic
-models on read rather than relying on a byte-for-byte compatibility
-contract.
+to ``ctx.output`` via
+:meth:`~kube_autotuner.trial_log.TrialLog.append`. ``ctx.output`` is a
+directory holding one zstd-compressed Parquet file per trial plus a
+``_meta.json`` :class:`ResumeMetadata` sidecar. Downstream analysers
+revalidate against the Pydantic models on read rather than relying on
+a byte-for-byte compatibility contract.
 
-* **baseline** -- one :class:`TrialResult` line. ``sysctl_values``
+* **baseline** -- one :class:`TrialResult` file. ``sysctl_values``
   captures the full
   :data:`~kube_autotuner.sysctl.params.PARAM_SPACE` snapshot taken on
   the target node; nothing is written back. Use this to record a
   "current kernel config" entry before a tuning pass.
-* **trial** -- one :class:`TrialResult` line. ``sysctl_values`` holds
+* **trial** -- one :class:`TrialResult` file. ``sysctl_values`` holds
   the keys from ``exp.trial.sysctls`` that were actually applied; the
   original values are restored through a ``finally`` block before the
   run returns.
-* **optimize** -- one :class:`TrialResult` line per completed Ax
+* **optimize** -- one :class:`TrialResult` file per completed Ax
   trial, emitted as the loop progresses. Failed trials are *not*
-  written to the file (they are marked failed with the Ax client
-  instead).
+  written to the dataset (they are marked failed with the Ax client
+  instead; their JSON dumps land under ``<output>/failures/``).
 
 Backend injection
 -----------------
@@ -63,7 +62,6 @@ from kube_autotuner.benchmark.runner import BenchmarkRunner
 from kube_autotuner.k8s.lease import NodeLease
 from kube_autotuner.models import (
     ResumeMetadata,
-    TrialLog,
     TrialResult,
     is_primary,
     metrics_for_stages,
@@ -77,6 +75,7 @@ from kube_autotuner.scoring import (
     score_rows,
 )
 from kube_autotuner.sysctl.params import PARAM_SPACE
+from kube_autotuner.trial_log import TrialLog, _validate_output_directory
 from kube_autotuner.units import (
     format_coefficient,
     format_duration,
@@ -119,7 +118,7 @@ class RunContext:
             :class:`~kube_autotuner.optimizer.OptimizationLoop` builds
             its own per-node setters (one per source when
             ``apply_source=True``).
-        output: JSONL destination for :class:`TrialResult` records.
+        output: Trial-log directory for :class:`TrialResult` records.
             Usually ``Path(exp.output)``; decoupled from ``exp`` so
             callers can redirect the sink without rewriting the
             config.
@@ -221,7 +220,7 @@ class _ResumeState:
             ``n_trials - attempts_so_far`` would -- accepted as the
             simplest interpretation. See the module docstring.
         verification_done_by_parent: Map of primary ``trial_id`` ->
-            count of verification rows already in the JSONL for that
+            count of verification rows already in the dataset for that
             parent. Fed to
             :meth:`~kube_autotuner.optimizer.OptimizationLoop.run_verification`
             so the verification loop skips work that a prior session
@@ -234,26 +233,29 @@ class _ResumeState:
 
 
 def _move_prior_artifacts(output: Path) -> None:
-    """Rename the prior JSONL and sidecar aside with a UTC timestamp.
+    """Rename the prior trial-log directory aside with a UTC timestamp.
 
-    Given ``output = <dir>/results.jsonl``, renames to
-    ``<dir>/results.jsonl.<T>.bak`` and the sidecar to
-    ``<dir>/results.jsonl.meta.json.<T>.bak`` where ``T`` is a UTC
-    ISO-like timestamp (``YYYYMMDDTHHMMSSZ``). Non-existent files are
-    skipped silently.
+    Given ``output = <dir>/results``, renames the directory to
+    ``<dir>/results.<T>.bak`` where ``T`` is a UTC ISO-like timestamp
+    (``YYYYMMDDTHHMMSSZ``). The sidecar and every parquet file travel
+    with the directory, so there is no separate rename step. A
+    non-existent ``output`` path is skipped silently.
 
     Args:
-        output: JSONL log path whose prior artefacts should be
+        output: Trial-log directory whose prior artefacts should be
             archived.
-    """
+
+    Raises:
+        typer.BadParameter: ``output`` exists but is not a trial-log
+            directory; raised by :func:`_validate_output_directory`.
+    """  # noqa: DOC502 - typer.BadParameter raised via _validate_output_directory
+    _validate_output_directory(output)
+    if not output.exists():
+        return
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    meta = TrialLog._metadata_path(output)  # noqa: SLF001 sibling path helper
-    for path in (output, meta):
-        if not path.exists():
-            continue
-        backup = path.with_name(f"{path.name}.{stamp}.bak")
-        path.rename(backup)
-        logger.info("moved prior results to %s", backup)
+    backup = output.with_name(f"{output.name}.{stamp}.bak")
+    output.rename(backup)
+    logger.info("moved prior results to %s", backup)
 
 
 def _check_compatibility(
@@ -268,9 +270,9 @@ def _check_compatibility(
     patches, iperf/fortio args, and ``apply_source`` can change
     silently between runs.
 
-    A ``None`` sidecar alongside a non-empty JSONL signals a prior
-    run that wrote no metadata (or a manually crafted JSONL); the
-    user must pass ``--fresh`` or supply a sidecar before resume.
+    A ``None`` sidecar alongside a non-empty dataset signals a prior
+    run that wrote no metadata (or a manually assembled directory);
+    the user must pass ``--fresh`` or supply a sidecar before resume.
 
     Args:
         meta: The loaded sidecar, or ``None`` when absent.
@@ -282,7 +284,7 @@ def _check_compatibility(
     """
     if meta is None:
         msg = (
-            "prior JSONL has no sidecar to validate against; pass "
+            "prior trial dataset has no sidecar to validate against; pass "
             "--fresh to move it aside or supply a sidecar before "
             "resuming."
         )
@@ -334,7 +336,7 @@ def _prepare_resume(
     is the simplest interpretation -- users can always stop early.
 
     Args:
-        output: JSONL destination path for the run.
+        output: Trial-log directory for the run.
         exp: Validated experiment. Must have ``exp.optimize`` set.
         fresh: When ``True``, archive any prior artefacts and return
             a fresh state unconditionally.
@@ -346,9 +348,10 @@ def _prepare_resume(
     Raises:
         RuntimeError: ``exp.optimize`` is ``None`` -- a caller
             invariant has been violated.
-        typer.BadParameter: The prior JSONL exists but has no
-            sidecar, or the sidecar's compatibility keys diverge from
-            ``exp``. Raised indirectly via
+        typer.BadParameter: ``output`` exists but is not a trial-log
+            directory, the prior dataset has no sidecar, or the
+            sidecar's compatibility keys diverge from ``exp``. Raised
+            indirectly via :func:`_validate_output_directory` or
             :func:`_check_compatibility`.
     """  # noqa: DOC502 - typer.BadParameter raised via _check_compatibility
     if exp.optimize is None:
@@ -359,6 +362,7 @@ def _prepare_resume(
         _move_prior_artifacts(output)
         return _ResumeState(prior_trials=[], remaining_trials=exp.optimize.n_trials)
 
+    _validate_output_directory(output)
     if not output.exists():
         return _ResumeState(prior_trials=[], remaining_trials=exp.optimize.n_trials)
 
@@ -401,8 +405,14 @@ def run_baseline(ctx: RunContext) -> None:
     Args:
         ctx: Orchestration context. ``ctx.backend`` must target
             ``ctx.exp.nodes.target``.
-    """
+
+    Raises:
+        typer.BadParameter: ``ctx.output`` exists but is not a
+            trial-log directory. Raised via
+            :func:`_validate_output_directory`.
+    """  # noqa: DOC502 - typer.BadParameter raised via _validate_output_directory
     exp = ctx.exp
+    _validate_output_directory(ctx.output)
     TrialLog.write_resume_metadata(
         ctx.output,
         ResumeMetadata(
@@ -480,7 +490,10 @@ def run_trial(ctx: RunContext) -> None:
     Raises:
         RuntimeError: ``ctx.exp.trial`` is ``None`` -- an
             :class:`ExperimentConfig` invariant has been violated.
-    """
+        typer.BadParameter: ``ctx.output`` exists but is not a
+            trial-log directory. Raised via
+            :func:`_validate_output_directory`.
+    """  # noqa: DOC502 - typer.BadParameter raised via _validate_output_directory
     exp = ctx.exp
     if exp.trial is None:
         msg = (
@@ -489,6 +502,7 @@ def run_trial(ctx: RunContext) -> None:
         )
         raise RuntimeError(msg)
 
+    _validate_output_directory(ctx.output)
     TrialLog.write_resume_metadata(
         ctx.output,
         ResumeMetadata(
@@ -602,17 +616,17 @@ def run_optimize(  # noqa: PLR0914, PLR0915
             populated (guaranteed by
             :class:`~kube_autotuner.experiment.ExperimentConfig`'s
             mode validator).
-        fresh: When ``True``, move any pre-existing ``ctx.output`` and
-            sidecar aside (timestamped ``.bak`` rename) before
+        fresh: When ``True``, move any pre-existing ``ctx.output``
+            directory aside (timestamped ``.bak`` rename) before
             starting, so the run begins from zero.
 
     Raises:
         RuntimeError: ``ctx.exp.optimize`` is ``None``, or
             ``ax-platform`` is not installed (the ``optimize`` dep
             group provides it).
-        typer.BadParameter: The prior JSONL exists but its sidecar is
-            missing or incompatible with the current experiment.
-            Raised indirectly via :func:`_prepare_resume`.
+        typer.BadParameter: The prior trial dataset exists but its
+            sidecar is missing or incompatible with the current
+            experiment. Raised indirectly via :func:`_prepare_resume`.
     """  # noqa: DOC502 - typer.BadParameter raised via _prepare_resume
     try:
         from kube_autotuner.optimizer import OptimizationLoop  # noqa: PLC0415

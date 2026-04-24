@@ -85,12 +85,13 @@ percentiles in one pass.
    never contends with iperf3 for NIC, CPU, or CNI state; within
    each sub-stage the source nodes still fan out in parallel.
 4. In `optimize` the Ax loop proposes trials, applies sysctls,
-   benchmarks, and appends one JSONL record per trial.
-5. Every run writes the resolved `objectives` block alongside the JSONL
-   as `<output>.meta.json`, so `kube-autotuner analyze` picks up the
-   same frontier and recommendation weights without re-specifying them
-   and turns the JSONL into Pareto plots, parameter importance scores,
-   and a ranked list of configurations.
+   benchmarks, and appends one zstd-compressed Parquet file per trial
+   into the `--output` directory.
+5. Every run writes the resolved `objectives` block alongside the
+   trial dataset as `<output>/_meta.json`, so `kube-autotuner analyze`
+   picks up the same frontier and recommendation weights without
+   re-specifying them and turns the dataset into Pareto plots,
+   parameter importance scores, and a ranked list of configurations.
 
 ## Parameter space
 
@@ -301,7 +302,7 @@ objectives:
                                      # disable. Applies only at recommendation-ranking
                                      # time; Ax exploration stays untouched.
 
-output: out/results.jsonl
+output: out/results
 ```
 
 A few rules govern how the `objectives:` block is interpreted:
@@ -365,7 +366,7 @@ Run it:
 ```sh
 # YAML drives every flow; the subcommand picks the execution path.
 kube-autotuner optimize experiment.yaml
-kube-autotuner analyze out/results.jsonl --output-dir out/analysis
+kube-autotuner analyze out/results --output-dir out/analysis
 ```
 
 ## Commands
@@ -375,7 +376,7 @@ kube-autotuner analyze out/results.jsonl --output-dir out/analysis
 | `baseline <experiment.yaml>` | iperf3 with the current sysctls; reference measurement.     |
 | `trial <experiment.yaml>`    | One benchmark with the YAML's `trial.sysctls` map applied.  |
 | `optimize <experiment.yaml>` | Ax Bayesian tuning loop (requires `[optimize]`).            |
-| `analyze <results.jsonl>`    | Pareto, importance, recommendations (requires `[analysis]`).|
+| `analyze <results/>`         | Pareto, importance, recommendations (requires `[analysis]`).|
 | `sysctl get/set`            | Low-level read/write against the selected backend.           |
 
 Per-command flags: `kube-autotuner <command> --help`.

@@ -38,7 +38,7 @@ def test_analyze_generates_reports_from_baseline_output(
     fake_sysctl_env: Path,  # noqa: ARG001 - activates fake backend env vars
     tmp_path: Path,
 ) -> None:
-    trials_file = tmp_path / "trials.jsonl"
+    trials_file = tmp_path / "trials"
     analysis_dir = tmp_path / "analysis"
 
     runner = CliRunner()

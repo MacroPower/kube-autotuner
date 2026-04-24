@@ -97,7 +97,7 @@ def test_mixed_priors_seed_only_primaries_into_ax(
             ),
             config=BenchmarkConfig(),
             param_space=PARAM_SPACE,
-            output=tmp_path / "out.jsonl",
+            output=tmp_path / "out",
             n_trials=3,
             n_sobol=1,
             objectives=ObjectivesSection(),

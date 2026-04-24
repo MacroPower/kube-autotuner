@@ -147,7 +147,7 @@ def test_sysctl_set_help() -> None:
 
 
 def test_no_progress_yields_null_observer(tmp_path: Path) -> None:
-    out = tmp_path / "results.jsonl"
+    out = tmp_path / "results"
     config = _write_yaml(tmp_path, _BASELINE_YAML.format(output=out))
     with (
         patch("kube_autotuner.cli.K8sClient") as client_cls,
@@ -181,7 +181,7 @@ def test_no_progress_yields_null_observer(tmp_path: Path) -> None:
 
 
 def test_progress_enabled_under_forced_terminal(tmp_path: Path) -> None:
-    out = tmp_path / "results.jsonl"
+    out = tmp_path / "results"
     config = _write_yaml(tmp_path, _BASELINE_YAML.format(output=out))
     with (
         patch("kube_autotuner.cli.K8sClient") as client_cls,
@@ -216,7 +216,7 @@ def test_progress_enabled_under_forced_terminal(tmp_path: Path) -> None:
 
 
 def test_baseline_invokes_run_baseline(tmp_path: Path) -> None:
-    out = tmp_path / "results.jsonl"
+    out = tmp_path / "results"
     config = _write_yaml(tmp_path, _BASELINE_YAML.format(output=out))
     with (
         patch("kube_autotuner.cli.K8sClient") as client_cls,
@@ -250,7 +250,7 @@ def test_baseline_invokes_run_baseline(tmp_path: Path) -> None:
 
 
 def test_trial_loads_yaml_and_invokes_run_trial(tmp_path: Path) -> None:
-    out = tmp_path / "results.jsonl"
+    out = tmp_path / "results"
     config = _write_yaml(tmp_path, _TRIAL_YAML.format(output=out))
     with (
         patch("kube_autotuner.cli.K8sClient") as client_cls,
@@ -277,7 +277,7 @@ def test_trial_loads_yaml_and_invokes_run_trial(tmp_path: Path) -> None:
 
 def test_trial_without_trial_section_errors(tmp_path: Path) -> None:
     """``trial`` rejects a YAML lacking a ``trial:`` section."""
-    out = tmp_path / "results.jsonl"
+    out = tmp_path / "results"
     config = _write_yaml(tmp_path, _BASELINE_YAML.format(output=out))
     with (
         patch("kube_autotuner.cli.K8sClient"),
@@ -291,7 +291,7 @@ def test_trial_without_trial_section_errors(tmp_path: Path) -> None:
 
 
 def test_optimize_invokes_run_optimize(tmp_path: Path) -> None:
-    out = tmp_path / "opt.jsonl"
+    out = tmp_path / "opt"
     config = _write_yaml(tmp_path, _OPTIMIZE_YAML.format(output=out))
     with (
         patch("kube_autotuner.cli.K8sClient") as client_cls,
@@ -316,7 +316,7 @@ def test_optimize_invokes_run_optimize(tmp_path: Path) -> None:
 
 def test_optimize_without_optimize_section_errors(tmp_path: Path) -> None:
     """``optimize`` rejects a YAML lacking an ``optimize:`` section."""
-    out = tmp_path / "opt.jsonl"
+    out = tmp_path / "opt"
     config = _write_yaml(tmp_path, _BASELINE_YAML.format(output=out))
     with (
         patch("kube_autotuner.cli.K8sClient"),
@@ -330,7 +330,7 @@ def test_optimize_without_optimize_section_errors(tmp_path: Path) -> None:
 
 
 def test_baseline_reports_preflight_failures(tmp_path: Path) -> None:
-    out = tmp_path / "results.jsonl"
+    out = tmp_path / "results"
     config = _write_yaml(tmp_path, _BASELINE_YAML.format(output=out))
     failing = PreflightResult(
         name="nodes-exist",
@@ -353,7 +353,7 @@ def test_baseline_reports_preflight_failures(tmp_path: Path) -> None:
 
 
 def test_optimize_forwards_fresh_flag(tmp_path: Path) -> None:
-    out = tmp_path / "opt.jsonl"
+    out = tmp_path / "opt"
     config = _write_yaml(tmp_path, _OPTIMIZE_YAML.format(output=out))
     with (
         patch("kube_autotuner.cli.K8sClient") as client_cls,

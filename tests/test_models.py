@@ -22,12 +22,12 @@ from kube_autotuner.models import (
     ParamSpace,
     ResumeMetadata,
     SysctlParam,
-    TrialLog,
     TrialResult,
     compute_sysctl_hash,
     is_primary,
     metrics_for_stages,
 )
+from kube_autotuner.trial_log import TrialLog
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -84,7 +84,7 @@ def test_trial_result_mean_tcp_throughput():
 
 
 def test_trial_log_round_trip(tmp_path: Path):
-    path = tmp_path / "trials.jsonl"
+    path = tmp_path / "trials"
     trial = TrialResult(
         node_pair=NodePair(source="n1", target="n2", hardware_class="1g"),
         sysctl_values={"net.core.rmem_max": 212992},
@@ -111,8 +111,12 @@ def test_trial_log_round_trip(tmp_path: Path):
 
 
 def test_trial_log_load_empty(tmp_path: Path):
-    path = tmp_path / "nonexistent.jsonl"
-    assert TrialLog.load(path) == []
+    # Non-existent directory.
+    assert TrialLog.load(tmp_path / "nonexistent") == []
+    # Existing but empty directory.
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    assert TrialLog.load(empty) == []
 
 
 def test_benchmark_config_defaults():
@@ -280,7 +284,7 @@ def test_trial_result_topology_defaults_unknown():
 
 
 def test_trial_log_round_trip_with_zones(tmp_path: Path):
-    path = tmp_path / "trials.jsonl"
+    path = tmp_path / "trials"
     trial = TrialResult(
         node_pair=NodePair(
             source="n1",
@@ -965,7 +969,7 @@ def test_trial_result_latency_results_defaults_empty() -> None:
 
 
 def test_trial_result_round_trip_preserves_latency_results(tmp_path: Path) -> None:
-    path = tmp_path / "trials.jsonl"
+    path = tmp_path / "trials"
     trial = TrialResult(
         node_pair=NodePair(source="n1", target="n2", hardware_class="10g"),
         sysctl_values={},
@@ -1013,7 +1017,7 @@ class TestResumeMetadata:
         )
 
     def test_resume_metadata_roundtrip(self, tmp_path: Path) -> None:
-        path = tmp_path / "results.jsonl"
+        path = tmp_path / "results"
         meta = self._meta()
         TrialLog.write_resume_metadata(path, meta)
         loaded = TrialLog.load_resume_metadata(path)
@@ -1025,9 +1029,9 @@ class TestResumeMetadata:
         tmp_path: Path,
     ) -> None:
         # Write a partial sidecar missing benchmark; load must raise.
-        path = tmp_path / "results.jsonl"
-        meta_path = path.parent / f"{path.name}.meta.json"
-        meta_path.write_text(
+        path = tmp_path / "results"
+        path.mkdir()
+        (path / "_meta.json").write_text(
             '{"objectives": {"pareto": [{"metric": "tcp_throughput", '
             '"direction": "maximize"}], "constraints": [], '
             '"recommendationWeights": {}}, '
@@ -1041,9 +1045,9 @@ class TestResumeMetadata:
         tmp_path: Path,
     ) -> None:
         # Write an objectives-only sidecar; load must raise.
-        path = tmp_path / "results.jsonl"
-        meta_path = path.parent / f"{path.name}.meta.json"
-        meta_path.write_text(
+        path = tmp_path / "results"
+        path.mkdir()
+        (path / "_meta.json").write_text(
             '{"pareto": [{"metric": "tcp_throughput", '
             '"direction": "maximize"}], "constraints": [], '
             '"recommendationWeights": {}}\n',
@@ -1052,10 +1056,10 @@ class TestResumeMetadata:
             TrialLog.load_resume_metadata(path)
 
     def test_missing_sidecar_returns_none(self, tmp_path: Path) -> None:
-        assert TrialLog.load_resume_metadata(tmp_path / "absent.jsonl") is None
+        assert TrialLog.load_resume_metadata(tmp_path / "absent") is None
 
     def test_resume_metadata_n_sobol_optional(self, tmp_path: Path) -> None:
-        path = tmp_path / "results.jsonl"
+        path = tmp_path / "results"
         meta = self._meta(n_sobol=None)
         TrialLog.write_resume_metadata(path, meta)
         loaded = TrialLog.load_resume_metadata(path)
@@ -1078,45 +1082,101 @@ class TestTrialLogLoadTruncatedTail:
             ],
         )
 
-    def test_malformed_trailing_line_is_dropped(
+    def test_load_truncated_final_file(
         self,
         tmp_path: Path,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        path = tmp_path / "results.jsonl"
+        path = tmp_path / "results"
         TrialLog.append(path, self._make_trial(0))
         TrialLog.append(path, self._make_trial(1))
-        with path.open("a", encoding="utf-8") as f:
-            f.write("{not valid json\n")
+        # Truncate the trailing parquet file mid-body to simulate a
+        # Ctrl-C during append.
+        files = sorted(path.glob("*.parquet"))
+        assert len(files) == 2
+        with files[-1].open("r+b") as f:
+            data = f.read()
+            f.seek(0)
+            f.truncate()
+            f.write(data[: len(data) // 2])
         caplog.set_level("WARNING")
         loaded = TrialLog.load(path)
-        assert len(loaded) == 2
-        assert any("truncated" in rec.message for rec in caplog.records)
-
-    def test_partial_trailing_line_without_newline_is_dropped(
-        self,
-        tmp_path: Path,
-        caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        path = tmp_path / "results.jsonl"
-        TrialLog.append(path, self._make_trial(0))
-        TrialLog.append(path, self._make_trial(1))
-        # Simulate a Ctrl-C mid-write: a partial JSON line without
-        # the trailing newline.
-        with path.open("a", encoding="utf-8") as f:
-            f.write('{"trial_id": "abc123", "node_pair"')
-        caplog.set_level("WARNING")
-        loaded = TrialLog.load(path)
-        assert len(loaded) == 2
+        assert len(loaded) == 1
         assert any("truncated" in rec.message for rec in caplog.records)
 
     def test_mid_file_corruption_still_raises(self, tmp_path: Path) -> None:
-        path = tmp_path / "results.jsonl"
-        with path.open("w", encoding="utf-8") as f:
-            f.write("{not valid json\n")
-            f.write(self._make_trial(0).model_dump_json() + "\n")
-        with pytest.raises((ValidationError, json.JSONDecodeError)):
+        import pyarrow as pa  # noqa: PLC0415
+
+        path = tmp_path / "results"
+        TrialLog.append(path, self._make_trial(0))
+        TrialLog.append(path, self._make_trial(1))
+        TrialLog.append(path, self._make_trial(2))
+        files = sorted(path.glob("*.parquet"))
+        assert len(files) == 3
+        # Corrupt the middle parquet — real corruption, not a
+        # truncated tail, so load must raise.
+        with files[1].open("r+b") as f:
+            data = f.read()
+            f.seek(0)
+            f.truncate()
+            f.write(data[: len(data) // 3])
+        with pytest.raises((pa.ArrowException, json.JSONDecodeError, ValidationError)):
             TrialLog.load(path)
+
+    def test_append_leaves_no_tmp(self, tmp_path: Path) -> None:
+        path = tmp_path / "results"
+        TrialLog.append(path, self._make_trial(0))
+        TrialLog.append(path, self._make_trial(1))
+        assert list(path.glob(".tmp-*.parquet")) == []
+
+    def test_load_cleans_stale_tmp(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        path = tmp_path / "results"
+        TrialLog.append(path, self._make_trial(0))
+        stale = path / ".tmp-99999999-stale.parquet"
+        stale.write_bytes(b"not a parquet")
+        loaded = TrialLog.load(path)
+        assert len(loaded) == 1
+        assert not stale.exists()
+
+    def test_append_sweeps_stale_tmp_before_seq(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        path = tmp_path / "results"
+        TrialLog.append(path, self._make_trial(0))
+        stale = path / ".tmp-00000002-stale.parquet"
+        stale.write_bytes(b"not a parquet")
+        TrialLog.append(path, self._make_trial(1))
+        assert not stale.exists()
+        files = sorted(path.glob("*.parquet"))
+        assert [f.name.split("-", 1)[0] for f in files] == [
+            "00000001",
+            "00000002",
+        ]
+
+    def test_append_o_excl_collision(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from kube_autotuner import trial_log  # noqa: PLC0415
+
+        path = tmp_path / "results"
+        path.mkdir()
+        trial = self._make_trial(1)
+
+        # Pin the scan to return seq=1 without sweeping, then pre-seed
+        # tmps at seqs 1, 2, 3 so every O_EXCL attempt collides.
+        monkeypatch.setattr(trial_log, "_sweep_and_next_sequence", lambda _path: 1)
+        for seq in (1, 2, 3):
+            tmp = path / f".tmp-{seq:08d}-{trial.trial_id}.parquet"
+            tmp.write_bytes(b"squatter")
+
+        with pytest.raises(FileExistsError):
+            TrialLog.append(path, trial)
 
 
 def test_sysctl_param_accepts_memory_cost_rule() -> None:

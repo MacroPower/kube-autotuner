@@ -48,4 +48,4 @@ patches:
       - op: add
         path: /spec/template/spec/hostNetwork
         value: true
-output: out/results.jsonl
+output: out/results

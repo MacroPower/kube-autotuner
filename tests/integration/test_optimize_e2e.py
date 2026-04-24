@@ -9,7 +9,7 @@ from typer.testing import CliRunner
 
 from kube_autotuner.cli import app
 from kube_autotuner.k8s.lease import NodeLease
-from kube_autotuner.models import TrialResult
+from kube_autotuner.trial_log import TrialLog
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -23,7 +23,7 @@ pytestmark = [
 ]
 
 
-def test_optimize_runs_trials_and_writes_jsonl(
+def test_optimize_runs_trials_and_writes_dataset(
     kubeconfig_env: str,  # noqa: ARG001 - activates KUBECONFIG env var
     k8s_client: K8sClient,
     node_names: dict[str, str],
@@ -33,7 +33,7 @@ def test_optimize_runs_trials_and_writes_jsonl(
 ) -> None:
     pytest.importorskip("ax")
 
-    output_file = tmp_path / "optimize.jsonl"
+    output_file = tmp_path / "optimize"
 
     runner = CliRunner()
     result = runner.invoke(
@@ -65,10 +65,9 @@ def test_optimize_runs_trials_and_writes_jsonl(
     assert result.exit_code == 0, f"CLI failed:\n{result.output}"
     assert "Completed 2 trials" in result.output
 
-    lines = output_file.read_text().strip().splitlines()
-    assert len(lines) == 2
-    for line in lines:
-        trial = TrialResult.model_validate_json(line)
+    trials = TrialLog.load(output_file)
+    assert len(trials) == 2
+    for trial in trials:
         assert trial.sysctl_values
         assert trial.results[0].bits_per_second > 0
 
@@ -139,7 +138,7 @@ class _BenchmarkRunCounter:
         monkeypatch.setattr(BenchmarkRunner, "run", _wrapped)
 
 
-def test_optimize_resumes_from_prior_jsonl(
+def test_optimize_resumes_from_prior_dataset(
     kubeconfig_env: str,  # noqa: ARG001 - activates KUBECONFIG env var
     node_names: dict[str, str],
     test_namespace: str,
@@ -150,7 +149,7 @@ def test_optimize_resumes_from_prior_jsonl(
     """Re-invoking optimize with the same output resumes from prior trials."""
     pytest.importorskip("ax")
 
-    output_file = tmp_path / "optimize.jsonl"
+    output_file = tmp_path / "optimize"
     counter = _BenchmarkRunCounter(monkeypatch)
 
     first = _invoke_optimize(
@@ -164,8 +163,9 @@ def test_optimize_resumes_from_prior_jsonl(
         f"first invocation should run 2 benchmarks, got {counter.calls}"
     )
 
-    first_two_lines = output_file.read_text().strip().splitlines()
-    assert len(first_two_lines) == 2
+    first_two = TrialLog.load(output_file)
+    assert len(first_two) == 2
+    first_two_ids = [t.trial_id for t in first_two]
 
     second = _invoke_optimize(
         output_file,
@@ -194,10 +194,10 @@ def test_optimize_resumes_from_prior_jsonl(
     assert "Trial 3/4" in second.output
     assert "Trial 4/4" in second.output
 
-    # Prior rows survive byte-identically; live loop only appended two.
-    all_lines = output_file.read_text().strip().splitlines()
-    assert len(all_lines) == 4
-    assert all_lines[:2] == first_two_lines
+    # Prior rows survive intact; live loop only appended two.
+    all_trials = TrialLog.load(output_file)
+    assert len(all_trials) == 4
+    assert [t.trial_id for t in all_trials[:2]] == first_two_ids
 
 
 def test_optimize_fresh_archives_prior_artefacts(
@@ -208,10 +208,10 @@ def test_optimize_fresh_archives_prior_artefacts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``--fresh`` renames the prior JSONL and sidecar aside, runs from zero."""
+    """``--fresh`` renames the prior trial dataset aside, runs from zero."""
     pytest.importorskip("ax")
 
-    output_file = tmp_path / "optimize.jsonl"
+    output_file = tmp_path / "optimize"
     counter = _BenchmarkRunCounter(monkeypatch)
 
     first = _invoke_optimize(
@@ -223,7 +223,7 @@ def test_optimize_fresh_archives_prior_artefacts(
     assert first.exit_code == 0, f"CLI failed:\n{first.output}"
     assert counter.calls == 2
 
-    # Re-invoke with --fresh. The prior JSONL + sidecar should be
+    # Re-invoke with --fresh. The prior dataset directory should be
     # archived aside and the run should start from zero.
     # ``n_sobol=1`` keeps the config valid against the
     # ``n_sobol <= n_trials`` invariant.
@@ -240,20 +240,16 @@ def test_optimize_fresh_archives_prior_artefacts(
         f"--fresh invocation should run 1 benchmark from zero, total={counter.calls}"
     )
 
-    jsonl_backups = [
-        p for p in tmp_path.glob("optimize.jsonl.*.bak") if ".meta.json" not in p.name
-    ]
-    meta_backups = list(tmp_path.glob("optimize.jsonl.meta.json.*.bak"))
-    assert len(jsonl_backups) == 1, f"expected 1 JSONL backup; got {jsonl_backups}"
-    assert len(meta_backups) == 1, f"expected 1 sidecar backup; got {meta_backups}"
+    from kube_autotuner.trial_log import TrialLog  # noqa: PLC0415
 
-    # Current JSONL has one fresh trial (not appended to the prior).
-    current_lines = output_file.read_text().strip().splitlines()
-    assert len(current_lines) == 1
+    backups = [p for p in tmp_path.glob("optimize.*.bak") if p.is_dir()]
+    assert len(backups) == 1, f"expected 1 archived dataset; got {backups}"
+    assert (backups[0] / "_meta.json").exists(), "sidecar missing from archived dataset"
 
-    # Backups preserve the prior two trials verbatim.
-    archived = jsonl_backups[0].read_text().strip().splitlines()
-    assert len(archived) == 2
+    # Current dataset has one fresh trial (not appended to the prior).
+    assert len(TrialLog.load(output_file)) == 1
+    # Backup preserves the prior two trials verbatim.
+    assert len(TrialLog.load(backups[0])) == 2
 
 
 def test_optimize_rejects_incompatible_n_sobol(
@@ -267,7 +263,7 @@ def test_optimize_rejects_incompatible_n_sobol(
     """Changing ``--n-sobol`` across sessions is a hard error without ``--fresh``."""
     pytest.importorskip("ax")
 
-    output_file = tmp_path / "optimize.jsonl"
+    output_file = tmp_path / "optimize"
     counter = _BenchmarkRunCounter(monkeypatch)
 
     first = _invoke_optimize(
@@ -306,7 +302,7 @@ def test_optimize_short_circuits_when_budget_already_met(
     """Re-invoking with ``n_trials <= prior_count`` skips the loop entirely."""
     pytest.importorskip("ax")
 
-    output_file = tmp_path / "optimize.jsonl"
+    output_file = tmp_path / "optimize"
     counter = _BenchmarkRunCounter(monkeypatch)
 
     first = _invoke_optimize(
@@ -330,4 +326,4 @@ def test_optimize_short_circuits_when_budget_already_met(
         f"short-circuit path should run no new benchmarks; total={counter.calls}"
     )
     assert "Budget already met" in second.output
-    assert len(output_file.read_text().strip().splitlines()) == 2
+    assert len(TrialLog.load(output_file)) == 2

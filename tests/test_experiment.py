@@ -162,7 +162,7 @@ def test_fixture_yaml_roundtrips():
     assert len(exp.patches) == 2
     assert exp.patches[0].target.kind == "Job"
     assert exp.patches[1].target.kind == "Deployment"
-    assert exp.output == "out/results.jsonl"
+    assert exp.output == "out/results"
 
 
 def test_multi_doc_yaml_raises(tmp_path: Path):
@@ -758,22 +758,21 @@ def test_check_nodes_exist_happy_path():
     assert client.get_node_zone.call_count == 3
 
 
-def test_output_path_creates_parent_dir(tmp_path: Path):
-    out = tmp_path / "subdir" / "results.jsonl"
+def test_output_path_creates_directory(tmp_path: Path):
+    out = tmp_path / "subdir" / "results"
     exp = ExperimentConfig.model_validate({
         "nodes": {"sources": ["a"], "target": "b"},
         "output": str(out),
     })
     result = exp._check_output_path()
     assert result.passed
-    assert out.parent.exists()
-    # Must not touch the output file itself -- avoid leaking empty files
-    # when later preflight steps fail.
-    assert not out.exists()
+    # Preflight creates the trial-log directory up-front so the first
+    # append does not have to.
+    assert out.is_dir()
 
 
-def test_output_path_parent_not_writable(tmp_path: Path, monkeypatch):
-    out = tmp_path / "results.jsonl"
+def test_output_path_not_writable(tmp_path: Path, monkeypatch):
+    out = tmp_path / "results"
     exp = ExperimentConfig.model_validate({
         "nodes": {"sources": ["a"], "target": "b"},
         "output": str(out),
@@ -782,6 +781,31 @@ def test_output_path_parent_not_writable(tmp_path: Path, monkeypatch):
     result = exp._check_output_path()
     assert not result.passed
     assert "not writable" in result.detail
+
+
+def test_output_path_rejects_existing_file(tmp_path: Path):
+    out = tmp_path / "results"
+    out.write_text("regular file")
+    exp = ExperimentConfig.model_validate({
+        "nodes": {"sources": ["a"], "target": "b"},
+        "output": str(out),
+    })
+    result = exp._check_output_path()
+    assert not result.passed
+    assert "not a directory" in result.detail
+
+
+def test_output_path_rejects_unrelated_directory(tmp_path: Path):
+    out = tmp_path / "results"
+    out.mkdir()
+    (out / "random.txt").write_text("not a trial log")
+    exp = ExperimentConfig.model_validate({
+        "nodes": {"sources": ["a"], "target": "b"},
+        "output": str(out),
+    })
+    result = exp._check_output_path()
+    assert not result.passed
+    assert "not a trial-log" in result.detail
 
 
 # --- preflight orchestration --------------------------------------------
@@ -810,7 +834,7 @@ def test_preflight_orchestration_smoke():
 
 def test_preflight_collects_multiple_failures(tmp_path: Path):
     """preflight() does not fail fast -- every failing check is returned."""
-    out = tmp_path / "results.jsonl"
+    out = tmp_path / "results"
     exp = ExperimentConfig.model_validate({
         "nodes": {"sources": ["a"], "target": "b"},
         "iperf": {"client": {"extraArgs": ["-c"]}},

@@ -79,7 +79,7 @@ def test_collect_host_state_yaml_threads_into_context(
     run_target: str,
 ) -> None:
     """``benchmark.collectHostState: true`` reaches ``RunContext``."""
-    out = tmp_path / "r.jsonl"
+    out = tmp_path / "r"
     config = tmp_path / "exp.yaml"
     if subcommand == "baseline":
         config.write_text(yaml_factory(out, collect_host_state=True))
@@ -104,7 +104,7 @@ def test_collect_host_state_yaml_threads_into_context(
 
 
 def test_baseline_collect_host_state_default_is_false(tmp_path: Path) -> None:
-    out = tmp_path / "r.jsonl"
+    out = tmp_path / "r"
     config = tmp_path / "exp.yaml"
     config.write_text(_baseline_yaml(out, collect_host_state=None))
     with (
@@ -126,7 +126,7 @@ def test_baseline_collect_host_state_default_is_false(tmp_path: Path) -> None:
 
 
 def test_baseline_explicit_false_threads_through(tmp_path: Path) -> None:
-    out = tmp_path / "r.jsonl"
+    out = tmp_path / "r"
     config = tmp_path / "exp.yaml"
     config.write_text(_baseline_yaml(out, collect_host_state=False))
     with (
@@ -149,7 +149,7 @@ def test_baseline_explicit_false_threads_through(tmp_path: Path) -> None:
 
 # --- analyze end-to-end rendering ----------------------------------------
 
-# These tests exercise the path from a JSONL log carrying
+# These tests exercise the path from a trial dataset carrying
 # ``host_state_snapshots`` through the ``analyze`` CLI to an HTML report
 # that surfaces the host-state section. They depend on the optional
 # ``analysis`` dependency group.
@@ -168,8 +168,8 @@ def _trial_with_snapshots_dict(
     only the fields the analyze pipeline reads need to be populated.
 
     Returns:
-        A dict with the ``TrialResult`` schema, suitable for writing
-        to a JSONL log and loading via ``TrialLog.load``.
+        A dict with the ``TrialResult`` schema, suitable for passing
+        to ``TrialResult.model_validate`` and then ``TrialLog.append``.
     """
     now = datetime.now(UTC).isoformat()
     snapshots: list[dict] = []
@@ -233,12 +233,12 @@ def _trial_with_snapshots_dict(
     }
 
 
-def _write_jsonl(path: Path, trials: list[dict]) -> None:
-    import json  # noqa: PLC0415
+def _write_dataset(path: Path, trials: list[dict]) -> None:
+    from kube_autotuner.models import TrialResult  # noqa: PLC0415
+    from kube_autotuner.trial_log import TrialLog  # noqa: PLC0415
 
-    with path.open("w", encoding="utf-8") as f:
-        for trial in trials:
-            f.write(json.dumps(trial) + "\n")
+    for trial in trials:
+        TrialLog.append(path, TrialResult.model_validate(trial))
 
 
 def _analysis_available() -> bool:
@@ -252,9 +252,9 @@ def _analysis_available() -> bool:
 def test_analyze_renders_host_state_section_when_snapshots_present(
     tmp_path: Path,
 ) -> None:
-    jsonl = tmp_path / "trials.jsonl"
-    _write_jsonl(
-        jsonl,
+    dataset = tmp_path / "trials"
+    _write_dataset(
+        dataset,
         [
             _trial_with_snapshots_dict(
                 trial_id=f"t{i}",
@@ -270,7 +270,7 @@ def test_analyze_renders_host_state_section_when_snapshots_present(
         app,
         [
             "analyze",
-            str(jsonl),
+            str(dataset),
             "--output-dir",
             str(output_dir),
             "--hardware-class",
@@ -295,9 +295,9 @@ def test_analyze_renders_host_state_section_when_snapshots_present(
 def test_analyze_omits_host_state_section_without_snapshots(
     tmp_path: Path,
 ) -> None:
-    jsonl = tmp_path / "trials.jsonl"
-    _write_jsonl(
-        jsonl,
+    dataset = tmp_path / "trials"
+    _write_dataset(
+        dataset,
         [
             _trial_with_snapshots_dict(
                 trial_id=f"t{i}",
@@ -313,7 +313,7 @@ def test_analyze_omits_host_state_section_without_snapshots(
         app,
         [
             "analyze",
-            str(jsonl),
+            str(dataset),
             "--output-dir",
             str(output_dir),
             "--hardware-class",

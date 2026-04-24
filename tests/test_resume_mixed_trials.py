@@ -1,4 +1,4 @@
-"""Tests for resume behaviour across mixed primary + verification JSONL."""
+"""Tests for resume behaviour across mixed primary + verification trials."""
 
 from __future__ import annotations
 
@@ -16,9 +16,9 @@ from kube_autotuner.models import (
     BenchmarkResult,
     NodePair,
     ResumeMetadata,
-    TrialLog,
     TrialResult,
 )
+from kube_autotuner.trial_log import TrialLog
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -101,7 +101,7 @@ def test_resume_partial_verification_runs_remaining(
     tmp_path: Path,
 ) -> None:
     """Primary budget met; one verification done, remainder queued."""
-    out = tmp_path / "mixed.jsonl"
+    out = tmp_path / "mixed"
     exp = _optimize_exp(
         out,
         n_trials=2,
@@ -148,7 +148,7 @@ def test_resume_partial_verification_runs_remaining(
 
 
 def test_resume_verification_trials_drift_rejects(tmp_path: Path) -> None:
-    out = tmp_path / "drift.jsonl"
+    out = tmp_path / "drift"
     exp_prior = _optimize_exp(
         out,
         n_trials=2,
@@ -181,7 +181,7 @@ def test_resume_verification_trials_drift_rejects(tmp_path: Path) -> None:
 
 
 def test_resume_verification_top_k_drift_rejects(tmp_path: Path) -> None:
-    out = tmp_path / "drift.jsonl"
+    out = tmp_path / "drift"
     exp_prior = _optimize_exp(
         out,
         n_trials=2,

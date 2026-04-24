@@ -112,7 +112,7 @@ class ProgressObserver(Protocol):
         """Pre-populate the observer with prior trial results.
 
         Called once before the optimize loop begins when resuming from
-        a previous session's JSONL. The default implementation is a
+        a previous session's trial dataset. The default implementation is a
         no-op; :class:`RichProgressObserver` overrides it to rebuild
         the "best so far" table so the live display does not start
         blank after a resume.
@@ -992,7 +992,7 @@ class RichProgressObserver:
         ``"bayesian"``); verification rows carry ``phase="verification"``
         and do not shift the Sobol/Bayesian index over primary rows. The
         two ranges are interleaved in the observer's ``_all_rows`` so
-        JSONL file order is preserved, and :meth:`_rerank` routes
+        dataset file order is preserved, and :meth:`_rerank` routes
         through the aggregation path when any verification row is
         present.
 

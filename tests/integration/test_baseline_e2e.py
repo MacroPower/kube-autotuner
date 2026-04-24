@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from typing import TYPE_CHECKING
 
 import pytest
@@ -26,7 +25,7 @@ def test_baseline_produces_results(
     fake_sysctl_env: Path,  # noqa: ARG001 - activates fake backend env vars
     tmp_path: Path,
 ) -> None:
-    output_file = tmp_path / "results.jsonl"
+    output_file = tmp_path / "results"
 
     runner = CliRunner()
     result = runner.invoke(
@@ -53,15 +52,16 @@ def test_baseline_produces_results(
     )
     assert result.exit_code == 0, f"CLI failed:\n{result.output}"
 
-    lines = output_file.read_text().strip().splitlines()
-    assert len(lines) == 1
+    from kube_autotuner.trial_log import TrialLog  # noqa: PLC0415
 
-    trial = json.loads(lines[0])
+    trials = TrialLog.load(output_file)
+    assert len(trials) == 1
+    trial = trials[0]
     # Each iteration runs both bw-tcp and bw-udp (no `modes:` dimension).
-    assert len(trial["results"]) == 2
-    assert {r["mode"] for r in trial["results"]} == {"tcp", "udp"}
-    assert trial["results"][0]["mode"] == "tcp"  # bw-tcp runs first
-    assert trial["results"][0]["bits_per_second"] > 0
-    udp = next(r for r in trial["results"] if r["mode"] == "udp")
-    assert udp["jitter"] is not None
-    assert trial["sysctl_values"]
+    assert len(trial.results) == 2
+    assert {r.mode for r in trial.results} == {"tcp", "udp"}
+    assert trial.results[0].mode == "tcp"  # bw-tcp runs first
+    assert trial.results[0].bits_per_second > 0
+    udp = next(r for r in trial.results if r.mode == "udp")
+    assert udp.jitter is not None
+    assert trial.sysctl_values

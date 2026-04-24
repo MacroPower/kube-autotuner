@@ -30,13 +30,14 @@ import typer
 from kube_autotuner import __version__, runs
 from kube_autotuner.experiment import ExperimentConfig, ExperimentConfigError
 from kube_autotuner.k8s.client import K8sClient
-from kube_autotuner.models import ALL_STAGES, TrialLog, metrics_for_stages
+from kube_autotuner.models import ALL_STAGES, metrics_for_stages
 from kube_autotuner.progress import make_observer
 from kube_autotuner.report import format_retransmit_rate
 from kube_autotuner.sysctl.setter import (
     make_sysctl_setter,
     make_sysctl_setter_from_env,
 )
+from kube_autotuner.trial_log import TrialLog
 from kube_autotuner.units import format_duration
 
 if TYPE_CHECKING:
@@ -589,8 +590,9 @@ def analyze(
         typer.Argument(
             ...,
             exists=True,
-            dir_okay=False,
-            help="Path to the JSONL trial data file.",
+            file_okay=False,
+            dir_okay=True,
+            help="Path to the trial dataset directory.",
         ),
     ],
     output_dir: Annotated[
@@ -623,8 +625,8 @@ def analyze(
     """Analyze trial data: Pareto frontier, parameter importance, recommendations.
 
     Raises:
-        typer.Exit: Input JSONL is empty or the requested hardware
-            class has no trials.
+        typer.Exit: The input trial dataset is empty or the requested
+            hardware class has no trials.
     """
     from kube_autotuner import analysis, report  # noqa: PLC0415
     from kube_autotuner.experiment import ObjectivesSection  # noqa: PLC0415

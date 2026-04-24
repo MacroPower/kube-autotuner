@@ -12,7 +12,6 @@ without the ``optimize`` dependency group.
 from __future__ import annotations
 
 from datetime import UTC, datetime
-import json
 from typing import TYPE_CHECKING
 from unittest.mock import MagicMock, patch
 
@@ -30,10 +29,10 @@ from kube_autotuner.models import (
     ParamSpace,
     ResumeMetadata,
     SysctlParam,
-    TrialLog,
     TrialResult,
 )
 from kube_autotuner.sysctl.params import PARAM_SPACE
+from kube_autotuner.trial_log import TrialLog
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -78,7 +77,7 @@ def test_run_baseline_threads_iperf_args_and_patches(
     backend.snapshot.side_effect = _snapshot
     mock_runner_cls.return_value.run.return_value = _results()
 
-    out = tmp_path / "r.jsonl"
+    out = tmp_path / "r"
     exp = ExperimentConfig.model_validate({
         "nodes": {"sources": ["a"], "target": "b"},
         "benchmark": {"duration": 1, "iterations": 1},
@@ -102,8 +101,9 @@ def test_run_baseline_threads_iperf_args_and_patches(
     assert kwargs["patches"][0].target.kind == "Job"
     assert mock_lease_cls.call_count == 2
 
-    trial = json.loads(out.read_text().strip())
-    assert trial["kernel_version"] == "6.1.0-talos"
+    loaded = TrialLog.load(out)
+    assert len(loaded) == 1
+    assert loaded[0].kernel_version == "6.1.0-talos"
 
 
 @patch("kube_autotuner.runs.NodeLease")
@@ -120,7 +120,7 @@ def test_run_trial_snapshots_only_applied_keys(
     }
     mock_runner_cls.return_value.run.return_value = _results()
 
-    out = tmp_path / "r.jsonl"
+    out = tmp_path / "r"
     exp = ExperimentConfig.model_validate({
         "nodes": {"sources": ["a"], "target": "b"},
         "benchmark": {"duration": 1, "iterations": 1},
@@ -168,7 +168,7 @@ def test_run_baseline_threads_collect_host_state_and_snapshots(
     backend.snapshot.side_effect = _snapshot
     mock_runner_cls.return_value.run.return_value = _results_with_snapshot()
 
-    out = tmp_path / "r.jsonl"
+    out = tmp_path / "r"
     exp = ExperimentConfig.model_validate({
         "nodes": {"sources": ["a"], "target": "b"},
         "benchmark": {"duration": 1, "iterations": 1},
@@ -187,9 +187,10 @@ def test_run_baseline_threads_collect_host_state_and_snapshots(
     assert kwargs["collect_host_state"] is True
     assert kwargs["snapshot_backends"] == [backend]
 
-    trial = json.loads(out.read_text().strip())
-    assert len(trial["host_state_snapshots"]) == 1
-    assert trial["host_state_snapshots"][0]["phase"] == "baseline"
+    loaded = TrialLog.load(out)
+    assert len(loaded) == 1
+    assert len(loaded[0].host_state_snapshots) == 1
+    assert loaded[0].host_state_snapshots[0].phase == "baseline"
 
 
 @patch("kube_autotuner.runs.NodeLease")
@@ -207,7 +208,7 @@ def test_run_trial_threads_collect_host_state_and_snapshots(
     }
     mock_runner_cls.return_value.run.return_value = _results_with_snapshot()
 
-    out = tmp_path / "r.jsonl"
+    out = tmp_path / "r"
     exp = ExperimentConfig.model_validate({
         "nodes": {"sources": ["a"], "target": "b"},
         "benchmark": {"duration": 1, "iterations": 1},
@@ -227,8 +228,9 @@ def test_run_trial_threads_collect_host_state_and_snapshots(
     assert kwargs["collect_host_state"] is True
     assert kwargs["snapshot_backends"] == [backend]
 
-    trial = json.loads(out.read_text().strip())
-    assert len(trial["host_state_snapshots"]) == 1
+    loaded = TrialLog.load(out)
+    assert len(loaded) == 1
+    assert len(loaded[0].host_state_snapshots) == 1
 
 
 @patch("kube_autotuner.runs.NodeLease")
@@ -243,7 +245,7 @@ def test_run_baseline_default_collect_host_state_is_false(
     backend.snapshot.side_effect = _snapshot
     mock_runner_cls.return_value.run.return_value = _results()
 
-    out = tmp_path / "r.jsonl"
+    out = tmp_path / "r"
     exp = ExperimentConfig.model_validate({
         "nodes": {"sources": ["a"], "target": "b"},
         "benchmark": {"duration": 1, "iterations": 1},
@@ -272,7 +274,7 @@ def test_run_baseline_snapshots_full_param_space(
     backend.snapshot.side_effect = _snapshot
     mock_runner_cls.return_value.run.return_value = _results()
 
-    out = tmp_path / "r.jsonl"
+    out = tmp_path / "r"
     exp = ExperimentConfig.model_validate({
         "nodes": {"sources": ["a"], "target": "b"},
         "benchmark": {"duration": 1, "iterations": 1},
@@ -346,11 +348,11 @@ def _seed_prior_results(
 
 
 @patch("kube_autotuner.optimizer.OptimizationLoop")
-def test_run_optimize_loads_prior_trials_when_jsonl_present(
+def test_run_optimize_loads_prior_trials_when_dataset_present(
     mock_loop_cls,
     tmp_path: Path,
 ):
-    out = tmp_path / "opt.jsonl"
+    out = tmp_path / "opt"
     exp = _optimize_exp(out, n_trials=5)
     priors = [_prior_trial(), _prior_trial(2097152)]
     _seed_prior_results(out, exp, priors)
@@ -375,11 +377,11 @@ def test_run_optimize_loads_prior_trials_when_jsonl_present(
 
 
 @patch("kube_autotuner.optimizer.OptimizationLoop")
-def test_run_optimize_fresh_moves_prior_files(
+def test_run_optimize_fresh_moves_prior(
     mock_loop_cls,
     tmp_path: Path,
 ):
-    out = tmp_path / "opt.jsonl"
+    out = tmp_path / "opt"
     exp = _optimize_exp(out, n_trials=5)
     priors = [_prior_trial()]
     _seed_prior_results(out, exp, priors)
@@ -401,19 +403,54 @@ def test_run_optimize_fresh_moves_prior_files(
     kwargs = mock_loop_cls.call_args.kwargs
     assert kwargs["prior_trials"] == []
 
-    # Archived files present with the exact naming scheme.
-    jsonl_backups = [
-        p for p in tmp_path.glob("opt.jsonl.*.bak") if ".meta.json" not in p.name
-    ]
-    assert len(jsonl_backups) == 1
-    meta_backups = list(tmp_path.glob("opt.jsonl.meta.json.*.bak"))
-    assert len(meta_backups) == 1
-    # Current output does not carry any prior trials.
-    assert not out.exists() or out.stat().st_size == 0
+    # Whole directory archived with `.<stamp>.bak` suffix.
+    backups = [p for p in tmp_path.glob("opt.*.bak") if p.is_dir()]
+    assert len(backups) == 1
+    assert (backups[0] / "_meta.json").exists()
+    assert list(backups[0].glob("*.parquet"))
+    # Current output is either missing or freshly created and empty.
+    assert not out.exists() or not list(out.glob("*.parquet"))
+
+
+def test_run_optimize_guards_non_trial_directory(tmp_path: Path) -> None:
+    """An existing directory with unrelated contents fails fast."""
+    out = tmp_path / "opt"
+    out.mkdir()
+    (out / "random.txt").write_text("not a trial log")
+    exp = _optimize_exp(out, n_trials=5)
+
+    ctx = runs.RunContext(
+        exp=exp,
+        client=_client_stub(),
+        backend=MagicMock(),
+        output=out,
+    )
+    with pytest.raises(typer.BadParameter, match="not a trial-log"):
+        runs.run_optimize(ctx)
+    # The directory is untouched.
+    assert (out / "random.txt").exists()
+    assert not list(tmp_path.glob("opt.*.bak"))
+
+
+def test_run_optimize_guards_existing_file(tmp_path: Path) -> None:
+    """An existing regular file at the output path fails fast."""
+    out = tmp_path / "opt"
+    out.write_text("regular file")
+    exp = _optimize_exp(out, n_trials=5)
+
+    ctx = runs.RunContext(
+        exp=exp,
+        client=_client_stub(),
+        backend=MagicMock(),
+        output=out,
+    )
+    with pytest.raises(typer.BadParameter, match="not a directory"):
+        runs.run_optimize(ctx)
+    assert out.is_file()
 
 
 def test_run_optimize_incompatible_param_space_raises(tmp_path: Path):
-    out = tmp_path / "opt.jsonl"
+    out = tmp_path / "opt"
     exp = _optimize_exp(out, n_trials=5)
     assert exp.optimize is not None
     priors = [_prior_trial()]
@@ -449,7 +486,7 @@ def test_run_optimize_incompatible_param_space_raises(tmp_path: Path):
 
 
 def test_run_optimize_incompatible_n_sobol_raises(tmp_path: Path):
-    out = tmp_path / "opt.jsonl"
+    out = tmp_path / "opt"
     exp = _optimize_exp(out, n_trials=5)
     assert exp.optimize is not None
     priors = [_prior_trial()]
@@ -471,7 +508,7 @@ def test_run_optimize_short_circuits_when_budget_met(
     tmp_path: Path,
     caplog,
 ):
-    out = tmp_path / "opt.jsonl"
+    out = tmp_path / "opt"
     exp = _optimize_exp(out, n_trials=2)
     priors = [_prior_trial(), _prior_trial(2097152)]
     _seed_prior_results(out, exp, priors)
@@ -495,9 +532,9 @@ def test_run_optimize_short_circuits_when_budget_met(
 
 
 def test_run_optimize_missing_sidecar_raises(tmp_path: Path):
-    out = tmp_path / "opt.jsonl"
+    out = tmp_path / "opt"
     exp = _optimize_exp(out, n_trials=5)
-    # Write JSONL but not sidecar.
+    # Append trials but not a sidecar.
     for t in [_prior_trial()]:
         TrialLog.append(out, t)
     ctx = runs.RunContext(
@@ -511,7 +548,7 @@ def test_run_optimize_missing_sidecar_raises(tmp_path: Path):
 
 
 def test_run_baseline_writes_resume_meta_without_n_sobol(tmp_path: Path):
-    out = tmp_path / "r.jsonl"
+    out = tmp_path / "r"
     exp = ExperimentConfig.model_validate({
         "nodes": {"sources": ["a"], "target": "b"},
         "benchmark": {"duration": 1, "iterations": 1},
@@ -540,7 +577,7 @@ def test_run_baseline_writes_resume_meta_without_n_sobol(tmp_path: Path):
 
 
 def test_run_trial_writes_resume_meta_without_n_sobol(tmp_path: Path):
-    out = tmp_path / "r.jsonl"
+    out = tmp_path / "r"
     exp = ExperimentConfig.model_validate({
         "nodes": {"sources": ["a"], "target": "b"},
         "benchmark": {"duration": 1, "iterations": 1},
@@ -687,7 +724,7 @@ class TestBenchmarkDriftExcludesSyncWindow:
 
     The barrier sleep happens before iperf3's ``-O <omit>`` warmup and
     does not influence any measurement, so tuning the window on resume
-    should not force ``--fresh`` on otherwise-compatible JSONLs.
+    should not force ``--fresh`` on otherwise-compatible datasets.
     """
 
     @staticmethod

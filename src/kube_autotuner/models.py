@@ -1,9 +1,12 @@
 """Pydantic data models for trial, benchmark, and node-pair records.
 
-JSONL field names produced by :class:`TrialLog` are kept stable on a
-best-effort basis -- they are not a frozen public contract. Downstream
-consumers that parse trial JSONL should be prepared to re-analyse when
-field names or structure evolve.
+Trial records persist through
+:class:`kube_autotuner.trial_log.TrialLog`, which serialises each
+:class:`TrialResult` as a one-row Parquet file under a shared
+directory plus a ``_meta.json`` :class:`ResumeMetadata` sidecar. The
+Pydantic schema is kept stable on a best-effort basis — it is not a
+frozen public contract. Downstream consumers should revalidate
+against the current models when field names or structure evolve.
 """
 
 from __future__ import annotations
@@ -12,16 +15,14 @@ from collections import defaultdict
 from datetime import UTC, datetime
 import hashlib
 import json
-import logging
 from typing import TYPE_CHECKING, Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
-    from pathlib import Path
 
     # Imported for the :class:`ResumeMetadata` forward reference only.
     # The actual import cannot live at module level because
@@ -29,8 +30,6 @@ if TYPE_CHECKING:
     # :func:`_ensure_resume_metadata_built` resolves the forward ref
     # lazily and is triggered from ``experiment``'s module initialiser.
     from kube_autotuner.experiment import ObjectivesSection  # noqa: TC004
-
-logger = logging.getLogger(__name__)
 
 
 class MemoryCost(BaseModel):
@@ -220,7 +219,7 @@ class BenchmarkConfig(BaseModel):
         description=(
             "Record per-iteration host-state snapshots (conntrack, sockets, "
             "slab, etc.) on each TrialResult. Diagnostic overlay; costs a "
-            "kubectl round-trip per iteration and enlarges the JSONL."
+            "kubectl round-trip per iteration and enlarges the dataset."
         ),
     )
 
@@ -693,12 +692,13 @@ class TrialResult(BaseModel):
 
 
 class ResumeMetadata(BaseModel):
-    """Sidecar describing the experiment that produced a JSONL log.
+    """Sidecar describing the experiment that produced a trial dataset.
 
-    Written next to the JSONL file at ``<path>.meta.json`` on every run
-    and consulted by :func:`kube_autotuner.runs.run_optimize` to decide
-    whether the prior trials are compatible with the incoming
-    experiment. ``objectives``, ``param_space``, ``benchmark`` are the
+    Written inside the trial-log directory at ``<dir>/_meta.json`` on
+    every run and consulted by
+    :func:`kube_autotuner.runs.run_optimize` to decide whether the
+    prior trials are compatible with the incoming experiment.
+    ``objectives``, ``param_space``, ``benchmark`` are the
     compatibility keys; ``n_sobol``, ``verification_trials``, and
     ``verification_top_k`` are only populated by ``optimize`` mode
     (baseline / trial leave them ``None``).
@@ -732,109 +732,3 @@ def _ensure_resume_metadata_built() -> None:
         _types_namespace={"ObjectivesSection": ObjectivesSection},
     )
     _resume_metadata_built = True
-
-
-class TrialLog:
-    """Append-only JSON-lines persistence for :class:`TrialResult` records."""
-
-    @staticmethod
-    def append(path: Path, trial: TrialResult) -> None:
-        """Append ``trial`` as a single JSON line to ``path``.
-
-        Args:
-            path: Target JSONL file. Created if it does not exist.
-            trial: The trial record to persist.
-        """
-        with path.open("a", encoding="utf-8") as f:
-            f.write(trial.model_dump_json() + "\n")
-
-    @staticmethod
-    def load(path: Path) -> list[TrialResult]:
-        """Load every trial record from the JSONL file at ``path``.
-
-        A single partially-written trailing line (from a Ctrl-C during
-        ``append``) is tolerated: the last line is parsed leniently and
-        a warning is logged if it fails. Any mid-file failure still
-        raises, because that signals real corruption rather than an
-        interrupted write.
-
-        Args:
-            path: Source JSONL file. If it does not exist, an empty list is
-                returned.
-
-        Returns:
-            The decoded trials, in file order.
-
-        Raises:
-            json.JSONDecodeError: Mid-file JSON decoding failure
-                (real corruption, not an interrupted write).
-            pydantic.ValidationError: Mid-file record fails schema
-                validation.
-        """
-        if not path.exists():
-            return []
-        with path.open(encoding="utf-8") as f:
-            raw_lines = f.readlines()
-        lines = [line for line in raw_lines if line.strip()]
-        if not lines:
-            return []
-        trials: list[TrialResult] = []
-        last_idx = len(lines) - 1
-        for idx, raw in enumerate(lines):
-            stripped = raw.strip()
-            try:
-                trials.append(TrialResult.model_validate_json(stripped))
-            except ValidationError, json.JSONDecodeError:
-                if idx == last_idx:
-                    logger.warning(
-                        "dropping truncated final line in %s (likely from "
-                        "an interrupted write)",
-                        path,
-                    )
-                    break
-                raise
-        return trials
-
-    @staticmethod
-    def _metadata_path(path: Path) -> Path:
-        """Return the sibling metadata path for a JSONL log at ``path``."""
-        return path.parent / f"{path.name}.meta.json"
-
-    @staticmethod
-    def write_resume_metadata(path: Path, meta: ResumeMetadata) -> None:
-        """Persist ``meta`` as a sidecar next to the JSONL log.
-
-        The sidecar lives at ``<path>.meta.json``. Writes are
-        idempotent for identical content; drift detection now happens
-        at resume time in
-        :func:`kube_autotuner.runs._check_compatibility`, not here.
-
-        Args:
-            path: JSONL log path; the sidecar is written beside it.
-            meta: :class:`ResumeMetadata` describing the run that is
-                about to write ``path``.
-        """
-        _ensure_resume_metadata_built()
-        meta_path = TrialLog._metadata_path(path)
-        meta_path.write_text(meta.model_dump_json() + "\n", encoding="utf-8")
-
-    @staticmethod
-    def load_resume_metadata(path: Path) -> ResumeMetadata | None:
-        """Return the sidecar :class:`ResumeMetadata` for ``path``.
-
-        Args:
-            path: JSONL log path whose sibling ``<path>.meta.json`` is
-                consulted.
-
-        Returns:
-            The parsed :class:`ResumeMetadata`, or ``None`` when no
-            sidecar exists. A malformed sidecar raises
-            :class:`pydantic.ValidationError`.
-        """
-        _ensure_resume_metadata_built()
-        meta_path = TrialLog._metadata_path(path)
-        if not meta_path.exists():
-            return None
-        return ResumeMetadata.model_validate_json(
-            meta_path.read_text(encoding="utf-8"),
-        )

@@ -9,7 +9,8 @@ from kubernetes.client.exceptions import ApiException
 import pytest
 
 from kube_autotuner.benchmark.runner import BenchmarkRunner
-from kube_autotuner.models import BenchmarkConfig, NodePair, TrialLog, TrialResult
+from kube_autotuner.models import BenchmarkConfig, NodePair, TrialResult
+from kube_autotuner.trial_log import TrialLog
 
 if TYPE_CHECKING:
     from kube_autotuner.k8s.client import K8sClient
@@ -80,7 +81,7 @@ def test_cleanup_removes_resources(
 def test_full_run_records_results(
     k8s_client: K8sClient, node_names: dict[str, str], test_namespace: str
 ) -> None:
-    """Run benchmark end-to-end and record results to JSONL, mirroring real usage."""
+    """Run benchmark end-to-end and record results, mirroring real usage."""
     runner = _make_runner(k8s_client, node_names, test_namespace)
     try:
         runner.setup_server()
@@ -88,8 +89,8 @@ def test_full_run_records_results(
     finally:
         runner.cleanup()
 
-    # Record to JSONL exactly as the CLI does.
-    output = Path(__file__).resolve().parent.parent.parent / "integration-results.jsonl"
+    # Record to the trial dataset exactly as the CLI does.
+    output = Path(__file__).resolve().parent.parent.parent / "integration-results"
     trial = TrialResult(
         node_pair=runner.node_pair,
         sysctl_values={},

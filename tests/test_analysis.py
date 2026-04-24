@@ -42,9 +42,9 @@ from kube_autotuner.models import (  # noqa: E402
     NodePair,
     ParamSpace,
     ResumeMetadata,
-    TrialLog,
     TrialResult,
 )
+from kube_autotuner.trial_log import TrialLog  # noqa: E402
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -778,9 +778,9 @@ class TestCLIAnalyze:
         mixed_trials: list[TrialResult],
         tmp_path: Path,
     ) -> None:
-        jsonl = tmp_path / "trials.jsonl"
+        dataset = tmp_path / "trials"
         for t in mixed_trials:
-            TrialLog.append(jsonl, t)
+            TrialLog.append(dataset, t)
 
         out_dir = tmp_path / "out"
         runner = CliRunner()
@@ -788,7 +788,7 @@ class TestCLIAnalyze:
             app,
             [
                 "analyze",
-                str(jsonl),
+                str(dataset),
                 "-o",
                 str(out_dir),
                 "--hardware-class",
@@ -809,15 +809,15 @@ class TestCLIAnalyze:
         mixed_trials: list[TrialResult],
         tmp_path: Path,
     ) -> None:
-        jsonl = tmp_path / "trials.jsonl"
+        dataset = tmp_path / "trials"
         for t in mixed_trials:
-            TrialLog.append(jsonl, t)
+            TrialLog.append(dataset, t)
 
         out_dir = tmp_path / "out"
         runner = CliRunner()
         result = runner.invoke(
             app,
-            ["analyze", str(jsonl), "-o", str(out_dir)],
+            ["analyze", str(dataset), "-o", str(out_dir)],
         )
         assert result.exit_code == 0, result.output
 
@@ -845,9 +845,9 @@ class TestCLIAnalyze:
                 rmem_max=16777216,
             ),
         ]
-        jsonl = tmp_path / "trials.jsonl"
+        dataset = tmp_path / "trials"
         for t in trials:
-            TrialLog.append(jsonl, t)
+            TrialLog.append(dataset, t)
 
         out_dir = tmp_path / "out"
         runner = CliRunner()
@@ -855,7 +855,7 @@ class TestCLIAnalyze:
             app,
             [
                 "analyze",
-                str(jsonl),
+                str(dataset),
                 "-o",
                 str(out_dir),
                 "--hardware-class",
@@ -874,7 +874,7 @@ class TestCLIAnalyze:
         self,
         tmp_path: Path,
     ) -> None:
-        """End-to-end: JSONL + sidecar → analyze → custom weights applied.
+        """End-to-end: dataset + sidecar → analyze → custom weights applied.
 
         Two non-dominated trials differ in throughput and retransmit
         rate. With a heavy retransmit_rate weight the lower-retx trial
@@ -899,9 +899,9 @@ class TestCLIAnalyze:
             )
 
         trials = [_mk(10.0, 500, "hi-tp"), _mk(5.0, 0, "lo-retx")]
-        jsonl = tmp_path / "trials.jsonl"
+        dataset = tmp_path / "trials"
         for t in trials:
-            TrialLog.append(jsonl, t)
+            TrialLog.append(dataset, t)
 
         section = ObjectivesSection(
             pareto=[
@@ -912,7 +912,7 @@ class TestCLIAnalyze:
             recommendation_weights={"tcp_retransmit_rate": 5.0},
         )
         TrialLog.write_resume_metadata(
-            jsonl,
+            dataset,
             ResumeMetadata(
                 objectives=section,
                 param_space=ParamSpace(params=[]),
@@ -926,7 +926,7 @@ class TestCLIAnalyze:
             app,
             [
                 "analyze",
-                str(jsonl),
+                str(dataset),
                 "-o",
                 str(out_dir),
                 "--hardware-class",
@@ -938,9 +938,9 @@ class TestCLIAnalyze:
         recs = json.loads((out_dir / "10g" / "recommendations.json").read_text())
         assert recs[0]["trial_id"] == "lo-retx"
 
-    def test_analyze_empty_file(self, tmp_path: Path) -> None:
-        empty = tmp_path / "empty.jsonl"
-        empty.write_text("")
+    def test_analyze_empty_dataset(self, tmp_path: Path) -> None:
+        empty = tmp_path / "empty"
+        empty.mkdir()
 
         runner = CliRunner()
         result = runner.invoke(

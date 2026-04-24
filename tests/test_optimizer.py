@@ -165,7 +165,7 @@ class TestOptimizationLoop:
         config,
         tmp_path,
     ):
-        output = tmp_path / "results.jsonl"
+        output = tmp_path / "results"
 
         mock_setter = MagicMock()
         mock_setter.snapshot.side_effect = _mock_snapshot
@@ -206,8 +206,10 @@ class TestOptimizationLoop:
 
         assert mock_lease_cls.call_count == 6
 
-        lines = output.read_text().strip().splitlines()
-        assert len(lines) == 3
+        from kube_autotuner.trial_log import TrialLog  # noqa: PLC0415
+
+        loaded = TrialLog.load(output)
+        assert len(loaded) == 3
 
     @patch("kube_autotuner.optimizer.NodeLease")
     @patch("kube_autotuner.optimizer.BenchmarkRunner")
@@ -222,7 +224,7 @@ class TestOptimizationLoop:
         tmp_path,
     ):
         """``_evaluate`` must thread ``host_state_snapshots`` onto the TrialResult."""
-        output = tmp_path / "results.jsonl"
+        output = tmp_path / "results"
         mock_setter = MagicMock()
         mock_setter.snapshot.side_effect = _mock_snapshot
         mock_setter_cls.return_value = mock_setter
@@ -267,13 +269,15 @@ class TestOptimizationLoop:
         assert kwargs["collect_host_state"] is True
         assert kwargs["snapshot_backends"] == [mock_setter]
 
-        # Snapshots landed on the TrialResult and round-tripped through JSONL.
+        # Snapshots landed on the TrialResult and round-tripped through
+        # the persisted parquet dataset.
         assert trials[0].host_state_snapshots == sample_snapshots
-        import json  # noqa: PLC0415
+        from kube_autotuner.trial_log import TrialLog  # noqa: PLC0415
 
-        row = json.loads(output.read_text().strip())
-        assert len(row["host_state_snapshots"]) == 2
-        assert row["host_state_snapshots"][0]["phase"] == "baseline"
+        loaded = TrialLog.load(output)
+        assert len(loaded) == 1
+        assert len(loaded[0].host_state_snapshots) == 2
+        assert loaded[0].host_state_snapshots[0].phase == "baseline"
 
     @patch("kube_autotuner.optimizer.NodeLease")
     @patch("kube_autotuner.optimizer.BenchmarkRunner")
@@ -287,7 +291,7 @@ class TestOptimizationLoop:
         config,
         tmp_path,
     ):
-        output = tmp_path / "results.jsonl"
+        output = tmp_path / "results"
 
         mock_setter = MagicMock()
         mock_setter.snapshot.side_effect = _mock_snapshot
@@ -348,7 +352,7 @@ class TestOptimizationLoop:
             node_pair=node_pair,
             config=config,
             param_space=PARAM_SPACE,
-            output=tmp_path / "results.jsonl",
+            output=tmp_path / "results",
             n_trials=1,
             n_sobol=1,
             objectives=ObjectivesSection(),
@@ -393,7 +397,7 @@ class TestOptimizationLoop:
             node_pair=node_pair,
             config=config,
             param_space=PARAM_SPACE,
-            output=tmp_path / "results.jsonl",
+            output=tmp_path / "results",
             n_trials=1,
             n_sobol=1,
             apply_source=True,
@@ -447,7 +451,7 @@ class TestOptimizationLoop:
             node_pair=node_pair,
             config=config,
             param_space=PARAM_SPACE,
-            output=tmp_path / "results.jsonl",
+            output=tmp_path / "results",
             n_trials=1,
             n_sobol=1,
             apply_source=True,
@@ -849,7 +853,7 @@ class TestSeedPriorTrials:
             node_pair=node_pair,
             config=config,
             param_space=PARAM_SPACE,
-            output=tmp_path / "r.jsonl",
+            output=tmp_path / "r",
             n_trials=5,
             n_sobol=5,
             objectives=ObjectivesSection(),
@@ -896,7 +900,7 @@ class TestSeedPriorTrials:
             node_pair=node_pair,
             config=config,
             param_space=PARAM_SPACE,
-            output=tmp_path / "r.jsonl",
+            output=tmp_path / "r",
             n_trials=5,
             n_sobol=5,
             objectives=ObjectivesSection(),
@@ -930,7 +934,7 @@ class TestSeedPriorTrials:
             node_pair=node_pair,
             config=config,
             param_space=PARAM_SPACE,
-            output=tmp_path / "r.jsonl",
+            output=tmp_path / "r",
             n_trials=5,
             n_sobol=5,
             objectives=ObjectivesSection(),
@@ -989,7 +993,7 @@ class TestSeedPriorTrials:
             node_pair=node_pair,
             config=config,
             param_space=PARAM_SPACE,
-            output=tmp_path / "r.jsonl",
+            output=tmp_path / "r",
             n_trials=10,
             n_sobol=5,
             objectives=ObjectivesSection(),
@@ -1042,7 +1046,7 @@ class TestSeedPriorTrials:
             node_pair=node_pair,
             config=config,
             param_space=PARAM_SPACE,
-            output=tmp_path / "r.jsonl",
+            output=tmp_path / "r",
             n_trials=3,
             n_sobol=3,
             objectives=ObjectivesSection(),
@@ -1247,7 +1251,7 @@ class TestWarnOnCollapsedObjectives:
             node_pair=node_pair,
             config=config,
             param_space=PARAM_SPACE,
-            output=tmp_path / "r.jsonl",
+            output=tmp_path / "r",
             n_trials=10,
             n_sobol=1,
             objectives=self._reduced_objectives(),
@@ -1304,7 +1308,7 @@ class TestWarnOnCollapsedObjectives:
             node_pair=node_pair,
             config=config,
             param_space=PARAM_SPACE,
-            output=tmp_path / "r.jsonl",
+            output=tmp_path / "r",
             n_trials=10,
             n_sobol=1,
             objectives=self._reduced_objectives(),
@@ -1398,7 +1402,7 @@ class TestSeededPriorAndPin:
             node_pair=node_pair,
             config=config,
             param_space=PARAM_SPACE,
-            output=tmp_path / "results.jsonl",
+            output=tmp_path / "results",
             n_trials=1,
             n_sobol=1,
             objectives=ObjectivesSection(),
@@ -1441,7 +1445,7 @@ class TestSeededPriorAndPin:
             node_pair=node_pair,
             config=config,
             param_space=PARAM_SPACE,
-            output=tmp_path / "results.jsonl",
+            output=tmp_path / "results",
             n_trials=2,
             n_sobol=2,
             objectives=ObjectivesSection(),
@@ -1505,7 +1509,7 @@ class TestSeededPriorAndPin:
             node_pair=node_pair,
             config=config,
             param_space=PARAM_SPACE,
-            output=tmp_path / "results.jsonl",
+            output=tmp_path / "results",
             n_trials=1,
             n_sobol=1,
             apply_source=True,
@@ -1556,7 +1560,7 @@ class TestSeededPriorAndPin:
             node_pair=node_pair,
             config=config,
             param_space=PARAM_SPACE,
-            output=tmp_path / "results.jsonl",
+            output=tmp_path / "results",
             n_trials=2,
             n_sobol=2,
             objectives=ObjectivesSection(),
@@ -1576,12 +1580,12 @@ class TestSeededPriorAndPin:
 def test_seed_prior_trials_filters_stale_keys(
     tmp_path,
 ):
-    """Historical JSONL containing a now-removed knob must still attach."""
+    """Historical trials containing a now-removed knob must still attach."""
     node_pair = NodePair(source="a", target="b", hardware_class="10g")
     stale_sysctls: dict[str, str | int] = {
         p.name: p.values[0] for p in PARAM_SPACE.params
     }
-    # Simulate a JSONL row written before ``tcp_no_metrics_save`` was
+    # Simulate a trial written before ``tcp_no_metrics_save`` was
     # removed from the space.
     stale_sysctls["net.ipv4.tcp_no_metrics_save"] = 0
     prior = TrialResult(
@@ -1611,7 +1615,7 @@ def test_seed_prior_trials_filters_stale_keys(
             node_pair=node_pair,
             config=BenchmarkConfig(),
             param_space=PARAM_SPACE,
-            output=tmp_path / "out.jsonl",
+            output=tmp_path / "out",
             n_trials=2,
             n_sobol=1,
             objectives=ObjectivesSection(),

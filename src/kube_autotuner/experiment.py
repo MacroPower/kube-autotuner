@@ -29,6 +29,7 @@ from pydantic import (
     model_validator,
 )
 from pydantic.alias_generators import to_camel
+import typer
 import yaml
 
 from kube_autotuner.models import (
@@ -610,7 +611,7 @@ class ExperimentConfig(BaseModel):
     fortio: FortioSection = Field(default_factory=FortioSection)
     patches: list[Patch] = Field(default_factory=list)
     objectives: ObjectivesSection = Field(default_factory=ObjectivesSection)
-    output: str = "results.jsonl"
+    output: str = "results"
 
     @model_validator(mode="after")
     def _prune_objectives_to_enabled_stages(self) -> ExperimentConfig:
@@ -928,31 +929,38 @@ class ExperimentConfig(BaseModel):
         return PreflightResult(name=name, passed=True)
 
     def _check_output_path(self) -> PreflightResult:
-        """Ensure the output path's parent directory exists and is writable.
+        """Ensure the output directory exists, is writable, and is ours.
 
-        Creates missing parents via :meth:`pathlib.Path.mkdir` so the
-        JSONL writer does not fail mid-run. The output file itself is
-        never touched -- a later preflight failure must not leak an
-        empty results file.
+        The trial-dataset writer expects ``self.output`` to be a
+        directory: either a fresh path (created here), an empty
+        directory, or an existing trial-log directory we recognise by
+        its ``_meta.json`` sidecar, ``*.parquet`` files, or
+        ``failures/`` subdirectory. A regular file or an unrelated
+        non-empty directory fails the check rather than being
+        clobbered.
 
         Returns:
-            A passing result when the parent exists (or was created) and
-            is writable by the current process, otherwise a failing
-            result describing the filesystem error.
+            A passing result when the directory is usable, otherwise a
+            failing result describing the filesystem error or shape
+            mismatch.
         """
+        from kube_autotuner.trial_log import _validate_output_directory  # noqa: PLC0415
+
         name = "output-path"
         out = Path(self.output)
         try:
-            if out.parent and not out.parent.exists():
-                out.parent.mkdir(parents=True, exist_ok=True)
+            _validate_output_directory(out)
+        except typer.BadParameter as e:
+            return PreflightResult(name=name, passed=False, detail=str(e))
+        try:
+            out.mkdir(parents=True, exist_ok=True)
         except OSError as e:
             detail = f"output path {self.output!r} not writable: {e}"
             return PreflightResult(name=name, passed=False, detail=detail)
-        parent = out.parent if str(out.parent) else Path()
-        if not os.access(parent, os.W_OK):
+        if not os.access(out, os.W_OK):
             detail = (
-                f"output path {self.output!r} not writable: parent "
-                f"directory {parent!s} is not writable"
+                f"output path {self.output!r} not writable: directory "
+                f"{out!s} is not writable"
             )
             return PreflightResult(name=name, passed=False, detail=detail)
         return PreflightResult(name=name, passed=True)

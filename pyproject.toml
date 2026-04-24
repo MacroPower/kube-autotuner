@@ -11,6 +11,7 @@ authors = [
 ]
 dependencies = [
     "kubernetes>=31.0.0",
+    "pyarrow>=22.0",
     "pydantic>=2.12",
     "pyyaml>=6.0",
     "rich>=14.0",
@@ -210,6 +211,17 @@ include = [
     "src/kube_autotuner/analysis.py",
     "src/kube_autotuner/report.py",
 ]
+
+[tool.ty.overrides.rules]
+unresolved-import = "ignore"
+
+# pyarrow is a mandatory runtime dep but still lazy-imported inside
+# ``trial_log.py`` methods to keep CLI startup (and ``task completions``)
+# cheap. The stubs shipped with pyarrow do not resolve cleanly under ty's
+# strict config; the override keeps the blast radius scoped to the one
+# module that touches pyarrow.
+[[tool.ty.overrides]]
+include = ["src/kube_autotuner/trial_log.py"]
 
 [tool.ty.overrides.rules]
 unresolved-import = "ignore"

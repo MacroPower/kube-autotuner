@@ -11,7 +11,6 @@ import pytest
 from typer.testing import CliRunner
 
 from kube_autotuner.cli import app
-from kube_autotuner.models import TrialResult
 
 if TYPE_CHECKING:
     from kube_autotuner.k8s.client import K8sClient
@@ -30,7 +29,7 @@ def test_trial_snapshots_applies_benchmarks_restores(
     fake_sysctl_env: Path,  # noqa: ARG001 - activates fake backend env vars
     tmp_path: Path,
 ) -> None:
-    output_file = tmp_path / "trial.jsonl"
+    output_file = tmp_path / "trial"
 
     runner = CliRunner()
     result = runner.invoke(
@@ -62,10 +61,11 @@ def test_trial_snapshots_applies_benchmarks_restores(
     assert "Applied 1 sysctl(s)" in result.stderr
     assert "Restored original sysctls" in result.stderr
 
-    lines = output_file.read_text().strip().splitlines()
-    assert len(lines) == 1
+    from kube_autotuner.trial_log import TrialLog  # noqa: PLC0415
 
-    trial = TrialResult.model_validate_json(lines[0])
+    trials = TrialLog.load(output_file)
+    assert len(trials) == 1
+    trial = trials[0]
     assert trial.sysctl_values == {"net.core.rmem_max": "16777216"}
     # Each iteration now runs both bw-tcp and bw-udp.
     assert {r.mode for r in trial.results} == {"tcp", "udp"}

@@ -32,7 +32,7 @@ def _optimize_yaml(out: Path, *, optimize_overrides: dict) -> str:
 
 
 def test_verification_yaml_threads_into_optimize_section(tmp_path: Path) -> None:
-    out = tmp_path / "opt.jsonl"
+    out = tmp_path / "opt"
     config = tmp_path / "exp.yaml"
     config.write_text(
         _optimize_yaml(
@@ -65,7 +65,7 @@ def test_verification_yaml_threads_into_optimize_section(tmp_path: Path) -> None
 
 def test_defaults_when_yaml_omits_verification_keys(tmp_path: Path) -> None:
     """Omitted keys leave the ``OptimizeSection`` defaults (0 disables verification)."""
-    out = tmp_path / "opt.jsonl"
+    out = tmp_path / "opt"
     config = tmp_path / "exp.yaml"
     config.write_text(_optimize_yaml(out, optimize_overrides={}))
     with (
