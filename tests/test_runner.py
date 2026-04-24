@@ -635,3 +635,47 @@ def test_sibling_abort_caps_retry_amplification():
     exhaustion_counts = sorted(attempts_per_client.values())
     assert exhaustion_counts[-1] == max_attempts
     assert exhaustion_counts[0] < max_attempts
+
+
+def test_run_flushes_network_state_per_iteration():
+    """Each iteration invokes ``flush_network_state`` on every configured backend."""
+    node_pair = NodePair(source="kmain07", target="kmain08", hardware_class="10g")
+    config = BenchmarkConfig(duration=1, iterations=2)
+
+    logs = {"iperf3-client-kmain07-p5201": _fake_iperf_json(9e9)}
+    client = _make_client(logs)
+
+    target_backend = MagicMock()
+    client_backend = MagicMock()
+
+    runner = BenchmarkRunner(
+        node_pair,
+        config,
+        client=client,
+        flush_backends=[target_backend, client_backend],
+    )
+    runner.setup_server()
+    runner.run()
+
+    assert target_backend.flush_network_state.call_count == 2
+    assert client_backend.flush_network_state.call_count == 2
+
+
+def test_run_without_flush_backends_skips_flush():
+    """Default ``flush_backends=None`` triggers no per-iteration flush work."""
+    node_pair = NodePair(source="kmain07", target="kmain08", hardware_class="10g")
+    config = BenchmarkConfig(duration=1, iterations=2)
+
+    logs = {"iperf3-client-kmain07-p5201": _fake_iperf_json(9e9)}
+    client = _make_client(logs)
+
+    runner = BenchmarkRunner(node_pair, config, client=client)
+    # Sentinel backend that must never be touched: if the default path
+    # ever grows a hidden flush call, this MagicMock will record it.
+    untouched_backend = MagicMock()
+    assert runner._flush_backends == []
+
+    runner.setup_server()
+    runner.run()
+
+    untouched_backend.flush_network_state.assert_not_called()

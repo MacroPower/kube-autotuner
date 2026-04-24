@@ -273,18 +273,20 @@ class TalosSysctlBackend:
         """Re-apply a previously captured snapshot."""
         self.apply(original)
 
-    def flush_tcp_metrics(self) -> None:
+    def flush_network_state(self) -> None:
         """No-op on Talos: ``talosctl`` offers no arbitrary-exec path.
 
         The Talos backend routes sysctl writes through
         ``talosctl patch mc``; there is no equivalent for running
-        ``ip tcp_metrics flush all`` as a one-shot command inside the
-        machine. Operators running on Talos and wanting strict trial
+        ``ip tcp_metrics flush all`` or ``conntrack -F`` as a one-shot
+        command inside the machine, so neither the TCP metrics cache
+        nor the conntrack table can be evicted between iterations.
+        Operators running on Talos and wanting strict iteration
         independence should reboot the node between trials or switch
         to the privileged-pod (``real``) backend.
         """
         logger.debug(
-            "tcp_metrics flush skipped on %s (Talos backend has no exec path)",
+            "network-state flush skipped on %s (Talos backend has no exec path)",
             self.node,
         )
 

@@ -591,6 +591,7 @@ class OptimizationLoop:
             patches=patches,
             fortio_args=fortio_args,
             observer=self.observer,
+            flush_backends=[self.target_setter, *self.client_setters.values()],
         )
         self._completed: list[TrialResult] = []
         self.prior_count: int = sum(1 for t in (prior_trials or []) if is_primary(t))
@@ -790,13 +791,13 @@ class OptimizationLoop:
             }
             try:
                 # Apply first so ``tcp_no_metrics_save=1`` is in effect
-                # before the flush; otherwise the kernel could cache
-                # fresh entries between the flush and the pin landing.
+                # before ``runner.run()`` performs its per-iteration
+                # ``flush_network_state()``; otherwise the kernel could
+                # cache fresh entries between the flush and the pin
+                # landing.
                 self.target_setter.apply(trial_sysctls)
-                self.target_setter.flush_tcp_metrics()
                 for setter in self.client_setters.values():
                     setter.apply(trial_sysctls)
-                    setter.flush_tcp_metrics()
                 iteration_results = self.runner.run()
             finally:
                 self.target_setter.restore(original_target)

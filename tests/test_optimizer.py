@@ -1329,7 +1329,7 @@ class TestSeededPriorAndPin:
     @patch("kube_autotuner.optimizer.NodeLease")
     @patch("kube_autotuner.optimizer.BenchmarkRunner")
     @patch("kube_autotuner.optimizer.make_sysctl_setter_from_env")
-    def test_apply_pins_tcp_no_metrics_save_and_flushes(
+    def test_apply_pins_tcp_no_metrics_save_and_wires_flush(
         self,
         mock_setter_cls,
         mock_runner_cls,
@@ -1338,7 +1338,7 @@ class TestSeededPriorAndPin:
         config,
         tmp_path,
     ):
-        """Every apply() call carries ``tcp_no_metrics_save=1`` and flush fires."""
+        """Apply pins ``tcp_no_metrics_save=1`` and flush is wired into the runner."""
         mock_setter = MagicMock()
         mock_setter.snapshot.side_effect = _mock_snapshot
         mock_setter_cls.return_value = mock_setter
@@ -1367,8 +1367,70 @@ class TestSeededPriorAndPin:
             applied = call[0][0]
             assert applied["net.ipv4.tcp_no_metrics_save"] == 1
 
-        # flush_tcp_metrics fires once per trial on the target setter.
-        assert mock_setter.flush_tcp_metrics.call_count == 2
+        # Flushing moved from ``_evaluate`` into ``BenchmarkRunner.run()``,
+        # so the optimizer's contract is to pass the target setter as a
+        # flush backend when constructing the runner. With
+        # ``apply_source`` defaulting to ``False`` there are no client
+        # setters, so the list contains only the target.
+        mock_runner_cls.assert_called_once()
+        flush_backends = mock_runner_cls.call_args.kwargs["flush_backends"]
+        assert flush_backends == [mock_setter]
+
+    @patch("kube_autotuner.optimizer.NodeLease")
+    @patch("kube_autotuner.optimizer.BenchmarkRunner")
+    @patch("kube_autotuner.optimizer.make_sysctl_setter_from_env")
+    def test_flush_backends_include_client_setters_when_apply_source(
+        self,
+        mock_setter_cls,
+        mock_runner_cls,
+        mock_lease_cls,  # noqa: ARG002
+        config,
+        tmp_path,
+    ):
+        """``apply_source=True`` wires target + each client setter for flushing."""
+        node_pair = NodePair(
+            source="kmain07",
+            target="kmain08",
+            hardware_class="10g",
+            namespace="default",
+            extra_sources=["kmain09"],
+        )
+
+        setters_by_node: dict[str, MagicMock] = {}
+
+        def _setter_factory(*, node, namespace, **_kwargs):
+            del namespace
+            s = MagicMock()
+            s.snapshot.side_effect = _mock_snapshot
+            setters_by_node[node] = s
+            return s
+
+        mock_setter_cls.side_effect = _setter_factory
+
+        mock_runner = MagicMock()
+        mock_runner.run.return_value = IterationResults(
+            bench=_make_results(),
+            latency=_make_latency_results(),
+        )
+        mock_runner_cls.return_value = mock_runner
+
+        loop = OptimizationLoop(
+            node_pair=node_pair,
+            config=config,
+            param_space=PARAM_SPACE,
+            output=tmp_path / "results.jsonl",
+            n_trials=1,
+            n_sobol=1,
+            apply_source=True,
+            objectives=ObjectivesSection(),
+        )
+        loop.run()
+
+        mock_runner_cls.assert_called_once()
+        flush_backends = mock_runner_cls.call_args.kwargs["flush_backends"]
+        target_setter = setters_by_node["kmain08"]
+        client_setters = [setters_by_node[n] for n in ("kmain07", "kmain09")]
+        assert flush_backends == [target_setter, *client_setters]
 
     @patch("kube_autotuner.optimizer.NodeLease")
     @patch("kube_autotuner.optimizer.BenchmarkRunner")

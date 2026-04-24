@@ -252,22 +252,24 @@ class SysctlSetter:
         logger.info("Restoring sysctls on %s", self.node)
         self.apply(original)
 
-    def flush_tcp_metrics(self) -> None:
-        """Clear cached per-peer TCP metrics on the target node.
+    def flush_network_state(self) -> None:
+        """Clear cached per-peer TCP metrics and the conntrack table.
 
-        Runs ``ip tcp_metrics flush all`` inside the same privileged
-        hostNetwork pod pattern used for sysctl writes. Failures
-        (SELinux denial on RHEL/OpenShift, image missing iproute2,
-        `tcp_metrics` netlink not compiled in) are logged and
-        swallowed so the per-trial methodology hook cannot stall the
-        whole optimizer.
+        Runs ``ip tcp_metrics flush all; conntrack -F`` inside one
+        privileged hostNetwork pod so both flushes amortise the same
+        pod schedule / image pull / teardown. ``;`` (not ``&&``) so a
+        missing tcp_metrics netlink module does not prevent the
+        conntrack flush. Failures (SELinux denial on RHEL/OpenShift,
+        image missing iproute2 or conntrack-tools, nf_conntrack module
+        not loaded) are logged and swallowed so the per-iteration
+        methodology hook cannot stall the whole optimizer.
         """
-        pod_name = f"tcp-metrics-flush-{self.node}"
+        pod_name = f"net-flush-{self.node}"
         try:
-            self._run_pod(pod_name, "ip tcp_metrics flush all")
+            self._run_pod(pod_name, "ip tcp_metrics flush all; conntrack -F")
         except (PodExecutionError, K8sApiError) as e:
             logger.warning(
-                "tcp_metrics flush failed on %s (continuing): %s",
+                "network-state flush failed on %s (continuing): %s",
                 self.node,
                 e,
             )

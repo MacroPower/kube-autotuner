@@ -94,9 +94,11 @@ class FakeSysctlBackend:
         """Re-apply a previously captured snapshot."""
         self.apply(original)
 
-    def flush_tcp_metrics(self) -> None:
-        """No-op: fake backend has no cached kernel state to flush."""
-        logger.debug("FakeSysctlBackend tcp_metrics flush is a no-op on %s", self.node)
+    def flush_network_state(self) -> None:
+        """No-op: fake backend has no kernel tcp_metrics or conntrack table to flush."""
+        logger.debug(
+            "FakeSysctlBackend network-state flush is a no-op on %s", self.node
+        )
 
     def lock(self) -> contextlib.AbstractContextManager[None]:  # noqa: PLR6301
         """Return a no-op context manager; serialisation is unnecessary in-memory."""

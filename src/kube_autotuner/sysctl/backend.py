@@ -75,16 +75,30 @@ class SysctlBackend(Protocol):
         """Re-apply a previously captured snapshot."""
         ...
 
-    def flush_tcp_metrics(self) -> None:
-        """Clear the kernel's cached per-peer TCP metrics.
+    def flush_network_state(self) -> None:
+        """Clear per-iteration kernel network state on the target node.
 
-        Per-trial methodology hook: ``net.ipv4.tcp_no_metrics_save=1``
-        stops new entries from being cached but does not evict rows
-        already in ``/proc/net/tcp_metrics``, so trial N's cached
-        ssthresh / RTT bleeds into trial N+1 without this flush.
+        Evicts two caches that otherwise bleed measurement state from
+        the previous iteration into the next:
+
+        * ``/proc/net/tcp_metrics`` -- ``net.ipv4.tcp_no_metrics_save=1``
+          stops *new* rows from being cached but does not evict rows
+          already present, so cached ssthresh / RTT survives the pin.
+        * The netfilter conntrack table -- residual entries from the
+          previous saturation sub-stage skew the next iteration's rps
+          ceiling and p99 latency once ``nf_conntrack_*`` timeouts are
+          in the tuning search space.
+
         Implementations should log-and-continue on failure (SELinux
         denial, missing iproute2, conntrack module not loaded) rather
-        than fail the trial.
+        than fail the iteration.
+
+        Warning:
+            The real backend flushes the **entire** host conntrack
+            table, not just benchmark entries. On nodes that carry
+            unrelated traffic (SSH, CNI control plane, sidecars) this
+            briefly disrupts those in-flight connections. Dedicated
+            benchmark nodes are the documented deployment model.
         """
         ...
 

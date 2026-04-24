@@ -83,6 +83,7 @@ if TYPE_CHECKING:
         NodePair,
     )
     from kube_autotuner.progress import ProgressObserver
+    from kube_autotuner.sysctl.backend import SysctlBackend
 
 _T = TypeVar("_T")
 
@@ -162,7 +163,7 @@ _CLIENT_WAIT_TIMEOUT_SECONDS = 180
 class BenchmarkRunner:
     """Orchestrates iperf3 server/client lifecycle via the Kubernetes API."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 - cohesive runner wiring (node pair, config, and every side-effect dep)
         self,
         node_pair: NodePair,
         config: BenchmarkConfig,
@@ -172,6 +173,7 @@ class BenchmarkRunner:
         *,
         fortio_args: FortioSection | None = None,
         observer: ProgressObserver | None = None,
+        flush_backends: list[SysctlBackend] | None = None,
     ) -> None:
         """Wire the runner to a node pair and benchmark config.
 
@@ -192,6 +194,14 @@ class BenchmarkRunner:
             observer: Optional progress callback. Defaults to
                 :class:`~kube_autotuner.progress.NullObserver` so
                 library consumers and tests see no output side-effects.
+            flush_backends: Optional sysctl backends whose
+                :meth:`~kube_autotuner.sysctl.backend.SysctlBackend.flush_network_state`
+                is invoked at the top of each iteration in
+                :meth:`run` (typically the target setter plus every
+                client setter). Defaults to ``None`` -- used by
+                non-optimizer callers (``run_benchmark`` /
+                ``run_trial``) and unit tests that do not need the
+                per-iteration flush.
         """
         self.node_pair = node_pair
         self.config = config
@@ -200,6 +210,7 @@ class BenchmarkRunner:
         self.fortio_args = fortio_args or FortioSection()
         self.patches = patches or []
         self.observer: ProgressObserver = observer or NullObserver()
+        self._flush_backends: list[SysctlBackend] = flush_backends or []
         self._server_name = f"iperf3-server-{node_pair.target}"
         self._fortio_server_name = f"fortio-server-{node_pair.target}"
         self._clients = list(node_pair.all_sources)
@@ -593,13 +604,45 @@ class BenchmarkRunner:
         )
         return diag
 
-    def run(self) -> IterationResults:
+    def _flush_network_state(self, iteration: int) -> None:
+        """Flush per-iteration kernel network state on every configured backend.
+
+        No-op when the runner was constructed without
+        ``flush_backends`` (non-optimizer callers and pure unit tests).
+        Each backend's implementation is contractually log-and-continue
+        on failure, so a flush failure never aborts the iteration loop.
+
+        Args:
+            iteration: Zero-based iteration index; only used for
+                structured logging so operators can correlate flush
+                telemetry with the surrounding stage logs.
+        """
+        if not self._flush_backends:
+            return
+        logger.debug(
+            "Flushing network state before iteration %d on %d backend(s)",
+            iteration,
+            len(self._flush_backends),
+        )
+        for backend in self._flush_backends:
+            backend.flush_network_state()
+
+    def run(self) -> IterationResults:  # noqa: PLR0915 - one cohesive iteration driver (flush + 4 sub-stages + observer fan-out)
         """Run every configured benchmark iteration.
 
         Each iteration expands into four sub-stages executed
         sequentially so fortio never contends with iperf3 for NIC,
         CPU, or CNI state: ``bw-tcp`` -> ``bw-udp`` -> ``fortio-sat``
         -> ``fortio-fixed``.
+
+        Before every iteration starts, :meth:`_flush_network_state`
+        evicts cached TCP metrics and conntrack entries on every
+        configured backend so the previous iteration's state cannot
+        bleed into the next. Relies on the caller having applied
+        ``tcp_no_metrics_save=1`` before calling :meth:`run`; the pin
+        stays in effect across all iterations (no restore happens
+        mid-run), so the ordering invariant holds from iteration 0
+        onward.
 
         Fires :meth:`ProgressObserver.on_benchmark_start` once up
         front with the trial-wide iteration budget
@@ -615,6 +658,7 @@ class BenchmarkRunner:
         all_bench: list[BenchmarkResult] = []
         all_latency: list[LatencyResult] = []
         for i in range(self.config.iterations):
+            self._flush_network_state(i)
             logger.info(
                 "Running iteration %d/%d: %s -> %s",
                 i + 1,
