@@ -679,3 +679,112 @@ def test_run_without_flush_backends_skips_flush():
     runner.run()
 
     untouched_backend.flush_network_state.assert_not_called()
+
+
+def _message_index(caplog, substring: str) -> int:
+    """Return the index of the first caplog record containing ``substring``.
+
+    Used to assert strict ordering between related log lines (start
+    before complete, benchmark-complete after the final stage). Fails the
+    test with a readable dump if the substring is not present.
+    """
+    for idx, record in enumerate(caplog.records):
+        if substring in record.getMessage():
+            return idx
+    dump = [r.getMessage() for r in caplog.records]
+    pytest.fail(f"no log record contained {substring!r}; got {dump}")
+    return -1  # unreachable, keeps ty happy
+
+
+def test_run_emits_stage_boundary_logs(caplog):
+    """``run`` logs benchmark start, start/complete per stage, and benchmark end."""
+    node_pair = NodePair(source="kmain07", target="kmain08", hardware_class="10g")
+    config = BenchmarkConfig(duration=1, iterations=2)
+    logs = {"iperf3-client-kmain07-p5201": _fake_iperf_json(9e9)}
+    client = _make_client(logs)
+
+    runner = BenchmarkRunner(node_pair, config, client=client)
+    runner.setup_server()
+    with caplog.at_level("INFO", logger="kube_autotuner.benchmark.runner"):
+        runner.run()
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert sum("Starting benchmark" in m for m in messages) == 1
+    assert sum("Benchmark complete" in m for m in messages) == 1
+
+    for iteration in (1, 2):
+        for stage in ("bw-tcp", "bw-udp", "fortio-sat", "fortio-fixed"):
+            start_tag = f"Stage {stage} starting (iteration {iteration}/2)"
+            complete_tag = f"Stage {stage} complete (iteration {iteration}/2"
+            start_idx = _message_index(caplog, start_tag)
+            complete_idx = _message_index(caplog, complete_tag)
+            assert start_idx < complete_idx, f"{start_tag} must precede {complete_tag}"
+
+    start_idx = _message_index(caplog, "Starting benchmark")
+    end_idx = _message_index(caplog, "Benchmark complete")
+    last_stage_idx = _message_index(
+        caplog,
+        "Stage fortio-fixed complete (iteration 2/2",
+    )
+    assert start_idx < last_stage_idx < end_idx
+
+
+def test_run_emits_flush_bookends_per_backend(caplog):
+    """Each configured backend gets a ``starting`` / ``complete`` INFO pair in order."""
+    node_pair = NodePair(source="kmain07", target="kmain08", hardware_class="10g")
+    config = BenchmarkConfig(duration=1, iterations=1)
+    logs = {"iperf3-client-kmain07-p5201": _fake_iperf_json(9e9)}
+    client = _make_client(logs)
+
+    target_backend = MagicMock()
+    target_backend.node = "kmain08"
+    client_backend = MagicMock()
+    client_backend.node = "kmain07"
+
+    runner = BenchmarkRunner(
+        node_pair,
+        config,
+        client=client,
+        flush_backends=[target_backend, client_backend],
+    )
+    runner.setup_server()
+    with caplog.at_level("INFO", logger="kube_autotuner.benchmark.runner"):
+        runner.run()
+
+    assert any(
+        "Flushing network state before iteration 1 on 2 backend(s)" in r.getMessage()
+        for r in caplog.records
+    )
+    for node in ("kmain08", "kmain07"):
+        start_idx = _message_index(caplog, f"Network flush starting on {node}")
+        complete_idx = _message_index(caplog, f"Network flush complete on {node}")
+        assert start_idx < complete_idx
+
+
+def test_run_flush_starting_logged_even_when_backend_raises(caplog):
+    """A raising backend still produces its ``starting`` line, and aborts the run."""
+    node_pair = NodePair(source="kmain07", target="kmain08", hardware_class="10g")
+    config = BenchmarkConfig(duration=1, iterations=1)
+    client = _make_client({"iperf3-client-kmain07-p5201": _fake_iperf_json(9e9)})
+
+    angry_backend = MagicMock()
+    angry_backend.node = "kmain08"
+    angry_backend.flush_network_state.side_effect = RuntimeError("flush exploded")
+
+    runner = BenchmarkRunner(
+        node_pair,
+        config,
+        client=client,
+        flush_backends=[angry_backend],
+    )
+    runner.setup_server()
+    with (
+        caplog.at_level("INFO", logger="kube_autotuner.benchmark.runner"),
+        pytest.raises(RuntimeError, match="flush exploded"),
+    ):
+        runner.run()
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("Network flush starting on kmain08" in m for m in messages)
+    # "complete" must NOT be logged when the backend propagated.
+    assert not any("Network flush complete on kmain08" in m for m in messages)

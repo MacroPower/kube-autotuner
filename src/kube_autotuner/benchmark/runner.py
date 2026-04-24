@@ -40,6 +40,7 @@ import concurrent.futures
 import json
 import logging
 import threading
+import time
 from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast
 
 from kube_autotuner.benchmark.client_spec import build_client_yaml
@@ -612,20 +613,41 @@ class BenchmarkRunner:
         Each backend's implementation is contractually log-and-continue
         on failure, so a flush failure never aborts the iteration loop.
 
+        Emits one INFO banner naming the iteration and the backend count,
+        plus a start / complete INFO pair around every backend so
+        operators can correlate flush activity with the surrounding stage
+        logs. ``SysctlSetter.flush_network_state`` runs a real privileged
+        pod; ``TalosSysctlBackend`` and ``FakeSysctlBackend`` are
+        effectively no-ops, so ``complete`` on those will follow
+        ``starting`` with near-zero elapsed -- the bracketing is emitted
+        uniformly so operators can confirm every configured backend was
+        attempted, but the log does not imply real work on the Talos or
+        Fake paths.
+
         Args:
-            iteration: Zero-based iteration index; only used for
-                structured logging so operators can correlate flush
-                telemetry with the surrounding stage logs.
+            iteration: Zero-based iteration index; presented as
+                ``iteration + 1`` in the banner to match the adjacent
+                "Running iteration N/M" one-based convention so
+                operators do not have to reconcile two numbering
+                schemes.
         """
         if not self._flush_backends:
             return
-        logger.debug(
+        logger.info(
             "Flushing network state before iteration %d on %d backend(s)",
-            iteration,
+            iteration + 1,
             len(self._flush_backends),
         )
         for backend in self._flush_backends:
+            node = getattr(backend, "node", type(backend).__name__)
+            flush_t0 = time.monotonic()
+            logger.info("Network flush starting on %s", node)
             backend.flush_network_state()
+            logger.info(
+                "Network flush complete on %s (elapsed=%.1fs)",
+                node,
+                time.monotonic() - flush_t0,
+            )
 
     def run(self) -> IterationResults:  # noqa: PLR0915 - one cohesive iteration driver (flush + 4 sub-stages + observer fan-out)
         """Run every configured benchmark iteration.
@@ -655,6 +677,12 @@ class BenchmarkRunner:
             produced across iterations.
         """
         self.observer.on_benchmark_start(self.config.iterations)
+        logger.info(
+            "Starting benchmark: %d iteration(s), target=%s, sources=%s",
+            self.config.iterations,
+            self.node_pair.target,
+            self._clients,
+        )
         all_bench: list[BenchmarkResult] = []
         all_latency: list[LatencyResult] = []
         for i in range(self.config.iterations):
@@ -673,29 +701,91 @@ class BenchmarkRunner:
             fixed: list[LatencyResult] = []
             try:
                 self.observer.on_stage_start("bw-tcp", i)
+                bw_tcp_t0 = time.monotonic()
+                logger.info(
+                    "Stage %s starting (iteration %d/%d)",
+                    "bw-tcp",
+                    i + 1,
+                    self.config.iterations,
+                )
                 try:
                     bench_tcp = self._run_bandwidth_stage("tcp", i)
                 finally:
+                    logger.info(
+                        "Stage %s complete (iteration %d/%d, elapsed=%.1fs)",
+                        "bw-tcp",
+                        i + 1,
+                        self.config.iterations,
+                        time.monotonic() - bw_tcp_t0,
+                    )
                     self.observer.on_stage_end("bw-tcp", i)
                 self.observer.on_stage_start("bw-udp", i)
+                bw_udp_t0 = time.monotonic()
+                logger.info(
+                    "Stage %s starting (iteration %d/%d)",
+                    "bw-udp",
+                    i + 1,
+                    self.config.iterations,
+                )
                 try:
                     bench_udp = self._run_bandwidth_stage("udp", i)
                 finally:
+                    logger.info(
+                        "Stage %s complete (iteration %d/%d, elapsed=%.1fs)",
+                        "bw-udp",
+                        i + 1,
+                        self.config.iterations,
+                        time.monotonic() - bw_udp_t0,
+                    )
                     self.observer.on_stage_end("bw-udp", i)
                 self.observer.on_stage_start("fortio-sat", i)
+                sat_t0 = time.monotonic()
+                logger.info(
+                    "Stage %s starting (iteration %d/%d)",
+                    "fortio-sat",
+                    i + 1,
+                    self.config.iterations,
+                )
                 try:
                     sat = self._run_latency_stage(i, workload="saturation")
                 finally:
+                    logger.info(
+                        "Stage %s complete (iteration %d/%d, elapsed=%.1fs)",
+                        "fortio-sat",
+                        i + 1,
+                        self.config.iterations,
+                        time.monotonic() - sat_t0,
+                    )
                     self.observer.on_stage_end("fortio-sat", i)
                 self.observer.on_stage_start("fortio-fixed", i)
+                fixed_t0 = time.monotonic()
+                logger.info(
+                    "Stage %s starting (iteration %d/%d)",
+                    "fortio-fixed",
+                    i + 1,
+                    self.config.iterations,
+                )
                 try:
                     fixed = self._run_latency_stage(i, workload="fixed_qps")
                 finally:
+                    logger.info(
+                        "Stage %s complete (iteration %d/%d, elapsed=%.1fs)",
+                        "fortio-fixed",
+                        i + 1,
+                        self.config.iterations,
+                        time.monotonic() - fixed_t0,
+                    )
                     self.observer.on_stage_end("fortio-fixed", i)
             finally:
                 self.observer.on_iteration_end(i)
             all_bench.extend([*bench_tcp, *bench_udp])
             all_latency.extend([*sat, *fixed])
+        logger.info(
+            "Benchmark complete: %d iteration(s), %d bench + %d latency result(s)",
+            self.config.iterations,
+            len(all_bench),
+            len(all_latency),
+        )
         return IterationResults(bench=all_bench, latency=all_latency)
 
     def _run_bandwidth_stage(

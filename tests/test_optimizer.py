@@ -987,6 +987,26 @@ class TestSeedPriorTrials:
         assert any("Trial 3/3" in rec.message for rec in caplog.records), [
             rec.message for rec in caplog.records
         ]
+        # New trial-start log must precede the existing trial-complete log.
+        start_idx = next(
+            (
+                i
+                for i, rec in enumerate(caplog.records)
+                if "Trial 3/3 [sobol] starting" in rec.message
+            ),
+            -1,
+        )
+        complete_idx = next(
+            (
+                i
+                for i, rec in enumerate(caplog.records)
+                if "Trial 3/3 [sobol] tcp_throughput" in rec.message
+            ),
+            -1,
+        )
+        assert start_idx >= 0, [rec.message for rec in caplog.records]
+        assert complete_idx >= 0, [rec.message for rec in caplog.records]
+        assert start_idx < complete_idx
 
 
 class TestComputeMetricsTcpFilter:

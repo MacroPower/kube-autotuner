@@ -1077,6 +1077,13 @@ class OptimizationLoop:
                 if phase == "bayesian" and self._first_bayesian_generate:
                     self._warn_on_collapsed_objectives()
                     self._first_bayesian_generate = False
+                logger.info(
+                    "Trial %d/%d [%s] starting: sysctls=%s",
+                    self.prior_count + i + 1,
+                    self.n_trials,
+                    phase,
+                    {_decode_param_name(k): v for k, v in parameterization.items()},
+                )
                 self.observer.on_trial_start(
                     self.prior_count + i,
                     self.n_trials,
@@ -1260,6 +1267,13 @@ class OptimizationLoop:
                 }
                 for _ in range(remaining):
                     obs_index = base_index + ordinal
+                    logger.info(
+                        "Trial %d/%d [%s] starting: sysctls=%s",
+                        obs_index + 1,
+                        total_remaining,
+                        "verification",
+                        {_decode_param_name(k): v for k, v in ax_params.items()},
+                    )
                     self.observer.on_trial_start(
                         obs_index,
                         total_remaining,
