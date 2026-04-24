@@ -208,6 +208,17 @@ def test_write_index_html_axis_chart_degenerates_below_two_columns(
     )
     assert 'class="axis-select-x"' not in html_text
     assert 'class="axis-select-y"' not in html_text
+    assert 'class="axis-trend-toggle"' not in html_text
+
+
+def test_write_index_html_axis_chart_has_trend_toggle(tmp_path: Path) -> None:
+    section = _minimal_section("10g")
+    path = report.write_index_html(tmp_path, [section])
+    html_text = path.read_text()
+
+    assert 'class="axis-trend-toggle"' in html_text
+    assert 'data-hw-slug="10g"' in html_text
+    assert "Trend line" in html_text
 
 
 def test_write_index_html_pareto_labels(tmp_path: Path) -> None:
@@ -718,6 +729,7 @@ def test_js_module_has_new_renderers() -> None:
     assert "renderCategoryRollup" in js
     assert "PHASE_SYMBOL" in js
     assert "axisStd" in js
+    assert "function linearFit(" in js
 
 
 def test_js_score_rows_port_matches_python(tmp_path: Path) -> None:  # noqa: PLR0914 - parity replay needs both JS and Python bookkeeping

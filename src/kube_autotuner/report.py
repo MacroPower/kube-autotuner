@@ -775,6 +775,8 @@ def _render_axis_chart(hw_slug: str, axis_columns: list[str]) -> str:
         f"{_options(default_x)}</select></label>\n"
         f'<label>Y <select class="axis-select-y" data-hw-slug="{slug_attr}">'
         f"{_options(default_y)}</select></label>\n"
+        f'<label><input type="checkbox" class="axis-trend-toggle"'
+        f' data-hw-slug="{slug_attr}"> Trend line</label>\n'
         "</div>\n"
         f'<div class="axis-chart" id="{html.escape(chart_id)}"></div>\n'
         "</section>"
@@ -1723,6 +1725,37 @@ function axisStd(row, col) {
   return MS_SCALED.has(col) ? v * 1000 : v;
 }
 
+// Closed-form OLS over finite (x, y) pairs. Returns null if fewer than
+// two points or zero x-variance (vertical fit is ill-defined).
+function linearFit(xs, ys) {
+  let n = 0, sx = 0, sy = 0;
+  let xmin = Infinity, xmax = -Infinity;
+  for (let i = 0; i < xs.length; i++) {
+    const a = xs[i], b = ys[i];
+    if (!Number.isFinite(a) || !Number.isFinite(b)) continue;
+    sx += a; sy += b;
+    if (a < xmin) xmin = a;
+    if (a > xmax) xmax = a;
+    n++;
+  }
+  if (n < 2) return null;
+  const mx = sx / n, my = sy / n;
+  let sxx = 0, sxy = 0, syy = 0;
+  for (let i = 0; i < xs.length; i++) {
+    const a = xs[i], b = ys[i];
+    if (!Number.isFinite(a) || !Number.isFinite(b)) continue;
+    const dx = a - mx, dy = b - my;
+    sxx += dx * dx; sxy += dx * dy; syy += dy * dy;
+  }
+  if (sxx === 0) return null;
+  const slope = sxy / sxx;
+  const intercept = my - slope * mx;
+  let r2 = syy === 0 ? 1 : (sxy * sxy) / (sxx * syy);
+  if (r2 > 1) r2 = 1;
+  if (r2 < 0) r2 = 0;
+  return {slope, intercept, r2, n, xmin, xmax};
+}
+
 // Build phase-split non-pareto traces plus a single pareto trace for
 // the interactive axis chart and hand them to Plotly. Error bars are
 // keyed off the per-row <col>_std arrays (null disables the bar for
@@ -1812,6 +1845,25 @@ function renderAxisChart(state) {
       `trial %{customdata}<br>${axisLabel(x)}=%{x:.3g}<br>`
       + `${axisLabel(y)}=%{y:.3g}<extra></extra>`,
   });
+  if (state.showTrend) {
+    const xs = section.allRows.map(r => axisValue(r, x));
+    const ys = section.allRows.map(r => axisValue(r, y));
+    const fit = linearFit(xs, ys);
+    if (fit) {
+      traces.push({
+        type: "scatter", mode: "lines",
+        name: `trend (R^2=${fit.r2.toFixed(2)})`,
+        x: [fit.xmin, fit.xmax],
+        y: [
+          fit.intercept + fit.slope * fit.xmin,
+          fit.intercept + fit.slope * fit.xmax,
+        ],
+        line: {color: "#E5C07B", width: 2, dash: "dash"},
+        hoverinfo: "skip",
+        showlegend: true,
+      });
+    }
+  }
   const layout = {
     template: "plotly_dark",
     paper_bgcolor: "rgba(0,0,0,0)",
@@ -1854,6 +1906,15 @@ function setupAxisChart(section, state) {
     state.axisY = selY.value;
     renderAxisChart(state);
   });
+  const trendEl = document.querySelector(
+    `input.axis-trend-toggle[data-hw-slug="${section.hwSlug}"]`);
+  if (trendEl) {
+    trendEl.checked = state.showTrend;
+    trendEl.addEventListener("change", () => {
+      state.showTrend = trendEl.checked;
+      renderAxisChart(state);
+    });
+  }
   renderAxisChart(state);
 }
 
@@ -1889,6 +1950,7 @@ function renderSection(panel, section) {
     topN: Math.max(1, Math.min(section.topN || 3, section.paretoRows.length)),
     axisX,
     axisY,
+    showTrend: false,
     lastTopIds: null,
   };
   const presetsEl = panel.querySelector(".presets");
