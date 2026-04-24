@@ -200,6 +200,9 @@ def _parse_conntrack_stats(
             try:
                 totals[k] += int(v)
             except ValueError:
+                # Aggregation: one bad per-cpu token does not tank the total.
+                # A key only ends up "missing" from errors if no cpu row ever
+                # parsed cleanly for it.
                 continue
             seen.add(k)
     for k in seen:

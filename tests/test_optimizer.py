@@ -23,6 +23,7 @@ from kube_autotuner.k8s.lease import LeaseHeldError
 from kube_autotuner.models import (
     BenchmarkConfig,
     BenchmarkResult,
+    HostStateSnapshot,
     IterationResults,
     LatencyResult,
     NodePair,
@@ -207,6 +208,72 @@ class TestOptimizationLoop:
 
         lines = output.read_text().strip().splitlines()
         assert len(lines) == 3
+
+    @patch("kube_autotuner.optimizer.NodeLease")
+    @patch("kube_autotuner.optimizer.BenchmarkRunner")
+    @patch("kube_autotuner.optimizer.make_sysctl_setter_from_env")
+    def test_host_state_snapshots_propagate_onto_trial_result(
+        self,
+        mock_setter_cls,
+        mock_runner_cls,
+        mock_lease_cls,  # noqa: ARG002
+        node_pair,
+        config,
+        tmp_path,
+    ):
+        """``_evaluate`` must thread ``host_state_snapshots`` onto the TrialResult."""
+        output = tmp_path / "results.jsonl"
+        mock_setter = MagicMock()
+        mock_setter.snapshot.side_effect = _mock_snapshot
+        mock_setter_cls.return_value = mock_setter
+
+        sample_snapshots = [
+            HostStateSnapshot(
+                node="b",
+                iteration=None,
+                phase="baseline",
+                metrics={"conntrack_count": 0},
+            ),
+            HostStateSnapshot(
+                node="b",
+                iteration=0,
+                phase="post-flush",
+                metrics={"conntrack_count": 0},
+            ),
+        ]
+        mock_runner = MagicMock()
+        mock_runner.run.return_value = IterationResults(
+            bench=_make_results(),
+            latency=_make_latency_results(),
+            host_state_snapshots=sample_snapshots,
+        )
+        mock_runner_cls.return_value = mock_runner
+
+        loop = OptimizationLoop(
+            node_pair=node_pair,
+            config=config,
+            param_space=PARAM_SPACE,
+            output=output,
+            n_trials=1,
+            n_sobol=1,
+            objectives=ObjectivesSection(),
+            collect_host_state=True,
+        )
+        trials = loop.run()
+        assert len(trials) == 1
+
+        # Runner received the flag + backend list.
+        kwargs = mock_runner_cls.call_args.kwargs
+        assert kwargs["collect_host_state"] is True
+        assert kwargs["snapshot_backends"] == [mock_setter]
+
+        # Snapshots landed on the TrialResult and round-tripped through JSONL.
+        assert trials[0].host_state_snapshots == sample_snapshots
+        import json  # noqa: PLC0415
+
+        row = json.loads(output.read_text().strip())
+        assert len(row["host_state_snapshots"]) == 2
+        assert row["host_state_snapshots"][0]["phase"] == "baseline"
 
     @patch("kube_autotuner.optimizer.NodeLease")
     @patch("kube_autotuner.optimizer.BenchmarkRunner")
