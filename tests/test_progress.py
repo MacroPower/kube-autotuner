@@ -117,7 +117,7 @@ def test_rich_observer_renders_bars_and_table() -> None:
         )
         observer.on_trial_failed(2, RuntimeError("boom"))
     output = cast("io.StringIO", console.file).getvalue()
-    assert "Trials" in output
+    assert "Trial" in output
     assert "Best so far" in output
     assert "9,412.0 Mbps" in output
     assert "0.12" in output  # retx/GB rendered
@@ -422,7 +422,7 @@ def test_rich_observer_trial_eta_ticks_down_mid_trial(
 def test_rich_observer_trial_eta_available_after_first_completion(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The Trials-bar ETA is concrete after a single completion.
+    """The Trial-bar ETA is concrete after a single completion.
 
     Rich's ``TimeRemainingColumn`` requires two samples to compute
     ``Task.speed``. The history-backed column reads observer-owned
@@ -569,13 +569,13 @@ def test_rich_observer_iteration_bar_spans_whole_trial(
             _do_iter(i)
         # Mid-trial: open the bw-udp stage of iteration 4 without
         # closing it. The stage label lives on the stage bar now;
-        # the iteration bar keeps the plain "Current" description.
+        # the iteration bar keeps the plain "Iteration" description.
         observer.on_iteration_start(4)
         observer.on_stage_start("bw-udp", 4)
         task = _task_for(observer, observer._iter_task_id)
         assert task.total == 6
         assert task.completed == 4
-        assert task.description == "Current"
+        assert task.description == "Iteration"
         stage_task = _task_for(observer, observer._stage_task_id)
         assert stage_task.description == "Stage [bw-udp]"
 
@@ -854,19 +854,19 @@ def test_rich_observer_iteration_description_stays_current_across_stages() -> No
         observer.on_stage_start("bw-udp", 0)
         iter_task = _task_for(observer, observer._iter_task_id)
         stage_task = _task_for(observer, observer._stage_task_id)
-        assert iter_task.description == "Current"
+        assert iter_task.description == "Iteration"
         assert stage_task.description == "Stage [bw-udp]"
 
 
 def test_rich_observer_render_order_is_trials_iteration_stage() -> None:
-    """Rich renders the bars top-to-bottom as trials -> iteration -> stage."""
+    """Rich renders the bars top-to-bottom as trial -> iteration -> stage."""
     console = _capture_console()
     observer = RichProgressObserver(console)
     with observer:
         observer.on_trial_start(0, 3, "sobol", {"net.core.rmem_max": "1048576"})
         observer.on_benchmark_start(2)
         descriptions = [t.description for t in observer._progress.tasks]
-        assert descriptions == ["Trials [sobol]", "Current", "Stage"]
+        assert descriptions == ["Trial [sobol]", "Iteration", "Stage"]
 
 
 def test_rich_observer_stage_bar_advance_clamped_at_total() -> None:

@@ -326,7 +326,7 @@ class _HistoryEtaColumn(ProgressColumn):
        on every mode boundary to restore the per-mode ``x/N`` display,
        so those samples vanished at every mode and trial boundary even
        after ``speed_estimate_period`` pruning was disabled.
-    2. *Trials bar.* ``Task.speed`` requires **at least two** progress
+    2. *Trial bar.* ``Task.speed`` requires **at least two** progress
        samples to produce a value (independent of pruning). With only
        one ``advance=1`` call posted after the first completion, the
        column would render ``-:--:--`` until the second trial finished
@@ -353,7 +353,7 @@ class _HistoryEtaColumn(ProgressColumn):
                 a unit instead of holding flat until the next
                 completion. Dispatching by task id lets a single
                 column serve every task in a shared ``Progress``
-                (trials bar, iteration bar, verification bar).
+                (trial bar, iteration bar, verify bar).
         """
         super().__init__()
         self._history = history
@@ -609,7 +609,7 @@ class _TtyEchoSuppressor:
 
 
 class RichProgressObserver:
-    """Live ``rich`` display with a trials bar, iteration bar, and results table.
+    """Live ``rich`` display with a trial bar, iteration bar, and results table.
 
     The observer must be entered as a context manager. It is safe to
     re-enter sequentially (construct, enter, exit, enter again) but
@@ -750,7 +750,7 @@ class RichProgressObserver:
 
         The single :class:`_HistoryEtaColumn` routed into
         ``self._progress`` calls this for every task it renders. The
-        trials and verification tasks share the observer-owned trial
+        trial and verify tasks share the observer-owned trial
         history (both measure wall-time per Ax trial), while the
         iteration bar uses its own per-iteration history. Unknown task
         ids fall through to the empty snapshot so ``render`` draws
@@ -782,7 +782,7 @@ class RichProgressObserver:
 
         Returns:
             A :class:`rich.console.Group` of the shared progress
-            region (trials, iteration, and verification tasks render
+            region (trial, iteration, and verify tasks render
             inside one ``Progress`` so their columns stay aligned)
             and, when any trial has completed, the current "best so
             far" table.
@@ -870,7 +870,7 @@ class RichProgressObserver:
         """Return the Rich ``Task`` for ``task_id`` or ``None`` if absent.
 
         Rich does not expose a public dict lookup, so this linear scan
-        over ``self._progress.tasks`` (at most four entries -- trials,
+        over ``self._progress.tasks`` (at most four entries -- trial,
         iteration, stage, verify) is the cheapest stable API.
 
         Args:
@@ -938,9 +938,9 @@ class RichProgressObserver:
         phase: str,
         params: Mapping[str, str],  # noqa: ARG002 reserved for future detail pane
     ) -> None:
-        """Create the trials bar on first call, advance the phase label."""
+        """Create the trial bar on first call, advance the phase label."""
         self._phase = phase
-        description = f"Trials [{phase}]"
+        description = f"Trial [{phase}]"
         if self._trial_task_id is None:
             self._trial_task_id = self._progress.add_task(
                 description,
@@ -962,7 +962,7 @@ class RichProgressObserver:
         trial: TrialResult,
         metrics: Mapping[str, tuple[float, float]],
     ) -> None:
-        """Advance the trials bar and fold the result into the top-N table."""
+        """Advance the trial bar and fold the result into the top-N table."""
         phase = trial.phase or "bayesian"
         if self._trial_start is not None:
             self._trial_total_seconds += time.monotonic() - self._trial_start
@@ -1160,7 +1160,7 @@ class RichProgressObserver:
     def on_verification_start(self, top_k: int, total_remaining: int) -> None:
         """Create a second progress task for the verification phase.
 
-        The primary trials bar is left in place so the live panel keeps
+        The primary trial bar is left in place so the live panel keeps
         its completed-primary history visible. ``total_remaining`` has
         already been trimmed by ``already_done_by_parent`` in
         :meth:`OptimizationLoop.run_verification`, so the bar sizes
@@ -1171,7 +1171,7 @@ class RichProgressObserver:
             top_k: Number of parent configs selected for verification.
             total_remaining: Total verification runs yet to execute.
         """
-        description = f"Verification [{top_k} configs, {total_remaining} runs]"
+        description = f"Verify [{top_k} configs, {total_remaining} runs]"
         if self._verify_task_id is None:
             self._verify_task_id = self._progress.add_task(
                 description,
@@ -1192,7 +1192,7 @@ class RichProgressObserver:
         index: int,  # noqa: ARG002 recorded for future failure panel
         exc: BaseException,  # noqa: ARG002
     ) -> None:
-        """Advance the trials bar without adding a row to the results table."""
+        """Advance the trial bar without adding a row to the results table."""
         if self._trial_start is not None:
             self._trial_total_seconds += time.monotonic() - self._trial_start
             self._trial_count += 1
@@ -1219,7 +1219,7 @@ class RichProgressObserver:
         matching end hook fired.
 
         The stage task is added **after** the iteration task on the
-        first benchmark so Rich renders trials -> iteration -> stage
+        first benchmark so Rich renders trial -> iteration -> stage
         top-to-bottom. On subsequent trials the ``reset`` branch
         preserves the original insertion index, so ordering is not
         re-established per trial; it relies on the protocol invariant
@@ -1230,7 +1230,7 @@ class RichProgressObserver:
         self._stage_start = None
         if self._iter_task_id is None:
             self._iter_task_id = self._progress.add_task(
-                "Current",
+                "Iteration",
                 total=total_iterations,
                 completed=0,
             )
@@ -1239,7 +1239,7 @@ class RichProgressObserver:
                 self._iter_task_id,
                 total=total_iterations,
                 completed=0,
-                description="Current",
+                description="Iteration",
             )
         if self._stage_task_id is None:
             self._stage_task_id = self._progress.add_task(
