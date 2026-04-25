@@ -316,7 +316,13 @@ def _run_experiment(
     Raises:
         typer.Exit: The YAML lacks the section required by ``mode``,
             or :meth:`ExperimentConfig.preflight` reports any failure.
-    """
+        Exception: Trial-level exceptions from
+            :func:`runs.run_optimize` propagate unchanged -- typically
+            :class:`~kube_autotuner.benchmark.errors.BenchmarkFailure`
+            once a trial's per-client-job retries are exhausted. Typer
+            converts the unhandled exception into a non-zero exit with
+            a traceback.
+    """  # noqa: DOC502 - trial-level exceptions raised inside runs.run_optimize
     exp = _load_experiment_yaml(config_path)
 
     if mode == "optimize" and exp.optimize is None:

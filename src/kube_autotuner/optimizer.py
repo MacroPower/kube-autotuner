@@ -1075,15 +1075,21 @@ class OptimizationLoop:
 
         Returns:
             The completed :class:`TrialResult` records, in execution
-            order. Failed trials are omitted; they are marked failed
-            with the Ax client instead.
+            order.
 
         Raises:
             KeyboardInterrupt: Propagated from a trial if the user
                 interrupts mid-benchmark; the loop still runs
                 :meth:`cleanup` through the ``finally`` block before
                 re-raising.
-        """
+            Exception: Any trial-level exception (typically
+                :class:`~kube_autotuner.benchmark.errors.BenchmarkFailure`
+                once the per-client-job ``max_attempts`` are exhausted)
+                is re-raised after :meth:`_dump_failure` writes a
+                post-mortem JSON and :meth:`cleanup` runs through the
+                ``finally`` block. The loop does not advance past the
+                failing trial.
+        """  # noqa: DOC502 - trial-level exceptions originate in _evaluate
         self.runner.setup_server()
         try:
             i = 0
@@ -1119,7 +1125,7 @@ class OptimizationLoop:
                     raise
                 except Exception as e:
                     logger.warning(
-                        "Trial %d/%d failed, continuing",
+                        "Trial %d/%d failed, exiting",
                         self.prior_count + i + 1,
                         self.n_trials,
                         exc_info=True,
@@ -1135,13 +1141,14 @@ class OptimizationLoop:
                         parameterization=parameterization,
                         exc=e,
                     )
-                    self.client.mark_trial_failed(trial_index=trial_index)
                     self.observer.on_trial_failed(self.prior_count + i, e)
-                    # If the failed trial was the seed, the next
-                    # _suggest iteration will re-attach automatically
-                    # while ``_seed_attempts_remaining`` is still > 0.
-                    if trial_index == self._seed_trial_index:
-                        self._seed_trial_index = None
+                    live = len(self._completed) - self.prior_count
+                    logger.info(
+                        "Trial %d aborted, exiting after %d completed trials",
+                        self.prior_count + i + 1,
+                        live,
+                    )
+                    raise
                 i += 1
         except KeyboardInterrupt:
             live = len(self._completed) - self.prior_count
@@ -1208,7 +1215,14 @@ class OptimizationLoop:
             KeyboardInterrupt: Propagated when the user interrupts
                 mid-verification; :meth:`cleanup` still runs through
                 the ``finally`` block before re-raising.
-        """
+            Exception: Any verification-trial exception (typically
+                :class:`~kube_autotuner.benchmark.errors.BenchmarkFailure`
+                once the per-client-job ``max_attempts`` are exhausted)
+                is re-raised after :meth:`_dump_failure` writes a
+                post-mortem JSON and :meth:`cleanup` runs through the
+                ``finally`` block. The loop does not advance past the
+                failing rerun.
+        """  # noqa: DOC502 - verification-trial exceptions originate in _evaluate
         already = dict(already_done_by_parent or {})
         primary = [tr for tr in self._completed if is_primary(tr)]
         if not primary or top_k <= 0 or repeats <= 0:
@@ -1305,13 +1319,18 @@ class OptimizationLoop:
                         raise
                     except Exception as e:
                         logger.warning(
-                            "Verification run for parent %s failed, continuing",
+                            "Verification run for parent %s failed, exiting",
                             parent.trial_id,
                             exc_info=True,
                         )
+                        self._dump_failure(
+                            trial_index=obs_index,
+                            phase="verification",
+                            parameterization=ax_params,
+                            exc=e,
+                        )
                         self.observer.on_trial_failed(obs_index, e)
-                        ordinal += 1
-                        continue
+                        raise
                     logger.info(
                         "Verification [%s] parent=%s tcp_throughput=%.1f Mbps",
                         parent.trial_id,

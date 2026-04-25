@@ -282,7 +282,7 @@ class TestOptimizationLoop:
     @patch("kube_autotuner.optimizer.NodeLease")
     @patch("kube_autotuner.optimizer.BenchmarkRunner")
     @patch("kube_autotuner.optimizer.make_sysctl_setter_from_env")
-    def test_handles_trial_failure(
+    def test_exits_on_trial_failure(
         self,
         mock_setter_cls,
         mock_runner_cls,
@@ -322,11 +322,17 @@ class TestOptimizationLoop:
             n_sobol=3,
             objectives=ObjectivesSection(),
         )
-        trials = loop.run()
+        with (
+            patch.object(loop.client, "mark_trial_failed") as mark_failed,
+            pytest.raises(RuntimeError, match="benchmark failed"),
+        ):
+            loop.run()
 
-        assert len(trials) == 2
-        assert mock_setter.restore.call_count == 3
+        assert mock_runner.run.call_count == 2
+        assert mock_setter.restore.call_count == 2
         mock_runner.cleanup.assert_called_once()
+        mark_failed.assert_not_called()
+        assert (output / "failures" / "trial-1.json").is_file()
 
     @patch("kube_autotuner.optimizer.NodeLease")
     @patch("kube_autotuner.optimizer.BenchmarkRunner")
@@ -1526,7 +1532,7 @@ class TestSeededPriorAndPin:
     @patch("kube_autotuner.optimizer.NodeLease")
     @patch("kube_autotuner.optimizer.BenchmarkRunner")
     @patch("kube_autotuner.optimizer.make_sysctl_setter_from_env")
-    def test_seed_retries_on_failed_first_trial(
+    def test_failed_seed_trial_exits(
         self,
         mock_setter_cls,
         mock_runner_cls,
@@ -1535,25 +1541,13 @@ class TestSeededPriorAndPin:
         config,
         tmp_path,
     ):
-        """A failed seed trial gets re-attached on the next iteration."""
+        """A failed seed trial exits the loop instead of being re-attached."""
         mock_setter = MagicMock()
         mock_setter.snapshot.side_effect = _mock_snapshot
         mock_setter_cls.return_value = mock_setter
 
         mock_runner = MagicMock()
-        call_count = 0
-
-        def run_side_effect():
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                raise RuntimeError("seed trial crashed")  # noqa: TRY003
-            return IterationResults(
-                bench=_make_results(),
-                latency=_make_latency_results(),
-            )
-
-        mock_runner.run.side_effect = run_side_effect
+        mock_runner.run.side_effect = RuntimeError("seed trial crashed")
         mock_runner_cls.return_value = mock_runner
 
         loop = OptimizationLoop(
@@ -1565,16 +1559,11 @@ class TestSeededPriorAndPin:
             n_sobol=2,
             objectives=ObjectivesSection(),
         )
-        trials = loop.run()
+        with pytest.raises(RuntimeError, match="seed trial crashed"):
+            loop.run()
 
-        # One failure + one success => one recorded trial whose
-        # parameterization must still be RECOMMENDED_DEFAULTS (the
-        # second attempt re-attached the seed).
-        assert len(trials) == 1
-        recorded = trials[0].sysctl_values
-        for name, value in RECOMMENDED_DEFAULTS.items():
-            if name in PARAM_SPACE.param_names():
-                assert str(recorded[name]) == str(value), name
+        assert mock_runner.run.call_count == 1
+        mock_runner.cleanup.assert_called_once()
 
 
 def test_seed_prior_trials_filters_stale_keys(
