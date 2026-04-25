@@ -9,6 +9,7 @@ from kubernetes.client.exceptions import ApiException
 import pytest
 
 from kube_autotuner.benchmark.runner import BenchmarkRunner
+from kube_autotuner.experiment import IperfSection
 from kube_autotuner.models import BenchmarkConfig, NodePair, TrialResult
 from kube_autotuner.trial_log import TrialLog
 
@@ -31,8 +32,14 @@ def _make_runner(
         namespace=namespace,
         ip_family_policy="SingleStack",
     )
-    config = BenchmarkConfig(duration=5, omit=0, iterations=1, parallel=1)
-    return BenchmarkRunner(node_pair, config, client=k8s_client)
+    config = BenchmarkConfig(iterations=1)
+    iperf_args = IperfSection(duration=5, omit=0, parallel=1)
+    return BenchmarkRunner(
+        node_pair,
+        config,
+        client=k8s_client,
+        iperf_args=iperf_args,
+    )
 
 
 def _deployment_exists(k8s_client: K8sClient, name: str, namespace: str) -> bool:

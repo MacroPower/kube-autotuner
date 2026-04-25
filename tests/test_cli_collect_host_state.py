@@ -27,7 +27,7 @@ def _fake_backend(tmp_path: Path) -> FakeSysctlBackend:
 def _baseline_yaml(out: Path, *, collect_host_state: bool | None) -> str:
     body: dict[str, object] = {
         "nodes": {"sources": ["a"], "target": "b"},
-        "benchmark": {"duration": 1, "iterations": 1},
+        "benchmark": {"iterations": 1},
         "output": str(out),
     }
     if collect_host_state is not None:
@@ -40,10 +40,10 @@ def _trial_yaml(out: Path, *, collect_host_state: bool) -> str:
     body = {
         "nodes": {"sources": ["a"], "target": "b"},
         "benchmark": {
-            "duration": 1,
             "iterations": 1,
             "collectHostState": collect_host_state,
         },
+        "iperf": {"duration": 1},
         "trial": {"sysctls": {"net.core.rmem_max": "16777216"}},
         "output": str(out),
     }
@@ -54,10 +54,10 @@ def _optimize_yaml(out: Path, *, collect_host_state: bool) -> str:
     body = {
         "nodes": {"sources": ["a"], "target": "b"},
         "benchmark": {
-            "duration": 1,
             "iterations": 1,
             "collectHostState": collect_host_state,
         },
+        "iperf": {"duration": 1},
         "optimize": {"nTrials": 1, "nSobol": 1},
         "output": str(out),
     }
@@ -212,7 +212,7 @@ def _trial_with_snapshots_dict(
         "sysctl_values": {"net.core.rmem_max": 212992},
         "sysctl_hash": "",
         "topology": "unknown",
-        "config": {"duration": 1, "iterations": 1},
+        "config": {"iterations": 1},
         "results": [
             {
                 "timestamp": now,

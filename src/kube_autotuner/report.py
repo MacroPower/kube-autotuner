@@ -576,7 +576,7 @@ def _clean_metadata(md: dict[str, Any] | None) -> dict[str, Any]:
     trial_count = md.get("trial_count")
     if isinstance(trial_count, int):
         result["trial_count"] = trial_count
-    for key in ("duration", "iterations"):
+    for key in ("iperf_duration", "fortio_duration", "iterations"):
         v = md.get(key)
         if isinstance(v, (int, float)) and math.isfinite(float(v)):
             result[key] = float(v) if isinstance(v, float) else int(v)
@@ -971,7 +971,8 @@ def _render_metadata_header(section: dict[str, Any]) -> str:
             f"{html.escape(', '.join(phase_chunks))}</span>",
         )
     _field("kernel", md.get("kernel_version"))
-    _field("duration", md.get("duration"))
+    _field("iperf duration", md.get("iperf_duration"))
+    _field("fortio duration", md.get("fortio_duration"))
     _field("iterations", md.get("iterations"))
     stages = md.get("stages")
     if stages is not None:

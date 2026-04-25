@@ -52,7 +52,7 @@ logger = logging.getLogger(__name__)
 # iperf3 flags the tool controls. Users cannot pass these through
 # ``extra_args`` because either :class:`BenchmarkConfig` owns them or
 # the JSON parser depends on the output format. Matching is whole-token,
-# not substring, so ``--windowsize-hint`` is not confused with ``--window``.
+# not substring.
 CLIENT_FLAG_DENYLIST: frozenset[str] = frozenset({
     "-c",
     "--client",
@@ -64,8 +64,6 @@ CLIENT_FLAG_DENYLIST: frozenset[str] = frozenset({
     "--omit",
     "-P",
     "--parallel",
-    "-w",
-    "--window",
     "-u",
     "--udp",
     "-J",
@@ -225,7 +223,12 @@ class IperfArgs(BaseModel):
 
 
 class IperfSection(BaseModel):
-    """Per-role ``extra_args`` and retry budget for iperf3 client Jobs.
+    """Iperf3-specific run shape, ``extra_args``, and retry budget.
+
+    ``duration``, ``omit``, and ``parallel`` map directly onto iperf3's
+    ``-t`` / ``-O`` / ``-P`` flags and have no fortio analogue (fortio
+    uses :attr:`FortioSection.duration` and
+    :attr:`FortioSection.connections` instead).
 
     ``max_attempts`` is the number of full Job lifecycles the benchmark
     runner may try per client per iteration before giving up and
@@ -242,6 +245,9 @@ class IperfSection(BaseModel):
 
     client: IperfArgs = Field(default_factory=IperfArgs)
     server: IperfArgs = Field(default_factory=IperfArgs)
+    duration: int = Field(default=30, ge=1)
+    omit: int = Field(default=5, ge=0)
+    parallel: int = Field(default=16, ge=1)
     max_attempts: int = Field(default=3, ge=1)
 
 
@@ -260,8 +266,8 @@ class FortioArgs(BaseModel):
 class FortioSection(BaseModel):
     """Per-role ``extra_args`` and run shape for the fortio sub-stages.
 
-    ``duration`` is intentionally independent of
-    :attr:`BenchmarkConfig.duration` so operators can keep fortio runs
+    ``duration`` is fortio's per-substage wall time, independent of
+    :attr:`IperfSection.duration` so operators can keep fortio runs
     short without shortening the iperf3 bandwidth window. ``fixed_qps``
     drives the latency percentile sub-stage; ``connections`` is
     forwarded to fortio's ``-c`` flag for both sub-stages.
@@ -1007,11 +1013,10 @@ class ExperimentConfig(BaseModel):
             node=primary,
             target=self.nodes.target,
             port=5201,
-            duration=self.benchmark.duration,
-            omit=self.benchmark.omit,
-            parallel=self.benchmark.parallel,
+            duration=self.iperf.duration,
+            omit=self.iperf.omit,
+            parallel=self.iperf.parallel,
             mode="tcp",
-            window=self.benchmark.window,
             extra_args=self.iperf.client.extra_args,
         )
         server_yaml = build_server_yaml(

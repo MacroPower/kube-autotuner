@@ -33,7 +33,12 @@ from kube_autotuner.analysis import (  # noqa: E402
     verification_stats,
 )
 from kube_autotuner.cli import _build_axis_payload, app  # noqa: E402, PLC2701
-from kube_autotuner.experiment import ObjectivesSection, ParetoObjective  # noqa: E402
+from kube_autotuner.experiment import (  # noqa: E402
+    FortioSection,
+    IperfSection,
+    ObjectivesSection,
+    ParetoObjective,
+)
 from kube_autotuner.models import (  # noqa: E402
     ALL_STAGES,
     BenchmarkConfig,
@@ -93,7 +98,7 @@ def _trial(  # noqa: PLR0913, PLR0917
             "net.core.rmem_max": rmem_max,
             "net.ipv4.tcp_congestion_control": congestion,
         },
-        config=BenchmarkConfig(duration=10, iterations=1),
+        config=BenchmarkConfig(iterations=1),
         results=[_result(bps, retransmits, bytes_sent)],
         **kw,
     )
@@ -521,7 +526,7 @@ class TestRecommendConfigs:
                 trial_id=tid,
                 node_pair=NodePair(source="a", target="b", hardware_class="10g"),
                 sysctl_values={"net.core.rmem_max": 212992 + (1 if tid == "a" else 2)},
-                config=BenchmarkConfig(duration=10, iterations=1),
+                config=BenchmarkConfig(iterations=1),
                 results=[
                     BenchmarkResult(
                         timestamp=datetime.now(UTC),
@@ -886,7 +891,7 @@ class TestCLIAnalyze:
                 trial_id=tid,
                 node_pair=NodePair(source="a", target="b", hardware_class="10g"),
                 sysctl_values={"net.core.rmem_max": 212992 + retx},
-                config=BenchmarkConfig(duration=10, iterations=1),
+                config=BenchmarkConfig(iterations=1),
                 results=[
                     BenchmarkResult(
                         timestamp=datetime.now(UTC),
@@ -916,7 +921,9 @@ class TestCLIAnalyze:
             ResumeMetadata(
                 objectives=section,
                 param_space=ParamSpace(params=[]),
-                benchmark=BenchmarkConfig(duration=10, iterations=1),
+                benchmark=BenchmarkConfig(iterations=1),
+                iperf=IperfSection(duration=10),
+                fortio=FortioSection(),
             ),
         )
 
@@ -1030,7 +1037,7 @@ def _trial_with_snapshots(
         node_pair=NodePair(source="a", target="b", hardware_class=hw),
         sysctl_values={"net.core.rmem_max": 212992},
         topology=topology,
-        config=BenchmarkConfig(duration=1, iterations=1),
+        config=BenchmarkConfig(iterations=1),
         results=[_result(1e9)],
         host_state_snapshots=snapshots,
     )
@@ -1242,7 +1249,7 @@ def _defaults_trial(
         "trial_id": trial_id,
         "node_pair": NodePair(source="a", target="b", hardware_class="10g"),
         "sysctl_values": dict(RECOMMENDED_DEFAULTS),
-        "config": BenchmarkConfig(duration=10, iterations=2),
+        "config": BenchmarkConfig(iterations=2),
         "results": [_result(bps)],
     }
     if phase is not None:
@@ -1442,15 +1449,41 @@ def test_trajectory_rows_skips_verification_repeats() -> None:
 # --- section_metadata ----------------------------------------------------
 
 
+def _resume_metadata(
+    *,
+    iperf_duration: int = 10,
+    fortio_duration: int = 7,
+) -> ResumeMetadata:
+    return ResumeMetadata(
+        objectives=ObjectivesSection(
+            pareto=[ParetoObjective(metric="tcp_throughput", direction="maximize")],
+            constraints=[],
+            recommendation_weights={},
+        ),
+        param_space=ParamSpace(params=[]),
+        benchmark=BenchmarkConfig(),
+        iperf=IperfSection(duration=iperf_duration),
+        fortio=FortioSection(duration=fortio_duration),
+    )
+
+
 def test_section_metadata_uniform_fields() -> None:
     t1 = _trial(hw="10g", bps=5e9, trial_id="t1")
     t2 = _trial(hw="10g", bps=6e9, trial_id="t2")
-    md = section_metadata([t1, t2], resume_metadata=None)
+    md = section_metadata([t1, t2], resume_metadata=_resume_metadata())
     assert md["trial_count"] == 2
-    assert md["duration"] == 10
+    assert md["iperf_duration"] == 10
+    assert md["fortio_duration"] == 7
     assert md["iterations"] == 1
     assert isinstance(md["stages"], list)
     assert md["kernel_version"] is None  # default "" -> None
+
+
+def test_section_metadata_durations_none_without_resume_metadata() -> None:
+    t1 = _trial(hw="10g", bps=5e9, trial_id="t1")
+    md = section_metadata([t1], resume_metadata=None)
+    assert md["iperf_duration"] is None
+    assert md["fortio_duration"] is None
 
 
 def test_section_metadata_mixed_fields_render_mixed() -> None:
@@ -1458,11 +1491,10 @@ def test_section_metadata_mixed_fields_render_mixed() -> None:
     t2 = _trial(hw="10g", bps=6e9, trial_id="t2")
     t2 = t2.model_copy(
         update={
-            "config": BenchmarkConfig(duration=30, iterations=5),
+            "config": BenchmarkConfig(iterations=5),
         },
     )
     md = section_metadata([t1, t2], resume_metadata=None)
-    assert md["duration"] == "mixed"
     assert md["iterations"] == "mixed"
 
 
@@ -1650,7 +1682,7 @@ def test_trials_to_dataframe_emits_std_columns_when_multi_iteration() -> None:
         trial_id="t1",
         node_pair=NodePair(source="a", target="b", hardware_class="10g"),
         sysctl_values={"net.core.rmem_max": 212992},
-        config=BenchmarkConfig(duration=10, iterations=3),
+        config=BenchmarkConfig(iterations=3),
         results=[
             BenchmarkResult(
                 timestamp=datetime.now(UTC),

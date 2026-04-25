@@ -272,7 +272,7 @@ _CONNECTION_PARAMS: list[SysctlParam] = [
         values=[131072, 262144, 4294967295],
         param_type="int",
     ),
-    # Ephemeral port pool size. With benchmark.parallel iperf3
+    # Ephemeral port pool size. With iperf.parallel iperf3
     # streams plus fortio saturation from the same source pod,
     # narrow ranges exhaust ports and cap rps. Expressed as a
     # "low high" integer tuple since sysctl -w reads two integers.

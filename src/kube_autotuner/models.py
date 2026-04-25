@@ -24,12 +24,16 @@ from pydantic.alias_generators import to_camel
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
 
-    # Imported for the :class:`ResumeMetadata` forward reference only.
+    # Imported for the :class:`ResumeMetadata` forward references only.
     # The actual import cannot live at module level because
     # :mod:`kube_autotuner.experiment` already imports from this module.
-    # :func:`_ensure_resume_metadata_built` resolves the forward ref
+    # :func:`_ensure_resume_metadata_built` resolves the forward refs
     # lazily and is triggered from ``experiment``'s module initialiser.
-    from kube_autotuner.experiment import ObjectivesSection  # noqa: TC004
+    from kube_autotuner.experiment import (  # noqa: TC004
+        FortioSection,
+        IperfSection,
+        ObjectivesSection,
+    )
 
 
 class MemoryCost(BaseModel):
@@ -175,7 +179,12 @@ def metrics_for_stages(stages: frozenset[StageName]) -> frozenset[str]:
 
 
 class BenchmarkConfig(BaseModel):
-    """Configuration for a single benchmark session.
+    """Backend-agnostic configuration for a benchmark session.
+
+    Holds settings that apply uniformly to every benchmark backend
+    (iperf3, fortio). Backend-specific knobs live on
+    :class:`~kube_autotuner.experiment.IperfSection` and
+    :class:`~kube_autotuner.experiment.FortioSection`.
 
     ``sync_window_seconds`` controls the wall-clock start-time barrier
     that aligns multi-client stages. The orchestrator picks a shared
@@ -203,11 +212,7 @@ class BenchmarkConfig(BaseModel):
         populate_by_name=True,
     )
 
-    duration: int = 30
-    omit: int = 5
     iterations: int = 3
-    parallel: int = 16
-    window: str | None = None
     sync_window_seconds: int = Field(default=15, ge=0, le=120)
     stages: frozenset[StageName] = Field(
         default_factory=lambda: frozenset(ALL_STAGES),
@@ -698,15 +703,18 @@ class ResumeMetadata(BaseModel):
     every run and consulted by
     :func:`kube_autotuner.runs.run_optimize` to decide whether the
     prior trials are compatible with the incoming experiment.
-    ``objectives``, ``param_space``, ``benchmark`` are the
-    compatibility keys; ``n_sobol``, ``verification_trials``, and
-    ``verification_top_k`` are only populated by ``optimize`` mode
-    (baseline / trial leave them ``None``).
+    ``objectives``, ``param_space``, ``benchmark``, ``iperf`` and
+    ``fortio`` are the compatibility keys; ``n_sobol``,
+    ``verification_trials``, and ``verification_top_k`` are only
+    populated by ``optimize`` mode (baseline / trial leave them
+    ``None``).
     """
 
     objectives: ObjectivesSection
     param_space: ParamSpace
     benchmark: BenchmarkConfig
+    iperf: IperfSection
+    fortio: FortioSection
     n_sobol: int | None = None
     verification_trials: int | None = None
     verification_top_k: int | None = None
@@ -716,19 +724,28 @@ _resume_metadata_built = False
 
 
 def _ensure_resume_metadata_built() -> None:
-    """Resolve :class:`ResumeMetadata`'s ``ObjectivesSection`` forward ref.
+    """Resolve :class:`ResumeMetadata`'s forward refs.
 
-    The annotation lives under ``TYPE_CHECKING`` to avoid an import
-    cycle with :mod:`kube_autotuner.experiment`. Callers invoke this
-    helper before the first validate/dump so Pydantic can bind the
-    real class into the model's type namespace.
+    The ``ObjectivesSection``, ``IperfSection`` and ``FortioSection``
+    annotations live under ``TYPE_CHECKING`` to avoid an import cycle
+    with :mod:`kube_autotuner.experiment`. Callers invoke this helper
+    before the first validate/dump so Pydantic can bind the real
+    classes into the model's type namespace.
     """
     global _resume_metadata_built  # noqa: PLW0603
     if _resume_metadata_built:
         return
-    from kube_autotuner.experiment import ObjectivesSection  # noqa: PLC0415
+    from kube_autotuner.experiment import (  # noqa: PLC0415
+        FortioSection,
+        IperfSection,
+        ObjectivesSection,
+    )
 
     ResumeMetadata.model_rebuild(
-        _types_namespace={"ObjectivesSection": ObjectivesSection},
+        _types_namespace={
+            "ObjectivesSection": ObjectivesSection,
+            "IperfSection": IperfSection,
+            "FortioSection": FortioSection,
+        },
     )
     _resume_metadata_built = True

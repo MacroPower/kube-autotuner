@@ -156,7 +156,7 @@ def _make_client(
 
 def test_single_client_single_iteration():
     node_pair = NodePair(source="kmain07", target="kmain08", hardware_class="10g")
-    config = BenchmarkConfig(duration=1, iterations=1)
+    config = BenchmarkConfig(iterations=1)
 
     logs = {"iperf3-client-kmain07-p5201": _fake_iperf_json(9e9)}
     client = _make_client(logs)
@@ -186,7 +186,7 @@ def test_multi_client_concurrent_launch():
         hardware_class="10g",
         extra_sources=["kmain09"],
     )
-    config = BenchmarkConfig(duration=1, iterations=2)
+    config = BenchmarkConfig(iterations=2)
 
     logs = {
         "iperf3-client-kmain07-p5201": _fake_iperf_json(4e9),
@@ -233,7 +233,7 @@ def test_first_exception_triggers_label_cleanup():
         hardware_class="10g",
         extra_sources=["kmain09"],
     )
-    config = BenchmarkConfig(duration=1, iterations=1)
+    config = BenchmarkConfig(iterations=1)
 
     client = _make_client({})
 
@@ -258,7 +258,7 @@ def test_first_exception_triggers_label_cleanup():
 
 def test_cleanup_removes_client_jobs_by_label():
     node_pair = NodePair(source="kmain07", target="kmain08", hardware_class="10g")
-    config = BenchmarkConfig(duration=1, iterations=1)
+    config = BenchmarkConfig(iterations=1)
     client = _make_client({})
 
     runner = BenchmarkRunner(node_pair, config, client=client)
@@ -277,7 +277,7 @@ def test_cleanup_removes_client_jobs_by_label():
 
 def test_extra_args_threaded_into_applied_yaml():
     node_pair = NodePair(source="kmain07", target="kmain08", hardware_class="10g")
-    config = BenchmarkConfig(duration=1, iterations=1)
+    config = BenchmarkConfig(iterations=1)
     client = _make_client({"iperf3-client-kmain07-p5201": _fake_iperf_json(1e9)})
     iperf_args = IperfSection(
         client=IperfArgs(extra_args=["-Z"]),
@@ -303,7 +303,7 @@ def test_extra_args_threaded_into_applied_yaml():
 )
 def test_patches_applied_to_server_yaml():
     node_pair = NodePair(source="kmain07", target="kmain08", hardware_class="10g")
-    config = BenchmarkConfig(duration=1, iterations=1)
+    config = BenchmarkConfig(iterations=1)
     client = _make_client({"iperf3-client-kmain07-p5201": _fake_iperf_json(1e9)})
     patches = [
         Patch(
@@ -328,7 +328,7 @@ def test_patches_applied_to_server_yaml():
 def test_substages_run_sequentially_in_order():
     """bw-tcp, bw-udp, fortio-sat, fortio-fixed run in that order."""
     node_pair = NodePair(source="kmain07", target="kmain08", hardware_class="10g")
-    config = BenchmarkConfig(duration=1, iterations=1)
+    config = BenchmarkConfig(iterations=1)
 
     logs = {"iperf3-client-kmain07-p5201": _fake_iperf_json(1e9)}
 
@@ -361,7 +361,6 @@ def test_disabled_bw_udp_stage_is_skipped():
     """bw-udp stage is not invoked and fires no observer callbacks."""
     node_pair = NodePair(source="kmain07", target="kmain08", hardware_class="10g")
     config = BenchmarkConfig(
-        duration=1,
         iterations=1,
         stages=frozenset({"bw-tcp", "fortio-sat", "fortio-fixed"}),
     )
@@ -389,7 +388,7 @@ def test_disabled_bw_udp_stage_is_skipped():
 
 def test_fortio_failure_cleans_up_by_fortio_label():
     node_pair = NodePair(source="kmain07", target="kmain08", hardware_class="10g")
-    config = BenchmarkConfig(duration=1, iterations=1)
+    config = BenchmarkConfig(iterations=1)
 
     logs = {"iperf3-client-kmain07-p5201": _fake_iperf_json(1e9)}
 
@@ -443,7 +442,7 @@ def _retry_runner(
         ``(runner, client_mock)``.
     """
     node_pair = NodePair(source="kmain07", target="kmain08", hardware_class="10g")
-    config = BenchmarkConfig(duration=1, iterations=1)
+    config = BenchmarkConfig(iterations=1)
 
     iperf_iter = iter(iperf_logs)
     client = _make_client(logs_by_job={})
@@ -555,7 +554,7 @@ def test_retry_on_iperf_error_payload():
 def test_retry_on_fortio_zero_count():
     """(e) fortio DurationHistogram.Count==0 → retry until Count > 0."""
     node_pair = NodePair(source="kmain07", target="kmain08", hardware_class="10g")
-    config = BenchmarkConfig(duration=1, iterations=1)
+    config = BenchmarkConfig(iterations=1)
 
     fortio_iter = iter([
         json.dumps({
@@ -634,7 +633,7 @@ def test_sibling_abort_caps_retry_amplification():
         hardware_class="10g",
         extra_sources=["kmain09"],
     )
-    config = BenchmarkConfig(duration=1, iterations=1)
+    config = BenchmarkConfig(iterations=1)
 
     max_attempts = 4
     attempts_per_client: dict[str, int] = {"kmain07": 0, "kmain09": 0}
@@ -680,7 +679,7 @@ def test_sibling_abort_caps_retry_amplification():
 def test_run_flushes_network_state_per_iteration():
     """Each iteration invokes ``flush_network_state`` on every configured backend."""
     node_pair = NodePair(source="kmain07", target="kmain08", hardware_class="10g")
-    config = BenchmarkConfig(duration=1, iterations=2)
+    config = BenchmarkConfig(iterations=2)
 
     logs = {"iperf3-client-kmain07-p5201": _fake_iperf_json(9e9)}
     client = _make_client(logs)
@@ -704,7 +703,7 @@ def test_run_flushes_network_state_per_iteration():
 def test_run_without_flush_backends_skips_flush():
     """Default ``flush_backends=None`` triggers no per-iteration flush work."""
     node_pair = NodePair(source="kmain07", target="kmain08", hardware_class="10g")
-    config = BenchmarkConfig(duration=1, iterations=2)
+    config = BenchmarkConfig(iterations=2)
 
     logs = {"iperf3-client-kmain07-p5201": _fake_iperf_json(9e9)}
     client = _make_client(logs)
@@ -739,7 +738,7 @@ def _message_index(caplog, substring: str) -> int:
 def test_run_emits_stage_boundary_logs(caplog):
     """``run`` logs benchmark start, start/complete per stage, and benchmark end."""
     node_pair = NodePair(source="kmain07", target="kmain08", hardware_class="10g")
-    config = BenchmarkConfig(duration=1, iterations=2)
+    config = BenchmarkConfig(iterations=2)
     logs = {"iperf3-client-kmain07-p5201": _fake_iperf_json(9e9)}
     client = _make_client(logs)
 
@@ -772,7 +771,7 @@ def test_run_emits_stage_boundary_logs(caplog):
 def test_run_emits_flush_bookends_per_backend(caplog):
     """Each configured backend gets a ``starting`` / ``complete`` INFO pair in order."""
     node_pair = NodePair(source="kmain07", target="kmain08", hardware_class="10g")
-    config = BenchmarkConfig(duration=1, iterations=1)
+    config = BenchmarkConfig(iterations=1)
     logs = {"iperf3-client-kmain07-p5201": _fake_iperf_json(9e9)}
     client = _make_client(logs)
 
@@ -804,7 +803,7 @@ def test_run_emits_flush_bookends_per_backend(caplog):
 def test_run_flush_starting_logged_even_when_backend_raises(caplog):
     """A raising backend still produces its ``starting`` line, and aborts the run."""
     node_pair = NodePair(source="kmain07", target="kmain08", hardware_class="10g")
-    config = BenchmarkConfig(duration=1, iterations=1)
+    config = BenchmarkConfig(iterations=1)
     client = _make_client({"iperf3-client-kmain07-p5201": _fake_iperf_json(9e9)})
 
     angry_backend = MagicMock()
@@ -853,7 +852,7 @@ def test_run_collects_host_state_snapshots_per_phase():
     """Each iteration produces exactly one post-flush + one post-iteration snapshot."""
     node_pair = NodePair(source="kmain07", target="kmain08", hardware_class="10g")
     iterations = 3
-    config = BenchmarkConfig(duration=1, iterations=iterations)
+    config = BenchmarkConfig(iterations=iterations)
 
     logs = {"iperf3-client-kmain07-p5201": _fake_iperf_json(9e9)}
     client = _make_client(logs)
@@ -890,7 +889,7 @@ def test_run_collects_host_state_snapshots_per_phase():
 def test_run_collect_host_state_off_is_no_op_even_with_backends():
     """The flag is required; passing backends alone never fires collection."""
     node_pair = NodePair(source="kmain07", target="kmain08", hardware_class="10g")
-    config = BenchmarkConfig(duration=1, iterations=2)
+    config = BenchmarkConfig(iterations=2)
 
     logs = {"iperf3-client-kmain07-p5201": _fake_iperf_json(9e9)}
     client = _make_client(logs)
@@ -913,7 +912,7 @@ def test_run_collect_host_state_off_is_no_op_even_with_backends():
 def test_run_warns_when_flag_on_but_no_snapshot_backends(caplog):
     """Flag on + empty snapshot list must emit a single warning per run()."""
     node_pair = NodePair(source="kmain07", target="kmain08", hardware_class="10g")
-    config = BenchmarkConfig(duration=1, iterations=2)
+    config = BenchmarkConfig(iterations=2)
 
     logs = {"iperf3-client-kmain07-p5201": _fake_iperf_json(9e9)}
     client = _make_client(logs)
@@ -936,7 +935,7 @@ def test_run_warns_when_flag_on_but_no_snapshot_backends(caplog):
 def test_run_warns_when_every_backend_returns_none_for_baseline(caplog):
     """Talos-only deployment case: every backend returns None."""
     node_pair = NodePair(source="kmain07", target="kmain08", hardware_class="10g")
-    config = BenchmarkConfig(duration=1, iterations=2)
+    config = BenchmarkConfig(iterations=2)
 
     logs = {"iperf3-client-kmain07-p5201": _fake_iperf_json(9e9)}
     client = _make_client(logs)
@@ -965,7 +964,7 @@ def test_run_warns_when_every_backend_returns_none_for_baseline(caplog):
 def test_run_partial_none_backend_does_not_warn(caplog):
     """Mixed real + Talos backends is a legitimate config; must stay silent."""
     node_pair = NodePair(source="kmain07", target="kmain08", hardware_class="10g")
-    config = BenchmarkConfig(duration=1, iterations=1)
+    config = BenchmarkConfig(iterations=1)
 
     logs = {"iperf3-client-kmain07-p5201": _fake_iperf_json(9e9)}
     client = _make_client(logs)

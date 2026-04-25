@@ -109,7 +109,7 @@ parameters as full ranges (as the YAML doc comment
 Either way, exhaustive search is not an option.
 
 | Category           | Count | Examples                                                                                |
-|--------------------|-------|-----------------------------------------------------------------------------------------|
+| ------------------ | ----- | --------------------------------------------------------------------------------------- |
 | TCP buffers        | 5     | `net.core.rmem_max`, `net.ipv4.tcp_rmem`, `net.ipv4.tcp_mem`                            |
 | Congestion control | 7     | `net.ipv4.tcp_congestion_control`, `net.core.default_qdisc`, `net.ipv4.tcp_autocorking` |
 | NAPI / softirq     | 3     | `net.core.netdev_budget`, `net.core.netdev_max_backlog`                                 |
@@ -143,7 +143,7 @@ Two shapes of customisation:
 The package is not yet published to PyPI. Install from source:
 
 ```sh
-pip install "git+https://github.com/<owner>/kube-autotuner.git"
+pip install "git+https://github.com/macropower/kube-autotuner.git"
 # or, from a clone:
 uv pip install -e .
 ```
@@ -160,34 +160,60 @@ you get when you omit them. The subcommand picks the execution flow
 section to run `optimize`, and a `trial:` section to run `trial`.
 
 ```yaml
+output: out/results
+
 nodes:
-  sources: [nodeA]               # >=1 source node; first entry is primary
+  sources: [nodeA]
   target: nodeB
-  hardwareClass: 10g             # free-form label; stratifies results
+  hardwareClass: 10g # Arbitrary label used to stratify results.
   namespace: default
   ipFamilyPolicy: RequireDualStack
 
 benchmark:
-  duration: 30                   # seconds of measurement per iteration
-  omit: 5                        # warmup seconds discarded from stats
-  iterations: 3
-  parallel: 16                   # iperf3 -P streams per client
-  window: null                   # iperf3 -w hint; e.g. "256K" to pin it
+  iterations: 3 # Iterations per trial.
+  # Wall-clock barrier that aligns multi-client stages on a shared start epoch.
+  # Note that this relies on NTP-synced nodes; a pod that misses the window starts
+  # late rather than blocking the run. Set to 0 to disable.
+  syncWindowSeconds: 15
+  # Benchmark sub-stages to run per iteration. Omitting a stage skips its
+  # wall-clock cost and prunes its metrics from objectives at load time.
+  stages: [bw-tcp, bw-udp, fortio-sat, fortio-fixed]
+  # Record per-iteration host-state snapshots (conntrack, sockets, slab) on
+  # each TrialResult.
+  collectHostState: false
 
-# Required for the `optimize` subcommand. Ax Bayesian loop knobs plus
-# the search space. Omit paramSpace to use the built-in canonical sysctl
-# set.
+# Ax Bayesian loop knobs plus the search space.
 optimize:
   nTrials: 50
-  nSobol: 15                     # quasi-random exploration trials; <= nTrials
-  applySource: false             # also write best sysctls on source nodes
+  # Quasi-random exploration trials; <= nTrials.
+  nSobol: 15
+  # Write best sysctls on source nodes (default: destination only).
+  applySource: false
+  # Optional parameter overrides; omit to use the built-in canonical sysctl set.
   paramSpace:
     - name: net.core.rmem_max
-      paramType: int             # integer range: values = [min, max]
+      # integer range: values = [min, max]
+      paramType: int
       values: [4194304, 67108864]
+      # Optional. Drives memoryCostWeight at recommendation time only.
+      # The `kind` selects how the rung value maps to bytes:
+      #   * identity (rung is bytes)
+      #   * triple_max (max field of the space-separated triple)
+      #   * triple_max_pages (same x 4096)
+      #   * kib (rung in KiB)
+      #   * per_entry (perEntryBytes sets the per-entry size)
+      memoryCost:
+        kind: identity
     - name: net.ipv4.tcp_congestion_control
-      paramType: choice          # discrete set; values are strings or ints
+      # Discrete set; values are strings or ints.
+      paramType: choice
       values: [cubic, bbr]
+  # After the Bayesian loop, re-run the top-K recommended configs this many
+  # extra times to confirm the win is real and not a noise artifact.
+  # Set to 0 to disable the verification phase.
+  verificationTrials: 0
+  # Number of top-ranked configs to verify when verificationTrials > 0.
+  verificationTopK: 3
 
 # Required for the `trial` subcommand. Apply a fixed sysctl set for one
 # benchmark.
@@ -196,53 +222,39 @@ optimize:
 #     net.core.rmem_max: 67108864
 #     net.ipv4.tcp_congestion_control: bbr
 
-# Extra iperf3 flags per role. Flags the tool itself owns (-t, -P, -w,
-# -u, -J, --bind, etc.) are rejected at preflight.
+# Iperf3 drives two bandwidth sub-stages per iteration, each ~`duration`
+# seconds of wall time:
+#   * `bw-tcp`: `iperf3`    -> `tcp_throughput|retransmit_rate`.
+#   * `bw-udp`: `iperf3 -u` -> `udp_throughput|loss_rate|jitter`.
 iperf:
+  duration: 30  # Seconds of measurement per iteration (iperf3 -t).
+  omit: 5       # Warmup seconds to discard from stats (iperf3 -O).
+  parallel: 16  # Streams per client (iperf3 -P).
   client:
     extraArgs: ["--bidir", "-Z"]
   server:
     extraArgs: ["--forceflush"]
+  # Job retry budget per client per iteration. Independent of the pod-level
+  # backoffLimit baked into the manifest: that controls pod retries inside
+  # one Job, this controls how many times the runner rebuilds the Job from
+  # scratch. Worst-case wall time per client is maxAttempts * 180s. Note
+  # the snake_case key: IperfSection does not register a camelCase alias.
+  maxAttempts: 3
 
-# Fortio drives the latency / RPS sub-stages. `duration` is independent
-# of benchmark.duration so fortio runs stay short. `fixedQps` is the
-# offered load for the latency sub-stage; the saturation sub-stage
-# always runs with -qps 0. Flags the tool controls (-qps, -c, -t, -n,
-# -json, -url, -H, -http1.0, -stdclient, -quiet on the client;
-# -http-port on the server) are rejected at preflight.
+# Fortio drives two request/response sub-stages per iteration, each ~`duration`
+# seconds of wall time:
+#   * `fortio-sat`:   `fortio load -qps 0`          -> `rps`.
+#   * `fortio-fixed`: `fortio load -qps <fixedQps>` -> `latency_p50|p90|p99`.
 fortio:
-  fixedQps: 1000
-  connections: 4
-  duration: 30                    # seconds, per fortio sub-stage
+  duration: 30     # Seconds of measurement per iteration (fortio -t <n>s).
+  fixedQps: 1000   # Offered QPS for the fixed sub-stage (fortio -qps).
+  connections: 4   # Fortio connections for both sub-stages (fortio -c).
   client:
     extraArgs: []
   server:
     extraArgs: []
-
-# Kustomize patches layered onto the generated client/server manifests.
-# `patch:` accepts a Strategic Merge Patch body (dict), a JSON6902 op
-# list, or a pre-rendered patch string. Do not set target.namespace or
-# metadata.namespace -- namespace is controlled by nodes.namespace.
-patches:
-  - target:
-      kind: Job
-      name: iperf3-client        # also: group, version, labelSelector, annotationSelector
-    patch:
-      spec:
-        template:
-          spec:
-            containers:
-              - name: iperf3-client
-                resources:
-                  limits:
-                    memory: "2Gi"
-  - target:
-      kind: Deployment
-    strict: false                # default true; false lets the patch no-op
-    patch:
-      - op: add
-        path: /spec/template/spec/hostNetwork
-        value: true
+  # Job retry budget per client per iteration; see `iperf.maxAttempts`.
+  maxAttempts: 3
 
 objectives:
   pareto:
@@ -255,129 +267,101 @@ objectives:
     - { metric: latency_p50, direction: minimize }
     - { metric: latency_p90, direction: minimize }
     - { metric: latency_p99, direction: minimize }
-  # k8s-style quantity suffixes accepted on the threshold. Every Pareto
-  # objective needs an explicit threshold so Ax's hypervolume geometry stays
-  # well-defined; supplying `constraints:` replaces the default list
-  # wholesale, so omit an entry only if you intend to drop that threshold.
+  # Every Pareto objective needs an explicit threshold so Ax's hypervolume
+  # geometry stays well-defined. Note that supplying any constraints will
+  # replace the default list. Accepts the k8s quantity grammar:
+  #   * Binary IEC (`Ki`, `Mi`, `Gi`, `Ti`, `Pi`, `Ei`)
+  #   * Decimal SI (`n`, `u`, `m`, `k`, `M`, `G`, `T`, `P`, `E`)
+  #   * Decimal exponents (`1e6`, `1E-9`)
   constraints:
-    # bits/sec; 1M (decimal mega) = 1e6.
+    # Throughput bits/sec.
     - "tcp_throughput >= 1M"
     - "udp_throughput >= 1M"
-    # retransmits per GB sent; 1000 retx/GB ~ 1 retx/MB.
+    # Retransmits per GB sent; 1000 retx/GB ~ 1 retx/MB.
     - "tcp_retransmit_rate <= 1000"
-    # 5% UDP packet loss cap; UDP loss naturally runs higher than TCP
-    # retransmit rate.
+    # 5% UDP packet loss cap.
     - "udp_loss_rate <= 0.05"
-    # seconds; 10ms jitter ceiling.
+    # Seconds; 10ms jitter ceiling.
     - "udp_jitter <= 10m"
-    # requests/sec; only the saturation sub-stage feeds rps, so this floor
-    # only fails on fortio server crash.
     - "rps >= 100"
-    # seconds; mean-latency loose cap from the fixed_qps sub-stage. Loose
-    # caps keep hypervolume informative without dominating the
-    # recommendation score -- final ranking runs through
-    # recommendationWeights, not Ax's hypervolume.
+    # Seconds; mean-latency loose cap from the fixed_qps sub-stage.
+    # Loose caps keep hypervolume informative without dominating the
+    # recommendation score.
     - "latency_p50 <= 100m"
-    # seconds; tail-latency loose cap.
     - "latency_p90 <= 500m"
-    # seconds; 1000m (milli) = 1.0s ceiling from the fixed_qps sub-stage only.
     - "latency_p99 <= 1000m"
+  # Weights apply to every metric listed in `pareto` (both maximize and minimize
+  # directions) and must reference a metric present in `pareto`. Defaults depend
+  # on direction: an omitted maximize-metric weight defaults to `1.0` (the
+  # metric contributes its full +norm), and an omitted minimize-metric weight
+  # defaults to `0.0` (the metric participates in frontier selection but does
+  # not bias the recommendation score). Raising a maximize weight above `1.0`
+  # biases the recommendation toward that metric; setting any weight to `0.0`
+  # disables the metric's contribution entirely.
   recommendationWeights:
     tcp_retransmit_rate: 0.3
-    udp_loss_rate: 0.3               # mirror tcp_retransmit_rate's weight; UDP loss pushes
-                                     # back on the score with the same force TCP retransmit
-                                     # rate does.
-    udp_jitter: 0.1                  # UDP inter-arrival jitter (ms); modest weight -- a
-                                     # stability signal, not a primary optimization target.
-    latency_p90: 0.1                 # tail-latency weights keep the live Best-so-far panel
-    latency_p99: 0.15                # and the post-hoc recommendation from over-indexing on
-                                     # raw throughput; latency_p50 stays unweighted so the
-                                     # mean-latency axis enters the Pareto set without
-                                     # dominating the score.
-  memoryCostWeight: 0.1              # gently penalises configs that burn kernel/CNI memory
-                                     # on over-sized buffers, conntrack entries, and
-                                     # backlog queues. Derived statically from the selected
-                                     # rungs, summed across sysctls, min-max normalised
-                                     # alongside the other minimize terms. Set to 0.0 to
-                                     # disable. Applies only at recommendation-ranking
-                                     # time; Ax exploration stays untouched.
+    udp_loss_rate: 0.3
+    udp_jitter: 0.1
+    latency_p50: 0.1
+    latency_p90: 0.2
+    latency_p99: 0.3
+  # Gently penalise configs that burn kernel/CNI memory on over-sized
+  # buffers, conntrack entries, and backlog queues. Derived statically
+  # from the selected rungs, summed across sysctls, min-max normalised
+  # alongside the other minimize terms. Set to 0.0 to disable. Applies
+  # only at recommendation-ranking time; Ax exploration stays untouched.
+  memoryCostWeight: 0.1
 
-output: out/results
+# Kustomize patches layered onto the generated client/server manifests.
+# Accepts a Strategic Merge Patch body (dict), a JSON6902 op list,
+# or a pre-rendered patch string.
+patches:
+  - target:
+      kind: Job
+      name: iperf3-client
+    patch:
+      spec:
+        template:
+          spec:
+            containers:
+              - name: iperf3-client
+                resources:
+                  limits:
+                    memory: "2Gi"
+  - target:
+      kind: Deployment
+    strict: false # Allow the patch to no-op.
+    patch:
+      - op: add
+        path: /spec/template/spec/hostNetwork
+        value: true
 ```
-
-A few rules govern how the `objectives:` block is interpreted:
-
-- Supplying `constraints:` or `recommendationWeights:` **replaces**
-  the default list wholesale rather than extending it.
-- Constraint thresholds accept the k8s quantity grammar: binary IEC
-  (`Ki`, `Mi`, `Gi`, `Ti`, `Pi`, `Ei`), decimal SI (`n`, `u`, `m`, `k`,
-  `M`, `G`, `T`, `P`, `E`), and decimal exponents (`1e6`, `1E-9`).
-  Values are normalized to bare floats at load time, so a config
-  written as `"throughput >= 1Gi"` is stored and forwarded to Ax as
-  `"throughput >= 1073741824"`.
-- Weights apply to every metric listed in `pareto` (both maximize
-  and minimize directions) and must reference a metric present in
-  `pareto`. Defaults depend on direction: an omitted
-  maximize-metric weight defaults to `1.0` (the metric contributes
-  its full +norm), and an omitted minimize-metric weight defaults
-  to `0.0` (the metric participates in frontier selection but does
-  not bias the recommendation score). Raising a maximize weight
-  above `1.0` biases the recommendation toward that metric; setting
-  any weight to `0.0` disables the metric's contribution entirely.
-- `memoryCostWeight` is a singular scalar, not a per-metric dict. It
-  weights a static per-trial memory footprint (bytes) derived from the
-  sysctl values -- buffer ceilings, conntrack table size,
-  `vm.min_free_kbytes`, and the backlog queues all contribute; flags,
-  timeouts, and congestion-control choices do not. The cost derivation
-  lives on each `SysctlParam` as a `memoryCost` rule (`identity`,
-  `triple_max`, `triple_max_pages`, `kib`, `per_entry`), so adding a
-  rung to an existing costed sysctl does not require hand-maintaining a
-  parallel bytes table.
-- Every iteration runs both iperf3 bandwidth stages (TCP then UDP)
-  and both fortio sub-stages, so every metric below is always
-  observable.
 
 ## Metric catalog
 
 Valid `pareto.metric` values and their sources:
 
-| Metric                | Direction | Source sub-stage         | Notes                                                                                                  |
-|-----------------------|-----------|--------------------------|--------------------------------------------------------------------------------------------------------|
-| `tcp_throughput`      | maximize  | iperf3 bw-tcp            | Bits per second. Summed across source clients per iteration, averaged across iterations.              |
-| `udp_throughput`      | maximize  | iperf3 bw-udp            | Bits per second. Same aggregation as `tcp_throughput`.                                                |
-| `tcp_retransmit_rate` | minimize  | iperf3 bw-tcp            | Retransmits per GB sent (1.0 ~ one retransmit per gigabyte); scale-invariant, so high-throughput/high-loss does not win on raw count. |
-| `udp_loss_rate`       | minimize  | iperf3 bw-udp            | Lost packets per packet sent; per-iteration ratio-of-sums then averaged. UDP analog of `tcp_retransmit_rate`. |
-| `udp_jitter`          | minimize  | iperf3 bw-udp            | Seconds (stored); displayed as milliseconds. Mean UDP inter-arrival jitter; tail-stability signal that TCP-only runs cannot observe. |
-| `rps`                 | maximize  | fortio saturation        | Achieved QPS under `-qps 0`. Fixed-QPS RPS would clamp to the offered load, so it is not a source.    |
-| `latency_p50`         | minimize  | fortio fixed-QPS         | Seconds (stored); displayed as milliseconds. Measured under the configured `fortio.fixedQps` offered load. |
-| `latency_p90`         | minimize  | fortio fixed-QPS         | Seconds (stored); displayed as milliseconds. See `latency_p50`.                                       |
-| `latency_p99`         | minimize  | fortio fixed-QPS         | Seconds (stored); displayed as milliseconds. Comparable across trials because offered load is stable. |
-
-Splitting latency and RPS across two fortio sub-stages avoids the
-"overloaded system has high latency because it's overloaded" confound:
-RPS is only meaningful under saturation, and latency percentiles are
-only comparable across trials under a stable offered load.
-
-See [`tests/fixtures/experiment_example.yaml`](tests/fixtures/experiment_example.yaml)
-for the canonical executable fixture.
-
-Run it:
-
-```sh
-# YAML drives every flow; the subcommand picks the execution path.
-kube-autotuner optimize experiment.yaml
-kube-autotuner analyze out/results --output-dir out/analysis
-```
+| Metric                | Direction | Source sub-stage  | Notes                                                                                    |
+| --------------------- | --------- | ----------------- | ---------------------------------------------------------------------------------------- |
+| `tcp_throughput`      | maximize  | iperf3 bw-tcp     | Bits per second. Summed across source clients per iteration, averaged across iterations. |
+| `udp_throughput`      | maximize  | iperf3 bw-udp     | Bits per second. Same aggregation as `tcp_throughput`.                                   |
+| `tcp_retransmit_rate` | minimize  | iperf3 bw-tcp     | Retransmits per GB sent (1.0 ~ one retransmit per gigabyte).                             |
+| `udp_loss_rate`       | minimize  | iperf3 bw-udp     | Lost packets per packet sent; per-iteration ratio-of-sums then averaged.                 |
+| `udp_jitter`          | minimize  | iperf3 bw-udp     | Seconds. Mean UDP inter-arrival jitter.                                                  |
+| `rps`                 | maximize  | fortio saturation | Achieved QPS under maximum load.                                                         |
+| `latency_p50`         | minimize  | fortio fixed-QPS  | Seconds. Measured under the configured `fortio.fixedQps` offered load.                   |
+| `latency_p90`         | minimize  | fortio fixed-QPS  | Seconds. See `latency_p50`.                                                              |
+| `latency_p99`         | minimize  | fortio fixed-QPS  | Seconds. See `latency_p50`.                                                              |
 
 ## Commands
 
-| Command                     | Purpose                                                      |
-|-----------------------------|--------------------------------------------------------------|
-| `baseline <experiment.yaml>` | iperf3 with the current sysctls; reference measurement.     |
-| `trial <experiment.yaml>`    | One benchmark with the YAML's `trial.sysctls` map applied.  |
-| `optimize <experiment.yaml>` | Ax Bayesian tuning loop (requires `[optimize]`).            |
-| `analyze <results/>`         | Pareto, importance, recommendations (requires `[analysis]`).|
-| `sysctl get/set`            | Low-level read/write against the selected backend.           |
+| Command                      | Purpose                                                      |
+| ---------------------------- | ------------------------------------------------------------ |
+| `baseline <experiment.yaml>` | iperf3 with the current sysctls; reference measurement.      |
+| `trial <experiment.yaml>`    | One benchmark with the YAML's `trial.sysctls` map applied.   |
+| `optimize <experiment.yaml>` | Ax Bayesian tuning loop (requires `[optimize]`).             |
+| `analyze <results/>`         | Pareto, importance, recommendations (requires `[analysis]`). |
+| `sysctl get/set`             | Low-level read/write against the selected backend.           |
 
 Per-command flags: `kube-autotuner <command> --help`.
 

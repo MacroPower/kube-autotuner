@@ -33,7 +33,7 @@ def _prior_trial(
     return TrialResult(
         node_pair=NodePair(source="a", target="b", hardware_class="10g"),
         sysctl_values={"net.core.rmem_max": sysctl_value},
-        config=BenchmarkConfig(duration=1, iterations=1),
+        config=BenchmarkConfig(iterations=1),
         results=[
             BenchmarkResult(
                 timestamp=datetime.now(UTC),
@@ -57,7 +57,8 @@ def _optimize_exp(
 ) -> ExperimentConfig:
     return ExperimentConfig.model_validate({
         "nodes": {"sources": ["a"], "target": "b"},
-        "benchmark": {"duration": 1, "iterations": 1},
+        "benchmark": {"iterations": 1},
+        "iperf": {"duration": 1},
         "optimize": {
             "n_trials": n_trials,
             "n_sobol": 2,
@@ -82,6 +83,8 @@ def _write_metadata(
             objectives=exp.objectives,
             param_space=exp.effective_param_space(),
             benchmark=exp.benchmark,
+            iperf=exp.iperf,
+            fortio=exp.fortio,
             n_sobol=exp.optimize.n_sobol,
             verification_trials=verification_trials,
             verification_top_k=verification_top_k,

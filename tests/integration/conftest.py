@@ -240,8 +240,9 @@ def write_experiment_yaml(
             f"  namespace: {namespace}",
             f"  ipFamilyPolicy: {ip_family_policy}",
             "benchmark:",
-            f"  duration: {duration}",
             f"  iterations: {iterations}",
+            "iperf:",
+            f"  duration: {duration}",
         ]
         if trial_sysctls is not None:
             lines.extend(("trial:", "  sysctls:"))

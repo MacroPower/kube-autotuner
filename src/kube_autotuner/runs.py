@@ -258,17 +258,17 @@ def _move_prior_artifacts(output: Path) -> None:
     logger.info("moved prior results to %s", backup)
 
 
-def _check_compatibility(
+def _check_compatibility(  # noqa: C901, PLR0912 - one branch per compatibility key
     meta: ResumeMetadata | None,
     exp: ExperimentConfig,
 ) -> None:
     """Validate that ``meta`` matches ``exp`` on the compatibility keys.
 
     Compatibility keys: ``objectives``, ``param_space``,
-    ``benchmark``, and (when the sidecar carries one) ``n_sobol``,
-    ``verification_trials``, ``verification_top_k``. Node identity,
-    patches, iperf/fortio args, and ``apply_source`` can change
-    silently between runs.
+    ``benchmark``, ``iperf``, ``fortio``, and (when the sidecar
+    carries one) ``n_sobol``, ``verification_trials``,
+    ``verification_top_k``. Node identity, patches, and
+    ``apply_source`` can change silently between runs.
 
     A ``None`` sidecar alongside a non-empty dataset signals a prior
     run that wrote no metadata (or a manually assembled directory);
@@ -300,6 +300,10 @@ def _check_compatibility(
         exclude=benchmark_exclude,
     ):
         changed.append("benchmark")
+    if meta.iperf.model_dump() != exp.iperf.model_dump():
+        changed.append("iperf")
+    if meta.fortio.model_dump() != exp.fortio.model_dump():
+        changed.append("fortio")
     if exp.optimize is not None and meta.n_sobol is not None:
         if meta.n_sobol != exp.optimize.n_sobol:
             changed.append("n_sobol")
@@ -419,6 +423,8 @@ def run_baseline(ctx: RunContext) -> None:
             objectives=exp.objectives,
             param_space=exp.effective_param_space(),
             benchmark=exp.benchmark,
+            iperf=exp.iperf,
+            fortio=exp.fortio,
         ),
     )
     node_pair = _resolve_zones(exp.to_node_pair(), ctx.client)
@@ -509,6 +515,8 @@ def run_trial(ctx: RunContext) -> None:
             objectives=exp.objectives,
             param_space=exp.effective_param_space(),
             benchmark=exp.benchmark,
+            iperf=exp.iperf,
+            fortio=exp.fortio,
         ),
     )
     params: dict[str, str] = {k: str(v) for k, v in exp.trial.sysctls.items()}
@@ -648,6 +656,8 @@ def run_optimize(  # noqa: PLR0914, PLR0915
             objectives=exp.objectives,
             param_space=exp.effective_param_space(),
             benchmark=exp.benchmark,
+            iperf=exp.iperf,
+            fortio=exp.fortio,
             n_sobol=exp.optimize.n_sobol,
             verification_trials=exp.optimize.verification_trials,
             verification_top_k=exp.optimize.verification_top_k,

@@ -151,7 +151,7 @@ class TestOptimizationLoop:
 
     @pytest.fixture
     def config(self):
-        return BenchmarkConfig(duration=10, iterations=3)
+        return BenchmarkConfig(iterations=3)
 
     @patch("kube_autotuner.optimizer.NodeLease")
     @patch("kube_autotuner.optimizer.BenchmarkRunner")
@@ -806,7 +806,7 @@ class TestSeedPriorTrials:
 
     @pytest.fixture
     def config(self) -> BenchmarkConfig:
-        return BenchmarkConfig(duration=10, iterations=3)
+        return BenchmarkConfig(iterations=3)
 
     def _prior(
         self,
@@ -1176,7 +1176,7 @@ class TestWarnOnCollapsedObjectives:
 
     @pytest.fixture
     def config(self) -> BenchmarkConfig:
-        return BenchmarkConfig(duration=10, iterations=3)
+        return BenchmarkConfig(iterations=3)
 
     @staticmethod
     def _trial(bps: float, retransmits: int = 5) -> TrialResult:

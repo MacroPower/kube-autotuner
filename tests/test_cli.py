@@ -25,8 +25,9 @@ nodes:
   sources: [a]
   target: b
 benchmark:
-  duration: 1
   iterations: 1
+iperf:
+  duration: 1
 output: {output}
 """
 
@@ -35,8 +36,9 @@ nodes:
   sources: [a]
   target: b
 benchmark:
-  duration: 1
   iterations: 1
+iperf:
+  duration: 1
 trial:
   sysctls:
     net.core.rmem_max: "16777216"
@@ -49,8 +51,9 @@ nodes:
   sources: [a]
   target: b
 benchmark:
-  duration: 1
   iterations: 1
+iperf:
+  duration: 1
 optimize:
   nTrials: 4
   nSobol: 2

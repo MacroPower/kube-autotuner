@@ -573,7 +573,8 @@ def test_metadata_header_renders_mixed_and_omits_empty_kernel(
         "trial_count": 5,
         "phase_counts": {"sobol": 2, "bayesian": 3, "verification": 0, "unknown": 0},
         "kernel_version": None,  # empty -> omit entirely
-        "duration": "mixed",
+        "iperf_duration": "mixed",
+        "fortio_duration": 30,
         "iterations": 3,
         "stages": ["bw-tcp", "bw-udp"],
         "first_created_at_iso": "2026-04-24T10:00:00+00:00",
@@ -583,6 +584,8 @@ def test_metadata_header_renders_mixed_and_omits_empty_kernel(
     html_text = path.read_text()
     assert "section-metadata" in html_text
     assert "mixed" in html_text
+    assert "iperf duration" in html_text
+    assert "fortio duration" in html_text
     # Extract just the metadata header block and check that the
     # kernel label did not render (None -> omitted).
     match = re.search(

@@ -80,7 +80,7 @@ def test_run_baseline_threads_iperf_args_and_patches(
     out = tmp_path / "r"
     exp = ExperimentConfig.model_validate({
         "nodes": {"sources": ["a"], "target": "b"},
-        "benchmark": {"duration": 1, "iterations": 1},
+        "benchmark": {"iterations": 1},
         "iperf": {"client": {"extra_args": ["-Z"]}},
         "patches": [
             {"target": {"kind": "Job"}, "patch": {"spec": {"replicas": 1}}},
@@ -123,7 +123,7 @@ def test_run_trial_snapshots_only_applied_keys(
     out = tmp_path / "r"
     exp = ExperimentConfig.model_validate({
         "nodes": {"sources": ["a"], "target": "b"},
-        "benchmark": {"duration": 1, "iterations": 1},
+        "benchmark": {"iterations": 1},
         "trial": {"sysctls": {"net.core.rmem_max": "16777216"}},
         "output": str(out),
     })
@@ -171,7 +171,7 @@ def test_run_baseline_threads_collect_host_state_and_snapshots(
     out = tmp_path / "r"
     exp = ExperimentConfig.model_validate({
         "nodes": {"sources": ["a"], "target": "b"},
-        "benchmark": {"duration": 1, "iterations": 1},
+        "benchmark": {"iterations": 1},
         "output": str(out),
     })
     ctx = runs.RunContext(
@@ -211,7 +211,7 @@ def test_run_trial_threads_collect_host_state_and_snapshots(
     out = tmp_path / "r"
     exp = ExperimentConfig.model_validate({
         "nodes": {"sources": ["a"], "target": "b"},
-        "benchmark": {"duration": 1, "iterations": 1},
+        "benchmark": {"iterations": 1},
         "trial": {"sysctls": {"net.core.rmem_max": "16777216"}},
         "output": str(out),
     })
@@ -248,7 +248,7 @@ def test_run_baseline_default_collect_host_state_is_false(
     out = tmp_path / "r"
     exp = ExperimentConfig.model_validate({
         "nodes": {"sources": ["a"], "target": "b"},
-        "benchmark": {"duration": 1, "iterations": 1},
+        "benchmark": {"iterations": 1},
         "output": str(out),
     })
     ctx = runs.RunContext(
@@ -277,7 +277,7 @@ def test_run_baseline_snapshots_full_param_space(
     out = tmp_path / "r"
     exp = ExperimentConfig.model_validate({
         "nodes": {"sources": ["a"], "target": "b"},
-        "benchmark": {"duration": 1, "iterations": 1},
+        "benchmark": {"iterations": 1},
         "output": str(out),
     })
     ctx = runs.RunContext(
@@ -302,7 +302,7 @@ def _prior_trial(sysctl_value: int = 1048576) -> TrialResult:
     return TrialResult(
         node_pair=NodePair(source="a", target="b", hardware_class="10g"),
         sysctl_values={"net.core.rmem_max": sysctl_value},
-        config=BenchmarkConfig(duration=1, iterations=1),
+        config=BenchmarkConfig(iterations=1),
         results=[
             BenchmarkResult(
                 timestamp=datetime.now(UTC),
@@ -318,7 +318,7 @@ def _prior_trial(sysctl_value: int = 1048576) -> TrialResult:
 def _optimize_exp(out: Path, n_trials: int = 5) -> ExperimentConfig:
     return ExperimentConfig.model_validate({
         "nodes": {"sources": ["a"], "target": "b"},
-        "benchmark": {"duration": 1, "iterations": 1},
+        "benchmark": {"iterations": 1},
         "optimize": {"n_trials": n_trials, "n_sobol": 2},
         "output": str(out),
     })
@@ -340,6 +340,8 @@ def _seed_prior_results(
             objectives=exp.objectives,
             param_space=exp.effective_param_space(),
             benchmark=exp.benchmark,
+            iperf=exp.iperf,
+            fortio=exp.fortio,
             n_sobol=n_sobol if n_sobol is not None else exp.optimize.n_sobol,
             verification_trials=exp.optimize.verification_trials,
             verification_top_k=exp.optimize.verification_top_k,
@@ -471,6 +473,8 @@ def test_run_optimize_incompatible_param_space_raises(tmp_path: Path):
                 ],
             ),
             benchmark=exp.benchmark,
+            iperf=exp.iperf,
+            fortio=exp.fortio,
             n_sobol=exp.optimize.n_sobol,
         ),
     )
@@ -551,7 +555,7 @@ def test_run_baseline_writes_resume_meta_without_n_sobol(tmp_path: Path):
     out = tmp_path / "r"
     exp = ExperimentConfig.model_validate({
         "nodes": {"sources": ["a"], "target": "b"},
-        "benchmark": {"duration": 1, "iterations": 1},
+        "benchmark": {"iterations": 1},
         "output": str(out),
     })
 
@@ -580,7 +584,7 @@ def test_run_trial_writes_resume_meta_without_n_sobol(tmp_path: Path):
     out = tmp_path / "r"
     exp = ExperimentConfig.model_validate({
         "nodes": {"sources": ["a"], "target": "b"},
-        "benchmark": {"duration": 1, "iterations": 1},
+        "benchmark": {"iterations": 1},
         "trial": {"sysctls": {"net.core.rmem_max": "16777216"}},
         "output": str(out),
     })
@@ -616,7 +620,7 @@ class TestLogVerificationSummary:
     def _pair() -> list[TrialResult]:
         """Return a primary + verification pair driving the headline metrics."""
         node_pair = NodePair(source="a", target="b", hardware_class="10g")
-        config = BenchmarkConfig(duration=1, iterations=1)
+        config = BenchmarkConfig(iterations=1)
         iter_results = _results()
         primary = TrialResult(
             node_pair=node_pair,
@@ -728,10 +732,15 @@ class TestBenchmarkDriftExcludesSyncWindow:
     """
 
     @staticmethod
-    def _exp(**benchmark_overrides: object) -> ExperimentConfig:
+    def _exp(
+        *,
+        iperf_overrides: dict[str, object] | None = None,
+        **benchmark_overrides: object,
+    ) -> ExperimentConfig:
         return ExperimentConfig.model_validate({
             "nodes": {"sources": ["a"], "target": "b"},
-            "benchmark": {"duration": 1, "iterations": 1, **benchmark_overrides},
+            "benchmark": {"iterations": 1, **benchmark_overrides},
+            "iperf": {"duration": 1, **(iperf_overrides or {})},
         })
 
     @staticmethod
@@ -740,6 +749,8 @@ class TestBenchmarkDriftExcludesSyncWindow:
             objectives=exp.objectives,
             param_space=exp.effective_param_space(),
             benchmark=exp.benchmark,
+            iperf=exp.iperf,
+            fortio=exp.fortio,
             n_sobol=None,
         )
 
@@ -767,8 +778,35 @@ class TestBenchmarkDriftExcludesSyncWindow:
         runs._check_compatibility(meta, exp)
 
     def test_duration_change_still_flags_drift(self) -> None:
-        """Negative-space gate: a real measurement-affecting change still drifts."""
-        exp = self._exp(duration=1, sync_window_seconds=60)
-        meta = self._meta(self._exp(duration=5, sync_window_seconds=15))
-        with pytest.raises(typer.BadParameter, match="benchmark"):
+        """Negative-space gate: a real measurement-affecting change still drifts.
+
+        ``duration`` lives on the iperf section now; the drift surfaces under
+        the ``iperf`` key rather than ``benchmark``.
+        """
+        exp = self._exp(
+            iperf_overrides={"duration": 1},
+            sync_window_seconds=60,
+        )
+        meta = self._meta(
+            self._exp(
+                iperf_overrides={"duration": 5},
+                sync_window_seconds=15,
+            ),
+        )
+        with pytest.raises(typer.BadParameter, match="iperf"):
+            runs._check_compatibility(meta, exp)
+
+    def test_fortio_change_flags_drift(self) -> None:
+        """Mirrors the iperf case for the fortio section."""
+        exp_dict = {
+            "nodes": {"sources": ["a"], "target": "b"},
+            "benchmark": {"iterations": 1},
+            "iperf": {"duration": 1},
+            "fortio": {"fixedQps": 500},
+        }
+        exp = ExperimentConfig.model_validate(exp_dict)
+        meta_dict = {**exp_dict, "fortio": {"fixedQps": 1500}}
+        meta_exp = ExperimentConfig.model_validate(meta_dict)
+        meta = self._meta(meta_exp)
+        with pytest.raises(typer.BadParameter, match="fortio"):
             runs._check_compatibility(meta, exp)

@@ -85,7 +85,7 @@ def test_build_custom_port():
     assert "5202" in argv
 
 
-def test_build_udp_and_window():
+def test_build_udp():
     doc = _parse(
         build_client_yaml(
             node="kmain08",
@@ -95,13 +95,10 @@ def test_build_udp_and_window():
             omit=5,
             parallel=16,
             mode="udp",
-            window="256K",
         )
     )
     argv = _iperf_argv(doc)
     assert "-u" in argv
-    assert "-w" in argv
-    assert "256K" in argv
     assert argv.index("-b") == argv.index("-u") + 1
     assert argv[argv.index("-b") + 1] == "0"
 
@@ -223,8 +220,7 @@ def test_barrier_prologue_preserves_all_flags():
             omit=5,
             parallel=16,
             mode="udp",
-            window="256K",
-            extra_args=["-Z", "--logfile", "path with spaces"],
+            extra_args=["-w", "256K", "-Z", "--logfile", "path with spaces"],
             start_at_epoch=1_700_000_000,
         )
     )

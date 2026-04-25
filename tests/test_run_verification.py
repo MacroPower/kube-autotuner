@@ -107,7 +107,7 @@ def test_run_verification_emits_phase_parent_rows_and_no_new_complete_trial_call
     # which Ax phase produced the parent.
     loop = OptimizationLoop(
         node_pair=node_pair,
-        config=BenchmarkConfig(duration=5, iterations=1),
+        config=BenchmarkConfig(iterations=1),
         param_space=PARAM_SPACE,
         output=output,
         n_trials=4,
@@ -162,7 +162,7 @@ def test_run_verification_skips_done_work(
 
     loop = OptimizationLoop(
         node_pair=NodePair(source="a", target="b", hardware_class="10g"),
-        config=BenchmarkConfig(duration=5, iterations=1),
+        config=BenchmarkConfig(iterations=1),
         param_space=PARAM_SPACE,
         output=tmp_path / "out",
         n_trials=4,

@@ -9,7 +9,12 @@ from typing import TYPE_CHECKING
 from pydantic import ValidationError
 import pytest
 
-from kube_autotuner.experiment import ObjectivesSection, ParetoObjective
+from kube_autotuner.experiment import (
+    FortioSection,
+    IperfSection,
+    ObjectivesSection,
+    ParetoObjective,
+)
 from kube_autotuner.models import (
     ALL_STAGES,
     STAGE_METRICS,
@@ -89,7 +94,7 @@ def test_trial_log_round_trip(tmp_path: Path):
         node_pair=NodePair(source="n1", target="n2", hardware_class="1g"),
         sysctl_values={"net.core.rmem_max": 212992},
         kernel_version="6.1.0",
-        config=BenchmarkConfig(duration=10, iterations=1),
+        config=BenchmarkConfig(iterations=1),
         results=[
             BenchmarkResult(
                 timestamp=datetime.now(UTC),
@@ -121,14 +126,20 @@ def test_trial_log_load_empty(tmp_path: Path):
 
 def test_benchmark_config_defaults():
     config = BenchmarkConfig()
-    assert config.duration == 30
-    assert config.omit == 5
     assert config.iterations == 3
-    assert config.parallel == 16
-    assert config.window is None
+    assert config.sync_window_seconds == 15
+    assert config.collect_host_state is False
     assert config.stages == frozenset(
         {"bw-tcp", "bw-udp", "fortio-sat", "fortio-fixed"},
     )
+
+
+def test_iperf_section_defaults():
+    section = IperfSection()
+    assert section.duration == 30
+    assert section.omit == 5
+    assert section.parallel == 16
+    assert section.max_attempts == 3
 
 
 def test_benchmark_config_accepts_stage_subset():
@@ -163,9 +174,14 @@ def test_metrics_for_stages_unions_stage_entries():
 
 def test_benchmark_config_rejects_unknown_keys():
     with pytest.raises(ValidationError):
-        BenchmarkConfig.model_validate(
-            {"duration": 10, "iterations": 1, "modes": ["tcp"]},
-        )
+        BenchmarkConfig.model_validate({"iterations": 1, "modes": ["tcp"]})
+
+
+def test_benchmark_config_rejects_moved_iperf_keys():
+    """``duration`` / ``omit`` / ``parallel`` now live on ``IperfSection``."""
+    for key in ("duration", "omit", "parallel"):
+        with pytest.raises(ValidationError):
+            BenchmarkConfig.model_validate({"iterations": 1, key: 1})
 
 
 def _make_phase_trial(
@@ -294,7 +310,7 @@ def test_trial_log_round_trip_with_zones(tmp_path: Path):
             target_zone="az02",
         ),
         sysctl_values={"net.core.rmem_max": 212992},
-        config=BenchmarkConfig(duration=10, iterations=1),
+        config=BenchmarkConfig(iterations=1),
         results=[
             BenchmarkResult(
                 timestamp=datetime.now(UTC),
@@ -1012,7 +1028,9 @@ class TestResumeMetadata:
                     ),
                 ],
             ),
-            benchmark=BenchmarkConfig(duration=10, iterations=2),
+            benchmark=BenchmarkConfig(iterations=2),
+            iperf=IperfSection(duration=10),
+            fortio=FortioSection(),
             n_sobol=n_sobol,
         )
 

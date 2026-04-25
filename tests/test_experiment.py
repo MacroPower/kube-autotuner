@@ -73,7 +73,6 @@ nodes:
   target: kmain08
   hardwareClass: 10g
 benchmark:
-  duration: 30
   iterations: 3
 optimize:
   nTrials: 50
@@ -82,6 +81,7 @@ optimize:
   paramSpace:
     - {name: net.core.rmem_max, paramType: int, values: [4194304, 67108864]}
 iperf:
+  duration: 30
   client:
     extraArgs: ["--bidir", "-Z"]
   server:
@@ -422,7 +422,6 @@ nodes:
   sources: [a]
   target: b
 benchmark:
-  duration: 10
   iterations: 1
   modes: [tcp]
 """,
@@ -527,7 +526,7 @@ iperf:
 
 
 def test_client_denylist_whole_token(tmp_path: Path):
-    """--windowsize-hint is not --window; must pass."""
+    """--timestamps is not --time; must pass."""
     path = _write(
         tmp_path,
         """\
@@ -536,7 +535,24 @@ nodes:
   target: b
 iperf:
   client:
-    extraArgs: ["--windowsize-hint"]
+    extraArgs: ["--timestamps"]
+""",
+    )
+    exp = ExperimentConfig.from_yaml(path)
+    assert exp._check_denylists().passed
+
+
+def test_client_extra_args_window_round_trip(tmp_path: Path):
+    """``-w`` is now a user-supplied iperf3 flag; extraArgs must accept it."""
+    path = _write(
+        tmp_path,
+        """\
+nodes:
+  sources: [a]
+  target: b
+iperf:
+  client:
+    extraArgs: ["-w", "256K"]
 """,
     )
     exp = ExperimentConfig.from_yaml(path)

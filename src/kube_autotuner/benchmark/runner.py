@@ -184,12 +184,13 @@ class BenchmarkRunner:
 
         Args:
             node_pair: Source/target nodes and namespace for this run.
-            config: :class:`BenchmarkConfig` (duration, iterations,
-                parallel streams, TCP window).
+            config: :class:`BenchmarkConfig` -- backend-agnostic shape
+                (iterations, stages, sync window, host-state toggle).
             client: Injected :class:`K8sClient`. Defaults to a freshly
                 constructed real client.
-            iperf_args: Optional per-role ``extra_args`` for the iperf3
-                client and server commands.
+            iperf_args: Optional iperf3 run shape and per-role
+                ``extra_args`` (``duration`` / ``omit`` / ``parallel``
+                feed the ``-t`` / ``-O`` / ``-P`` flags).
             patches: Optional kustomize patches applied to every rendered
                 manifest (server Deployment/Service and every client
                 Job) via :func:`kube_autotuner.benchmark.patch.apply_patches`.
@@ -312,11 +313,10 @@ class BenchmarkRunner:
                 node=client,
                 target=self.node_pair.target,
                 port=port,
-                duration=self.config.duration,
-                omit=self.config.omit,
-                parallel=self.config.parallel,
+                duration=self.iperf_args.duration,
+                omit=self.iperf_args.omit,
+                parallel=self.iperf_args.parallel,
                 mode=mode,
-                window=self.config.window,
                 extra_args=self.iperf_args.client.extra_args,
                 start_at_epoch=start_at_epoch,
             ),

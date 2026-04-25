@@ -147,8 +147,6 @@ def _runner(
         extra_sources=extra_sources,
     )
     config = BenchmarkConfig(
-        duration=1,
-        omit=0,
         iterations=1,
         sync_window_seconds=sync_window_seconds,
     )

@@ -24,7 +24,7 @@ def _fake_backend(tmp_path: Path) -> FakeSysctlBackend:
 def _optimize_yaml(out: Path, *, optimize_overrides: dict) -> str:
     body = {
         "nodes": {"sources": ["a"], "target": "b"},
-        "benchmark": {"duration": 1, "iterations": 1},
+        "benchmark": {"iterations": 1},
         "optimize": {"nTrials": 4, "nSobol": 2, **optimize_overrides},
         "output": str(out),
     }

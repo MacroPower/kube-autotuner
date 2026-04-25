@@ -43,7 +43,6 @@ def build_client_yaml(  # noqa: PLR0913, PLR0917 - iperf3 client flag surface
     omit: int,
     parallel: int,
     mode: Literal["tcp", "udp"],
-    window: str | None = None,
     extra_args: list[str] | None = None,
     *,
     start_at_epoch: int | None = None,
@@ -68,7 +67,6 @@ def build_client_yaml(  # noqa: PLR0913, PLR0917 - iperf3 client flag surface
         mode: ``"tcp"`` (default) or ``"udp"``; ``"udp"`` appends
             ``-u -b 0`` to lift iperf3's per-stream 1 Mbit/sec UDP
             default. Callers can override ``-b`` via ``extra_args``.
-        window: Optional ``-w`` TCP window size argument.
         extra_args: Additional iperf3 flags appended after the controlled
             arguments. Reserved-flag enforcement happens in the
             experiment config layer, not here.
@@ -96,8 +94,6 @@ def build_client_yaml(  # noqa: PLR0913, PLR0917 - iperf3 client flag surface
     ]
     if mode == "udp":
         args.extend(["-u", "-b", "0"])
-    if window:
-        args.extend(["-w", window])
     if extra_args:
         args.extend(extra_args)
     iperf3_cmd = shlex.join(["iperf3", *args])

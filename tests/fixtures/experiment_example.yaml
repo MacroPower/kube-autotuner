@@ -10,10 +10,7 @@ nodes:
   namespace: default
   ipFamilyPolicy: RequireDualStack
 benchmark:
-  duration: 30
   iterations: 3
-  omit: 5
-  parallel: 16
 optimize:
   nTrials: 50
   nSobol: 15
@@ -26,6 +23,9 @@ optimize:
       paramType: choice
       values: [cubic, bbr]
 iperf:
+  duration: 30
+  omit: 5
+  parallel: 16
   client:
     extraArgs: ["--bidir", "-Z"]
   server:

@@ -1250,7 +1250,7 @@ def trajectory_rows(
     return rows
 
 
-def section_metadata(  # noqa: PLR0914 - one-pass summary over many aggregates
+def section_metadata(
     trials: list[TrialResult],
     resume_metadata: ResumeMetadata | None,
 ) -> dict[str, Any]:
@@ -1267,14 +1267,16 @@ def section_metadata(  # noqa: PLR0914 - one-pass summary over many aggregates
 
     Args:
         trials: The per-hardware-class trial set.
-        resume_metadata: Unused; retained for call-site symmetry.
+        resume_metadata: Source for the iperf/fortio durations;
+            ``None`` leaves both ``iperf_duration`` and
+            ``fortio_duration`` ``None``.
 
     Returns:
         A dict with keys ``trial_count``, ``phase_counts``,
-        ``kernel_version``, ``duration``, ``iterations``, ``stages``,
-        ``first_created_at_iso``, ``last_created_at_iso``.
+        ``kernel_version``, ``iperf_duration``, ``fortio_duration``,
+        ``iterations``, ``stages``, ``first_created_at_iso``,
+        ``last_created_at_iso``.
     """
-    _ = resume_metadata
     primaries = sorted(
         (t for t in trials if is_primary(t)),
         key=lambda t: t.created_at,
@@ -1307,8 +1309,12 @@ def section_metadata(  # noqa: PLR0914 - one-pass summary over many aggregates
     resolved_kernel = _unique_or_mixed(kernel_vals)
     kernel_version: str | None = resolved_kernel or None
 
-    duration_vals = [t.config.duration for t in primaries]
-    duration = _unique_or_mixed(duration_vals)
+    iperf_duration: int | None = (
+        resume_metadata.iperf.duration if resume_metadata is not None else None
+    )
+    fortio_duration: int | None = (
+        resume_metadata.fortio.duration if resume_metadata is not None else None
+    )
     iterations_vals = [t.config.iterations for t in primaries]
     iterations = _unique_or_mixed(iterations_vals)
 
@@ -1329,7 +1335,8 @@ def section_metadata(  # noqa: PLR0914 - one-pass summary over many aggregates
         "trial_count": len(primaries),
         "phase_counts": phase_counts,
         "kernel_version": kernel_version,
-        "duration": duration,
+        "iperf_duration": iperf_duration,
+        "fortio_duration": fortio_duration,
         "iterations": iterations,
         "stages": stages,
         "first_created_at_iso": first_iso,
