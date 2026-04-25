@@ -58,7 +58,7 @@ _HOST_STATE_COMMANDS: tuple[str, ...] = (
     "echo '===snmp==='",
     "cat /proc/net/snmp 2>/dev/null || echo NA",
     "echo '===tcp_metrics==='",
-    "{ wc -l < /proc/net/tcp_metrics; } 2>/dev/null || echo NA",
+    "ip tcp_metrics show 2>/dev/null | wc -l",
     "echo '===route==='",
     "{ wc -l < /proc/net/route; } 2>/dev/null || echo NA",
     "echo '===arp==='",

@@ -56,6 +56,38 @@ def test_get_reads_sysctl_values(
         )
 
 
+def test_collect_host_state_records_tcp_metrics_rows(
+    k8s_client: K8sClient,
+    node_names: dict[str, str],
+    test_namespace: str,
+    sysctls_available: None,  # noqa: ARG001 - activation fixture
+) -> None:
+    """``tcp_metrics_rows`` must be read via netlink, not ``/proc/net/tcp_metrics``.
+
+    Mainline Linux exposes the TCP metrics cache only through the
+    ``tcp_metrics`` generic netlink family; ``/proc/net/tcp_metrics``
+    does not exist, so the older ``wc -l`` form silently produced an
+    ``NA`` fallback for every snapshot on every node. Regression guard
+    for the fix that swapped the script line to
+    ``ip tcp_metrics show | wc -l``.
+    """
+    setter = _make_setter(k8s_client, node_names, test_namespace)
+    snapshot = setter.collect_host_state(iteration=None, phase="baseline")
+    if snapshot is None:
+        pytest.skip("backend does not support host-state collection")
+
+    tcp_errors = [e for e in snapshot.errors if e.startswith("tcp_metrics")]
+    assert not tcp_errors, (
+        f"tcp_metrics section produced collection errors: {tcp_errors!r}"
+    )
+    assert "tcp_metrics_rows" in snapshot.metrics, (
+        f"tcp_metrics_rows missing from metrics: {snapshot.metrics!r}"
+    )
+    rows = snapshot.metrics["tcp_metrics_rows"]
+    assert isinstance(rows, int)
+    assert rows >= 0
+
+
 @pytest.mark.requires_real_sysctl_write
 def test_apply_and_verify(
     k8s_client: K8sClient, node_names: dict[str, str], test_namespace: str
