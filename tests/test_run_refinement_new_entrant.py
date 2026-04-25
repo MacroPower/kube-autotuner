@@ -1,0 +1,137 @@
+"""A parent newly entering top-K in round 2 is sampled with refinement_round=2."""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING
+from unittest.mock import patch
+
+import pytest
+
+pytest.importorskip("ax")
+
+if TYPE_CHECKING:
+    from unittest.mock import MagicMock
+
+from kube_autotuner.experiment import ObjectivesSection
+from kube_autotuner.models import (
+    BenchmarkConfig,
+    BenchmarkResult,
+    NodePair,
+    TrialResult,
+)
+from kube_autotuner.optimizer import OptimizationLoop
+from kube_autotuner.sysctl.params import PARAM_SPACE
+
+
+def _seed_primary(
+    loop: OptimizationLoop,
+    *,
+    trial_id: str,
+    bps: float,
+) -> TrialResult:
+    tr = TrialResult(
+        node_pair=loop.node_pair,
+        sysctl_values={"net.core.rmem_max": int(bps)},
+        config=BenchmarkConfig(),
+        results=[
+            BenchmarkResult(
+                timestamp=datetime.now(UTC),
+                mode="tcp",
+                bits_per_second=bps,
+                bytes_sent=int(bps),
+                retransmits=1,
+                iteration=0,
+                client_node="a",
+            ),
+        ],
+        phase="bayesian",
+    )
+    tr.trial_id = trial_id
+    loop._completed.append(tr)
+    return tr
+
+
+def _refine_factory(
+    by_parent: dict[str, list[float]],
+) -> object:
+    counters: dict[str, int] = {}
+
+    def fake_evaluate(
+        self: OptimizationLoop,
+        parameterization: dict[str, str],  # noqa: ARG001 - shape match
+        *,
+        phase: str,
+        parent_trial_id: str | None,
+        refinement_round: int | None = None,
+    ) -> tuple[TrialResult, dict[str, tuple[float, float]]]:
+        assert parent_trial_id is not None
+        idx = counters.get(parent_trial_id, 0)
+        counters[parent_trial_id] = idx + 1
+        bps = by_parent[parent_trial_id][idx]
+        tr = TrialResult(
+            node_pair=self.node_pair,
+            sysctl_values={"net.core.rmem_max": int(bps)},
+            config=BenchmarkConfig(),
+            results=[
+                BenchmarkResult(
+                    timestamp=datetime.now(UTC),
+                    mode="tcp",
+                    bits_per_second=bps,
+                    bytes_sent=int(bps),
+                    retransmits=1,
+                    iteration=0,
+                    client_node="a",
+                ),
+            ],
+            phase=phase,  # ty: ignore[invalid-argument-type]
+            parent_trial_id=parent_trial_id,
+            refinement_round=refinement_round,
+        )
+        self._completed.append(tr)
+        from kube_autotuner.optimizer import _compute_metrics  # noqa: PLC0415, PLC2701
+
+        return tr, _compute_metrics(tr)
+
+    return fake_evaluate
+
+
+@patch("kube_autotuner.optimizer.NodeLease")
+@patch("kube_autotuner.optimizer.BenchmarkRunner")
+@patch("kube_autotuner.optimizer.make_sysctl_setter_from_env")
+def test_new_entrant_gets_refinement_round_2(
+    mock_setter_cls: MagicMock,  # noqa: ARG001 - patched out
+    mock_runner_cls: MagicMock,  # noqa: ARG001 - patched out
+    mock_lease_cls: MagicMock,  # noqa: ARG001 - patched out
+    tmp_path,
+) -> None:
+    with patch.object(
+        OptimizationLoop,
+        "_seed_prior_trials",
+        lambda self, prior: None,  # noqa: ARG005 - patch stub
+    ):
+        loop = OptimizationLoop(
+            node_pair=NodePair(source="a", target="b", hardware_class="10g"),
+            config=BenchmarkConfig(iterations=1),
+            param_space=PARAM_SPACE,
+            output=tmp_path / "out",
+            n_trials=3,
+            n_sobol=3,
+            objectives=ObjectivesSection(),
+        )
+    a = _seed_primary(loop, trial_id="parent-a", bps=12e9)
+    b = _seed_primary(loop, trial_id="parent-b", bps=11e9)
+    c = _seed_primary(loop, trial_id="parent-c", bps=10e9)
+
+    # Round 1 picks {A, B}. A regresses to 1e9; round 2 picks {B, C}.
+    by_parent: dict[str, list[float]] = {
+        a.trial_id: [1e9],
+        b.trial_id: [11e9, 11e9],
+        c.trial_id: [10e9],
+    }
+    with patch.object(OptimizationLoop, "_evaluate", _refine_factory(by_parent)):
+        created = loop.run_refinement(top_k=2, rounds=2)
+
+    c_samples = [tr for tr in created if tr.parent_trial_id == c.trial_id]
+    assert len(c_samples) == 1
+    assert c_samples[0].refinement_round == 2

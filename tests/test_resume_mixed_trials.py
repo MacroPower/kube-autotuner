@@ -1,4 +1,4 @@
-"""Tests for resume behaviour across mixed primary + verification trials."""
+"""Tests for resume behaviour across mixed primary + refinement trials."""
 
 from __future__ import annotations
 
@@ -29,6 +29,7 @@ def _prior_trial(
     *,
     phase: str = "bayesian",
     parent_trial_id: str | None = None,
+    refinement_round: int | None = None,
 ) -> TrialResult:
     return TrialResult(
         node_pair=NodePair(source="a", target="b", hardware_class="10g"),
@@ -45,6 +46,7 @@ def _prior_trial(
         ],
         phase=phase,  # ty: ignore[invalid-argument-type]
         parent_trial_id=parent_trial_id,
+        refinement_round=refinement_round,
     )
 
 
@@ -52,8 +54,8 @@ def _optimize_exp(
     out: Path,
     *,
     n_trials: int = 4,
-    verification_trials: int = 0,
-    verification_top_k: int = 3,
+    refinement_rounds: int = 0,
+    refinement_top_k: int = 3,
 ) -> ExperimentConfig:
     return ExperimentConfig.model_validate({
         "nodes": {"sources": ["a"], "target": "b"},
@@ -62,8 +64,8 @@ def _optimize_exp(
         "optimize": {
             "n_trials": n_trials,
             "n_sobol": 2,
-            "verification_trials": verification_trials,
-            "verification_top_k": verification_top_k,
+            "refinement_rounds": refinement_rounds,
+            "refinement_top_k": refinement_top_k,
         },
         "output": str(out),
     })
@@ -73,8 +75,8 @@ def _write_metadata(
     out: Path,
     exp: ExperimentConfig,
     *,
-    verification_trials: int | None = None,
-    verification_top_k: int | None = None,
+    refinement_rounds: int | None = None,
+    refinement_top_k: int | None = None,
 ) -> None:
     assert exp.optimize is not None
     TrialLog.write_resume_metadata(
@@ -86,8 +88,8 @@ def _write_metadata(
             iperf=exp.iperf,
             fortio=exp.fortio,
             n_sobol=exp.optimize.n_sobol,
-            verification_trials=verification_trials,
-            verification_top_k=verification_top_k,
+            refinement_rounds=refinement_rounds,
+            refinement_top_k=refinement_top_k,
         ),
     )
 
@@ -99,39 +101,40 @@ def _client_stub() -> MagicMock:
 
 
 @patch("kube_autotuner.optimizer.OptimizationLoop")
-def test_resume_partial_verification_runs_remaining(
+def test_resume_partial_refinement_runs_remaining(
     mock_loop_cls: MagicMock,
     tmp_path: Path,
 ) -> None:
-    """Primary budget met; one verification done, remainder queued."""
+    """Primary budget met; round 1 done for one parent, remainder queued."""
     out = tmp_path / "mixed"
     exp = _optimize_exp(
         out,
         n_trials=2,
-        verification_trials=2,
-        verification_top_k=1,
+        refinement_rounds=2,
+        refinement_top_k=1,
     )
     primary = _prior_trial(1048576, phase="bayesian")
     primary2 = _prior_trial(2097152, phase="bayesian")
-    one_verification = _prior_trial(
+    round1_sample = _prior_trial(
         1048576,
-        phase="verification",
+        phase="refinement",
         parent_trial_id=primary.trial_id,
+        refinement_round=1,
     )
-    for tr in (primary, primary2, one_verification):
+    for tr in (primary, primary2, round1_sample):
         TrialLog.append(out, tr)
     _write_metadata(
         out,
         exp,
-        verification_trials=2,
-        verification_top_k=1,
+        refinement_rounds=2,
+        refinement_top_k=1,
     )
 
     loop = MagicMock()
     loop.run.return_value = [primary, primary2]
     loop.prior_count = 2
     loop.pareto_front.return_value = []
-    loop._completed = [primary, primary2, one_verification]
+    loop._completed = [primary, primary2, round1_sample]
     mock_loop_cls.return_value = loop
 
     ctx = runs.RunContext(
@@ -142,36 +145,36 @@ def test_resume_partial_verification_runs_remaining(
     )
     runs.run_optimize(ctx)
 
-    # run_verification should have been called with the already-done map.
-    loop.run_verification.assert_called_once()
-    kwargs = loop.run_verification.call_args.kwargs
-    assert kwargs["already_done_by_parent"] == {primary.trial_id: 1}
+    # run_refinement should have been called with the per-round done map.
+    loop.run_refinement.assert_called_once()
+    kwargs = loop.run_refinement.call_args.kwargs
+    assert kwargs["completed_by_round"] == {1: {primary.trial_id}}
     assert kwargs["top_k"] == 1
-    assert kwargs["repeats"] == 2
+    assert kwargs["rounds"] == 2
 
 
-def test_resume_verification_trials_drift_rejects(tmp_path: Path) -> None:
+def test_resume_refinement_rounds_drift_rejects(tmp_path: Path) -> None:
     out = tmp_path / "drift"
     exp_prior = _optimize_exp(
         out,
         n_trials=2,
-        verification_trials=2,
-        verification_top_k=1,
+        refinement_rounds=2,
+        refinement_top_k=1,
     )
     primary = _prior_trial(phase="bayesian")
     TrialLog.append(out, primary)
     _write_metadata(
         out,
         exp_prior,
-        verification_trials=2,
-        verification_top_k=1,
+        refinement_rounds=2,
+        refinement_top_k=1,
     )
-    # Current run bumps verification_trials.
+    # Current run bumps refinement_rounds.
     exp_current = _optimize_exp(
         out,
         n_trials=2,
-        verification_trials=5,
-        verification_top_k=1,
+        refinement_rounds=5,
+        refinement_top_k=1,
     )
     ctx = runs.RunContext(
         exp=exp_current,
@@ -179,30 +182,30 @@ def test_resume_verification_trials_drift_rejects(tmp_path: Path) -> None:
         backend=MagicMock(),
         output=out,
     )
-    with pytest.raises(typer.BadParameter, match="verification_trials"):
+    with pytest.raises(typer.BadParameter, match="refinement_rounds"):
         runs.run_optimize(ctx)
 
 
-def test_resume_verification_top_k_drift_rejects(tmp_path: Path) -> None:
+def test_resume_refinement_top_k_drift_rejects(tmp_path: Path) -> None:
     out = tmp_path / "drift"
     exp_prior = _optimize_exp(
         out,
         n_trials=2,
-        verification_trials=2,
-        verification_top_k=1,
+        refinement_rounds=2,
+        refinement_top_k=1,
     )
     TrialLog.append(out, _prior_trial(phase="bayesian"))
     _write_metadata(
         out,
         exp_prior,
-        verification_trials=2,
-        verification_top_k=1,
+        refinement_rounds=2,
+        refinement_top_k=1,
     )
     exp_current = _optimize_exp(
         out,
         n_trials=2,
-        verification_trials=2,
-        verification_top_k=3,
+        refinement_rounds=2,
+        refinement_top_k=3,
     )
     ctx = runs.RunContext(
         exp=exp_current,
@@ -210,5 +213,5 @@ def test_resume_verification_top_k_drift_rejects(tmp_path: Path) -> None:
         backend=MagicMock(),
         output=out,
     )
-    with pytest.raises(typer.BadParameter, match="verification_top_k"):
+    with pytest.raises(typer.BadParameter, match="refinement_top_k"):
         runs.run_optimize(ctx)

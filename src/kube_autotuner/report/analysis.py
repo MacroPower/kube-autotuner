@@ -33,7 +33,7 @@ from kube_autotuner.models import (
 )
 from kube_autotuner.scoring import (
     METRIC_TO_DF_COLUMN,
-    aggregate_verification,
+    aggregate_by_parent,
     config_memory_cost,
     score_rows,
 )
@@ -690,7 +690,7 @@ def pareto_recommendation_rows(  # noqa: PLR0914 - one-pass build over many inte
     """Return every Pareto-frontier row for a class, scored and sorted.
 
     The full-frontier counterpart to :func:`recommend_configs`.
-    Aggregates verification samples back into their parents, computes
+    Aggregates refinement samples back into their parents, computes
     the Pareto frontier, scores each row via
     :func:`kube_autotuner.scoring.score_rows`, and sorts by
     ``(score desc, trial_id asc)`` with a stable mergesort.
@@ -753,7 +753,7 @@ def pareto_recommendation_rows(  # noqa: PLR0914 - one-pass build over many inte
     if memory_cost_weight is None:
         memory_cost_weight = defaults.memory_cost_weight
 
-    agg_rows = aggregate_verification(filtered)
+    agg_rows = aggregate_by_parent(filtered)
     if not agg_rows:
         return []
 
@@ -773,7 +773,7 @@ def pareto_recommendation_rows(  # noqa: PLR0914 - one-pass build over many inte
         return []
 
     # Memory cost: computed once per primary trial off the filtered list
-    # (aggregate_verification drops sysctl_values, so we keep a parent-
+    # (aggregate_by_parent drops sysctl_values, so we keep a parent-
     # keyed lookup aligned with the aggregation key
     # ``parent_trial_id or trial_id``).
     cost_by_trial: dict[str, float] = {
@@ -803,7 +803,7 @@ def pareto_recommendation_rows(  # noqa: PLR0914 - one-pass build over many inte
     for _, row in front.iterrows():
         # row["trial_id"] is the aggregation key (``parent_trial_id
         # or trial_id``) so it always resolves to the primary trial,
-        # not a verification repeat.
+        # not a refinement sample.
         trial = next(t for t in filtered if t.trial_id == row["trial_id"])
         rows.append(
             {
@@ -1017,8 +1017,8 @@ def baseline_comparison(  # noqa: PLR0914 - one-pass aggregation over many inter
 
     The baseline is the set of primary trials whose sysctl hash matches
     :data:`kube_autotuner.sysctl.params.RECOMMENDED_DEFAULTS`. Matches
-    are aggregated with verification children via
-    :func:`kube_autotuner.scoring.aggregate_verification`; the
+    are aggregated with refinement children via
+    :func:`kube_autotuner.scoring.aggregate_by_parent`; the
     per-metric mean across matches forms the baseline value. Returns
     ``None`` when no primary trial matches the defaults.
 
@@ -1053,7 +1053,7 @@ def baseline_comparison(  # noqa: PLR0914 - one-pass aggregation over many inter
         if (is_primary(t) and t.trial_id in match_ids)
         or (not is_primary(t) and t.parent_trial_id in match_ids)
     ]
-    agg_rows = aggregate_verification(related)
+    agg_rows = aggregate_by_parent(related)
     if not agg_rows:
         return None
 
@@ -1098,12 +1098,12 @@ def baseline_comparison(  # noqa: PLR0914 - one-pass aggregation over many inter
     return out
 
 
-def verification_stats(
+def refinement_stats(
     trials: list[TrialResult],
 ) -> dict[str, dict[str, dict[str, float | None]]]:
-    """Return per-parent mean/stdev/cv across verification children.
+    """Return per-parent mean/stdev/cv across refinement children.
 
-    Groups verification rows by ``parent_trial_id`` and projects each
+    Groups refinement rows by ``parent_trial_id`` and projects each
     child's per-trial metric means (from
     :meth:`TrialResult.mean_tcp_throughput` and friends). Per-metric
     ``mean`` is the mean across finite samples, ``stdev`` is
@@ -1112,7 +1112,7 @@ def verification_stats(
     ``None`` when ``abs(mean) < 1e-12``.
 
     Args:
-        trials: The combined primary + verification population.
+        trials: The combined primary + refinement population.
 
     Returns:
         A dict keyed by parent trial id, mapping to a dict keyed by
@@ -1262,7 +1262,7 @@ def per_iteration_samples(
 ) -> dict[str, list[dict[str, int | str | float | None]]]:
     """Return per-iteration measurement rows grouped by recommendation key.
 
-    Group key matches :func:`~kube_autotuner.scoring.aggregate_verification`:
+    Group key matches :func:`~kube_autotuner.scoring.aggregate_by_parent`:
     ``parent_trial_id or trial_id``. Within each group, every contributing
     :class:`~kube_autotuner.models.TrialResult` emits one row per
     iteration index observed in its records. The original
@@ -1273,7 +1273,7 @@ def per_iteration_samples(
     ``render._embed_json``.
 
     Args:
-        trials: The combined primary + verification population for one
+        trials: The combined primary + refinement population for one
             hardware-class section.
 
     Returns:
@@ -1312,20 +1312,20 @@ def per_iteration_samples(
 def stability_badge(
     verif_row: dict[str, dict[str, float | None]] | None,
 ) -> str:
-    """Classify a recommendation row's stability from its verification CVs.
+    """Classify a recommendation row's stability from its refinement CVs.
 
     Thresholds match the plan's interpretation aid:
 
     * ``"green"``   — max CV < 5%
     * ``"amber"``   — 5% ≤ max CV < 15%
     * ``"red"``     — max CV ≥ 15%
-    * ``"unverified"`` — no verification children, or every CV is
+    * ``"unverified"`` — no refinement children, or every CV is
       ``None`` (zero-mean guard).
 
     Args:
-        verif_row: One value of :func:`verification_stats`, i.e. the
+        verif_row: One value of :func:`refinement_stats`, i.e. the
             per-metric ``{mean, stdev, cv}`` dict for a single parent;
-            ``None`` when the parent has no verification children.
+            ``None`` when the parent has no refinement children.
 
     Returns:
         The badge label.
@@ -1416,7 +1416,7 @@ def section_metadata(
     the field rather than print a blank. ``stages`` is rendered as a
     sorted list when agreed.
 
-    Phase counts include every trial (primary + verification);
+    Phase counts include every trial (primary + refinement);
     primary phases use ``t.phase`` verbatim (``None`` → ``"unknown"``).
 
     Args:
@@ -1438,13 +1438,13 @@ def section_metadata(
     phase_counts: dict[str, int] = {
         "sobol": 0,
         "bayesian": 0,
-        "verification": 0,
+        "refinement": 0,
         "unknown": 0,
     }
     for t in primaries:
         label = t.phase if t.phase is not None else "unknown"
         phase_counts[label] = phase_counts.get(label, 0) + 1
-    phase_counts["verification"] += sum(1 for t in trials if not is_primary(t))
+    phase_counts["refinement"] += sum(1 for t in trials if not is_primary(t))
 
     def _unique_or_mixed(values: list[Any]) -> Any:  # noqa: ANN401
         unique = []

@@ -343,8 +343,8 @@ def _seed_prior_results(
             iperf=exp.iperf,
             fortio=exp.fortio,
             n_sobol=n_sobol if n_sobol is not None else exp.optimize.n_sobol,
-            verification_trials=exp.optimize.verification_trials,
-            verification_top_k=exp.optimize.verification_top_k,
+            refinement_rounds=exp.optimize.refinement_rounds,
+            refinement_top_k=exp.optimize.refinement_top_k,
         ),
     )
 
@@ -613,12 +613,12 @@ def test_run_trial_writes_resume_meta_without_n_sobol(tmp_path: Path):
     assert loaded.n_sobol is None
 
 
-class TestLogVerificationSummary:
-    """Column visibility in the verification summary respects enabled stages."""
+class TestLogRefinementSummary:
+    """Column visibility in the refinement summary respects enabled stages."""
 
     @staticmethod
     def _pair() -> list[TrialResult]:
-        """Return a primary + verification pair driving the headline metrics."""
+        """Return a primary + refinement pair driving the headline metrics."""
         node_pair = NodePair(source="a", target="b", hardware_class="10g")
         config = BenchmarkConfig(iterations=1)
         iter_results = _results()
@@ -635,8 +635,9 @@ class TestLogVerificationSummary:
             node_pair=node_pair,
             sysctl_values={"net.core.rmem_max": "1048576"},
             config=config,
-            phase="verification",
+            phase="refinement",
             parent_trial_id="primary-1",
+            refinement_round=1,
             results=iter_results.bench,
             latency_results=iter_results.latency,
         )
@@ -644,7 +645,7 @@ class TestLogVerificationSummary:
 
     @staticmethod
     def _render_summary(stages: frozenset[StageName]) -> str:
-        """Call ``_log_verification_summary`` under a wide console and capture output.
+        """Call ``_log_refinement_summary`` under a wide console and capture output.
 
         The function constructs its own ``rich.console.Console()``; in
         a non-tty stdout capture that console picks a default width
@@ -663,8 +664,8 @@ class TestLogVerificationSummary:
         buffer = io.StringIO()
         wide = RichConsole(file=buffer, width=200, color_system=None)
         with patch("kube_autotuner.runs.Console", return_value=wide):
-            runs._log_verification_summary(
-                TestLogVerificationSummary._pair(),
+            runs._log_refinement_summary(
+                TestLogRefinementSummary._pair(),
                 ObjectivesSection(),
                 stages,
             )
@@ -688,7 +689,7 @@ class TestLogVerificationSummary:
 
 
 class TestFormatMeanSem:
-    """Pin the mean / SEM formatting rule used by the verification table."""
+    """Pin the mean / SEM formatting rule used by the refinement table."""
 
     def test_small_sem_renders_with_scientific_notation(self) -> None:
         """Regression: SEM around 5e-5 must not collapse to ``"0"``.

@@ -373,7 +373,7 @@ def _trial(bps: float, retransmits: int) -> TrialResult:
     """One-iteration TCP-only primary trial parametrized by throughput and retx.
 
     Local copy of the helper in
-    :mod:`tests.test_aggregate_verification` so this test stays
+    :mod:`tests.test_aggregate_by_parent` so this test stays
     self-contained (the flat ``tests/`` tree has no ``__init__.py``,
     so sibling test modules are not importable by name).
 

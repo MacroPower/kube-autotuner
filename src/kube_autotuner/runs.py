@@ -46,7 +46,6 @@ place to call
 
 from __future__ import annotations
 
-from collections import Counter
 import contextlib
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -69,7 +68,7 @@ from kube_autotuner.models import (
 from kube_autotuner.progress import NullObserver
 from kube_autotuner.scoring import (
     METRIC_TO_DF_COLUMN,
-    aggregate_verification,
+    aggregate_by_parent,
     config_memory_cost,
     score_rows,
 )
@@ -211,7 +210,7 @@ class _ResumeState:
     Attributes:
         prior_trials: Successful :class:`TrialResult` records loaded
             from the prior session, in file order. Includes both
-            primary and verification rows when present; empty when no
+            primary and refinement rows when present; empty when no
             resume occurred.
         remaining_trials: Live-loop primary-attempt budget: ``max(0,
             n_trials - len(primary_priors))``. Counts successful
@@ -219,17 +218,18 @@ class _ResumeState:
             the remaining budget wider than a strict
             ``n_trials - attempts_so_far`` would -- accepted as the
             simplest interpretation. See the module docstring.
-        verification_done_by_parent: Map of primary ``trial_id`` ->
-            count of verification rows already in the dataset for that
-            parent. Fed to
-            :meth:`~kube_autotuner.optimizer.OptimizationLoop.run_verification`
-            so the verification loop skips work that a prior session
+        completed_refinement_by_round: Map of refinement round number
+            (1-indexed) to the set of ``parent_trial_id`` values that
+            already have a refinement sample for that round in the
+            dataset. Fed to
+            :meth:`~kube_autotuner.optimizer.OptimizationLoop.run_refinement`
+            so the refinement loop skips work that a prior session
             already finished.
     """
 
     prior_trials: list[TrialResult]
     remaining_trials: int
-    verification_done_by_parent: dict[str, int] = field(default_factory=dict)
+    completed_refinement_by_round: dict[int, set[str]] = field(default_factory=dict)
 
 
 def _move_prior_artifacts(output: Path) -> None:
@@ -266,8 +266,8 @@ def _check_compatibility(  # noqa: C901, PLR0912 - one branch per compatibility 
 
     Compatibility keys: ``objectives``, ``param_space``,
     ``benchmark``, ``iperf``, ``fortio``, and (when the sidecar
-    carries one) ``n_sobol``, ``verification_trials``,
-    ``verification_top_k``. Node identity, patches, and
+    carries one) ``n_sobol``, ``refinement_rounds``,
+    ``refinement_top_k``. Node identity, patches, and
     ``apply_source`` can change silently between runs.
 
     A ``None`` sidecar alongside a non-empty dataset signals a prior
@@ -311,10 +311,10 @@ def _check_compatibility(  # noqa: C901, PLR0912 - one branch per compatibility 
         logger.warning("sidecar has no n_sobol; not verified")
 
     if exp.optimize is not None:
-        if meta.verification_trials != exp.optimize.verification_trials:
-            changed.append("verification_trials")
-        if meta.verification_top_k != exp.optimize.verification_top_k:
-            changed.append("verification_top_k")
+        if meta.refinement_rounds != exp.optimize.refinement_rounds:
+            changed.append("refinement_rounds")
+        if meta.refinement_top_k != exp.optimize.refinement_top_k:
+            changed.append("refinement_top_k")
 
     if changed:
         msg = (
@@ -378,10 +378,18 @@ def _prepare_resume(
     _check_compatibility(meta, exp)
 
     primary_prior = [t for t in prior if is_primary(t)]
-    verification_done = Counter(t.parent_trial_id for t in prior if t.parent_trial_id)
+    completed_refinement: dict[int, set[str]] = {}
+    for t in prior:
+        if is_primary(t):
+            continue
+        if t.refinement_round is None or t.parent_trial_id is None:
+            continue
+        completed_refinement.setdefault(t.refinement_round, set()).add(
+            t.parent_trial_id,
+        )
     remaining = max(0, exp.optimize.n_trials - len(primary_prior))
     logger.info(
-        "Resuming: %d prior trials (%d primary + %d verification); "
+        "Resuming: %d prior trials (%d primary + %d refinement); "
         "running %d more primary (budget=%d)",
         len(prior),
         len(primary_prior),
@@ -392,7 +400,7 @@ def _prepare_resume(
     return _ResumeState(
         prior_trials=prior,
         remaining_trials=remaining,
-        verification_done_by_parent={k: v for k, v in verification_done.items() if k},
+        completed_refinement_by_round=completed_refinement,
     )
 
 
@@ -659,8 +667,8 @@ def run_optimize(  # noqa: PLR0914, PLR0915
             iperf=exp.iperf,
             fortio=exp.fortio,
             n_sobol=exp.optimize.n_sobol,
-            verification_trials=exp.optimize.verification_trials,
-            verification_top_k=exp.optimize.verification_top_k,
+            refinement_rounds=exp.optimize.refinement_rounds,
+            refinement_top_k=exp.optimize.refinement_top_k,
         ),
     )
     ctx.observer.seed_history(resume.prior_trials, exp.optimize.n_sobol)
@@ -703,13 +711,13 @@ def run_optimize(  # noqa: PLR0914, PLR0915
     if not trials:
         return
 
-    if exp.optimize.verification_trials > 0:
-        loop.run_verification(
-            top_k=exp.optimize.verification_top_k,
-            repeats=exp.optimize.verification_trials,
-            already_done_by_parent=resume.verification_done_by_parent,
+    if exp.optimize.refinement_rounds > 0:
+        loop.run_refinement(
+            top_k=exp.optimize.refinement_top_k,
+            rounds=exp.optimize.refinement_rounds,
+            completed_by_round=resume.completed_refinement_by_round,
         )
-        _log_verification_summary(
+        _log_refinement_summary(
             loop._completed,  # noqa: SLF001
             exp.objectives,
             exp.benchmark.stages,
@@ -747,29 +755,30 @@ def run_optimize(  # noqa: PLR0914, PLR0915
         )
 
 
-def _log_verification_summary(  # noqa: PLR0914, PLR0915 - per-stage column gates inflate statement count
+def _log_refinement_summary(  # noqa: C901, PLR0912, PLR0914, PLR0915 - per-stage column gates inflate statement count
     all_trials: list[TrialResult],
     objectives: ObjectivesSection,
     stages: frozenset[StageName],
 ) -> None:
-    """Print a Rich table comparing primary vs combined scores.
+    """Print a Rich table comparing primary vs combined scores after refinement.
 
     Groups ``all_trials`` by ``parent_trial_id or trial_id`` via
-    :func:`kube_autotuner.scoring.aggregate_verification`, scores both
+    :func:`kube_autotuner.scoring.aggregate_by_parent`, scores both
     the primary-only population and the combined (primary +
-    verification) population through
+    refinement) population through
     :func:`kube_autotuner.scoring.score_rows`, and prints one row per
-    verified parent showing the primary score, the combined score,
-    the score delta, and per-metric ``mean ± SEM`` for the headline
-    metrics (tcp_throughput, tcp_retransmit_rate, latency_p99).
+    refined parent showing the primary score, the combined score,
+    the score delta, sample count, last refinement round, and
+    per-metric ``mean ± SEM`` for the headline metrics
+    (tcp_throughput, tcp_retransmit_rate, latency_p99).
 
-    Only parents with at least one verification child are rendered --
+    Only parents with at least one refinement child are rendered --
     listing every primary would dilute the table and confuse the
-    user about which rows were actually re-run.
+    user about which rows were actually refined.
 
     Args:
         all_trials: Every :class:`TrialResult` from the run (primary
-            and verification, in file order).
+            and refinement, in file order).
         objectives: The experiment's objective configuration; drives
             the weighted score used for the "primary score" /
             "combined score" comparison.
@@ -778,16 +787,25 @@ def _log_verification_summary(  # noqa: PLR0914, PLR0915 - per-stage column gate
             table, matching the objective pruning applied at
             config-load time.
     """
-    verification_parents = {t.parent_trial_id for t in all_trials if t.parent_trial_id}
-    if not verification_parents:
+    last_round_by_parent: dict[str, int] = {}
+    for t in all_trials:
+        if is_primary(t) or t.parent_trial_id is None:
+            continue
+        if t.refinement_round is None:
+            continue
+        prev = last_round_by_parent.get(t.parent_trial_id)
+        if prev is None or t.refinement_round > prev:
+            last_round_by_parent[t.parent_trial_id] = t.refinement_round
+    refinement_parents = set(last_round_by_parent)
+    if not refinement_parents:
         return
 
     relevant = metrics_for_stages(stages)
     primary_only = [t for t in all_trials if is_primary(t)]
-    combined_rows = aggregate_verification(all_trials)
-    primary_rows = aggregate_verification(primary_only)
+    combined_rows = aggregate_by_parent(all_trials)
+    primary_rows = aggregate_by_parent(primary_only)
 
-    # aggregate_verification does not carry sysctl_values, so we build a
+    # aggregate_by_parent does not carry sysctl_values, so we build a
     # parent-keyed cost map off the primary list and look up by each
     # aggregated row's trial_id (which is ``parent_trial_id or trial_id``).
     memory_cost_by_trial: dict[str, float] = {
@@ -835,13 +853,13 @@ def _log_verification_summary(  # noqa: PLR0914, PLR0915 - per-stage column gate
             _iter_rendered_means(
                 combined_rows,
                 ordered,
-                verification_parents,
+                refinement_parents,
                 p99_col,
             ),
         )
 
     table = Table(
-        title="Verification summary",
+        title="Refinement summary",
         title_style="bold",
         show_header=True,
         header_style="bold",
@@ -852,6 +870,8 @@ def _log_verification_summary(  # noqa: PLR0914, PLR0915 - per-stage column gate
     table.add_column("primary", justify="right")
     table.add_column("combined", justify="right")
     table.add_column("Δ", justify="right")
+    table.add_column("samples", justify="right")
+    table.add_column("last_round", justify="right")
     if "tcp_throughput" in relevant:
         table.add_column("tcp_throughput", justify="right")
     if "tcp_retransmit_rate" in relevant:
@@ -863,18 +883,25 @@ def _log_verification_summary(  # noqa: PLR0914, PLR0915 - per-stage column gate
     for i in ordered:
         row = combined_rows[i]
         trial_id = str(row["trial_id"])
-        if trial_id not in verification_parents:
+        if trial_id not in refinement_parents:
             continue
         rank += 1
         primary = primary_score_by_id.get(trial_id, float("nan"))
         combined = combined_scores[i]
         delta = combined - primary if not math.isnan(primary) else float("nan")
+        sample_count_raw = row.get("sample_count", 0)
+        sample_count = (
+            int(sample_count_raw) if isinstance(sample_count_raw, (int, float)) else 0
+        )
+        last_round = last_round_by_parent.get(trial_id)
         cells: list[str] = [
             str(rank),
             trial_id,
             "n/a" if math.isnan(primary) else f"{primary:.4f}",
             f"{combined:.4f}",
             "n/a" if math.isnan(delta) else f"{delta:+.4f}",
+            str(sample_count),
+            "—" if last_round is None else str(last_round),
         ]
         if "tcp_throughput" in relevant:
             cells.append(
@@ -902,21 +929,21 @@ def _log_verification_summary(  # noqa: PLR0914, PLR0915 - per-stage column gate
 def _iter_rendered_means(
     combined_rows: Sequence[Mapping[str, float | int | str]],
     ordered: Sequence[int],
-    verification_parents: Container[str],
+    refinement_parents: Container[str],
     col: str,
 ) -> Iterator[float]:
     """Yield finite ``col`` means for rows that will actually be rendered.
 
-    Used by :func:`_log_verification_summary` to collect a series
+    Used by :func:`_log_refinement_summary` to collect a series
     through which ``pick_duration_unit_for_series`` can pick one
     column-wide display unit.
 
     Args:
         combined_rows: Aggregation rows produced by
-            :func:`aggregate_verification`.
+            :func:`aggregate_by_parent`.
         ordered: Indices into ``combined_rows`` in render order.
-        verification_parents: The ``parent_trial_id`` set used by
-            :func:`_log_verification_summary` to filter rendered
+        refinement_parents: The ``parent_trial_id`` set used by
+            :func:`_log_refinement_summary` to filter rendered
             rows.
         col: DataFrame-column name for the metric (see
             :data:`METRIC_TO_DF_COLUMN`).
@@ -928,7 +955,7 @@ def _iter_rendered_means(
     """
     for i in ordered:
         row = combined_rows[i]
-        if str(row["trial_id"]) not in verification_parents:
+        if str(row["trial_id"]) not in refinement_parents:
             continue
         raw = row.get(col)
         if not isinstance(raw, (int, float)):
@@ -947,7 +974,7 @@ def _format_mean_sem(
     """Render ``<mean> ± <SEM>`` for one metric in an aggregation row.
 
     Args:
-        row: An :func:`aggregate_verification` row.
+        row: An :func:`aggregate_by_parent` row.
         col: DataFrame-column name for the metric (see
             :data:`METRIC_TO_DF_COLUMN`).
         scale: Multiplier applied to both mean and SEM before

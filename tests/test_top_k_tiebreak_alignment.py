@@ -2,7 +2,7 @@
 
 The live panel (``RichProgressObserver._rerank``),
 ``recommend_configs``, and
-``OptimizationLoop.run_verification``'s top-K selector all sort by
+``OptimizationLoop.run_refinement``'s top-K selector all sort by
 ``(-score, trial_id)`` under score ties. This test holds the invariant.
 
 Load-bearing assumption: ``_DEFAULT_WEIGHTS`` in
@@ -129,8 +129,8 @@ def test_build_trial_row_populates_udp_keys() -> None:
     assert row.metrics[METRIC_TO_DF_COLUMN["udp_loss_rate"]] == pytest.approx(0.02)
 
 
-def test_run_verification_top_k_selector_agrees_on_trial_id_tiebreak() -> None:
-    """The selector inside run_verification uses the same tiebreak key."""
+def test_run_refinement_top_k_selector_agrees_on_trial_id_tiebreak() -> None:
+    """The selector inside run_refinement uses the same tiebreak key."""
     a = _trial("aaa", 1e9)
     b = _trial("zzz", 1e9)
     rows = [

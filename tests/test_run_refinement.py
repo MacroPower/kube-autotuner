@@ -1,4 +1,4 @@
-"""Integration-style test for :meth:`OptimizationLoop.run_verification`.
+"""Integration-style tests for :meth:`OptimizationLoop.run_refinement`.
 
 Uses the same mocked benchmark / setter pattern as ``test_optimizer.py``:
 the Ax client is real (the test is gated on the ``optimize`` dep
@@ -75,13 +75,13 @@ def _make_latency_results() -> list[LatencyResult]:
 @patch("kube_autotuner.optimizer.NodeLease")
 @patch("kube_autotuner.optimizer.BenchmarkRunner")
 @patch("kube_autotuner.optimizer.make_sysctl_setter_from_env")
-def test_run_verification_emits_phase_parent_rows_and_no_new_complete_trial_calls(
+def test_run_refinement_emits_phase_parent_rows_and_no_new_complete_trial_calls(
     mock_setter_cls: MagicMock,
     mock_runner_cls: MagicMock,
     mock_lease_cls: MagicMock,  # noqa: ARG001 - patched out to avoid real K8s calls
     tmp_path,
 ) -> None:
-    """6 primary trials + 2 verification per top-2 = 4 verification rows."""
+    """4 primary trials + 2 rounds * 2 top-K = 4 refinement rows."""
     mock_setter = MagicMock()
     mock_setter.snapshot.side_effect = _mock_snapshot
     mock_setter_cls.return_value = mock_setter
@@ -103,7 +103,7 @@ def test_run_verification_emits_phase_parent_rows_and_no_new_complete_trial_call
 
     # Use n_sobol == n_trials so the test does not depend on Ax's
     # Sobol->Bayesian transition criteria (identical-metric mocks can
-    # stall the transition). The verification pass is independent of
+    # stall the transition). The refinement pass is independent of
     # which Ax phase produced the parent.
     loop = OptimizationLoop(
         node_pair=node_pair,
@@ -126,29 +126,31 @@ def test_run_verification_emits_phase_parent_rows_and_no_new_complete_trial_call
     loop.run()
     primary_complete_count = call_counter["n"]
 
-    created = loop.run_verification(top_k=2, repeats=2)
-    # 2 configs * 2 repeats = 4 verification rows.
+    created = loop.run_refinement(top_k=2, rounds=2)
+    # 2 rounds * top-K 2 = 4 refinement rows.
     assert len(created) == 4
-    assert all(tr.phase == "verification" for tr in created)
+    assert all(tr.phase == "refinement" for tr in created)
     primary_ids = {tr.trial_id for tr in loop._completed if is_primary(tr)}
     assert all(tr.parent_trial_id in primary_ids for tr in created)
-    # Dataset got 4 primary + 4 verification rows.
+    # Each created row carries a 1-indexed refinement_round.
+    assert {tr.refinement_round for tr in created} == {1, 2}
+    # Dataset got 4 primary + 4 refinement rows.
     persisted = TrialLog.load(output)
     assert len(persisted) == 4 + 4
-    # Verification does not call complete_trial -- Ax never sees the repeats.
+    # Refinement does not call complete_trial -- Ax never sees the samples.
     assert call_counter["n"] == primary_complete_count
 
 
 @patch("kube_autotuner.optimizer.NodeLease")
 @patch("kube_autotuner.optimizer.BenchmarkRunner")
 @patch("kube_autotuner.optimizer.make_sysctl_setter_from_env")
-def test_run_verification_skips_done_work(
+def test_run_refinement_skips_already_done_round(
     mock_setter_cls: MagicMock,
     mock_runner_cls: MagicMock,
     mock_lease_cls: MagicMock,  # noqa: ARG001 - patched out to avoid real K8s calls
     tmp_path,
 ) -> None:
-    """``already_done_by_parent`` trims the per-parent repeat count."""
+    """``completed_by_round`` skips parents already sampled in a given round."""
     mock_setter = MagicMock()
     mock_setter.snapshot.side_effect = _mock_snapshot
     mock_setter_cls.return_value = mock_setter
@@ -170,47 +172,49 @@ def test_run_verification_skips_done_work(
         objectives=ObjectivesSection(),
     )
     loop.run()
-    # Rank the primaries the same way run_verification will; feed one
-    # of the top-2 parents as already-done.
-    from kube_autotuner.optimizer import _compute_metrics  # noqa: PLC0415, PLC2701
-    from kube_autotuner.progress import _build_trial_row  # noqa: PLC0415, PLC2701
-    from kube_autotuner.scoring import config_memory_cost, score_rows  # noqa: PLC0415
+
+    # Pick a parent that will be in the round-1 top-K and pretend it
+    # was already sampled. Score the primaries the same way
+    # run_refinement does (aggregate_by_parent + score_rows over the
+    # population), then take the top entry.
+    from kube_autotuner.scoring import (  # noqa: PLC0415
+        aggregate_by_parent,
+        config_memory_cost,
+        score_rows,
+    )
 
     primaries = [tr for tr in loop._completed if is_primary(tr)]
-    rows = [
-        _build_trial_row(
-            0,
-            tr.phase or "bayesian",
-            _compute_metrics(tr),
-            trial_id=tr.trial_id,
-            parent_trial_id=None,
-            memory_cost=config_memory_cost(tr.sysctl_values, PARAM_SPACE),
-        )
-        for tr in primaries
-    ]
-    objectives = ObjectivesSection()
+    agg = aggregate_by_parent(primaries)
+    parent_by_id = {p.trial_id: p for p in primaries}
+    usable = [r for r in agg if str(r["trial_id"]) in parent_by_id]
+    parents_aligned = [parent_by_id[str(r["trial_id"])] for r in usable]
+    costs = [config_memory_cost(p.sysctl_values, PARAM_SPACE) for p in parents_aligned]
     scores = score_rows(
-        [r.metrics for r in rows],
-        objectives.pareto,
-        objectives.recommendation_weights,
-        memory_costs=[r.memory_cost for r in rows],
-        memory_cost_weight=objectives.memory_cost_weight,
+        usable,
+        ObjectivesSection().pareto,
+        ObjectivesSection().recommendation_weights,
+        memory_costs=costs,
+        memory_cost_weight=ObjectivesSection().memory_cost_weight,
     )
     ranked = sorted(
-        range(len(rows)),
-        key=lambda i: (-scores[i], rows[i].trial_id),
+        range(len(parents_aligned)),
+        key=lambda i: (-scores[i], parents_aligned[i].trial_id),
     )
-    first_parent_id = rows[ranked[0]].trial_id
+    first_parent_id = parents_aligned[ranked[0]].trial_id
 
-    created = loop.run_verification(
+    created = loop.run_refinement(
         top_k=2,
-        repeats=2,
-        already_done_by_parent={first_parent_id: 1},
+        rounds=2,
+        completed_by_round={1: {first_parent_id}},
     )
-    # Parent one: 2-1=1 remaining; parent two: 2 remaining. Total=3.
+    # Round 1: 1 parent already done -> 1 new sample.
+    # Round 2: 2 parents -> 2 new samples.
+    # Total: 3 new samples.
     assert len(created) == 3
     counts: dict[str, int] = {}
     for tr in created:
         assert tr.parent_trial_id is not None
         counts[tr.parent_trial_id] = counts.get(tr.parent_trial_id, 0) + 1
-    assert counts[first_parent_id] == 1
+    # The pre-completed parent gets one fewer sample because it was
+    # skipped in round 1.
+    assert counts.get(first_parent_id, 0) == 1

@@ -1,6 +1,6 @@
 """Tests for :meth:`OptimizationLoop._seed_prior_trials` with mixed priors.
 
-Verification rows must land in ``self._completed`` but skip Ax's
+Refinement rows must land in ``self._completed`` but skip Ax's
 ``attach_trial`` / ``complete_trial`` (Ax cannot accept the same arm
 twice and has no use for a repeat observation).
 """
@@ -46,6 +46,7 @@ def _prior(
     phase: str,
     parent_trial_id: str | None = None,
     offset: int = 0,
+    refinement_round: int | None = None,
 ) -> TrialResult:
     return TrialResult(
         node_pair=NodePair(source="a", target="b", hardware_class="10g"),
@@ -62,6 +63,7 @@ def _prior(
         ],
         phase=phase,  # ty: ignore[invalid-argument-type]
         parent_trial_id=parent_trial_id,
+        refinement_round=refinement_round,
     )
 
 
@@ -76,10 +78,11 @@ def test_mixed_priors_seed_only_primaries_into_ax(
 ) -> None:
     primary_a = _prior(phase="sobol", offset=0)
     primary_b = _prior(phase="bayesian", offset=1)
-    verification_child = _prior(
-        phase="verification",
+    refinement_child = _prior(
+        phase="refinement",
         offset=0,
         parent_trial_id=primary_a.trial_id,
+        refinement_round=1,
     )
 
     with (
@@ -109,13 +112,13 @@ def test_mixed_priors_seed_only_primaries_into_ax(
     loop.client.attach_trial = attach_spy  # ty: ignore[invalid-assignment]
     loop.client.complete_trial = complete_spy  # ty: ignore[invalid-assignment]
 
-    prior = [primary_a, verification_child, primary_b]
+    prior = [primary_a, refinement_child, primary_b]
     loop._seed_prior_trials(prior)
 
-    # Both primaries attached + completed; the verification row did not.
+    # Both primaries attached + completed; the refinement row did not.
     assert attach_spy.call_count == 2
     assert complete_spy.call_count == 2
 
     # _completed holds all three rows in file order.
-    assert loop._completed == [primary_a, verification_child, primary_b]
+    assert loop._completed == [primary_a, refinement_child, primary_b]
     assert sum(1 for t in loop._completed if is_primary(t)) == 2

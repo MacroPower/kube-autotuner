@@ -1,4 +1,4 @@
-"""Tests for :func:`kube_autotuner.scoring.aggregate_verification`."""
+"""Tests for :func:`kube_autotuner.scoring.aggregate_by_parent`."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from kube_autotuner.models import (
 )
 from kube_autotuner.scoring import (
     METRIC_TO_DF_COLUMN,
-    aggregate_verification,
+    aggregate_by_parent,
     score_rows,
 )
 
@@ -26,8 +26,9 @@ def _trial(
     *,
     phase: str = "bayesian",
     parent_trial_id: str | None = None,
+    refinement_round: int | None = None,
 ) -> TrialResult:
-    """Build a one-iteration primary or verification :class:`TrialResult`.
+    """Build a one-iteration primary or refinement :class:`TrialResult`.
 
     Returns:
         A trial record carrying a single TCP iperf3 record with the
@@ -50,13 +51,14 @@ def _trial(
         ],
         phase=phase,  # ty: ignore[invalid-argument-type]
         parent_trial_id=parent_trial_id,
+        refinement_round=refinement_round,
     )
 
 
 def test_primary_only_input_keeps_scoring_identical() -> None:
     a = _trial(1e9)
     b = _trial(2e9)
-    agg = aggregate_verification([a, b])
+    agg = aggregate_by_parent([a, b])
     assert {str(row["trial_id"]) for row in agg} == {a.trial_id, b.trial_id}
     scores = score_rows(
         agg,
@@ -68,18 +70,28 @@ def test_primary_only_input_keeps_scoring_identical() -> None:
     assert score_by_id[b.trial_id] > score_by_id[a.trial_id]
 
 
-def test_adding_verification_samples_changes_means_and_rank() -> None:
+def test_adding_refinement_samples_changes_means_and_rank() -> None:
     # Primary A reports 1.5e9; primary B reports 1.0e9. With A alone, A wins.
     primary_a = _trial(1.5e9)
     primary_b = _trial(1.0e9)
-    # Two verification samples on A both land at 0.9e9. New mean for A is
+    # Two refinement samples on A both land at 0.9e9. New mean for A is
     # (1.5 + 0.9 + 0.9)/3 = 1.1e9 vs B's 1.0e9 -- A still leads, but by
     # a narrower margin than before.
-    v1 = _trial(0.9e9, phase="verification", parent_trial_id=primary_a.trial_id)
-    v2 = _trial(0.9e9, phase="verification", parent_trial_id=primary_a.trial_id)
+    v1 = _trial(
+        0.9e9,
+        phase="refinement",
+        parent_trial_id=primary_a.trial_id,
+        refinement_round=1,
+    )
+    v2 = _trial(
+        0.9e9,
+        phase="refinement",
+        parent_trial_id=primary_a.trial_id,
+        refinement_round=2,
+    )
 
-    agg_primary = aggregate_verification([primary_a, primary_b])
-    agg_combined = aggregate_verification([primary_a, primary_b, v1, v2])
+    agg_primary = aggregate_by_parent([primary_a, primary_b])
+    agg_combined = aggregate_by_parent([primary_a, primary_b, v1, v2])
     col = METRIC_TO_DF_COLUMN["tcp_throughput"]
 
     def _by_id(rows: list[dict[str, float | int | str]]) -> dict[str, float]:
@@ -91,14 +103,14 @@ def test_adding_verification_samples_changes_means_and_rank() -> None:
     assert combined_means[primary_a.trial_id] == pytest.approx(
         (1.5e9 + 0.9e9 + 0.9e9) / 3,
     )
-    # B has no verification samples, so its combined mean is unchanged.
+    # B has no refinement samples, so its combined mean is unchanged.
     assert combined_means[primary_b.trial_id] == pytest.approx(
         primary_means[primary_b.trial_id],
     )
 
 
 def test_sem_zero_when_n_equals_one() -> None:
-    agg = aggregate_verification([_trial(1e9)])
+    agg = aggregate_by_parent([_trial(1e9)])
     row = agg[0]
     assert row["sample_count"] == 1
     sem_col = f"{METRIC_TO_DF_COLUMN['tcp_throughput']}_sem"
@@ -107,8 +119,13 @@ def test_sem_zero_when_n_equals_one() -> None:
 
 def test_sem_positive_with_multiple_samples() -> None:
     parent = _trial(1.0e9)
-    child = _trial(0.8e9, phase="verification", parent_trial_id=parent.trial_id)
-    agg = aggregate_verification([parent, child])
+    child = _trial(
+        0.8e9,
+        phase="refinement",
+        parent_trial_id=parent.trial_id,
+        refinement_round=1,
+    )
+    agg = aggregate_by_parent([parent, child])
     row = next(r for r in agg if r["trial_id"] == parent.trial_id)
     assert row["sample_count"] == 2
     sem_col = f"{METRIC_TO_DF_COLUMN['tcp_throughput']}_sem"
@@ -146,7 +163,7 @@ def test_aggregate_emits_udp_columns() -> None:
         ],
         phase="bayesian",
     )
-    agg = aggregate_verification([trial])
+    agg = aggregate_by_parent([trial])
     assert len(agg) == 1
     row = agg[0]
     udp_tp_col = METRIC_TO_DF_COLUMN["udp_throughput"]
@@ -161,7 +178,7 @@ def test_udp_columns_contribute_to_default_score() -> None:
     """UDP throughput / loss rate are first-class objectives under defaults."""
     a = _trial(1e9)
     b = _trial(2e9)
-    agg = aggregate_verification([a, b])
+    agg = aggregate_by_parent([a, b])
     # Inject distinctly different UDP values per row. Trial b wins on
     # TCP throughput; trial a wins on UDP throughput and UDP loss --
     # the new objectives should reorder the score gap.
@@ -202,8 +219,13 @@ def test_udp_columns_contribute_to_default_score() -> None:
     )
 
 
-def test_orphaned_verification_row_forms_its_own_group() -> None:
-    orphan = _trial(1e9, phase="verification", parent_trial_id="ghost")
-    agg = aggregate_verification([orphan])
+def test_orphaned_refinement_row_forms_its_own_group() -> None:
+    orphan = _trial(
+        1e9,
+        phase="refinement",
+        parent_trial_id="ghost",
+        refinement_round=1,
+    )
+    agg = aggregate_by_parent([orphan])
     assert len(agg) == 1
     assert str(agg[0]["trial_id"]) == "ghost"

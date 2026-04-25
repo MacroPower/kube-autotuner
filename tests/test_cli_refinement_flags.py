@@ -1,4 +1,4 @@
-"""Tests for ``optimize.verification*`` YAML threading on the ``optimize`` command."""
+"""Tests for ``optimize.refinement*`` YAML threading on the ``optimize`` command."""
 
 from __future__ import annotations
 
@@ -31,15 +31,15 @@ def _optimize_yaml(out: Path, *, optimize_overrides: dict) -> str:
     return yaml.safe_dump(body)
 
 
-def test_verification_yaml_threads_into_optimize_section(tmp_path: Path) -> None:
+def test_refinement_yaml_threads_into_optimize_section(tmp_path: Path) -> None:
     out = tmp_path / "opt"
     config = tmp_path / "exp.yaml"
     config.write_text(
         _optimize_yaml(
             out,
             optimize_overrides={
-                "verificationTrials": 3,
-                "verificationTopK": 2,
+                "refinementRounds": 3,
+                "refinementTopK": 2,
             },
         ),
     )
@@ -59,12 +59,12 @@ def test_verification_yaml_threads_into_optimize_section(tmp_path: Path) -> None
     assert result.exit_code == 0, result.output
     ctx = run_optimize.call_args.args[0]
     assert ctx.exp.optimize is not None
-    assert ctx.exp.optimize.verification_trials == 3
-    assert ctx.exp.optimize.verification_top_k == 2
+    assert ctx.exp.optimize.refinement_rounds == 3
+    assert ctx.exp.optimize.refinement_top_k == 2
 
 
-def test_defaults_when_yaml_omits_verification_keys(tmp_path: Path) -> None:
-    """Omitted keys leave the ``OptimizeSection`` defaults (0 disables verification)."""
+def test_defaults_when_yaml_omits_refinement_keys(tmp_path: Path) -> None:
+    """Omitted keys leave the ``OptimizeSection`` defaults (0 disables refinement)."""
     out = tmp_path / "opt"
     config = tmp_path / "exp.yaml"
     config.write_text(_optimize_yaml(out, optimize_overrides={}))
@@ -84,5 +84,5 @@ def test_defaults_when_yaml_omits_verification_keys(tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
     ctx = run_optimize.call_args.args[0]
     assert ctx.exp.optimize is not None
-    assert ctx.exp.optimize.verification_trials == 0
-    assert ctx.exp.optimize.verification_top_k == 3
+    assert ctx.exp.optimize.refinement_rounds == 0
+    assert ctx.exp.optimize.refinement_top_k == 3

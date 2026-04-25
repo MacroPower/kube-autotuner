@@ -158,30 +158,38 @@ class ProgressObserver(Protocol):
             trial: The :class:`TrialResult` just persisted. Carries
                 ``phase``, ``trial_id``, and ``parent_trial_id`` so the
                 observer can key its internal aggregation and render
-                correctly for both primary and verification rows.
+                correctly for both primary and refinement rows.
             metrics: The per-metric ``(mean, SEM)`` table returned by
                 the optimizer's metric aggregation.
         """
         ...
 
-    def on_verification_start(self, top_k: int, total_remaining: int) -> None:
-        """Announce the start of the post-primary verification phase.
+    def on_refinement_round_start(
+        self,
+        round_index: int,
+        total_rounds: int,
+        pending: int,
+    ) -> None:
+        """Announce the start of one refinement round.
 
-        Called once by
-        :meth:`kube_autotuner.optimizer.OptimizationLoop.run_verification`
-        before the first verification ``on_trial_start``. Rich-backed
-        observers use ``total_remaining`` to size a dedicated
-        verification progress bar; ``total_remaining`` already reflects
-        work skipped by a resume (it is
-        ``sum(max(0, repeats - already_done_by_parent.get(p, 0))
-        for p in parents)``), so the bar does not overshoot on partial
-        resumes. There is no matching ``on_verification_end`` -- the
-        existing ``__exit__`` handles teardown.
+        Called once per round by
+        :meth:`kube_autotuner.optimizer.OptimizationLoop.run_refinement`
+        before the round's first ``on_trial_start``, and only when at
+        least one parent in this round's top-K is not already in
+        ``completed_by_round``. Rich-backed observers use
+        ``total_rounds`` to label a dedicated refinement progress bar
+        and reset its total to ``pending`` so the bar reaches 100% when
+        every queued sample completes (including on resume, when a
+        partial round R fed in some parents via
+        ``completed_by_round[R]``). There is no matching
+        ``on_refinement_round_end`` -- the next round's start hook (or
+        the existing ``__exit__``) handles teardown.
 
         Args:
-            top_k: Number of parent configs selected for verification.
-            total_remaining: Total verification runs yet to execute in
-                the current session (post-``already_done_by_parent``).
+            round_index: 1-indexed refinement round number.
+            total_rounds: Total refinement rounds configured.
+            pending: Number of parent configs to sample this round
+                (top-K minus any parents already done on resume).
         """
         ...
 
@@ -292,7 +300,12 @@ class NullObserver:
     ) -> None:
         """No-op."""
 
-    def on_verification_start(self, top_k: int, total_remaining: int) -> None:
+    def on_refinement_round_start(
+        self,
+        round_index: int,
+        total_rounds: int,
+        pending: int,
+    ) -> None:
         """No-op."""
 
     def on_trial_failed(self, index: int, exc: BaseException) -> None:
@@ -353,7 +366,7 @@ class _HistoryEtaColumn(ProgressColumn):
                 a unit instead of holding flat until the next
                 completion. Dispatching by task id lets a single
                 column serve every task in a shared ``Progress``
-                (trial bar, iteration bar, verify bar).
+                (trial bar, iteration bar, refinement bar).
         """
         super().__init__()
         self._history = history
@@ -424,13 +437,13 @@ class _TrialRow:
 
         Args:
             index: Zero-based trial index within this run.
-            phase: ``"sobol"``, ``"bayesian"``, or ``"verification"``.
+            phase: ``"sobol"``, ``"bayesian"``, or ``"refinement"``.
             trial_id: The trial's stable ``TrialResult.trial_id``.
                 Primary rows key their own aggregation group by this
-                value; verification rows link to the parent via
+                value; refinement rows link to the parent via
                 ``parent_trial_id``.
             parent_trial_id: The primary trial's ``trial_id`` when
-                ``phase == "verification"``; ``None`` otherwise.
+                ``phase == "refinement"``; ``None`` otherwise.
             throughput_mbps: Mean throughput in megabits-per-second.
             retx_per_gb: Retransmits per gigabyte; ``NaN`` when the
                 trial produced no TCP bytes (every ``bw-tcp`` stage
@@ -496,11 +509,11 @@ def _build_trial_row(
 
     Args:
         index: Zero-based trial index within this run.
-        phase: ``"sobol"``, ``"bayesian"``, or ``"verification"``.
+        phase: ``"sobol"``, ``"bayesian"``, or ``"refinement"``.
         metrics: The ``(mean, SEM)`` bundle from the optimizer.
         trial_id: The trial's stable ``TrialResult.trial_id``.
         parent_trial_id: The primary trial's ``trial_id`` when
-            ``phase == "verification"``; ``None`` otherwise.
+            ``phase == "refinement"``; ``None`` otherwise.
         memory_cost: Cached static memory footprint in bytes (see
             :func:`kube_autotuner.scoring.config_memory_cost`).
 
@@ -668,7 +681,7 @@ class RichProgressObserver:
         self._trial_task_id: TaskID | None = None
         self._iter_task_id: TaskID | None = None
         self._stage_task_id: TaskID | None = None
-        self._verify_task_id: TaskID | None = None
+        self._refinement_task_id: TaskID | None = None
         self._progress: Progress = Progress(
             TextColumn("[bold]{task.description}[/bold]"),
             BarColumn(bar_width=None),
@@ -750,7 +763,7 @@ class RichProgressObserver:
 
         The single :class:`_HistoryEtaColumn` routed into
         ``self._progress`` calls this for every task it renders. The
-        trial and verify tasks share the observer-owned trial
+        trial and refinement tasks share the observer-owned trial
         history (both measure wall-time per Ax trial), while the
         iteration bar uses its own per-iteration history. Unknown task
         ids fall through to the empty snapshot so ``render`` draws
@@ -764,7 +777,7 @@ class RichProgressObserver:
             The matching history tuple, or ``(0, 0.0, 0.0)`` when the
             task id is not one the observer owns.
         """
-        if task_id in {self._trial_task_id, self._verify_task_id}:
+        if task_id in {self._trial_task_id, self._refinement_task_id}:
             return self._trial_history()
         if task_id == self._iter_task_id:
             return self._iter_history()
@@ -782,7 +795,7 @@ class RichProgressObserver:
 
         Returns:
             A :class:`rich.console.Group` of the shared progress
-            region (trial, iteration, and verify tasks render
+            region (trial, iteration, and refinement tasks render
             inside one ``Progress`` so their columns stay aligned)
             and, when any trial has completed, the current "best so
             far" table.
@@ -792,8 +805,8 @@ class RichProgressObserver:
         sort_key = (
             "weighted score" if self._objectives is not None else "tcp_throughput"
         )
-        has_verification = any(r.phase == "verification" for r in self._all_rows)
-        suffix = ", verified" if has_verification else ""
+        has_refinement = any(r.phase == "refinement" for r in self._all_rows)
+        suffix = ", refined" if has_refinement else ""
         table = Table(
             title=f"Best so far (top {_TOP_N} by {sort_key}{suffix})",
             title_style="bold",
@@ -871,7 +884,7 @@ class RichProgressObserver:
 
         Rich does not expose a public dict lookup, so this linear scan
         over ``self._progress.tasks`` (at most four entries -- trial,
-        iteration, stage, verify) is the cheapest stable API.
+        iteration, stage, refinement) is the cheapest stable API.
 
         Args:
             task_id: The Rich ``TaskID`` to resolve.
@@ -968,10 +981,10 @@ class RichProgressObserver:
             self._trial_total_seconds += time.monotonic() - self._trial_start
             self._trial_count += 1
             self._trial_start = None
-        if phase != "verification" and self._trial_task_id is not None:
+        if phase != "refinement" and self._trial_task_id is not None:
             self._progress.update(self._trial_task_id, advance=1)
-        if phase == "verification" and self._verify_task_id is not None:
-            self._progress.update(self._verify_task_id, advance=1)
+        if phase == "refinement" and self._refinement_task_id is not None:
+            self._progress.update(self._refinement_task_id, advance=1)
         row = _build_trial_row(
             index,
             phase,
@@ -989,11 +1002,11 @@ class RichProgressObserver:
 
         Called once at loop-start when resuming from a prior session.
         Primary rows carry a stored ``phase`` (``"sobol"`` or
-        ``"bayesian"``); verification rows carry ``phase="verification"``
+        ``"bayesian"``); refinement rows carry ``phase="refinement"``
         and do not shift the Sobol/Bayesian index over primary rows. The
         two ranges are interleaved in the observer's ``_all_rows`` so
         dataset file order is preserved, and :meth:`_rerank` routes
-        through the aggregation path when any verification row is
+        through the aggregation path when any refinement row is
         present.
 
         ``_trial_count`` / ``_trial_total_seconds`` are deliberately
@@ -1023,7 +1036,7 @@ class RichProgressObserver:
                 assert tr.phase is not None  # noqa: S101 - run_optimize invariant
                 phase = tr.phase
             else:
-                phase = "verification"
+                phase = "refinement"
             self._all_rows.append(
                 _build_trial_row(
                     idx,
@@ -1048,12 +1061,12 @@ class RichProgressObserver:
         construction, ``baseline`` / ``trial`` flows) the
         throughput-descending sort is used.
 
-        Once any ``_all_rows`` entry carries ``phase="verification"``,
-        ranking aggregates each parent's primary + verification
+        Once any ``_all_rows`` entry carries ``phase="refinement"``,
+        ranking aggregates each parent's primary + refinement
         samples first (mirroring
-        :func:`kube_autotuner.scoring.aggregate_verification`) and
+        :func:`kube_autotuner.scoring.aggregate_by_parent`) and
         keys the rendered top by the parent's stored ``_TrialRow``.
-        The pre-verification path stays ungrouped -- hot path, no
+        The pre-refinement path stays ungrouped -- hot path, no
         per-refresh allocation change.
         """
         if self._objectives is None:
@@ -1064,8 +1077,8 @@ class RichProgressObserver:
             )[:_TOP_N]
             return
 
-        has_verification = any(r.phase == "verification" for r in self._all_rows)
-        if has_verification:
+        has_refinement = any(r.phase == "refinement" for r in self._all_rows)
+        if has_refinement:
             self._top = self._rerank_aggregated()
             return
 
@@ -1078,7 +1091,7 @@ class RichProgressObserver:
         )
         # Rank by score desc, break ties by trial_id ascending to
         # match recommend_configs (kube_autotuner.report.analysis) and
-        # OptimizationLoop.run_verification's top-K selector.
+        # OptimizationLoop.run_refinement's top-K selector.
         order = sorted(
             range(len(self._all_rows)),
             key=lambda i: (-scores[i], self._all_rows[i].trial_id),
@@ -1086,10 +1099,10 @@ class RichProgressObserver:
         self._top = [self._all_rows[i] for i in order[:_TOP_N]]
 
     def _rerank_aggregated(self) -> list[_TrialRow]:
-        """Return the top rows grouped by parent for verification panels.
+        """Return the top rows grouped by parent for refinement panels.
 
         Groups ``_all_rows`` by ``parent_trial_id or trial_id`` (same
-        key as :func:`kube_autotuner.scoring.aggregate_verification`),
+        key as :func:`kube_autotuner.scoring.aggregate_by_parent`),
         means each group's raw metrics into a single row dict, scores
         those, and returns the parent's stored ``_TrialRow`` for each
         winning group so the live panel keeps rendering display-domain
@@ -1126,19 +1139,19 @@ class RichProgressObserver:
             aggregated.append(agg)
 
         # Pick each group's "primary row" for display: prefer a
-        # non-verification sample (the original primary); fall back to
-        # whatever sample is first in the group (orphaned verification
+        # non-refinement sample (the original primary); fall back to
+        # whatever sample is first in the group (orphaned refinement
         # rows on a dropped parent).
         display_rows: list[_TrialRow] = []
         for key in group_order:
             samples = groups[key]
             primary = next(
-                (r for r in samples if r.phase != "verification"),
+                (r for r in samples if r.phase != "refinement"),
                 samples[0],
             )
             display_rows.append(primary)
 
-        # Parent and verification repeats share sysctl_values and
+        # Parent and refinement samples share sysctl_values and
         # therefore share memory_cost; pull it off the display (primary)
         # row.
         memory_costs = [r.memory_cost for r in display_rows]
@@ -1157,33 +1170,41 @@ class RichProgressObserver:
         )
         return [display_rows[i] for i in order[:_TOP_N]]
 
-    def on_verification_start(self, top_k: int, total_remaining: int) -> None:
-        """Create a second progress task for the verification phase.
+    def on_refinement_round_start(
+        self,
+        round_index: int,
+        total_rounds: int,
+        pending: int,
+    ) -> None:
+        """Create or relabel the refinement progress task for one round.
 
         The primary trial bar is left in place so the live panel keeps
-        its completed-primary history visible. ``total_remaining`` has
-        already been trimmed by ``already_done_by_parent`` in
-        :meth:`OptimizationLoop.run_verification`, so the bar sizes
-        correctly on partial resumes and reaches 100% when every
-        remaining run has completed.
+        its completed-primary history visible. The refinement task's
+        total is reset to ``pending`` each round so the bar fills as
+        the round's queued samples land. On resume, parents already
+        sampled in this round are subtracted by the optimizer before
+        the hook fires, so the bar still reaches 100% when every
+        queued sample completes.
 
         Args:
-            top_k: Number of parent configs selected for verification.
-            total_remaining: Total verification runs yet to execute.
+            round_index: 1-indexed refinement round number.
+            total_rounds: Total refinement rounds configured.
+            pending: Number of parent configs queued this round
+                (top-K minus any parents already done on resume).
         """
-        description = f"Verify [{top_k} configs, {total_remaining} runs]"
-        if self._verify_task_id is None:
-            self._verify_task_id = self._progress.add_task(
+        description = f"Refinement [round {round_index}/{total_rounds}]"
+        if self._refinement_task_id is None:
+            self._refinement_task_id = self._progress.add_task(
                 description,
-                total=total_remaining,
+                total=pending,
                 completed=0,
             )
         else:
-            self._progress.update(
-                self._verify_task_id,
-                description=description,
-                total=total_remaining,
+            self._progress.reset(
+                self._refinement_task_id,
+                total=pending,
                 completed=0,
+                description=description,
             )
         self._refresh()
 

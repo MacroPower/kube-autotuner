@@ -121,7 +121,7 @@ def test_optimize_help_shows_fresh_and_runtime_flags(
     assert "--fresh" in result.stdout
     assert "--backend" in result.stdout
     assert "--n-trials" not in result.stdout
-    assert "--verification-trials" not in result.stdout
+    assert "--refinement-rounds" not in result.stdout
 
 
 def test_sysctl_help() -> None:

@@ -483,9 +483,9 @@ def is_primary(t: TrialResult) -> bool:
 
     Returns:
         ``True`` for rows that belong in the primary Ax population;
-        ``False`` for rows emitted by the verification pass.
+        ``False`` for rows emitted by the refinement loop.
     """
-    return t.phase != "verification"
+    return t.phase != "refinement"
 
 
 class TrialResult(BaseModel):
@@ -502,8 +502,9 @@ class TrialResult(BaseModel):
     latency_results: list[LatencyResult] = Field(default_factory=list)
     host_state_snapshots: list[HostStateSnapshot] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
-    phase: Literal["sobol", "bayesian", "verification"] | None = None
+    phase: Literal["sobol", "bayesian", "refinement"] | None = None
     parent_trial_id: str | None = None
+    refinement_round: int | None = None
 
     def model_post_init(self, _context: Any, /) -> None:  # noqa: ANN401
         """Populate derived fields (``sysctl_hash`` and ``topology``)."""
@@ -705,7 +706,7 @@ class ResumeMetadata(BaseModel):
     prior trials are compatible with the incoming experiment.
     ``objectives``, ``param_space``, ``benchmark``, ``iperf`` and
     ``fortio`` are the compatibility keys; ``n_sobol``,
-    ``verification_trials``, and ``verification_top_k`` are only
+    ``refinement_rounds``, and ``refinement_top_k`` are only
     populated by ``optimize`` mode (baseline / trial leave them
     ``None``).
     """
@@ -716,8 +717,8 @@ class ResumeMetadata(BaseModel):
     iperf: IperfSection
     fortio: FortioSection
     n_sobol: int | None = None
-    verification_trials: int | None = None
-    verification_top_k: int | None = None
+    refinement_rounds: int | None = None
+    refinement_top_k: int | None = None
 
 
 _resume_metadata_built = False

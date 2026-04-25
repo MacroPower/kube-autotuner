@@ -571,7 +571,7 @@ def test_metadata_header_renders_mixed_and_omits_empty_kernel(
     section = _minimal_section("10g")
     section["metadata"] = {
         "trial_count": 5,
-        "phase_counts": {"sobol": 2, "bayesian": 3, "verification": 0, "unknown": 0},
+        "phase_counts": {"sobol": 2, "bayesian": 3, "refinement": 0, "unknown": 0},
         "kernel_version": None,  # empty -> omit entirely
         "iperf_duration": "mixed",
         "fortio_duration": 30,
@@ -739,7 +739,7 @@ def test_per_iteration_samples_payload_and_summary(tmp_path: Path) -> None:
     """The drill-down payload is keyed by parent trial_id and JS renders it.
 
     Builds a section whose top recommendation has a primary plus 2
-    verification children (3 iterations each, 9 samples total).
+    refinement children (3 iterations each, 9 samples total).
     Asserts the embedded JSON carries ``perIterationSamples`` keyed
     by the parent trial_id with 9 rows whose ``iteration`` values
     preserve the original 0/1/2 indices verbatim, and that the JS
@@ -786,7 +786,7 @@ def test_per_iteration_samples_payload_and_summary(tmp_path: Path) -> None:
 
 
 def test_per_iteration_samples_omitted_when_no_data(tmp_path: Path) -> None:
-    """Sections without verification still render -- payload defaults to {}."""
+    """Sections without refinement still render -- payload defaults to {}."""
     section = _minimal_section("10g", n_pareto_rows=1)
     # No per_iteration_samples key at all.
     path = render.write_index_html(tmp_path, [section])

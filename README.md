@@ -208,12 +208,16 @@ optimize:
       # Discrete set; values are strings or ints.
       paramType: choice
       values: [cubic, bbr]
-  # After the Bayesian loop, re-run the top-K recommended configs this many
-  # extra times to confirm the win is real and not a noise artifact.
-  # Set to 0 to disable the verification phase.
-  verificationTrials: 0
-  # Number of top-ranked configs to verify when verificationTrials > 0.
-  verificationTopK: 3
+  # After the Bayesian loop, run a refinement pass over the top-K configs.
+  # Each round re-picks top-K from the combined (primary + refinement)
+  # population and runs one extra benchmark per pending parent, so a
+  # parent that regresses under repeat sampling drops out and stops
+  # accumulating instead of dragging stale optimism into the final
+  # ranking. Total budget = refinementTopK * refinementRounds. Set to 0
+  # to disable the refinement phase.
+  refinementRounds: 0
+  # Number of top-ranked configs to sample each refinement round.
+  refinementTopK: 3
 
 # Required for the `trial` subcommand. Apply a fixed sysctl set for one
 # benchmark.

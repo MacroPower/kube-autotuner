@@ -43,13 +43,13 @@ from kube_autotuner.report.analysis import (  # noqa: E402
     pareto_front,
     per_iteration_samples,
     recommend_configs,
+    refinement_stats,
     section_metadata,
     split_trials_by_hardware_class,
     stability_badge,
     sysctl_correlation_matrix,
     trajectory_rows,
     trials_to_dataframe,
-    verification_stats,
 )
 from kube_autotuner.scoring import _per_trial_metric_means  # noqa: E402, PLC2701
 from kube_autotuner.trial_log import TrialLog  # noqa: E402
@@ -1245,7 +1245,7 @@ def _defaults_trial(
     *,
     bps: float = 1e10,
     trial_id: str = "baseline",
-    phase: Literal["sobol", "bayesian", "verification"] | None = None,
+    phase: Literal["sobol", "bayesian", "refinement"] | None = None,
     parent_trial_id: str | None = None,
 ) -> TrialResult:
     from kube_autotuner.sysctl.params import RECOMMENDED_DEFAULTS  # noqa: PLC0415
@@ -1303,54 +1303,54 @@ def test_baseline_comparison_multi_match_means_across_primaries() -> None:
     assert entries[0]["baseline"] == pytest.approx(5e9)
 
 
-def test_baseline_comparison_folds_verification_children() -> None:
+def test_baseline_comparison_folds_refinement_children() -> None:
     b1 = _defaults_trial(bps=4e9, trial_id="b1", phase="bayesian")
     v1 = _defaults_trial(
         bps=6e9,
         trial_id="b1-v1",
-        phase="verification",
+        phase="refinement",
         parent_trial_id="b1",
     )
     v2 = _defaults_trial(
         bps=8e9,
         trial_id="b1-v2",
-        phase="verification",
+        phase="refinement",
         parent_trial_id="b1",
     )
     top_row = {"mean_tcp_throughput": 1e10, "tcp_retransmit_rate": 0.0}
     entries = baseline_comparison([b1, v1, v2], _SIMPLE_OBJECTIVES, top_row)
     assert entries is not None
-    # Aggregated verification-adjusted baseline: mean(4e9, 6e9, 8e9) = 6e9
+    # Aggregated refinement-adjusted baseline: mean(4e9, 6e9, 8e9) = 6e9
     assert entries[0]["baseline"] == pytest.approx(6e9)
 
 
-# --- verification_stats --------------------------------------------------
+# --- refinement_stats ----------------------------------------------------
 
 
-def test_verification_stats_skips_groups_under_two_children() -> None:
+def test_refinement_stats_skips_groups_under_two_children() -> None:
     parent = _trial(hw="10g", bps=5e9, trial_id="p1")
     child = _trial(
         hw="10g",
         bps=6e9,
         trial_id="c1",
     )
-    # Manually mark child as verification of p1
+    # Manually mark child as refinement of p1
     child = child.model_copy(
-        update={"phase": "verification", "parent_trial_id": "p1"},
+        update={"phase": "refinement", "parent_trial_id": "p1"},
     )
-    stats = verification_stats([parent, child])
+    stats = refinement_stats([parent, child])
     assert stats == {}
 
 
-def test_verification_stats_computes_mean_stdev_cv() -> None:
+def test_refinement_stats_computes_mean_stdev_cv() -> None:
     parent = _trial(hw="10g", bps=5e9, trial_id="p1")
-    verifications = [
+    children = [
         _trial(hw="10g", bps=bps, trial_id=f"c{i}").model_copy(
-            update={"phase": "verification", "parent_trial_id": "p1"},
+            update={"phase": "refinement", "parent_trial_id": "p1"},
         )
         for i, bps in enumerate([6e9, 8e9, 10e9])
     ]
-    stats = verification_stats([parent, *verifications])
+    stats = refinement_stats([parent, *children])
     assert "p1" in stats
     tp = stats["p1"]["mean_tcp_throughput"]
     assert tp["mean"] == pytest.approx(8e9)
@@ -1359,20 +1359,20 @@ def test_verification_stats_computes_mean_stdev_cv() -> None:
     assert tp["cv"] == pytest.approx(0.25)
 
 
-def test_verification_stats_zero_mean_cv_is_none() -> None:
+def test_refinement_stats_zero_mean_cv_is_none() -> None:
     parent = _trial(hw="10g", bps=5e9, trial_id="p1")
     # Retransmit rate is 0 in all children -> mean 0, cv should be None.
-    verifications = [
+    children = [
         _trial(
             hw="10g",
             bps=5e9,
             retransmits=0,
             trial_id=f"c{i}",
             bytes_sent=_DEFAULT_BYTES_SENT,
-        ).model_copy(update={"phase": "verification", "parent_trial_id": "p1"})
+        ).model_copy(update={"phase": "refinement", "parent_trial_id": "p1"})
         for i in range(3)
     ]
-    stats = verification_stats([parent, *verifications])
+    stats = refinement_stats([parent, *children])
     assert stats["p1"]["tcp_retransmit_rate"]["mean"] == pytest.approx(0.0)
     assert stats["p1"]["tcp_retransmit_rate"]["cv"] is None
 
@@ -1438,10 +1438,10 @@ def test_trajectory_rows_phase_fallback_to_unknown_without_metadata() -> None:
     assert rows[0]["phase_effective"] == "unknown"
 
 
-def test_trajectory_rows_skips_verification_repeats() -> None:
+def test_trajectory_rows_skips_refinement_repeats() -> None:
     primary = _trial(hw="10g", bps=5e9, trial_id="p1")
     verif = _trial(hw="10g", bps=6e9, trial_id="v1").model_copy(
-        update={"phase": "verification", "parent_trial_id": "p1"},
+        update={"phase": "refinement", "parent_trial_id": "p1"},
     )
     rows = trajectory_rows(
         [primary, verif],
@@ -1520,14 +1520,14 @@ def test_section_metadata_all_empty_kernel_is_none() -> None:
     assert md["kernel_version"] is None
 
 
-def test_section_metadata_counts_verification_separately() -> None:
+def test_section_metadata_counts_refinement_separately() -> None:
     p1 = _trial(hw="10g", bps=5e9, trial_id="p1")
     v1 = _trial(hw="10g", bps=6e9, trial_id="v1").model_copy(
-        update={"phase": "verification", "parent_trial_id": "p1"},
+        update={"phase": "refinement", "parent_trial_id": "p1"},
     )
     md = section_metadata([p1, v1], resume_metadata=None)
     assert md["trial_count"] == 1
-    assert md["phase_counts"]["verification"] == 1
+    assert md["phase_counts"]["refinement"] == 1
 
 
 # --- sysctl_correlation_matrix ------------------------------------------
@@ -1747,7 +1747,7 @@ def _multi_iter_trial(
     bps_per_iter: list[float],
     retx_per_iter: list[int] | None = None,
     bytes_sent: int = _DEFAULT_BYTES_SENT,
-    phase: Literal["sobol", "bayesian", "verification"] | None = None,
+    phase: Literal["sobol", "bayesian", "refinement"] | None = None,
     parent_trial_id: str | None = None,
 ) -> TrialResult:
     retx_vals = retx_per_iter if retx_per_iter is not None else [0] * len(bps_per_iter)
@@ -1801,7 +1801,7 @@ def test_per_iteration_samples_preserves_iteration_index_across_children() -> No
         child = _multi_iter_trial(
             trial_id=f"p1-v{i + 1}",
             bps_per_iter=[base, base + 1e9, base + 2e9],
-            phase="verification",
+            phase="refinement",
             parent_trial_id="p1",
         )
         child = child.model_copy(
@@ -1817,7 +1817,7 @@ def test_per_iteration_samples_preserves_iteration_index_across_children() -> No
     # renumbered: 0,1,2,0,1,2,0,1,2.
     assert [r["iteration"] for r in rows] == [0, 1, 2, 0, 1, 2, 0, 1, 2]
     # Trial id ordering follows (created_at, trial_id) so primary first,
-    # then verification children chronologically.
+    # then refinement children chronologically.
     assert [r["trial_id"] for r in rows] == [
         "p1",
         "p1",
@@ -1988,12 +1988,12 @@ def test_per_iteration_samples_empty_when_no_trials() -> None:
     assert per_iteration_samples([]) == {}
 
 
-def test_per_iteration_samples_orphan_verification_keys_on_parent_id() -> None:
-    """A verification row whose parent_trial_id does not match groups by that id."""
+def test_per_iteration_samples_orphan_refinement_keys_on_parent_id() -> None:
+    """A refinement row whose parent_trial_id does not match groups by that id."""
     orphan = _multi_iter_trial(
         trial_id="v1",
         bps_per_iter=[5e9, 6e9],
-        phase="verification",
+        phase="refinement",
         parent_trial_id="missing-parent",
     )
     out = per_iteration_samples([orphan])

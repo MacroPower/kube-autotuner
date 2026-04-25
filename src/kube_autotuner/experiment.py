@@ -322,8 +322,8 @@ class OptimizeSection(BaseModel):
     n_sobol: int = Field(default=15, ge=1)
     apply_source: bool = False
     param_space: list[SysctlParam] | None = None
-    verification_trials: int = Field(default=0, ge=0)
-    verification_top_k: int = Field(default=3, ge=1)
+    refinement_rounds: int = Field(default=0, ge=0)
+    refinement_top_k: int = Field(default=3, ge=1)
 
     @model_validator(mode="after")
     def _n_sobol_le_n_trials(self) -> OptimizeSection:

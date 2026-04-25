@@ -322,14 +322,14 @@ def _mean_sem_of(values: list[float]) -> tuple[float, float]:
     return mean, sem
 
 
-def aggregate_verification(
+def aggregate_by_parent(
     trials: list[TrialResult],
 ) -> list[dict[str, float | int | str]]:
     """Return one row per parent config, metrics meaned across all samples.
 
     Groups ``trials`` by ``parent_trial_id or trial_id`` so every
-    verification repeat folds back into its parent's bucket and a
-    primary trial without any verification repeats still produces a
+    refinement sample folds back into its parent's bucket and a
+    primary trial without any refinement samples still produces a
     single-sample row. Per-metric aggregation mirrors
     :func:`kube_autotuner.optimizer._compute_metrics`:
 
@@ -345,13 +345,13 @@ def aggregate_verification(
     parent's finite samples (``stdev / sqrt(n)``); ``0.0`` when fewer
     than two samples survive.
 
-    Verification rows whose ``parent_trial_id`` does not match any
+    Refinement rows whose ``parent_trial_id`` does not match any
     primary ``trial_id`` in ``trials`` still form their own group
     keyed by that id, which is harmless because downstream callers
     filter by the primary ``trial_id`` they care about.
 
     Args:
-        trials: The combined primary + verification population.
+        trials: The combined primary + refinement population.
 
     Returns:
         One row per aggregation group, keyed by the DataFrame column

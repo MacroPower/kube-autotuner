@@ -186,6 +186,39 @@ def _decode_param_name(name: str) -> str:
     return name.replace("__", ".")
 
 
+def _log_strandings(
+    round_index: int,
+    parent_ids: set[str],
+    done: set[str],
+    prev_round_topk: set[str],
+) -> None:
+    """Emit one INFO line per parent stranded by re-ranking.
+
+    Round 1 surfaces parents that a prior session's resume completed
+    but whose ids have since fallen out of the current top-K. Later
+    rounds surface parents that drop out of top-K between rounds.
+
+    Args:
+        round_index: 1-indexed refinement round being entered.
+        parent_ids: ``trial_id`` set picked for this round's top-K.
+        done: ``trial_id`` set already sampled in this round (resume
+            state).
+        prev_round_topk: ``trial_id`` set picked in the previous round;
+            empty on round 1.
+    """
+    if round_index == 1:
+        for stranded in done - parent_ids:
+            logger.info(
+                "prior refinement of %s in round %d is stranded; "
+                "current top-K has re-ranked",
+                stranded,
+                round_index,
+            )
+        return
+    for stranded in prev_round_topk - parent_ids:
+        logger.info("%s dropped out of top-K in round %d", stranded, round_index)
+
+
 def build_ax_params(param_space: ParamSpace) -> list[ChoiceParameterConfig]:
     """Convert a :class:`ParamSpace` into Ax ``ChoiceParameterConfig`` objects.
 
@@ -627,12 +660,12 @@ class OptimizationLoop:
         NaN filter from :meth:`_record` so ``complete_trial`` cannot
         abort mid-seeding.
 
-        Verification rows (``phase == "verification"``) are **not**
+        Refinement rows (``phase == "refinement"``) are **not**
         attached: Ax cannot accept the same arm twice, and the
         surrogate has no use for a repeat observation of a parent it
         already saw. They are still appended to ``self._completed``
         so the aggregation and re-ranking paths in the live panel and
-        the verification summary see the full sample population.
+        the refinement summary see the full sample population.
 
         Parameter names are encoded with :func:`_encode_param_name` and
         values are string-coerced to match the Ax schema built by
@@ -760,24 +793,28 @@ class OptimizationLoop:
         *,
         phase: str,
         parent_trial_id: str | None,
+        refinement_round: int | None = None,
     ) -> tuple[TrialResult, dict[str, tuple[float, float]]]:
         """Run one trial end-to-end: lock, snapshot, apply, benchmark, restore.
 
-        The returned :class:`TrialResult` carries ``phase`` and
-        ``parent_trial_id`` so the observer and the persisted row
-        agree on which population the sample belongs to. Primary call
-        sites pass the Ax phase label with ``parent_trial_id=None``;
-        the verification pass passes ``phase="verification"`` and the
-        primary's ``trial_id``.
+        The returned :class:`TrialResult` carries ``phase``,
+        ``parent_trial_id`` and ``refinement_round`` so the observer
+        and the persisted row agree on which population the sample
+        belongs to. Primary call sites pass the Ax phase label with
+        ``parent_trial_id=None`` and ``refinement_round=None``; the
+        refinement pass passes ``phase="refinement"``, the primary's
+        ``trial_id``, and the 1-indexed round number.
 
         Args:
             parameterization: Ax-encoded parameter dict (keys use ``__``
                 separators).
             phase: Phase label to stamp on the resulting
                 :class:`TrialResult` (``"sobol"`` / ``"bayesian"`` /
-                ``"verification"``).
-            parent_trial_id: For verification runs, the ``trial_id``
-                of the primary being verified; ``None`` otherwise.
+                ``"refinement"``).
+            parent_trial_id: For refinement runs, the ``trial_id``
+                of the primary being refined; ``None`` otherwise.
+            refinement_round: 1-indexed refinement round number when
+                ``phase == "refinement"``; ``None`` for primary trials.
 
         Returns:
             A ``(trial_result, metrics)`` pair. ``metrics`` is the
@@ -827,6 +864,7 @@ class OptimizationLoop:
             host_state_snapshots=iteration_results.host_state_snapshots,
             phase=phase,  # ty: ignore[invalid-argument-type]
             parent_trial_id=parent_trial_id,
+            refinement_round=refinement_round,
         )
         TrialLog.append(self.output, trial_result)
         self._completed.append(trial_result)
@@ -856,7 +894,7 @@ class OptimizationLoop:
             trial_index: Zero-based trial index as logged by the
                 observer (``prior_count + i``).
             phase: Ax phase label for the trial (``"sobol"`` /
-                ``"bayesian"`` / ``"verification"``).
+                ``"bayesian"`` / ``"refinement"``).
             parameterization: The Ax-encoded parameter dict proposed
                 for this trial.
             exc: The exception that marked the trial failed.
@@ -1161,189 +1199,245 @@ class OptimizationLoop:
             self.cleanup()
         return self._completed
 
-    def run_verification(  # noqa: PLR0914, PLR0915
+    def _run_refinement_trial(
         self,
-        top_k: int,
-        repeats: int,
-        already_done_by_parent: dict[str, int] | None = None,
-    ) -> list[TrialResult]:
-        """Re-run the top-K primary configs for confidence gain.
+        *,
+        parent: TrialResult,
+        round_index: int,
+        obs_index: int,
+        total_samples: int,
+    ) -> TrialResult:
+        """Run one refinement sample of ``parent`` and return its row.
 
-        Computes the current top-K primaries by weighted score using
-        :func:`kube_autotuner.scoring.score_rows` (ties broken by
-        ``trial_id`` ascending -- same key as
-        :func:`kube_autotuner.report.analysis.recommend_configs`), and for
-        each selected parent runs
-        ``max(0, repeats - already_done_by_parent.get(trial_id, 0))``
-        further benchmarks with ``phase="verification"`` and
-        ``parent_trial_id`` pointing at the primary's id. Verification
-        runs are **not** attached to the Ax client: Ax rejects
-        duplicate arms and the surrogate has no use for a repeat
-        observation.
-
-        An ``already_done_by_parent`` entry whose ``trial_id`` is
-        absent from the current top-K is logged at INFO (``"prior
-        verification of %s is stranded; current top-K has re-ranked"``)
-        so users can tell their resume skipped work when primary
-        ranking shifted.
-
-        The observer sees a single ``on_verification_start(top_k,
-        total_remaining)`` call and one ``on_trial_start`` /
-        ``on_trial_complete`` pair per run, with ``phase="verification"``.
-        Observer indices continue the primary counter
-        (``prior_count + primary_live_count + verification_ordinal``)
-        so :class:`~kube_autotuner.progress.RichProgressObserver`'s
-        ``_all_rows`` can index every row unambiguously. The summary
-        table renders the parent's ``trial_id`` rather than this
-        internal counter.
+        Wraps the same observer / logging / failure-dump dance the
+        primary loop uses, but with ``phase="refinement"`` and the
+        parent's sysctl arm replayed verbatim. Exceptions are dumped,
+        reported to the observer, and re-raised so :meth:`run_refinement`
+        can stop the round.
 
         Args:
-            top_k: Number of top primary configs to verify.
-            repeats: Number of verification runs per parent (the
-                absolute target; resumes subtract
-                ``already_done_by_parent``).
-            already_done_by_parent: Optional map of
-                ``parent_trial_id -> completed_count`` from a prior
-                partial run; used to trim ``repeats`` per parent so
-                resumes pick up where they left off.
+            parent: The primary trial whose arm is being replayed.
+            round_index: 1-indexed refinement round number.
+            obs_index: Observer-space index for this sample (continues
+                the primary counter; see :meth:`run_refinement`).
+            total_samples: Total refinement samples expected this run
+                (``top_k * rounds``); used to size the observer bar.
 
         Returns:
-            The newly created verification :class:`TrialResult`
-            records, in execution order.
+            The persisted refinement :class:`TrialResult`.
+
+        Raises:
+            KeyboardInterrupt: Propagated when the user interrupts the
+                in-flight benchmark.
+            Exception: Any trial-level exception is re-raised after
+                :meth:`_dump_failure` writes a post-mortem JSON and the
+                observer is notified via ``on_trial_failed``.
+        """  # noqa: DOC502 - refinement-trial exceptions originate in _evaluate
+        ax_params: dict[str, str] = {
+            _encode_param_name(k): str(v) for k, v in parent.sysctl_values.items()
+        }
+        logger.info(
+            "Trial %d [refinement round %d] starting: sysctls=%s",
+            obs_index + 1,
+            round_index,
+            {_decode_param_name(k): v for k, v in ax_params.items()},
+        )
+        self.observer.on_trial_start(obs_index, total_samples, "refinement", ax_params)
+        try:
+            trial_result, metrics = self._evaluate(
+                ax_params,
+                phase="refinement",
+                parent_trial_id=parent.trial_id,
+                refinement_round=round_index,
+            )
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            logger.warning(
+                "Refinement run for parent %s round %d failed, exiting",
+                parent.trial_id,
+                round_index,
+                exc_info=True,
+            )
+            self._dump_failure(
+                trial_index=obs_index,
+                phase="refinement",
+                parameterization=ax_params,
+                exc=e,
+            )
+            self.observer.on_trial_failed(obs_index, e)
+            raise
+        logger.info(
+            "Refinement [round %d] parent=%s tcp_throughput=%.1f Mbps",
+            round_index,
+            parent.trial_id,
+            metrics["tcp_throughput"][0] / 1e6,
+        )
+        self.observer.on_trial_complete(obs_index, trial_result, metrics)
+        return trial_result
+
+    def run_refinement(
+        self,
+        top_k: int,
+        rounds: int,
+        completed_by_round: dict[int, set[str]] | None = None,
+    ) -> list[TrialResult]:
+        """Iteratively re-rank top-K and sample one extra trial per round.
+
+        At the start of each round ``r in 1..rounds``, aggregates the
+        current ``self._completed`` population by parent via
+        :func:`kube_autotuner.scoring.aggregate_by_parent`, scores the
+        rows with :func:`kube_autotuner.scoring.score_rows` (ties
+        broken by ``trial_id`` ascending -- same key as
+        :func:`kube_autotuner.report.analysis.recommend_configs`),
+        picks the top-K, and runs one fresh benchmark per parent that
+        is not already in ``completed_by_round.get(r, set())``.
+
+        Refinement samples are persisted with ``phase="refinement"``,
+        ``parent_trial_id`` pointing at the primary's id, and a
+        1-indexed ``refinement_round``. They are **not** attached to
+        the Ax client: Ax rejects duplicate arms and the surrogate has
+        no use for a repeat observation. The top-K is recomputed every
+        round, so a parent that regresses toward the mean on its first
+        refinement sample drops out and stops accumulating, while a
+        previously-unsampled parent that climbs into top-K starts
+        accumulating from its primary baseline.
+
+        Stranded-parent logging: a parent that was in top-K last round
+        but is not in top-K this round is logged once at INFO. Resume
+        stranded entries (any ``done`` parent missing from round R's
+        top-K) are also logged once at the start.
+
+        The observer sees one
+        ``on_refinement_round_start(round_index, total_rounds, pending)``
+        per round that has at least one pending parent, plus one
+        ``on_trial_start`` / ``on_trial_complete`` pair per sample with
+        ``phase="refinement"``. ``pending`` is the count of this
+        round's top-K parents not already in ``done`` (a stranded
+        ``done`` parent that fell out of top-K does not subtract), so
+        a partially-resumed round still drives a progress bar that
+        reaches 100% when the remaining samples land. Observer indices
+        continue the primary counter
+        (``prior_count + live_primary + total_prior_refinement +
+        session_ordinal``) so
+        :class:`~kube_autotuner.progress.RichProgressObserver`'s
+        ``_all_rows`` can index every row unambiguously across resumes.
+
+        Args:
+            top_k: Number of top configs to refine each round.
+            rounds: Number of refinement rounds. Total budget is
+                ``top_k * rounds`` when at least ``top_k`` primaries
+                exist; fewer primaries shrink each round's top-K.
+            completed_by_round: Optional map of
+                ``round_index -> {parent_trial_id, ...}`` from a prior
+                partial run; parents already sampled in a given round
+                are skipped on resume.
+
+        Returns:
+            The newly created refinement :class:`TrialResult` records,
+            in execution order.
 
         Raises:
             KeyboardInterrupt: Propagated when the user interrupts
-                mid-verification; :meth:`cleanup` still runs through
-                the ``finally`` block before re-raising.
-            Exception: Any verification-trial exception (typically
+                mid-refinement; :meth:`cleanup` still runs through the
+                ``finally`` block before re-raising.
+            Exception: Any refinement-trial exception (typically
                 :class:`~kube_autotuner.benchmark.errors.BenchmarkFailure`
                 once the per-client-job ``max_attempts`` are exhausted)
                 is re-raised after :meth:`_dump_failure` writes a
                 post-mortem JSON and :meth:`cleanup` runs through the
                 ``finally`` block. The loop does not advance past the
-                failing rerun.
-        """  # noqa: DOC502 - verification-trial exceptions originate in _evaluate
-        already = dict(already_done_by_parent or {})
+                failing sample.
+        """  # noqa: DOC502 - refinement-trial exceptions originate in _evaluate
+        if top_k <= 0 or rounds <= 0:
+            return []
         primary = [tr for tr in self._completed if is_primary(tr)]
-        if not primary or top_k <= 0 or repeats <= 0:
+        if not primary:
             return []
 
-        # Lazy import: scoring is pure stdlib but progress isn't --
-        # keep the scoring call at the top where it's intuitive and
-        # import _build_trial_row inside the function to avoid a
-        # runtime cycle between optimizer and progress.
-        from kube_autotuner.progress import _build_trial_row  # noqa: PLC0415
+        done_by_round: dict[int, set[str]] = {
+            r: set(ids) for r, ids in (completed_by_round or {}).items()
+        }
+
         from kube_autotuner.scoring import (  # noqa: PLC0415
+            aggregate_by_parent,
             config_memory_cost,
             score_rows,
         )
         from kube_autotuner.sysctl.params import PARAM_SPACE  # noqa: PLC0415
 
-        primary_rows = []
-        for tr in primary:
-            cost = config_memory_cost(tr.sysctl_values, PARAM_SPACE)
-            row = _build_trial_row(
-                0,
-                tr.phase or "bayesian",
-                _compute_metrics(tr),
-                trial_id=tr.trial_id,
-                parent_trial_id=None,
-                memory_cost=cost,
+        parent_by_id: dict[str, TrialResult] = {p.trial_id: p for p in primary}
+
+        def _select_top_k() -> list[TrialResult]:
+            usable: list[tuple[dict[str, float | int | str], TrialResult]] = [
+                (row, parent_by_id[str(row["trial_id"])])
+                for row in aggregate_by_parent(self._completed)
+                if str(row["trial_id"]) in parent_by_id
+            ]
+            if not usable:
+                return []
+            rows = [row for row, _ in usable]
+            parents = [parent for _, parent in usable]
+            scores = score_rows(
+                rows,
+                self.objectives.pareto,
+                self.objectives.recommendation_weights,
+                memory_costs=[
+                    config_memory_cost(p.sysctl_values, PARAM_SPACE) for p in parents
+                ],
+                memory_cost_weight=self.objectives.memory_cost_weight,
             )
-            primary_rows.append((tr, row))
-
-        scores = score_rows(
-            [row.metrics for _tr, row in primary_rows],
-            self.objectives.pareto,
-            self.objectives.recommendation_weights,
-            memory_costs=[row.memory_cost for _tr, row in primary_rows],
-            memory_cost_weight=self.objectives.memory_cost_weight,
-        )
-        ranking = sorted(
-            range(len(primary_rows)),
-            key=lambda i: (-scores[i], primary_rows[i][0].trial_id),
-        )
-        parents = [primary_rows[i][0] for i in ranking[:top_k]]
-        parent_ids = {p.trial_id for p in parents}
-
-        for stranded in set(already) - parent_ids:
-            logger.info(
-                "prior verification of %s is stranded; current top-K has re-ranked",
-                stranded,
+            ranking = sorted(
+                range(len(parents)),
+                key=lambda i: (-scores[i], parents[i].trial_id),
             )
+            return [parents[i] for i in ranking[:top_k]]
 
-        remaining_per_parent = {
-            p.trial_id: max(0, repeats - already.get(p.trial_id, 0)) for p in parents
-        }
-        total_remaining = sum(remaining_per_parent.values())
-        if total_remaining == 0:
-            logger.info("verification budget already satisfied; nothing to re-run")
-            return []
-
-        self.observer.on_verification_start(top_k, total_remaining)
-
+        prev_round_topk: set[str] = set()
+        total_prior_refinement = sum(
+            1 for tr in self._completed if tr.phase == "refinement"
+        )
         live_primary = len(primary) - self.prior_count
-        base_index = self.prior_count + live_primary
+        base_index = self.prior_count + live_primary + total_prior_refinement
         ordinal = 0
         created: list[TrialResult] = []
+
         self.runner.setup_server()
         try:
-            for parent in parents:
-                remaining = remaining_per_parent[parent.trial_id]
-                ax_params: dict[str, str] = {
-                    _encode_param_name(k): str(v)
-                    for k, v in parent.sysctl_values.items()
-                }
-                for _ in range(remaining):
+            for round_index in range(1, rounds + 1):
+                parents = _select_top_k()
+                parent_ids = {p.trial_id for p in parents}
+                done = done_by_round.get(round_index, set())
+
+                _log_strandings(round_index, parent_ids, done, prev_round_topk)
+
+                pending = [p for p in parents if p.trial_id not in done]
+                if not pending:
+                    logger.info(
+                        "refinement round %d: nothing to run (already complete)",
+                        round_index,
+                    )
+                    prev_round_topk = parent_ids
+                    continue
+                self.observer.on_refinement_round_start(
+                    round_index,
+                    rounds,
+                    len(pending),
+                )
+
+                for parent in pending:
                     obs_index = base_index + ordinal
-                    logger.info(
-                        "Trial %d/%d [%s] starting: sysctls=%s",
-                        obs_index + 1,
-                        total_remaining,
-                        "verification",
-                        {_decode_param_name(k): v for k, v in ax_params.items()},
+                    created.append(
+                        self._run_refinement_trial(
+                            parent=parent,
+                            round_index=round_index,
+                            obs_index=obs_index,
+                            total_samples=top_k * rounds,
+                        ),
                     )
-                    self.observer.on_trial_start(
-                        obs_index,
-                        total_remaining,
-                        "verification",
-                        ax_params,
-                    )
-                    try:
-                        trial_result, metrics = self._evaluate(
-                            ax_params,
-                            phase="verification",
-                            parent_trial_id=parent.trial_id,
-                        )
-                    except KeyboardInterrupt:
-                        raise
-                    except Exception as e:
-                        logger.warning(
-                            "Verification run for parent %s failed, exiting",
-                            parent.trial_id,
-                            exc_info=True,
-                        )
-                        self._dump_failure(
-                            trial_index=obs_index,
-                            phase="verification",
-                            parameterization=ax_params,
-                            exc=e,
-                        )
-                        self.observer.on_trial_failed(obs_index, e)
-                        raise
-                    logger.info(
-                        "Verification [%s] parent=%s tcp_throughput=%.1f Mbps",
-                        parent.trial_id,
-                        parent.trial_id,
-                        metrics["tcp_throughput"][0] / 1e6,
-                    )
-                    self.observer.on_trial_complete(
-                        obs_index,
-                        trial_result,
-                        metrics,
-                    )
-                    created.append(trial_result)
                     ordinal += 1
+
+                prev_round_topk = parent_ids
         finally:
             self.cleanup()
         return created
@@ -1361,8 +1455,8 @@ class OptimizationLoop:
         """Return the Pareto-optimal parameters and their predicted metrics.
 
         This call reads from the Ax client, which only sees primary
-        trials (verification repeats are deliberately not attached,
-        since Ax rejects duplicate arms). The post-primary verification
+        trials (refinement samples are deliberately not attached,
+        since Ax rejects duplicate arms). The post-primary refinement
         summary table emitted by :func:`kube_autotuner.runs.run_optimize`
         is the authoritative combined-mean view; this frontier is the
         Ax-model view over primary observations only.

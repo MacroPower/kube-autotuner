@@ -202,8 +202,8 @@ def test_is_primary_treats_phaseless_rows_as_primary() -> None:
     assert is_primary(_make_phase_trial()) is True
 
 
-def test_is_primary_rejects_verification_rows() -> None:
-    assert is_primary(_make_phase_trial(phase="verification")) is False
+def test_is_primary_rejects_refinement_rows() -> None:
+    assert is_primary(_make_phase_trial(phase="refinement")) is False
 
 
 def test_is_primary_accepts_sobol_and_bayesian() -> None:

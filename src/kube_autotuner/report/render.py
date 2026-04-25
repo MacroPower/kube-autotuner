@@ -478,7 +478,7 @@ def _correlation_matrix_payload(matrix: pd.DataFrame | None) -> dict[str, Any] |
     return {"columns": columns, "values": values}
 
 
-def _clean_verification_stats(
+def _clean_refinement_stats(
     stats: dict[str, dict[str, dict[str, float | None]]] | None,
 ) -> dict[str, dict[str, dict[str, float | None]]]:
     """Coerce every numeric cell in ``stats`` to a finite float or ``None``.
@@ -682,8 +682,8 @@ def _section_payload(section: dict[str, Any]) -> dict[str, Any]:
         "baselineComparison": _clean_baseline_comparison(
             section.get("baseline_comparison"),
         ),
-        "verificationStats": _clean_verification_stats(
-            section.get("verification_stats"),
+        "refinementStats": _clean_refinement_stats(
+            section.get("refinement_stats"),
         ),
         "perIterationSamples": _clean_per_iteration_samples(
             section.get("per_iteration_samples"),
@@ -1575,11 +1575,11 @@ function buildRankedTable(wrapper, state, visibleCols) {
     wrapper.appendChild(table);
     details.appendChild(wrapper);
 
-    const verifStats = (state.section.verificationStats || {})[row.trial_id];
+    const verifStats = (state.section.refinementStats || {})[row.trial_id];
     if (verifStats) {
       const verifDetails = document.createElement("details");
       const verifSummary = document.createElement("summary");
-      verifSummary.textContent = "verification stability";
+      verifSummary.textContent = "refinement stability";
       verifDetails.appendChild(verifSummary);
       const verifWrapper = document.createElement("div");
       verifWrapper.className = "decomposition-wrapper";
@@ -1803,14 +1803,14 @@ function highlightInPlots(figureDivIds, topTrialIds) {
 const PHASE_SYMBOL = {
   sobol: "circle",
   bayesian: "square",
-  verification: "diamond",
+  refinement: "diamond",
   unknown: "triangle-up",
 };
 
 const PHASE_COLOR = {
   sobol: "#BABBBD",
   bayesian: "#5B9BD5",
-  verification: "#98C379",
+  refinement: "#98C379",
   unknown: "#828997",
 };
 
@@ -1874,7 +1874,7 @@ function renderAxisChart(state) {
     }
   }
   const traces = [];
-  const phaseOrder = ["sobol", "bayesian", "verification", "unknown"]
+  const phaseOrder = ["sobol", "bayesian", "refinement", "unknown"]
     .filter(p => byPhase[p] && byPhase[p].length);
   for (const p of Object.keys(byPhase).sort()) {
     if (!phaseOrder.includes(p)) phaseOrder.push(p);

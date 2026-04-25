@@ -865,11 +865,11 @@ def _analyze_one_class(  # noqa: PLR0914 - threads many helpers into one section
         trials=hw_trials,
     )
 
-    verif_stats = analysis.verification_stats(hw_trials)
+    refine_stats = analysis.refinement_stats(hw_trials)
     per_iter_samples = analysis.per_iteration_samples(hw_trials)
     for row in pareto_rows:
         row["stability_badge"] = analysis.stability_badge(
-            verif_stats.get(row["trial_id"]),
+            refine_stats.get(row["trial_id"]),
         )
 
     objective_dicts = [obj.model_dump(mode="json") for obj in objectives.pareto]
@@ -920,7 +920,7 @@ def _analyze_one_class(  # noqa: PLR0914 - threads many helpers into one section
             topology,
         ),
         "baseline_comparison": baseline,
-        "verification_stats": verif_stats,
+        "refinement_stats": refine_stats,
         "per_iteration_samples": per_iter_samples,
         "trajectory_rows": trajectory,
         "metadata": metadata,
