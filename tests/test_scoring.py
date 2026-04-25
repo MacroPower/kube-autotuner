@@ -2,12 +2,21 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 import math
 
 import pytest
 
-from kube_autotuner.experiment import ParetoObjective
-from kube_autotuner.models import MemoryCost, ParamSpace, SysctlParam
+from kube_autotuner.experiment import ObjectivesSection, ParetoObjective
+from kube_autotuner.models import (
+    BenchmarkConfig,
+    BenchmarkResult,
+    MemoryCost,
+    NodePair,
+    ParamSpace,
+    SysctlParam,
+    TrialResult,
+)
 from kube_autotuner.scoring import (
     METRIC_TO_DF_COLUMN,
     config_memory_cost,
@@ -358,3 +367,85 @@ def test_config_memory_cost_zero_for_all_uncosted() -> None:
         ],
     )
     assert config_memory_cost({"a": 1}, space) == pytest.approx(0.0)
+
+
+def _trial(bps: float, retransmits: int) -> TrialResult:
+    """One-iteration TCP-only primary trial parametrized by throughput and retx.
+
+    Local copy of the helper in
+    :mod:`tests.test_aggregate_verification` so this test stays
+    self-contained (the flat ``tests/`` tree has no ``__init__.py``,
+    so sibling test modules are not importable by name).
+
+    Returns:
+        A primary :class:`TrialResult` carrying a single TCP iperf3
+        record with the requested throughput, byte total, and
+        retransmit count.
+    """
+    return TrialResult(
+        node_pair=NodePair(source="a", target="b", hardware_class="10g"),
+        sysctl_values={"net.core.rmem_max": int(bps)},
+        config=BenchmarkConfig(),
+        results=[
+            BenchmarkResult(
+                timestamp=datetime.now(UTC),
+                mode="tcp",
+                bits_per_second=bps,
+                bytes_sent=int(bps),
+                retransmits=retransmits,
+                iteration=0,
+                client_node="a",
+            ),
+        ],
+        phase="bayesian",
+    )
+
+
+def test_pareto_recommendation_rows_score_matches_score_rows() -> None:
+    """The analysis path's ``score`` field equals a direct ``score_rows`` call.
+
+    Regression guard against the analysis path silently bypassing
+    :func:`score_rows` -- e.g. an inline normalization or
+    post-multiplier sneaking into
+    :func:`kube_autotuner.analysis.pareto_recommendation_rows`
+    between the ``score_rows`` call and the returned ``score`` field.
+    A change inside ``score_rows`` itself would shift both sides
+    equally and would *not* be caught here; that contract is held
+    by the unit tests above.
+    """
+    pytest.importorskip("pandas")
+    pytest.importorskip("sklearn")
+    from kube_autotuner.analysis import pareto_recommendation_rows  # noqa: PLC0415
+
+    # Three trials chosen so multiple sit on the Pareto frontier (each
+    # wins on at least one of the two surviving objectives,
+    # ``tcp_throughput`` and ``tcp_retransmit_rate``). The other seven
+    # default objectives have all-NaN columns and are filtered out by
+    # ``_objectives_with_data``.
+    trials = [
+        _trial(bps=2.0e9, retransmits=10),  # high tp, high retx
+        _trial(bps=1.5e9, retransmits=2),  # mid tp, mid retx
+        _trial(bps=1.0e9, retransmits=0),  # low tp, low retx
+    ]
+
+    analysis_rows = pareto_recommendation_rows(trials, "10g")
+    assert len(analysis_rows) >= 2  # the test only has teeth with >1 row
+
+    section = ObjectivesSection()
+    records = [
+        {col: row[col] for col in METRIC_TO_DF_COLUMN.values()} for row in analysis_rows
+    ]
+    memory_costs = [row["memory_cost"] for row in analysis_rows]
+    direct_scores = score_rows(
+        records,
+        section.pareto,
+        section.recommendation_weights,
+        memory_costs=memory_costs,
+        memory_cost_weight=section.memory_cost_weight,
+    )
+
+    direct_by_id = {
+        row["trial_id"]: s for row, s in zip(analysis_rows, direct_scores, strict=True)
+    }
+    analysis_by_id = {row["trial_id"]: row["score"] for row in analysis_rows}
+    assert direct_by_id == pytest.approx(analysis_by_id, abs=1e-12)

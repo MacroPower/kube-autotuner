@@ -76,10 +76,11 @@ def _to_float_or_nan(v: object) -> float:
 def _normalize_column(values: list[float]) -> list[float]:
     """Min-max normalize ``values``, mapping NaN and degenerate to ``0.5``.
 
-    Mirrors ``kube_autotuner.analysis._norm``: when the column has no
-    finite values or ``min == max`` the entire column collapses to
-    ``0.5``; finite values are mapped linearly to ``[0, 1]``; NaN rows
-    fall back to ``0.5`` (pandas ``.fillna(0.5)`` after division).
+    Canonical implementation: the analysis path consumes this through
+    :func:`score_rows`. When the column has no finite values or
+    ``min == max`` the entire column collapses to ``0.5``; finite
+    values are mapped linearly to ``[0, 1]``; NaN rows fall back to
+    ``0.5`` (the equivalent of ``.fillna(0.5)`` after division).
 
     Args:
         values: Per-row raw values for a single metric column.
