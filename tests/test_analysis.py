@@ -26,6 +26,7 @@ from kube_autotuner.models import (  # noqa: E402
     BenchmarkConfig,
     BenchmarkResult,
     HostStateSnapshot,
+    LatencyResult,
     NodePair,
     ParamSpace,
     ResumeMetadata,
@@ -40,6 +41,7 @@ from kube_autotuner.report.analysis import (  # noqa: E402
     host_state_series,
     parameter_importance,
     pareto_front,
+    per_iteration_samples,
     recommend_configs,
     section_metadata,
     split_trials_by_hardware_class,
@@ -49,6 +51,7 @@ from kube_autotuner.report.analysis import (  # noqa: E402
     trials_to_dataframe,
     verification_stats,
 )
+from kube_autotuner.scoring import _per_trial_metric_means  # noqa: E402, PLC2701
 from kube_autotuner.trial_log import TrialLog  # noqa: E402
 
 if TYPE_CHECKING:
@@ -1709,3 +1712,290 @@ def test_trials_to_dataframe_single_iteration_std_is_none() -> None:
     assert df.iloc[0]["mean_tcp_throughput_std"] is None or math.isnan(
         df.iloc[0]["mean_tcp_throughput_std"],
     )
+
+
+# --- per_iteration_samples ----------------------------------------------
+
+
+def _bench(  # noqa: PLR0913 - per-record fields land here as kwargs
+    *,
+    mode: Literal["tcp", "udp"],
+    iteration: int,
+    bps: float,
+    retransmits: int | None = None,
+    bytes_sent: int | None = None,
+    packets: int | None = None,
+    lost_packets: int | None = None,
+    jitter: float | None = None,
+) -> BenchmarkResult:
+    return BenchmarkResult(
+        timestamp=datetime.now(UTC),
+        mode=mode,
+        bits_per_second=bps,
+        iteration=iteration,
+        retransmits=retransmits,
+        bytes_sent=bytes_sent,
+        packets=packets,
+        lost_packets=lost_packets,
+        jitter=jitter,
+    )
+
+
+def _multi_iter_trial(
+    *,
+    trial_id: str,
+    bps_per_iter: list[float],
+    retx_per_iter: list[int] | None = None,
+    bytes_sent: int = _DEFAULT_BYTES_SENT,
+    phase: Literal["sobol", "bayesian", "verification"] | None = None,
+    parent_trial_id: str | None = None,
+) -> TrialResult:
+    retx_vals = retx_per_iter if retx_per_iter is not None else [0] * len(bps_per_iter)
+    kwargs: dict[str, Any] = {
+        "trial_id": trial_id,
+        "node_pair": NodePair(source="a", target="b", hardware_class="10g"),
+        "sysctl_values": {"net.core.rmem_max": 212992},
+        "config": BenchmarkConfig(iterations=len(bps_per_iter)),
+        "results": [
+            _bench(
+                mode="tcp",
+                iteration=i,
+                bps=bps,
+                retransmits=retx,
+                bytes_sent=bytes_sent,
+            )
+            for i, (bps, retx) in enumerate(zip(bps_per_iter, retx_vals, strict=True))
+        ],
+    }
+    if phase is not None:
+        kwargs["phase"] = phase
+    if parent_trial_id is not None:
+        kwargs["parent_trial_id"] = parent_trial_id
+    return TrialResult(**kwargs)
+
+
+def test_per_iteration_samples_primary_only_emits_one_row_per_iteration() -> None:
+    trial = _multi_iter_trial(
+        trial_id="p1",
+        bps_per_iter=[5e9, 7e9, 9e9],
+    )
+    out = per_iteration_samples([trial])
+    assert list(out.keys()) == ["p1"]
+    rows = out["p1"]
+    assert [r["iteration"] for r in rows] == [0, 1, 2]
+    assert [r["trial_id"] for r in rows] == ["p1", "p1", "p1"]
+    assert [r["mean_tcp_throughput"] for r in rows] == pytest.approx([5e9, 7e9, 9e9])
+
+
+def test_per_iteration_samples_preserves_iteration_index_across_children() -> None:
+    primary = _multi_iter_trial(
+        trial_id="p1",
+        bps_per_iter=[5e9, 6e9, 7e9],
+        phase="bayesian",
+    )
+    primary = primary.model_copy(
+        update={"created_at": datetime(2026, 1, 1, tzinfo=UTC)},
+    )
+    children = []
+    for i, base in enumerate([8e9, 9e9]):
+        child = _multi_iter_trial(
+            trial_id=f"p1-v{i + 1}",
+            bps_per_iter=[base, base + 1e9, base + 2e9],
+            phase="verification",
+            parent_trial_id="p1",
+        )
+        child = child.model_copy(
+            update={"created_at": datetime(2026, 1, 2 + i, tzinfo=UTC)},
+        )
+        children.append(child)
+
+    out = per_iteration_samples([primary, *children])
+    assert list(out.keys()) == ["p1"]
+    rows = out["p1"]
+    assert len(rows) == 9
+    # Iteration index is preserved verbatim across children, not globally
+    # renumbered: 0,1,2,0,1,2,0,1,2.
+    assert [r["iteration"] for r in rows] == [0, 1, 2, 0, 1, 2, 0, 1, 2]
+    # Trial id ordering follows (created_at, trial_id) so primary first,
+    # then verification children chronologically.
+    assert [r["trial_id"] for r in rows] == [
+        "p1",
+        "p1",
+        "p1",
+        "p1-v1",
+        "p1-v1",
+        "p1-v1",
+        "p1-v2",
+        "p1-v2",
+        "p1-v2",
+    ]
+
+
+def test_per_iteration_samples_sparse_metric_uses_none_without_shifting() -> None:
+    """Iterations with no UDP record produce ``None`` in udp_loss_rate.
+
+    Regression test for the zip-by-position bug: TCP records exist for
+    iterations 0/1/2, UDP records exist only for iteration 1. Per
+    iteration alignment must put udp_loss_rate=None for iter 0 and 2,
+    not shift iter 1's value into iter 0's row.
+    """
+    trial = TrialResult(
+        trial_id="p1",
+        node_pair=NodePair(source="a", target="b", hardware_class="10g"),
+        sysctl_values={"net.core.rmem_max": 212992},
+        config=BenchmarkConfig(iterations=3),
+        results=[
+            _bench(
+                mode="tcp",
+                iteration=0,
+                bps=5e9,
+                retransmits=0,
+                bytes_sent=_DEFAULT_BYTES_SENT,
+            ),
+            _bench(
+                mode="tcp",
+                iteration=1,
+                bps=5e9,
+                retransmits=0,
+                bytes_sent=_DEFAULT_BYTES_SENT,
+            ),
+            _bench(
+                mode="udp",
+                iteration=1,
+                bps=4e9,
+                packets=1000,
+                lost_packets=10,
+                jitter=1e-3,
+            ),
+            _bench(
+                mode="tcp",
+                iteration=2,
+                bps=5e9,
+                retransmits=0,
+                bytes_sent=_DEFAULT_BYTES_SENT,
+            ),
+        ],
+    )
+    rows = per_iteration_samples([trial])["p1"]
+    by_iter = {r["iteration"]: r for r in rows}
+    assert by_iter[0]["udp_loss_rate"] is None
+    assert by_iter[2]["udp_loss_rate"] is None
+    assert by_iter[1]["udp_loss_rate"] == pytest.approx(0.01)
+    # mean_udp_throughput on iters 0/2 also stays None.
+    assert by_iter[0]["mean_udp_throughput"] is None
+    assert by_iter[2]["mean_udp_throughput"] is None
+    assert by_iter[1]["mean_udp_throughput"] == pytest.approx(4e9)
+    # TCP cells stay populated on every iteration.
+    for it in (0, 1, 2):
+        assert by_iter[it]["mean_tcp_throughput"] == pytest.approx(5e9)
+
+
+def test_per_iteration_samples_no_nan_in_payload() -> None:
+    """Every numeric cell is a finite float or None -- never nan."""
+    trial = _multi_iter_trial(
+        trial_id="p1",
+        bps_per_iter=[5e9, 7e9, 9e9],
+    )
+    out = per_iteration_samples([trial])
+    # json.dumps(allow_nan=False) is the report's serialization gate.
+    json.dumps(out, allow_nan=False)
+    for rows in out.values():
+        for row in rows:
+            for col in METRIC_TO_DF_COLUMN.values():
+                cell = row.get(col)
+                assert cell is None or (isinstance(cell, float) and math.isfinite(cell))
+
+
+def test_per_iteration_samples_consistent_with_per_trial_metric_means() -> None:
+    """Per-iteration mean equals the canonical per-trial metric mean.
+
+    Locks the reuse-of-by-iteration semantics so the parent's mean
+    surfaced via :func:`_per_trial_metric_means` and the per-iteration
+    drill-down view never drift.
+    """
+    trial = TrialResult(
+        trial_id="p1",
+        node_pair=NodePair(source="a", target="b", hardware_class="10g"),
+        sysctl_values={"net.core.rmem_max": 212992},
+        config=BenchmarkConfig(iterations=3),
+        results=[
+            _bench(
+                mode="tcp",
+                iteration=i,
+                bps=tcp_bps,
+                retransmits=retx,
+                bytes_sent=_DEFAULT_BYTES_SENT,
+            )
+            for i, (tcp_bps, retx) in enumerate([
+                (5e9, 5),
+                (7e9, 3),
+                (9e9, 1),
+            ])
+        ]
+        + [
+            _bench(
+                mode="udp",
+                iteration=i,
+                bps=udp_bps,
+                packets=1000,
+                lost_packets=lost,
+                jitter=jitter,
+            )
+            for i, (udp_bps, lost, jitter) in enumerate([
+                (4e9, 20, 1e-3),
+                (4.5e9, 10, 1.2e-3),
+                (5e9, 5, 1.5e-3),
+            ])
+        ],
+        latency_results=[
+            LatencyResult(
+                timestamp=datetime.now(UTC),
+                workload="saturation",
+                iteration=i,
+                rps=rps,
+            )
+            for i, rps in enumerate([1000.0, 1100.0, 1200.0])
+        ]
+        + [
+            LatencyResult(
+                timestamp=datetime.now(UTC),
+                workload="fixed_qps",
+                iteration=i,
+                rps=500.0,
+                latency_p50=p50,
+                latency_p90=p90,
+                latency_p99=p99,
+            )
+            for i, (p50, p90, p99) in enumerate([
+                (1e-3, 2e-3, 3e-3),
+                (1.5e-3, 2.5e-3, 3.5e-3),
+                (2e-3, 3e-3, 4e-3),
+            ])
+        ],
+    )
+    out = per_iteration_samples([trial])["p1"]
+    parent_means = _per_trial_metric_means(trial)
+    for col in METRIC_TO_DF_COLUMN.values():
+        per_iter = [r[col] for r in out if r[col] is not None]
+        assert per_iter, f"expected per-iteration values for {col}"
+        actual_mean = sum(per_iter) / len(per_iter)
+        expected = parent_means[col]
+        assert math.isfinite(expected), f"unexpected nan parent mean for {col}"
+        assert actual_mean == pytest.approx(expected), col
+
+
+def test_per_iteration_samples_empty_when_no_trials() -> None:
+    assert per_iteration_samples([]) == {}
+
+
+def test_per_iteration_samples_orphan_verification_keys_on_parent_id() -> None:
+    """A verification row whose parent_trial_id does not match groups by that id."""
+    orphan = _multi_iter_trial(
+        trial_id="v1",
+        bps_per_iter=[5e9, 6e9],
+        phase="verification",
+        parent_trial_id="missing-parent",
+    )
+    out = per_iteration_samples([orphan])
+    assert list(out.keys()) == ["missing-parent"]
+    assert [r["trial_id"] for r in out["missing-parent"]] == ["v1", "v1"]

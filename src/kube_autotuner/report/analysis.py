@@ -1155,6 +1155,160 @@ def verification_stats(
     return out
 
 
+def _per_iteration_cells(  # noqa: PLR0914 - one-pass projection over many independent metrics
+    t: TrialResult,
+) -> dict[int, dict[str, float | None]]:
+    """Return one cell-dict per observed iteration index for ``t``.
+
+    Walks ``t.results`` (iperf3) and ``t.latency_results`` (fortio)
+    once each, bucketing by the record's ``iteration`` field. Per-metric
+    aggregation mirrors the canonical
+    :class:`~kube_autotuner.models.TrialResult` accessors so a mean of
+    the per-iteration values equals the parent's
+    :func:`~kube_autotuner.scoring._per_trial_metric_means` value:
+
+    * Throughput / RPS: summed across clients within an iteration.
+    * Jitter / latency percentiles: meaned across clients.
+    * ``tcp_retransmit_rate`` / ``udp_loss_rate``: per-iteration
+      ratio-of-sums with the same drop conditions as
+      :func:`~kube_autotuner.models.tcp_retransmit_rate_by_iteration`
+      and
+      :func:`~kube_autotuner.models.udp_loss_rate_by_iteration`.
+
+    Iterations contribute one entry to the returned mapping when at
+    least one record (iperf3 or fortio) carries that iteration index;
+    metrics absent at that iteration are emitted as ``None`` so the
+    iteration index is preserved without shifting other columns.
+
+    Args:
+        t: Trial whose records should be projected.
+
+    Returns:
+        A dict keyed by the original ``iteration`` index, mapping to a
+        cell dict whose keys are the values of
+        :data:`~kube_autotuner.scoring.METRIC_TO_DF_COLUMN`. Each numeric
+        cell is a finite ``float`` or ``None``.
+    """
+    bench_by_iter: dict[int, list[Any]] = defaultdict(list)
+    for r in t.results:
+        bench_by_iter[r.iteration].append(r)
+    latency_by_iter: dict[int, list[Any]] = defaultdict(list)
+    for r in t.latency_results:
+        latency_by_iter[r.iteration].append(r)
+
+    out: dict[int, dict[str, float | None]] = {}
+    for it in sorted(set(bench_by_iter) | set(latency_by_iter)):
+        bench = bench_by_iter.get(it, [])
+        latency = latency_by_iter.get(it, [])
+
+        tcp_records = [r for r in bench if r.mode == "tcp"]
+        udp_records = [r for r in bench if r.mode == "udp"]
+
+        tcp_throughput: float | None = (
+            sum(r.bits_per_second for r in tcp_records) if tcp_records else None
+        )
+        udp_throughput: float | None = (
+            sum(r.bits_per_second for r in udp_records) if udp_records else None
+        )
+
+        retx_total = sum(r.retransmits for r in bench if r.retransmits is not None)
+        bytes_total = sum(
+            r.bytes_sent for r in bench if r.bytes_sent is not None and r.bytes_sent > 0
+        )
+        saw_retx = any(r.retransmits is not None for r in bench)
+        tcp_retx_rate: float | None = (
+            retx_total * 1e9 / bytes_total if saw_retx and bytes_total > 0 else None
+        )
+
+        lost_total = sum(r.lost_packets for r in bench if r.lost_packets is not None)
+        packets_total = sum(
+            r.packets for r in bench if r.packets is not None and r.packets > 0
+        )
+        saw_lost = any(r.lost_packets is not None for r in bench)
+        udp_loss: float | None = (
+            lost_total / packets_total if saw_lost and packets_total > 0 else None
+        )
+
+        jitter_vals = [r.jitter for r in bench if r.jitter is not None]
+        jitter_mean: float | None = (
+            sum(jitter_vals) / len(jitter_vals) if jitter_vals else None
+        )
+
+        saturation = [r for r in latency if r.workload == "saturation"]
+        rps_sum: float | None = sum(r.rps for r in saturation) if saturation else None
+
+        fixed = [r for r in latency if r.workload == "fixed_qps"]
+
+        def _latency_mean(records: list[Any], attr: str) -> float | None:
+            vals = [getattr(r, attr) for r in records if getattr(r, attr) is not None]
+            return sum(vals) / len(vals) if vals else None
+
+        out[it] = {
+            "mean_tcp_throughput": _finite_or_none(tcp_throughput),
+            "mean_udp_throughput": _finite_or_none(udp_throughput),
+            "tcp_retransmit_rate": _finite_or_none(tcp_retx_rate),
+            "udp_loss_rate": _finite_or_none(udp_loss),
+            "mean_udp_jitter": _finite_or_none(jitter_mean),
+            "mean_rps": _finite_or_none(rps_sum),
+            "mean_latency_p50": _finite_or_none(_latency_mean(fixed, "latency_p50")),
+            "mean_latency_p90": _finite_or_none(_latency_mean(fixed, "latency_p90")),
+            "mean_latency_p99": _finite_or_none(_latency_mean(fixed, "latency_p99")),
+        }
+    return out
+
+
+def per_iteration_samples(
+    trials: list[TrialResult],
+) -> dict[str, list[dict[str, int | str | float | None]]]:
+    """Return per-iteration measurement rows grouped by recommendation key.
+
+    Group key matches :func:`~kube_autotuner.scoring.aggregate_verification`:
+    ``parent_trial_id or trial_id``. Within each group, every contributing
+    :class:`~kube_autotuner.models.TrialResult` emits one row per
+    iteration index observed in its records. The original
+    ``BenchmarkResult.iteration`` / ``LatencyResult.iteration`` values
+    are preserved verbatim so a row can be correlated with the on-disk
+    record. Numeric cells are finite or ``None`` -- never ``nan`` -- so
+    the payload survives ``json.dumps(allow_nan=False)`` in
+    ``render._embed_json``.
+
+    Args:
+        trials: The combined primary + verification population for one
+            hardware-class section.
+
+    Returns:
+        A dict keyed by recommendation/parent ``trial_id``, mapping to
+        a list of per-iteration row dicts. Each row carries the original
+        ``iteration`` index, the source ``trial_id``, and one
+        finite-or-``None`` cell per metric column in
+        :data:`~kube_autotuner.scoring.METRIC_TO_DF_COLUMN`.
+    """
+    groups: dict[str, list[TrialResult]] = defaultdict(list)
+    order: list[str] = []
+    for t in trials:
+        key = t.parent_trial_id or t.trial_id
+        if key not in groups:
+            order.append(key)
+        groups[key].append(t)
+
+    out: dict[str, list[dict[str, int | str | float | None]]] = {}
+    for key in order:
+        members = sorted(groups[key], key=lambda x: (x.created_at, x.trial_id))
+        rows: list[dict[str, int | str | float | None]] = []
+        for trial in members:
+            cells = _per_iteration_cells(trial)
+            for it in sorted(cells):
+                row: dict[str, int | str | float | None] = {
+                    "iteration": it,
+                    "trial_id": trial.trial_id,
+                }
+                row.update(cells[it])
+                rows.append(row)
+        if rows:
+            out[key] = rows
+    return out
+
+
 def stability_badge(
     verif_row: dict[str, dict[str, float | None]] | None,
 ) -> str:

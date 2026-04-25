@@ -735,6 +735,65 @@ def test_js_module_has_new_renderers() -> None:
     assert "function linearFit(" in js
 
 
+def test_per_iteration_samples_payload_and_summary(tmp_path: Path) -> None:
+    """The drill-down payload is keyed by parent trial_id and JS renders it.
+
+    Builds a section whose top recommendation has a primary plus 2
+    verification children (3 iterations each, 9 samples total).
+    Asserts the embedded JSON carries ``perIterationSamples`` keyed
+    by the parent trial_id with 9 rows whose ``iteration`` values
+    preserve the original 0/1/2 indices verbatim, and that the JS
+    module emits the ``per-iteration measurements (N samples)``
+    summary text driving the ``<details>`` panel.
+    """
+    section = _minimal_section("10g", n_pareto_rows=1)
+    parent_id = section["pareto_rows"][0]["trial_id"]
+    rows: list[dict[str, Any]] = [
+        {
+            "iteration": it,
+            "trial_id": trial_id,
+            "mean_tcp_throughput": 5e9 + 1e8 * it,
+            "mean_udp_throughput": None,
+            "tcp_retransmit_rate": 0.1,
+            "udp_loss_rate": None,
+            "mean_udp_jitter": None,
+            "mean_rps": None,
+            "mean_latency_p50": None,
+            "mean_latency_p90": None,
+            "mean_latency_p99": None,
+        }
+        for trial_id in (parent_id, f"{parent_id}-v1", f"{parent_id}-v2")
+        for it in (0, 1, 2)
+    ]
+    section["per_iteration_samples"] = {parent_id: rows}
+
+    path = render.write_index_html(tmp_path, [section])
+    html_text = path.read_text()
+
+    payload = _section_payload_from_html(html_text, "10g")
+    samples = payload["perIterationSamples"]
+    assert parent_id in samples
+    assert len(samples[parent_id]) == 9
+    assert [r["iteration"] for r in samples[parent_id]] == [0, 1, 2] * 3
+    assert [r["trial_id"] for r in samples[parent_id]] == (
+        [parent_id] * 3 + [f"{parent_id}-v1"] * 3 + [f"{parent_id}-v2"] * 3
+    )
+
+    js = render._JS_MODULE
+    assert "per-iteration measurements (" in js
+    assert 'samples.length + " samples)"' in js
+    assert "perIterationSamples" in js
+
+
+def test_per_iteration_samples_omitted_when_no_data(tmp_path: Path) -> None:
+    """Sections without verification still render -- payload defaults to {}."""
+    section = _minimal_section("10g", n_pareto_rows=1)
+    # No per_iteration_samples key at all.
+    path = render.write_index_html(tmp_path, [section])
+    payload = _section_payload_from_html(path.read_text(), "10g")
+    assert payload["perIterationSamples"] == {}
+
+
 def test_js_score_rows_port_matches_python(tmp_path: Path) -> None:  # noqa: PLR0914 - parity replay needs both JS and Python bookkeeping
     """Replay the JS ``scoreRows`` arithmetic and check it matches Python.
 

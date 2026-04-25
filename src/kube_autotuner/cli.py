@@ -866,6 +866,7 @@ def _analyze_one_class(  # noqa: PLR0914 - threads many helpers into one section
     )
 
     verif_stats = analysis.verification_stats(hw_trials)
+    per_iter_samples = analysis.per_iteration_samples(hw_trials)
     for row in pareto_rows:
         row["stability_badge"] = analysis.stability_badge(
             verif_stats.get(row["trial_id"]),
@@ -920,6 +921,7 @@ def _analyze_one_class(  # noqa: PLR0914 - threads many helpers into one section
         ),
         "baseline_comparison": baseline,
         "verification_stats": verif_stats,
+        "per_iteration_samples": per_iter_samples,
         "trajectory_rows": trajectory,
         "metadata": metadata,
         "correlation_matrix": correlation,

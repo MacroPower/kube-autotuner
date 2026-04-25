@@ -501,6 +501,54 @@ def _clean_verification_stats(
     return out
 
 
+_PER_ITERATION_METRIC_KEYS: tuple[str, ...] = (
+    "mean_tcp_throughput",
+    "mean_udp_throughput",
+    "tcp_retransmit_rate",
+    "udp_loss_rate",
+    "mean_udp_jitter",
+    "mean_rps",
+    "mean_latency_p50",
+    "mean_latency_p90",
+    "mean_latency_p99",
+)
+
+
+def _clean_per_iteration_samples(
+    samples: dict[str, list[dict[str, Any]]] | None,
+) -> dict[str, list[dict[str, Any]]]:
+    """Coerce numeric cells in ``samples`` to a finite float or ``None``.
+
+    Belt-and-braces: ``per_iteration_samples`` already routes every
+    numeric cell through ``_finite_or_none``, so this scrub is a no-op
+    in practice. It guards against future drift that could leak ``nan``
+    into ``json.dumps(allow_nan=False)`` in :func:`_embed_json`.
+
+    Args:
+        samples: Mapping from recommendation/parent ``trial_id`` to a
+            list of per-iteration row dicts.
+
+    Returns:
+        A scrubbed copy of ``samples``; empty dict when ``samples`` is
+        falsy.
+    """
+    if not samples:
+        return {}
+    out: dict[str, list[dict[str, Any]]] = {}
+    for parent, rows in samples.items():
+        cleaned_rows: list[dict[str, Any]] = []
+        for row in rows:
+            cleaned: dict[str, Any] = {
+                "iteration": row.get("iteration"),
+                "trial_id": row.get("trial_id"),
+            }
+            for col in _PER_ITERATION_METRIC_KEYS:
+                cleaned[col] = _finite_or_none(row.get(col))
+            cleaned_rows.append(cleaned)
+        out[parent] = cleaned_rows
+    return out
+
+
 def _clean_baseline_comparison(
     entries: list[dict[str, Any]] | None,
 ) -> list[dict[str, Any]] | None:
@@ -636,6 +684,9 @@ def _section_payload(section: dict[str, Any]) -> dict[str, Any]:
         ),
         "verificationStats": _clean_verification_stats(
             section.get("verification_stats"),
+        ),
+        "perIterationSamples": _clean_per_iteration_samples(
+            section.get("per_iteration_samples"),
         ),
         "trajectoryRows": _clean_trajectory_rows(
             section.get("trajectory_rows"),
@@ -1553,6 +1604,65 @@ function buildRankedTable(wrapper, state, visibleCols) {
       verifWrapper.appendChild(verifTable);
       verifDetails.appendChild(verifWrapper);
       details.appendChild(verifDetails);
+    }
+
+    const samples =
+      (state.section.perIterationSamples || {})[row.trial_id];
+    if (Array.isArray(samples) && samples.length > 0) {
+      const iterDetails = document.createElement("details");
+      const iterSummary = document.createElement("summary");
+      iterSummary.textContent =
+        "per-iteration measurements (" + samples.length + " samples)";
+      iterDetails.appendChild(iterSummary);
+      const iterWrapper = document.createElement("div");
+      iterWrapper.className = "decomposition-wrapper";
+      const iterTable = document.createElement("table");
+      iterTable.className = "report-table decomposition-table";
+      const iterThead = document.createElement("thead");
+      const iterHeadRow = document.createElement("tr");
+      for (const h of ["#", "iteration", "trial"]) {
+        const th = document.createElement("th");
+        th.textContent = h;
+        iterHeadRow.appendChild(th);
+      }
+      for (const col of visibleCols) {
+        const th = document.createElement("th");
+        th.textContent = METRIC_DISPLAY[col].label
+          + (METRIC_DISPLAY[col].unit
+            ? " (" + METRIC_DISPLAY[col].unit + ")" : "");
+        iterHeadRow.appendChild(th);
+      }
+      iterThead.appendChild(iterHeadRow);
+      iterTable.appendChild(iterThead);
+      const iterTbody = document.createElement("tbody");
+      for (let s = 0; s < samples.length; s++) {
+        const sample = samples[s];
+        const sampleTr = document.createElement("tr");
+        const ordinalTd = document.createElement("td");
+        ordinalTd.className = "numeric";
+        ordinalTd.textContent = String(s + 1);
+        sampleTr.appendChild(ordinalTd);
+        const iterTd = document.createElement("td");
+        iterTd.className = "numeric";
+        iterTd.textContent = sample.iteration === null
+          || sample.iteration === undefined
+            ? "-" : String(sample.iteration);
+        sampleTr.appendChild(iterTd);
+        const trialTd = document.createElement("td");
+        trialTd.textContent = sample.trial_id || "";
+        sampleTr.appendChild(trialTd);
+        for (const col of visibleCols) {
+          const cellTd = document.createElement("td");
+          cellTd.className = "numeric";
+          cellTd.textContent = formatMetric(col, sample[col]);
+          sampleTr.appendChild(cellTd);
+        }
+        iterTbody.appendChild(sampleTr);
+      }
+      iterTable.appendChild(iterTbody);
+      iterWrapper.appendChild(iterTable);
+      iterDetails.appendChild(iterWrapper);
+      details.appendChild(iterDetails);
     }
 
     const sysctlDetails = document.createElement("details");
