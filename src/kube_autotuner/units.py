@@ -198,3 +198,19 @@ def format_duration(seconds: float) -> str:
     """
     scale, suffix = pick_duration_unit(seconds)
     return f"{format_coefficient(seconds / scale)}{suffix}"
+
+
+def format_retransmit_rate(rate: float | None) -> str:
+    """Format a retx-per-GB rate for display.
+
+    Args:
+        rate: Retransmits per gigabyte, or ``None`` when the trial
+            had no observable rate (UDP-only, empty TCP).
+
+    Returns:
+        ``"-"`` when ``rate`` is ``None``; otherwise ``rate``
+        formatted with two decimals.
+    """
+    if rate is None:
+        return "-"
+    return f"{rate:.2f}"

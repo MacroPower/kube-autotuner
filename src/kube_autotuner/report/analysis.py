@@ -2,9 +2,9 @@
 
 The heavy dependencies -- ``pandas``, ``numpy``, ``scikit-learn`` -- live in
 the optional ``analysis`` dependency group. They are lazy-imported inside
-function bodies so that ``import kube_autotuner.analysis`` succeeds under
-the base ``dev`` sync (``task completions`` and the analyze Typer command
-both rely on this). Three rules enforce the discipline:
+function bodies so that ``import kube_autotuner.report.analysis`` succeeds
+under the base ``dev`` sync (``task completions`` and the analyze Typer
+command both rely on this). Three rules enforce the discipline:
 
 * ``from __future__ import annotations`` at the top keeps every
   signature a string, so ``-> pd.DataFrame`` does not trigger an eager

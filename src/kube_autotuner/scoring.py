@@ -1,13 +1,16 @@
 """Unit-agnostic scalarization of Pareto objectives into a single score.
 
-Factored out of :func:`kube_autotuner.analysis.recommend_configs` so the
-same ranking formula drives both the post-hoc recommendation output and
-the live ``Best so far`` panel in
+Factored out of :func:`kube_autotuner.report.analysis.recommend_configs`
+so the same ranking formula drives both the post-hoc recommendation
+output and the live ``Best so far`` panel in
 :class:`kube_autotuner.progress.RichProgressObserver`. Pure-stdlib by
 design: :mod:`kube_autotuner.progress` sits under an import ceiling
 that forbids ``pandas`` / ``numpy`` / ``ax-platform`` and forbids
-reaching into :mod:`kube_autotuner.analysis`, and this helper is
-reachable from there.
+reaching into :mod:`kube_autotuner.report.analysis`, and this helper
+is reachable from there. The companion docstring in
+:mod:`kube_autotuner.report` states the inverse direction: the
+``report`` subpackage is the post-hoc presentation layer and nothing
+in core may import from it.
 
 Min-max normalization makes the score scale-invariant: the live panel
 can hand in raw-domain floats (bits/sec, bytes) while
@@ -136,7 +139,7 @@ def score_rows(
 
     * :mod:`kube_autotuner.progress` emits raw ``float`` values with
       :data:`math.nan` for missing readings.
-    * :func:`kube_autotuner.analysis.recommend_configs` passes
+    * :func:`kube_autotuner.report.analysis.recommend_configs` passes
       ``front[cols].to_dict(orient="records")``; pandas emits ``nan``
       for numeric columns and ``None`` for object-dtype columns.
 

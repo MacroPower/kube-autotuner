@@ -16,7 +16,7 @@ Import constraint: this module is reachable from ``cli.py`` at import
 time (``task completions`` eagerly imports the Typer ``app``), so it
 MUST NOT import ``ax-platform``, ``pandas``, ``plotly``,
 ``scikit-learn``, or anything under ``kube_autotuner.optimizer`` /
-``kube_autotuner.analysis`` / ``kube_autotuner.report``. Keep the
+``kube_autotuner.report``. Keep the
 import set to ``rich``, the standard library, and pure-typing helpers.
 :mod:`kube_autotuner.scoring` is pure-stdlib and :mod:`kube_autotuner.experiment`
 is Pydantic-only, so both are safe to import here.
@@ -1077,7 +1077,7 @@ class RichProgressObserver:
             memory_cost_weight=self._objectives.memory_cost_weight,
         )
         # Rank by score desc, break ties by trial_id ascending to
-        # match recommend_configs (analysis.py) and
+        # match recommend_configs (kube_autotuner.report.analysis) and
         # OptimizationLoop.run_verification's top-K selector.
         order = sorted(
             range(len(self._all_rows)),

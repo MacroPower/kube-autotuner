@@ -208,8 +208,8 @@ unresolved-import = "ignore"
 # must still type-check thanks to the lazy-import discipline.
 [[tool.ty.overrides]]
 include = [
-    "src/kube_autotuner/analysis.py",
-    "src/kube_autotuner/report.py",
+    "src/kube_autotuner/report/analysis.py",
+    "src/kube_autotuner/report/render.py",
 ]
 
 [tool.ty.overrides.rules]

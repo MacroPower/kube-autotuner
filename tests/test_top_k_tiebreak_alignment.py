@@ -95,7 +95,7 @@ def test_live_panel_rerank_ties_break_on_trial_id() -> None:
 def test_recommend_configs_agrees_on_trial_id_tiebreak() -> None:
     pd = pytest.importorskip("pandas")
     pytest.importorskip("sklearn")
-    from kube_autotuner.analysis import recommend_configs  # noqa: PLC0415
+    from kube_autotuner.report.analysis import recommend_configs  # noqa: PLC0415
 
     del pd  # ensure pandas import ran
     a = _trial("aaa", 1e9)

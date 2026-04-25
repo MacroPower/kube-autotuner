@@ -9,8 +9,8 @@ is weight-invariant so no Python round-trip is needed.
 
 ``pandas`` and ``plotly`` live in the optional ``analysis`` dependency
 group. All runtime uses are lazy-imported inside function bodies so
-that ``import kube_autotuner.report`` remains cheap under the base
-``dev`` sync. Runtime helpers raise :class:`RuntimeError` with the
+that ``import kube_autotuner.report.render`` remains cheap under the
+base ``dev`` sync. Runtime helpers raise :class:`RuntimeError` with the
 ``uv sync --group analysis`` hint when the group is missing.
 """
 
@@ -33,22 +33,6 @@ _TOP_IMPORTANCE_ROWS = 20
 _MIN_AXIS_COLUMNS = 2
 
 _PLOTLY_CDN = "https://cdn.plot.ly/plotly-2.35.2.min.js"
-
-
-def format_retransmit_rate(rate: float | None) -> str:
-    """Format a retx-per-GB rate for display.
-
-    Args:
-        rate: Retransmits per gigabyte, or ``None`` when the trial
-            had no observable rate (UDP-only, empty TCP).
-
-    Returns:
-        ``"-"`` when ``rate`` is ``None``; otherwise ``rate``
-        formatted with two decimals.
-    """
-    if rate is None:
-        return "-"
-    return f"{rate:.2f}"
 
 
 _STYLE = """
@@ -309,7 +293,7 @@ def _render_importance(df: pd.DataFrame, top_n: int = _TOP_IMPORTANCE_ROWS) -> s
 
     Args:
         df: Frame produced by
-            :func:`kube_autotuner.analysis.parameter_importance`.
+            :func:`kube_autotuner.report.analysis.parameter_importance`.
         top_n: Maximum number of rows to include.
 
     Returns:
@@ -470,7 +454,7 @@ def _correlation_matrix_payload(matrix: pd.DataFrame | None) -> dict[str, Any] |
 
     Args:
         matrix: Square DataFrame produced by
-            :func:`kube_autotuner.analysis.sysctl_correlation_matrix`,
+            :func:`kube_autotuner.report.analysis.sysctl_correlation_matrix`,
             or ``None`` when there was not enough variance.
 
     Returns:
@@ -619,7 +603,7 @@ def _section_payload(section: dict[str, Any]) -> dict[str, Any]:
     Returns:
         A dict safe to pass to :func:`json.dumps` with
         ``allow_nan=False``: every unmeasured metric is ``None`` (from
-        :func:`kube_autotuner.analysis.pareto_recommendation_rows`
+        :func:`kube_autotuner.report.analysis.pareto_recommendation_rows`
         and :func:`kube_autotuner.cli._build_axis_payload`) and every
         Pydantic ``ParetoObjective`` has already been lowered to a
         plain dict upstream.
@@ -804,7 +788,7 @@ def _render_host_state_chart(
         hw_slug: Slugified hardware-class label; used to namespace
             ids and data attributes.
         payload: The host-state payload produced by
-            :func:`kube_autotuner.analysis.host_state_series`, or
+            :func:`kube_autotuner.report.analysis.host_state_series`, or
             ``None``.
 
     Returns:

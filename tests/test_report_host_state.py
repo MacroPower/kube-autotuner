@@ -10,8 +10,8 @@ import pytest
 
 pd = pytest.importorskip("pandas")
 
-from kube_autotuner import report  # noqa: E402
 from kube_autotuner.experiment import ObjectivesSection  # noqa: E402
+from kube_autotuner.report import render  # noqa: E402
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -24,12 +24,12 @@ def _minimal_section(hw: str) -> dict[str, Any]:
     """Build a minimal per-hardware-class section dict for report tests.
 
     Mirrors the fixture in ``tests/test_report.py`` but trimmed to only
-    the fields :func:`report._render_section` reads when rendering the
+    the fields :func:`render._render_section` reads when rendering the
     host-state block.
 
     Returns:
-        A section dict suitable for :func:`report.write_index_html` or
-        :func:`report._render_section`.
+        A section dict suitable for :func:`render.write_index_html` or
+        :func:`render._render_section`.
     """
     pareto_rows = [
         {
@@ -154,7 +154,7 @@ def _section_payload_from_html(html_text: str, hw_slug: str) -> dict[str, Any]:
 def test_render_section_omits_host_state_when_missing(tmp_path: Path) -> None:
     section = _minimal_section("10g")
     section["host_state"] = None
-    path = report.write_index_html(tmp_path, [section])
+    path = render.write_index_html(tmp_path, [section])
     html_text = path.read_text()
 
     assert "<h3>Host state</h3>" not in html_text
@@ -165,7 +165,7 @@ def test_render_section_omits_host_state_when_key_absent(tmp_path: Path) -> None
     section = _minimal_section("10g")
     # No host_state key at all; _render_section's .get() must tolerate it.
     assert "host_state" not in section
-    path = report.write_index_html(tmp_path, [section])
+    path = render.write_index_html(tmp_path, [section])
     html_text = path.read_text()
 
     assert "<h3>Host state</h3>" not in html_text
@@ -174,7 +174,7 @@ def test_render_section_omits_host_state_when_key_absent(tmp_path: Path) -> None
 def test_render_section_emits_host_state_skeleton(tmp_path: Path) -> None:
     section = _minimal_section("10g")
     section["host_state"] = _host_state_payload()
-    path = report.write_index_html(tmp_path, [section])
+    path = render.write_index_html(tmp_path, [section])
     html_text = path.read_text()
 
     assert "<h3>Host state</h3>" in html_text
@@ -191,7 +191,7 @@ def test_render_section_emits_host_state_skeleton(tmp_path: Path) -> None:
 def test_host_state_payload_embedded_for_js(tmp_path: Path) -> None:
     section = _minimal_section("10g")
     section["host_state"] = _host_state_payload()
-    path = report.write_index_html(tmp_path, [section])
+    path = render.write_index_html(tmp_path, [section])
     html_text = path.read_text()
 
     payload = _section_payload_from_html(html_text, "10g")
@@ -210,7 +210,7 @@ def test_host_state_payload_embedded_for_js(tmp_path: Path) -> None:
 def test_host_state_payload_survives_allow_nan_false() -> None:
     section = _minimal_section("10g")
     section["host_state"] = _host_state_payload()
-    payload = report._section_payload(section)  # type: ignore[attr-defined]
+    payload = render._section_payload(section)  # type: ignore[attr-defined]
 
     # Mirrors _embed_json's serialization guard; host_state contributes
     # only int metrics, so this must round-trip cleanly.
@@ -239,7 +239,7 @@ def test_render_section_pre_select_falls_back_when_preferred_absent(
             },
         ],
     )
-    path = report.write_index_html(tmp_path, [section])
+    path = render.write_index_html(tmp_path, [section])
     html_text = path.read_text()
 
     # No preferred metric present -> the first metric is pre-selected.
@@ -251,7 +251,7 @@ def test_render_section_pre_select_falls_back_when_preferred_absent(
 
 def test_js_module_wires_host_state_setup() -> None:
     # Guardrail against silent removal of the JS boot wiring.
-    js = report._JS_MODULE  # type: ignore[attr-defined]
+    js = render._JS_MODULE  # type: ignore[attr-defined]
     assert "setupHostStateChart" in js
     assert "renderHostStateChart" in js
     assert "HOST_STATE_PHASE_SYMBOL" in js

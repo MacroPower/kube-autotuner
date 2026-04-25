@@ -10,8 +10,8 @@ import pytest
 
 pd = pytest.importorskip("pandas")
 
-from kube_autotuner import report  # noqa: E402
 from kube_autotuner.experiment import ObjectivesSection, ParetoObjective  # noqa: E402
+from kube_autotuner.report import render  # noqa: E402
 
 _DEFAULT_WEIGHTS = ObjectivesSection().recommendation_weights
 
@@ -138,7 +138,7 @@ def test_write_index_html_renders_all_sections(
     hw_classes: list[str],
 ) -> None:
     sections = [_minimal_section(hw) for hw in hw_classes]
-    path = report.write_index_html(tmp_path, sections)
+    path = render.write_index_html(tmp_path, sections)
 
     assert path == tmp_path / "index.html"
     assert path.exists()
@@ -156,7 +156,7 @@ def test_write_index_html_renders_all_sections(
 
 def test_write_index_html_slugifies_hardware_class_in_ids(tmp_path: Path) -> None:
     section = _minimal_section("10G NIC")
-    path = report.write_index_html(tmp_path, [section])
+    path = render.write_index_html(tmp_path, [section])
     html_text = path.read_text()
 
     assert "href='#hw-10g-nic'" in html_text
@@ -168,7 +168,7 @@ def test_write_index_html_slugifies_hardware_class_in_ids(tmp_path: Path) -> Non
 
 def test_write_index_html_handles_empty_importance(tmp_path: Path) -> None:
     section = _minimal_section("10g", with_importance=False)
-    path = report.write_index_html(tmp_path, [section])
+    path = render.write_index_html(tmp_path, [section])
     html_text = path.read_text()
 
     assert "Parameter importance unavailable" in html_text
@@ -178,7 +178,7 @@ def test_write_index_html_handles_empty_importance(tmp_path: Path) -> None:
 
 def test_write_index_html_axis_chart_defaults_are_selected(tmp_path: Path) -> None:
     section = _minimal_section("10g")
-    path = report.write_index_html(tmp_path, [section])
+    path = render.write_index_html(tmp_path, [section])
     html_text = path.read_text()
 
     # Python's `selected` attribute must agree with the JS-side default
@@ -196,7 +196,7 @@ def test_write_index_html_axis_chart_degenerates_below_two_columns(
 ) -> None:
     section = _minimal_section("10g")
     section["axis_columns"] = ["mean_tcp_throughput"]
-    path = report.write_index_html(tmp_path, [section])
+    path = render.write_index_html(tmp_path, [section])
     html_text = path.read_text()
 
     # Fallback message replaces the controls, but the div keeps its
@@ -213,7 +213,7 @@ def test_write_index_html_axis_chart_degenerates_below_two_columns(
 
 def test_write_index_html_axis_chart_has_trend_toggle(tmp_path: Path) -> None:
     section = _minimal_section("10g")
-    path = report.write_index_html(tmp_path, [section])
+    path = render.write_index_html(tmp_path, [section])
     html_text = path.read_text()
 
     assert 'class="axis-trend-toggle"' in html_text
@@ -223,7 +223,7 @@ def test_write_index_html_axis_chart_has_trend_toggle(tmp_path: Path) -> None:
 
 def test_write_index_html_pareto_labels(tmp_path: Path) -> None:
     section = _minimal_section("10g")
-    path = report.write_index_html(tmp_path, [section])
+    path = render.write_index_html(tmp_path, [section])
     html_text = path.read_text()
 
     # Guard against regressing the scatter-matrix / Pareto-2D plots.
@@ -236,7 +236,7 @@ def test_write_index_html_uses_cdn_not_inlined_plotly(tmp_path: Path) -> None:
         _minimal_section("10g"),
         _minimal_section("1g"),
     ]
-    path = report.write_index_html(tmp_path, sections)
+    path = render.write_index_html(tmp_path, sections)
     html_text = path.read_text()
 
     cdn_matches = re.findall(r'src="https://cdn\.plot\.ly/[^"]+"', html_text)
@@ -255,7 +255,7 @@ def test_write_index_html_embeds_pareto_rows(tmp_path: Path) -> None:
         _minimal_section("10g", n_pareto_rows=4),
         _minimal_section("1g", n_pareto_rows=2),
     ]
-    path = report.write_index_html(tmp_path, sections)
+    path = render.write_index_html(tmp_path, sections)
     html_text = path.read_text()
 
     data_scripts = re.findall(
@@ -306,7 +306,7 @@ def test_write_index_html_embeds_pareto_rows(tmp_path: Path) -> None:
 def test_write_index_html_escapes_script_close_in_payload(tmp_path: Path) -> None:
     section = _minimal_section("10g", n_pareto_rows=1)
     section["pareto_rows"][0]["sysctl_values"]["payload"] = "</script><b>xss</b>"
-    path = report.write_index_html(tmp_path, [section])
+    path = render.write_index_html(tmp_path, [section])
     html_text = path.read_text()
 
     # The verbatim `</script>` must not appear inside our data payload.
@@ -322,7 +322,7 @@ def test_write_index_html_rejects_nan_in_payload(tmp_path: Path) -> None:
     section["pareto_rows"][0]["mean_tcp_throughput"] = float("nan")
 
     with pytest.raises(ValueError, match="Out of range float values"):
-        report.write_index_html(tmp_path, [section])
+        render.write_index_html(tmp_path, [section])
 
 
 def _extract_js_object_literal(js: str, identifier: str) -> dict[str, Any]:
@@ -352,7 +352,7 @@ def _extract_js_object_literal(js: str, identifier: str) -> dict[str, Any]:
 
 
 def test_presets_subset_of_defaults() -> None:
-    presets = _extract_js_object_literal(report._JS_MODULE, "PRESETS")
+    presets = _extract_js_object_literal(render._JS_MODULE, "PRESETS")
     default_keys = set(_DEFAULT_WEIGHTS.keys())
     for name, overrides in presets.items():
         if overrides is None:
@@ -365,8 +365,8 @@ def test_presets_subset_of_defaults() -> None:
 
 
 def test_presets_labels_cover_every_preset() -> None:
-    presets = _extract_js_object_literal(report._JS_MODULE, "PRESETS")
-    labels = _extract_js_object_literal(report._JS_MODULE, "PRESET_LABELS")
+    presets = _extract_js_object_literal(render._JS_MODULE, "PRESETS")
+    labels = _extract_js_object_literal(render._JS_MODULE, "PRESET_LABELS")
     assert set(presets.keys()) == set(labels.keys())
 
 
@@ -378,7 +378,7 @@ def test_decomposition_table_weight_cell_is_always_numeric() -> None:
     After the change every row shows a numeric weight; guard against
     a future regression that reintroduces the placeholder.
     """
-    js = report._JS_MODULE
+    js = render._JS_MODULE
     assert 'c.direction === "maximize"\n      ? "-"' not in js
     assert '? "-" : c.weight.toFixed(2)' not in js
 
@@ -390,7 +390,7 @@ def test_render_sliders_does_not_filter_by_direction() -> None:
     to minimize metrics. Confirm the rename landed and no stale
     direction filter survives inside the renderer.
     """
-    js = report._JS_MODULE
+    js = render._JS_MODULE
     assert "minimizeMetricKeys" not in js
     assert "weightedMetricKeys" in js
     # renderSliders iterates every pareto objective; no direction
@@ -402,7 +402,7 @@ def test_render_sliders_does_not_filter_by_direction() -> None:
 
 
 # The three helpers below mirror the JS ``directionDefault``,
-# ``applyPreset``, and ``activePresetKey`` in ``report._JS_MODULE``.
+# ``applyPreset``, and ``activePresetKey`` in ``render._JS_MODULE``.
 # The JS is the source of truth; these Python mirrors exist so the
 # preset round-trip can be asserted without an in-test JS runtime.
 # Update both sides in lockstep when the preset logic changes.
@@ -454,7 +454,7 @@ def _active_preset_key_py(
 def test_apply_preset_throughput_only_sets_maximize_to_one() -> None:
     """``throughput-only`` zeros minimize weights and keeps maximize at 1.0."""
     section = _minimal_section("10g", n_pareto_rows=1)
-    presets = _extract_js_object_literal(report._JS_MODULE, "PRESETS")
+    presets = _extract_js_object_literal(render._JS_MODULE, "PRESETS")
     weights = _apply_preset_py("throughput-only", section, presets)
     for obj in section["objectives"]:
         if obj["direction"] == "maximize":
@@ -466,7 +466,7 @@ def test_apply_preset_throughput_only_sets_maximize_to_one() -> None:
 def test_active_preset_key_round_trip_throughput_only() -> None:
     """The weights produced by ``throughput-only`` round-trip back to it."""
     section = _minimal_section("10g", n_pareto_rows=1)
-    presets = _extract_js_object_literal(report._JS_MODULE, "PRESETS")
+    presets = _extract_js_object_literal(render._JS_MODULE, "PRESETS")
     weights = _apply_preset_py("throughput-only", section, presets)
     assert _active_preset_key_py(weights, section, presets) == "throughput-only"
 
@@ -477,7 +477,7 @@ def test_apply_preset_latency_sensitive_keeps_maximize_at_one() -> None:
     Maximize weights stay at their 1.0 default.
     """
     section = _minimal_section("10g", n_pareto_rows=1)
-    presets = _extract_js_object_literal(report._JS_MODULE, "PRESETS")
+    presets = _extract_js_object_literal(render._JS_MODULE, "PRESETS")
     overrides = presets["latency-sensitive"]
     assert overrides is not None
     weights = _apply_preset_py("latency-sensitive", section, presets)
@@ -492,7 +492,7 @@ def test_apply_preset_latency_sensitive_keeps_maximize_at_one() -> None:
 
 
 def test_write_index_html_is_dark_themed(tmp_path: Path) -> None:
-    path = report.write_index_html(tmp_path, [_minimal_section("10g")])
+    path = render.write_index_html(tmp_path, [_minimal_section("10g")])
     html_text = path.read_text()
     assert "color-scheme: dark" in html_text
     for forbidden in (
@@ -512,7 +512,7 @@ def test_write_index_html_is_dark_themed(tmp_path: Path) -> None:
 
 
 def test_decomposition_uses_table_not_plotly() -> None:
-    js = report._JS_MODULE
+    js = render._JS_MODULE
     assert "renderDecompositionTable(" in js
     assert "decomposition-table" in js
     # Match the function definition with a word boundary so the new
@@ -523,7 +523,7 @@ def test_decomposition_uses_table_not_plotly() -> None:
 
 
 def test_decomposition_table_is_styled() -> None:
-    css = report._STYLE
+    css = render._STYLE
     assert "decomposition-wrapper" in css
     assert "table.decomposition-table" in css
     assert ".decomposition-chart" not in css
@@ -532,7 +532,7 @@ def test_decomposition_table_is_styled() -> None:
 def test_write_index_html_emits_decomposition_wrapper(
     tmp_path: Path,
 ) -> None:
-    path = report.write_index_html(tmp_path, [_minimal_section("10g")])
+    path = render.write_index_html(tmp_path, [_minimal_section("10g")])
     html_text = path.read_text()
     assert "decomposition-wrapper" in html_text
     assert "decomposition-table" in html_text
@@ -541,7 +541,7 @@ def test_write_index_html_emits_decomposition_wrapper(
 def test_baseline_card_omitted_when_no_comparison(tmp_path: Path) -> None:
     section = _minimal_section("10g")
     # No baseline_comparison key
-    path = report.write_index_html(tmp_path, [section])
+    path = render.write_index_html(tmp_path, [section])
     html_text = path.read_text()
     assert "<h3>Baseline comparison</h3>" not in html_text
 
@@ -558,7 +558,7 @@ def test_baseline_card_renders_when_present(tmp_path: Path) -> None:
             "pct_delta": 1.0,
         },
     ]
-    path = report.write_index_html(tmp_path, [section])
+    path = render.write_index_html(tmp_path, [section])
     html_text = path.read_text()
     assert "<h3>Baseline comparison</h3>" in html_text
     # Positive delta on a maximize metric renders with the positive class.
@@ -580,7 +580,7 @@ def test_metadata_header_renders_mixed_and_omits_empty_kernel(
         "first_created_at_iso": "2026-04-24T10:00:00+00:00",
         "last_created_at_iso": "2026-04-24T11:00:00+00:00",
     }
-    path = report.write_index_html(tmp_path, [section])
+    path = render.write_index_html(tmp_path, [section])
     html_text = path.read_text()
     assert "section-metadata" in html_text
     assert "mixed" in html_text
@@ -601,7 +601,7 @@ def test_metadata_header_renders_mixed_and_omits_empty_kernel(
 def test_stability_boundary_unverified_when_zero_mean(tmp_path: Path) -> None:
     section = _minimal_section("10g", n_pareto_rows=1)
     section["pareto_rows"][0]["stability_badge"] = "unverified"
-    path = report.write_index_html(tmp_path, [section])
+    path = render.write_index_html(tmp_path, [section])
     # Payload must embed stability_badge for consumption by the JS.
     payload = _section_payload_from_html(path.read_text(), "10g")
     assert payload["paretoRows"][0]["stability_badge"] == "unverified"
@@ -625,7 +625,7 @@ def test_trajectory_payload_shape(tmp_path: Path) -> None:
             "mean_tcp_throughput_best_so_far": 6e9,
         },
     ]
-    path = report.write_index_html(tmp_path, [section])
+    path = render.write_index_html(tmp_path, [section])
     html_text = path.read_text()
     assert "Optimization trajectory" in html_text
     assert 'id="trajectory-chart-10g"' in html_text
@@ -647,7 +647,7 @@ def test_correlation_heatmap_payload_omits_pairs_below_floor(
         index=["a", "b"],
     )
     section["correlation_matrix"] = dummy_df
-    path = report.write_index_html(tmp_path, [section])
+    path = render.write_index_html(tmp_path, [section])
     html_text = path.read_text()
     assert "correlation heatmap" in html_text
     payload = _section_payload_from_html(html_text, "10g")
@@ -667,7 +667,7 @@ def test_category_importance_payload_embedded(tmp_path: Path) -> None:
             {"category": "congestion", "rf_sum": 0.1},
         ],
     }
-    path = report.write_index_html(tmp_path, [section])
+    path = render.write_index_html(tmp_path, [section])
     html_text = path.read_text()
     assert 'id="category-bar-10g"' in html_text
     payload = _section_payload_from_html(html_text, "10g")
@@ -679,7 +679,7 @@ def test_category_importance_payload_embedded(tmp_path: Path) -> None:
 def test_host_state_issues_omitted_when_empty(tmp_path: Path) -> None:
     section = _minimal_section("10g")
     section["host_state_issues"] = []
-    path = report.write_index_html(tmp_path, [section])
+    path = render.write_index_html(tmp_path, [section])
     html_text = path.read_text()
     assert "Data-collection issues" not in html_text
 
@@ -696,7 +696,7 @@ def test_host_state_issues_present_and_truncated(tmp_path: Path) -> None:
             "error_text": long_err,
         },
     ]
-    path = report.write_index_html(tmp_path, [section])
+    path = render.write_index_html(tmp_path, [section])
     html_text = path.read_text()
     assert "Data-collection issues (1 snapshots affected)" in html_text
     assert long_err in html_text
@@ -709,24 +709,24 @@ def test_single_iteration_survives_allow_nan_false(tmp_path: Path) -> None:
     section["all_rows"][0]["mean_tcp_throughput_std"] = None
     section["all_rows"][0]["tcp_retransmit_rate_std"] = None
     # No exception should be raised (allow_nan=False).
-    path = report.write_index_html(tmp_path, [section])
+    path = render.write_index_html(tmp_path, [section])
     assert path.exists()
 
 
 def test_correlation_matrix_payload_handles_none() -> None:
     section: dict[str, Any] = {"correlation_matrix": None}
-    assert report._correlation_matrix_payload(section["correlation_matrix"]) is None
+    assert render._correlation_matrix_payload(section["correlation_matrix"]) is None
 
 
 def test_axis_chart_uses_x_not_multiplication_sign() -> None:
     """Guard against regressing to the ambiguous multiplication character."""
     multiplication_sign = chr(0xD7)
-    assert multiplication_sign not in report._JS_MODULE
+    assert multiplication_sign not in render._JS_MODULE
 
 
 def test_js_module_has_new_renderers() -> None:
     """Regression guard: new JS renderers must remain wired."""
-    js = report._JS_MODULE
+    js = render._JS_MODULE
     assert "renderTrajectoryChart" in js
     assert "renderCorrelationHeatmap" in js
     assert "renderCategoryRollup" in js
@@ -739,7 +739,7 @@ def test_js_score_rows_port_matches_python(tmp_path: Path) -> None:  # noqa: PLR
     """Replay the JS ``scoreRows`` arithmetic and check it matches Python.
 
     The browser-side decomposition panel has a standalone port of
-    :func:`kube_autotuner.scoring.score_rows` (``report.py:scoreRows``)
+    :func:`kube_autotuner.scoring.score_rows` (``report/render.py:scoreRows``)
     that must match the Python scorer for the same embedded payload.
     We recompute the JS formula here against the embedded JSON and
     assert the ranking agrees with Python's ``score_rows``.
@@ -756,7 +756,7 @@ def test_js_score_rows_port_matches_python(tmp_path: Path) -> None:  # noqa: PLR
         row["memory_cost"] = float((i + 1) * 1_000_000_000)
     section["memory_cost_weight"] = 0.1
 
-    path = report.write_index_html(tmp_path, [section])
+    path = render.write_index_html(tmp_path, [section])
     payload = _section_payload_from_html(path.read_text(), "10g")
 
     rows = payload["paretoRows"]

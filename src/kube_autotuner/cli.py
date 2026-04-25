@@ -32,13 +32,12 @@ from kube_autotuner.experiment import ExperimentConfig, ExperimentConfigError
 from kube_autotuner.k8s.client import K8sClient
 from kube_autotuner.models import ALL_STAGES, metrics_for_stages
 from kube_autotuner.progress import make_observer
-from kube_autotuner.report import format_retransmit_rate
 from kube_autotuner.sysctl.setter import (
     make_sysctl_setter,
     make_sysctl_setter_from_env,
 )
 from kube_autotuner.trial_log import TrialLog
-from kube_autotuner.units import format_duration
+from kube_autotuner.units import format_duration, format_retransmit_rate
 
 if TYPE_CHECKING:
     from kube_autotuner.experiment import ObjectivesSection
@@ -78,7 +77,7 @@ class AppState:
                 for the active experiment. Forwarded to the observer
                 so the live ``Best so far`` panel ranks trials by
                 the same weighted score used by
-                :func:`kube_autotuner.analysis.recommend_configs`.
+                :func:`kube_autotuner.report.analysis.recommend_configs`.
                 ``None`` keeps the throughput-descending fallback,
                 which is used by flows that never call
                 ``on_trial_complete`` (``baseline`` / ``trial``).
@@ -628,8 +627,8 @@ def analyze(
         typer.Exit: The input trial dataset is empty or the requested
             hardware class has no trials.
     """
-    from kube_autotuner import analysis, report  # noqa: PLC0415
     from kube_autotuner.experiment import ObjectivesSection  # noqa: PLC0415
+    from kube_autotuner.report import analysis, render  # noqa: PLC0415
 
     trials = TrialLog.load(input_file)
     if not trials:
@@ -682,7 +681,7 @@ def analyze(
             progress.advance(task_id)
 
     if sections:
-        index_path = report.write_index_html(output_dir, sections)
+        index_path = render.write_index_html(output_dir, sections)
         typer.echo(f"\nCombined report: {index_path}")
 
 
@@ -691,7 +690,7 @@ def _format_top_recommendation(r: dict[str, Any]) -> str:
 
     Args:
         r: A single recommendation dict as returned by
-            :func:`kube_autotuner.analysis.recommend_configs`.
+            :func:`kube_autotuner.report.analysis.recommend_configs`.
 
     Returns:
         A comma-separated summary covering every measured metric:
@@ -744,7 +743,7 @@ def _analyze_one_class(  # noqa: PLR0914 - threads many helpers into one section
 
     Writes ``recommendations.json`` and ``importance.json`` under
     ``output_dir / hardware_class / ...`` and returns a section dict
-    suitable for :func:`kube_autotuner.report.write_index_html`.
+    suitable for :func:`kube_autotuner.report.render.write_index_html`.
 
     Args:
         trials: The full trial list (unfiltered).
@@ -752,7 +751,7 @@ def _analyze_one_class(  # noqa: PLR0914 - threads many helpers into one section
         topology: Optional topology filter.
         top_n: Number of recommendations to emit.
         output_dir: Root output directory.
-        analysis: The lazy-imported ``kube_autotuner.analysis`` module.
+        analysis: The lazy-imported ``kube_autotuner.report.analysis`` module.
         explicit_class: ``True`` when the user supplied
             ``--hardware-class``; in that case an empty result is a
             hard error (no other class will be tried), otherwise we
@@ -938,7 +937,7 @@ def _null_disabled_stage_metrics(
 
     Args:
         rows: Recommendation rows produced by
-            :func:`kube_autotuner.analysis.pareto_recommendation_rows`.
+            :func:`kube_autotuner.report.analysis.pareto_recommendation_rows`.
             Mutated in-place.
         stages: Enabled benchmark sub-stages.
     """
@@ -975,15 +974,15 @@ def _build_axis_payload(
     """Return JSON-safe per-trial rows plus the chart's axis columns.
 
     Mirrors the NaN-to-None coercion used by
-    :func:`kube_autotuner.analysis.pareto_recommendation_rows` so the
+    :func:`kube_autotuner.report.analysis.pareto_recommendation_rows` so the
     browser-side ``json.dumps(allow_nan=False)`` in
-    :func:`kube_autotuner.report._embed_json` cannot choke. Also
+    :func:`kube_autotuner.report.render._embed_json` cannot choke. Also
     guards against infinities (``math.isfinite``), which ``pd.isna``
     does not catch.
 
     Args:
         df: The per-class DataFrame from
-            :func:`kube_autotuner.analysis.trials_to_dataframe`.
+            :func:`kube_autotuner.report.analysis.trials_to_dataframe`.
         pareto_mask: Boolean Series aligned with ``df``; ``True``
             marks Pareto-optimal rows.
         stages: Enabled benchmark sub-stages. Metric columns whose

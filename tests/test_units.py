@@ -14,6 +14,7 @@ import pytest
 from kube_autotuner.units import (
     format_coefficient,
     format_duration,
+    format_retransmit_rate,
     parse_quantity,
     pick_duration_unit,
     pick_duration_unit_for_series,
@@ -322,3 +323,23 @@ class TestFormatDuration:
         """Regression: large seconds values must not drop into scientific notation."""
         assert "e" not in format_duration(1200.0)
         assert format_duration(1200.0) == "1200s"
+
+
+class TestFormatRetransmitRate:
+    def test_none_renders_as_dash(self) -> None:
+        """Trials with no observable rate render as ``"-"``."""
+        assert format_retransmit_rate(None) == "-"
+
+    @pytest.mark.parametrize(
+        ("rate", "expected"),
+        [
+            (0.0, "0.00"),
+            (1.234, "1.23"),
+            (1.235, "1.24"),
+            (12.0, "12.00"),
+            (0.005, "0.01"),
+        ],
+    )
+    def test_two_decimal_places(self, rate: float, expected: str) -> None:
+        """Numeric rates render with exactly two decimal places."""
+        assert format_retransmit_rate(rate) == expected

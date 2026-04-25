@@ -499,7 +499,7 @@ class ObjectivesSection(BaseModel):
     scales every pareto metric in the shared scoring formula
     implemented by :func:`kube_autotuner.scoring.score_rows` -- the
     same formula drives both the live ``Best so far`` panel and the
-    post-hoc :func:`kube_autotuner.analysis.recommend_configs`
+    post-hoc :func:`kube_autotuner.report.analysis.recommend_configs`
     ranking. Defaults are direction-sensitive: a maximize-metric
     weight omitted from the map defaults to ``1.0`` (full +norm
     contribution, reproducing historical behavior), while a

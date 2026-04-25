@@ -1165,7 +1165,7 @@ class OptimizationLoop:
         Computes the current top-K primaries by weighted score using
         :func:`kube_autotuner.scoring.score_rows` (ties broken by
         ``trial_id`` ascending -- same key as
-        :func:`kube_autotuner.analysis.recommend_configs`), and for
+        :func:`kube_autotuner.report.analysis.recommend_configs`), and for
         each selected parent runs
         ``max(0, repeats - already_done_by_parent.get(trial_id, 0))``
         further benchmarks with ``phase="verification"`` and

@@ -67,7 +67,6 @@ from kube_autotuner.models import (
     metrics_for_stages,
 )
 from kube_autotuner.progress import NullObserver
-from kube_autotuner.report import format_retransmit_rate
 from kube_autotuner.scoring import (
     METRIC_TO_DF_COLUMN,
     aggregate_verification,
@@ -79,6 +78,7 @@ from kube_autotuner.trial_log import TrialLog, _validate_output_directory
 from kube_autotuner.units import (
     format_coefficient,
     format_duration,
+    format_retransmit_rate,
     pick_duration_unit_for_series,
 )
 

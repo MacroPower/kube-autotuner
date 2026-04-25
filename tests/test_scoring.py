@@ -407,7 +407,7 @@ def test_pareto_recommendation_rows_score_matches_score_rows() -> None:
     Regression guard against the analysis path silently bypassing
     :func:`score_rows` -- e.g. an inline normalization or
     post-multiplier sneaking into
-    :func:`kube_autotuner.analysis.pareto_recommendation_rows`
+    :func:`kube_autotuner.report.analysis.pareto_recommendation_rows`
     between the ``score_rows`` call and the returned ``score`` field.
     A change inside ``score_rows`` itself would shift both sides
     equally and would *not* be caught here; that contract is held
@@ -415,7 +415,9 @@ def test_pareto_recommendation_rows_score_matches_score_rows() -> None:
     """
     pytest.importorskip("pandas")
     pytest.importorskip("sklearn")
-    from kube_autotuner.analysis import pareto_recommendation_rows  # noqa: PLC0415
+    from kube_autotuner.report.analysis import (  # noqa: PLC0415
+        pareto_recommendation_rows,
+    )
 
     # Three trials chosen so multiple sit on the Pareto frontier (each
     # wins on at least one of the two surviving objectives,

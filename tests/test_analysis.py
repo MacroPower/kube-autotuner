@@ -14,24 +14,6 @@ pytest.importorskip("sklearn")
 
 from typer.testing import CliRunner  # noqa: E402
 
-from kube_autotuner.analysis import (  # noqa: E402
-    DEFAULT_OBJECTIVES,
-    METRIC_TO_DF_COLUMN,
-    baseline_comparison,
-    category_importance_rollup,
-    host_state_issues,
-    host_state_series,
-    parameter_importance,
-    pareto_front,
-    recommend_configs,
-    section_metadata,
-    split_trials_by_hardware_class,
-    stability_badge,
-    sysctl_correlation_matrix,
-    trajectory_rows,
-    trials_to_dataframe,
-    verification_stats,
-)
 from kube_autotuner.cli import _build_axis_payload, app  # noqa: E402, PLC2701
 from kube_autotuner.experiment import (  # noqa: E402
     FortioSection,
@@ -48,6 +30,24 @@ from kube_autotuner.models import (  # noqa: E402
     ParamSpace,
     ResumeMetadata,
     TrialResult,
+)
+from kube_autotuner.report.analysis import (  # noqa: E402
+    DEFAULT_OBJECTIVES,
+    METRIC_TO_DF_COLUMN,
+    baseline_comparison,
+    category_importance_rollup,
+    host_state_issues,
+    host_state_series,
+    parameter_importance,
+    pareto_front,
+    recommend_configs,
+    section_metadata,
+    split_trials_by_hardware_class,
+    stability_badge,
+    sysctl_correlation_matrix,
+    trajectory_rows,
+    trials_to_dataframe,
+    verification_stats,
 )
 from kube_autotuner.trial_log import TrialLog  # noqa: E402
 
@@ -329,7 +329,7 @@ class TestParetoFront:
                 **_pad_latency_cols(2),
             },
         )
-        with caplog.at_level("WARNING", logger="kube_autotuner.analysis"):
+        with caplog.at_level("WARNING", logger="kube_autotuner.report.analysis"):
             front = pareto_front(df)
         assert list(front["trial_id"]) == ["A"]
         assert any("NaN" in rec.message for rec in caplog.records)
@@ -357,7 +357,7 @@ class TestParetoFront:
                 "mean_latency_p99": [10.0] * 2,
             },
         )
-        with caplog.at_level("INFO", logger="kube_autotuner.analysis"):
+        with caplog.at_level("INFO", logger="kube_autotuner.report.analysis"):
             front = pareto_front(df)
         assert set(front["trial_id"]) == {"A", "B"}
         assert any(
@@ -614,7 +614,7 @@ class TestRecommendConfigs:
         mixed_trials: list[TrialResult],
     ) -> None:
         """``recommend_configs`` is a top-N slice of ``pareto_recommendation_rows``."""
-        from kube_autotuner.analysis import (  # noqa: PLC0415
+        from kube_autotuner.report.analysis import (  # noqa: PLC0415
             pareto_recommendation_rows,
         )
 
@@ -967,7 +967,9 @@ class TestCLIAnalyze:
 
 def test_pareto_recommendation_rows_flips_tied_configs_by_memory_cost() -> None:
     """Two trials tied on performance; lower-memory rmem_max wins at 0.1."""
-    from kube_autotuner.analysis import pareto_recommendation_rows  # noqa: PLC0415
+    from kube_autotuner.report.analysis import (  # noqa: PLC0415
+        pareto_recommendation_rows,
+    )
 
     big = _trial(
         hw="10g",
