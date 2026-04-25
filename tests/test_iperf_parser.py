@@ -1,11 +1,11 @@
-"""Unit tests for :mod:`kube_autotuner.benchmark.parser`."""
+"""Unit tests for :mod:`kube_autotuner.benchmark.iperf_parser`."""
 
 from __future__ import annotations
 
 import pytest
 
 from kube_autotuner.benchmark.errors import ResultValidationError
-from kube_autotuner.benchmark.parser import parse_iperf_json
+from kube_autotuner.benchmark.iperf_parser import parse_iperf_json, parse_iperf_output
 
 SAMPLE_TCP_JSON = {
     "start": {
@@ -168,3 +168,24 @@ def test_json_loads_rejects_prologue_leakage():
     contaminated = f"sync-barrier: released at 2026-04-23T00:00:00+00:00\n{clean}"
     with pytest.raises(json.JSONDecodeError):
         json.loads(contaminated)
+
+
+def test_parse_iperf_output_invalid_json_raises_validation_error():
+    """parse_iperf_output wraps json.loads ValueError as ResultValidationError."""
+    with pytest.raises(ResultValidationError, match="not valid JSON"):
+        parse_iperf_output("not json", "tcp", client_node="kmain07", iteration=0)
+
+
+def test_parse_iperf_output_threads_through_to_parser():
+    """Valid JSON flows through to parse_iperf_json with the same kwargs."""
+    import json  # noqa: PLC0415 - scoped to keep module imports tidy
+
+    result = parse_iperf_output(
+        json.dumps(SAMPLE_TCP_JSON),
+        "tcp",
+        client_node="kmain09",
+        iteration=4,
+    )
+    assert result.client_node == "kmain09"
+    assert result.iteration == 4
+    assert result.mode == "tcp"

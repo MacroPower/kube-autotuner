@@ -208,3 +208,43 @@ def parse_fortio_json(
         latency_p99=p99,
         raw_json=raw,
     )
+
+
+def parse_fortio_output(
+    output: str,
+    *,
+    client_node: str,
+    iteration: int,
+    workload: Workload,
+) -> LatencyResult:
+    """Parse a raw fortio client log into a :class:`LatencyResult`.
+
+    Wraps :class:`ValueError` raised by
+    :func:`extract_fortio_result_json` as
+    :class:`ResultValidationError` so the benchmark runner's retry loop
+    treats a missing result document the same as a degenerate one.
+
+    Args:
+        output: Raw container log body from a fortio client pod.
+        client_node: Name of the node that ran this fortio client.
+        iteration: Zero-based iteration index.
+        workload: ``"saturation"`` or ``"fixed_qps"``.
+
+    Returns:
+        The parsed :class:`LatencyResult`.
+
+    Raises:
+        ResultValidationError: ``output`` contained no fortio results
+            JSON document, or the decoded document is degenerate per
+            :func:`parse_fortio_json`.
+    """
+    try:
+        raw = extract_fortio_result_json(output)
+    except ValueError as exc:
+        raise ResultValidationError(str(exc)) from exc
+    return parse_fortio_json(
+        raw,
+        client_node=client_node,
+        iteration=iteration,
+        workload=workload,
+    )

@@ -37,31 +37,26 @@ the primary exception so neither failure is hidden from the operator.
 from __future__ import annotations
 
 import concurrent.futures
-import json
 import logging
 import threading
 import time
-from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast
+from typing import TYPE_CHECKING, Literal, TypeVar, cast
 
-from kube_autotuner.benchmark.client_spec import build_client_yaml
+from kube_autotuner.benchmark import manifests
+from kube_autotuner.benchmark.diagnostics import (
+    collect_server_snapshot,
+    diagnostics_from,
+    log_job_diagnostics,
+)
 from kube_autotuner.benchmark.errors import (
     BenchmarkFailure,
     ClientJobFailed,
     JobAttemptError,
     ResultValidationError,
 )
-from kube_autotuner.benchmark.fortio_client_spec import (
-    build_fortio_client_yaml,
-    fortio_client_job_name,
-)
-from kube_autotuner.benchmark.fortio_parser import (
-    extract_fortio_result_json,
-    parse_fortio_json,
-)
-from kube_autotuner.benchmark.fortio_server_spec import build_fortio_server_yaml
-from kube_autotuner.benchmark.parser import parse_iperf_json
-from kube_autotuner.benchmark.patch import apply_patches
-from kube_autotuner.benchmark.server_spec import build_server_yaml
+from kube_autotuner.benchmark.fortio_client_spec import fortio_client_job_name
+from kube_autotuner.benchmark.fortio_parser import parse_fortio_output
+from kube_autotuner.benchmark.iperf_parser import parse_iperf_output
 from kube_autotuner.experiment import FortioSection, IperfSection
 from kube_autotuner.k8s.client import (
     JobFailedConditionError,
@@ -91,68 +86,6 @@ if TYPE_CHECKING:
 _T = TypeVar("_T")
 
 logger = logging.getLogger(__name__)
-
-
-def _diagnostics_from(exc: BaseException) -> list[JobFailureDiagnostics]:
-    """Extract per-attempt diagnostics from a :class:`ClientJobFailed`.
-
-    Returns ``[]`` for any other exception type so the stage method
-    can unconditionally call this on ``first_exc``.
-
-    Args:
-        exc: The first exception raised by a stage's per-client
-            future.
-
-    Returns:
-        The per-attempt diagnostics list, or ``[]`` when ``exc`` is
-        not a :class:`ClientJobFailed` (e.g. a cleanup
-        :class:`RuntimeError` surfaced from the retry loop's
-        ``finally`` block).
-    """
-    if isinstance(exc, ClientJobFailed):
-        return list(exc.diagnostics)
-    return []
-
-
-def _server_container_status_rows(pod: Any) -> list[dict[str, Any]]:  # noqa: ANN401
-    """Flatten a server pod's ``containerStatuses`` to plain dicts.
-
-    Captures the fields the plan calls out for the stage snapshot:
-    container name, ``ready``, ``restartCount``, and the
-    ``lastState.terminated`` reason/exit code so a recently crashed
-    iperf3 server is visible as a non-zero ``restartCount`` plus a
-    ``last_terminated`` payload.
-
-    Args:
-        pod: Typed pod object from the CoreV1 API.
-
-    Returns:
-        A list of dicts, one per container. Empty list when the pod
-        has no container statuses yet.
-    """
-    rows: list[dict[str, Any]] = []
-    statuses = getattr(getattr(pod, "status", None), "container_statuses", None) or []
-    for cs in statuses:
-        last_state = getattr(cs, "last_state", None)
-        term = getattr(last_state, "terminated", None) if last_state else None
-        last_terminated: dict[str, Any] = {}
-        if term is not None:
-            last_terminated = {
-                "reason": str(getattr(term, "reason", "") or ""),
-                "exit_code": (
-                    int(getattr(term, "exit_code", 0) or 0)
-                    if getattr(term, "exit_code", None) is not None
-                    else None
-                ),
-                "message": str(getattr(term, "message", "") or ""),
-            }
-        rows.append({
-            "name": str(getattr(cs, "name", "") or ""),
-            "ready": bool(getattr(cs, "ready", False)),
-            "restart_count": int(getattr(cs, "restart_count", 0) or 0),
-            "last_terminated": last_terminated,
-        })
-    return rows
 
 
 CLIENT_LABEL = "app.kubernetes.io/name=iperf3-client"
@@ -240,13 +173,13 @@ class BenchmarkRunner:
 
     def setup_server(self) -> None:
         """Deploy the iperf3 + fortio servers on the target node and await rollout."""
-        server_yaml = build_server_yaml(
+        server_yaml = manifests.render_iperf_server(
             node=self.node_pair.target,
-            ports=list(self._ports.values()),
             ip_family_policy=self.node_pair.ip_family_policy,
-            extra_args=self.iperf_args.server.extra_args,
+            ports=list(self._ports.values()),
+            iperf_args=self.iperf_args,
+            patches=self.patches,
         )
-        server_yaml = apply_patches(server_yaml, self.patches)
         self.client.apply(server_yaml, self.node_pair.namespace)
         self.client.rollout_status(
             "deployment", self._server_name, self.node_pair.namespace
@@ -257,12 +190,12 @@ class BenchmarkRunner:
             sorted(self._ports.values()),
         )
 
-        fortio_server_yaml = build_fortio_server_yaml(
+        fortio_server_yaml = manifests.render_fortio_server(
             node=self.node_pair.target,
             ip_family_policy=self.node_pair.ip_family_policy,
-            extra_args=self.fortio_args.server.extra_args,
+            fortio_args=self.fortio_args,
+            patches=self.patches,
         )
-        fortio_server_yaml = apply_patches(fortio_server_yaml, self.patches)
         self.client.apply(fortio_server_yaml, self.node_pair.namespace)
         self.client.rollout_status(
             "deployment",
@@ -308,29 +241,19 @@ class BenchmarkRunner:
             iteration.
         """
         job_name = f"iperf3-client-{client}-p{port}"
-        client_yaml = apply_patches(
-            build_client_yaml(
-                node=client,
-                target=self.node_pair.target,
-                port=port,
-                duration=self.iperf_args.duration,
-                omit=self.iperf_args.omit,
-                parallel=self.iperf_args.parallel,
-                mode=mode,
-                extra_args=self.iperf_args.client.extra_args,
-                start_at_epoch=start_at_epoch,
-            ),
-            self.patches,
+        client_yaml = manifests.render_iperf_client(
+            source_node=client,
+            target_node=self.node_pair.target,
+            port=port,
+            mode=mode,
+            iperf_args=self.iperf_args,
+            patches=self.patches,
+            start_at_epoch=start_at_epoch,
         )
 
         def parse(output: str) -> BenchmarkResult:
-            try:
-                raw = json.loads(output)
-            except ValueError as exc:
-                msg = f"iperf3 log is not valid JSON: {exc}"
-                raise ResultValidationError(msg) from exc
-            return parse_iperf_json(
-                raw,
+            return parse_iperf_output(
+                output,
                 mode,
                 client_node=client,
                 iteration=iteration,
@@ -382,29 +305,19 @@ class BenchmarkRunner:
             iteration, and sub-stage workload.
         """
         job_name = fortio_client_job_name(client, workload, iteration)
-        qps = 0 if workload == "saturation" else self.fortio_args.fixed_qps
-        client_yaml = apply_patches(
-            build_fortio_client_yaml(
-                node=client,
-                target=self.node_pair.target,
-                iteration=iteration,
-                workload=workload,
-                qps=qps,
-                connections=self.fortio_args.connections,
-                duration=self.fortio_args.duration,
-                extra_args=self.fortio_args.client.extra_args,
-                start_at_epoch=start_at_epoch,
-            ),
-            self.patches,
+        client_yaml = manifests.render_fortio_client(
+            source_node=client,
+            target_node=self.node_pair.target,
+            iteration=iteration,
+            workload=workload,
+            fortio_args=self.fortio_args,
+            patches=self.patches,
+            start_at_epoch=start_at_epoch,
         )
 
         def parse(output: str) -> LatencyResult:
-            try:
-                raw = extract_fortio_result_json(output)
-            except ValueError as exc:
-                raise ResultValidationError(str(exc)) from exc
-            return parse_fortio_json(
-                raw,
+            return parse_fortio_output(
+                output,
                 client_node=client,
                 iteration=iteration,
                 workload=workload,
@@ -534,7 +447,8 @@ class BenchmarkRunner:
                     return result
                 finally:
                     if not attempt_ok:
-                        diag = self._log_job_diagnostics(
+                        diag = log_job_diagnostics(
+                            self.client,
                             job_name,
                             ns,
                             kind,
@@ -591,68 +505,6 @@ class BenchmarkRunner:
             f"failed after {max_attempts} attempts"
         )
         raise ClientJobFailed(msg, diagnostics=diagnostics) from last_error
-
-    def _log_job_diagnostics(
-        self,
-        job_name: str,
-        namespace: str,
-        kind: str,
-        attempt: int,
-        *,
-        stage_label: str,
-        iteration: int,
-    ) -> JobFailureDiagnostics | None:
-        """Emit a single warning line describing a failed Job attempt.
-
-        Pulls :meth:`K8sClient.describe_job_failure` and renders the
-        returned :class:`JobFailureDiagnostics` into one structured log
-        record. Diagnostics must never mask the primary failure: every
-        downstream call in the diagnostic path is best-effort and we
-        log at ``warning`` rather than raising.
-
-        Invariant: this method MUST NOT propagate any exception. The
-        retry loop's per-attempt ``finally`` block runs this before the
-        Job ``delete``; if this raised, ``delete`` would be skipped and
-        the Job would leak until the stage-level label sweep runs.
-
-        Args:
-            job_name: Job metadata.name.
-            namespace: Target namespace.
-            kind: Short label for log grouping (``"iperf3"``, ``"fortio"``).
-            attempt: 1-based attempt index.
-            stage_label: Sub-stage label (``"bw-tcp"`` / ``"bw-udp"`` /
-                ``"fortio-saturation"`` / ``"fortio-fixed_qps"``).
-            iteration: Zero-based iteration index.
-
-        Returns:
-            The :class:`JobFailureDiagnostics` payload on success, or
-            ``None`` if the describe call itself failed. The retry loop
-            accumulates non-``None`` returns into the envelope carried
-            by :class:`ClientJobFailed`.
-        """
-        try:
-            diag = self.client.describe_job_failure(job_name, namespace)
-        except Exception:
-            logger.warning(
-                "Could not describe %s client job %s [stage=%s iter=%d] (attempt %d)",
-                kind,
-                job_name,
-                stage_label,
-                iteration,
-                attempt,
-                exc_info=True,
-            )
-            return None
-        logger.warning(
-            "%s client Job %s [stage=%s iter=%d] attempt %d diagnostics: %s",
-            kind,
-            job_name,
-            stage_label,
-            iteration,
-            attempt,
-            diag,
-        )
-        return diag
 
     def _flush_network_state(self, iteration: int) -> None:
         """Flush per-iteration kernel network state on every configured backend.
@@ -981,7 +833,11 @@ class BenchmarkRunner:
                     break
 
             if first_exc is not None:
-                server_snapshots = self._collect_server_snapshot(label=SERVER_LABEL)
+                server_snapshots = collect_server_snapshot(
+                    self.client,
+                    namespace=self.node_pair.namespace,
+                    label=SERVER_LABEL,
+                )
                 self._cleanup_after_failure(
                     cast(
                         "set[concurrent.futures.Future[BenchmarkResult | LatencyResult]]",  # noqa: E501
@@ -992,7 +848,7 @@ class BenchmarkRunner:
                 )
                 raise BenchmarkFailure(
                     cause=first_exc,
-                    attempt_diagnostics=_diagnostics_from(first_exc),
+                    attempt_diagnostics=diagnostics_from(first_exc),
                     server_snapshots=server_snapshots,
                     stage=stage_label,
                     iteration=iteration,
@@ -1053,7 +909,9 @@ class BenchmarkRunner:
                     break
 
             if first_exc is not None:
-                server_snapshots = self._collect_server_snapshot(
+                server_snapshots = collect_server_snapshot(
+                    self.client,
+                    namespace=self.node_pair.namespace,
                     label=FORTIO_SERVER_LABEL,
                 )
                 self._cleanup_after_failure(
@@ -1066,82 +924,13 @@ class BenchmarkRunner:
                 )
                 raise BenchmarkFailure(
                     cause=first_exc,
-                    attempt_diagnostics=_diagnostics_from(first_exc),
+                    attempt_diagnostics=diagnostics_from(first_exc),
                     server_snapshots=server_snapshots,
                     stage=stage_label,
                     iteration=iteration,
                 ) from first_exc
 
             return [f.result() for f in done]
-
-    def _collect_server_snapshot(self, *, label: str) -> list[dict[str, Any]]:
-        """Snapshot server pods matching ``label``; log a warning, return rows.
-
-        Fires once per failed stage from the stage method's
-        ``first_exc is not None`` branch -- no cross-thread
-        coordination because both :meth:`_run_bandwidth_stage` and
-        :meth:`_run_latency_stage` execute on the calling thread after
-        the executor's ``wait(...)`` returns.
-
-        Best-effort: every downstream call is wrapped so a missing
-        server, vanished pod, events-listing failure, or log-read
-        failure degrades to an empty row (or empty return) rather than
-        raising. Diagnostics must never mask the primary failure they
-        describe.
-
-        Args:
-            label: Label selector for the server pods, e.g.
-                ``SERVER_LABEL`` or ``FORTIO_SERVER_LABEL``.
-
-        Returns:
-            One dict per server pod with ``name``, ``phase``,
-            ``container_statuses`` (name, ready, restart_count,
-            last_terminated.reason/exit_code), ``events``, and
-            ``log_tail`` fields. Empty list when listing failed or no
-            pods matched.
-        """
-        ns = self.node_pair.namespace
-        try:
-            pods = self.client.list_pods_by_label(label, ns)
-        except Exception:
-            logger.warning(
-                "server snapshot [label=%s] list_pods_by_label failed",
-                label,
-                exc_info=True,
-            )
-            return []
-        rows: list[dict[str, Any]] = []
-        for pod in pods:
-            name = str(getattr(getattr(pod, "metadata", None), "name", "") or "")
-            phase = str(getattr(getattr(pod, "status", None), "phase", "") or "")
-            container_statuses = _server_container_status_rows(pod)
-            events: list[Any] = []
-            log_tail = ""
-            if name:
-                try:
-                    events = list(
-                        self.client._recent_pod_events(name, ns, 10),  # noqa: SLF001
-                    )
-                except Exception:  # noqa: BLE001 - best-effort diagnostic, swallow silently
-                    events = []
-                try:
-                    log_tail = self.client._read_pod_log_tail(name, ns, 100)  # noqa: SLF001
-                except Exception:  # noqa: BLE001 - best-effort diagnostic, swallow silently
-                    log_tail = ""
-            rows.append({
-                "name": name,
-                "phase": phase,
-                "container_statuses": container_statuses,
-                "events": events,
-                "log_tail": log_tail,
-            })
-        logger.warning(
-            "server snapshot [label=%s] pods=%d rows=%s",
-            label,
-            len(rows),
-            rows,
-        )
-        return rows
 
     def _cleanup_after_failure(
         self,

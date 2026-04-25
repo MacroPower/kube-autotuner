@@ -18,7 +18,7 @@ from kube_autotuner.benchmark.errors import (
     ClientJobFailed,
     ResultValidationError,
 )
-from kube_autotuner.benchmark.parser import parse_iperf_json
+from kube_autotuner.benchmark.iperf_parser import parse_iperf_json
 from kube_autotuner.benchmark.runner import (
     CLIENT_LABEL,
     FORTIO_CLIENT_LABEL,

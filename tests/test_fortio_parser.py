@@ -10,6 +10,7 @@ from kube_autotuner.benchmark.errors import ResultValidationError
 from kube_autotuner.benchmark.fortio_parser import (
     extract_fortio_result_json,
     parse_fortio_json,
+    parse_fortio_output,
 )
 
 
@@ -226,3 +227,29 @@ def test_percentile_entry_without_value_returns_none():
         workload="fixed_qps",
     )
     assert result.latency_p99 is None
+
+
+def test_parse_fortio_output_missing_result_raises_validation_error():
+    """parse_fortio_output wraps the extract ValueError as ResultValidationError."""
+    with pytest.raises(ResultValidationError, match="DurationHistogram"):
+        parse_fortio_output(
+            "no DurationHistogram here\n",
+            client_node="c1",
+            iteration=0,
+            workload="fixed_qps",
+        )
+
+
+def test_parse_fortio_output_threads_through_to_parser():
+    """A valid log body flows through to parse_fortio_json with the same kwargs."""
+    body = "Fortio 1.69.0 running...\n" + json.dumps(_full_payload(), indent=2)
+    result = parse_fortio_output(
+        body,
+        client_node="kmain07",
+        iteration=3,
+        workload="saturation",
+    )
+    assert result.client_node == "kmain07"
+    assert result.iteration == 3
+    assert result.workload == "saturation"
+    assert result.rps == pytest.approx(1234.5)

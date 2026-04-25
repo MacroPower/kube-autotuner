@@ -1,8 +1,9 @@
-"""Parser for iperf3 JSON output."""
+"""Parser for ``iperf3 --json`` output."""
 
 from __future__ import annotations
 
 from datetime import UTC, datetime
+import json
 from typing import Any, Literal
 
 from kube_autotuner.benchmark.errors import ResultValidationError
@@ -109,3 +110,39 @@ def parse_iperf_json(  # noqa: PLR0915 - linear sanity-check ladder, no branchin
         iteration=iteration,
         raw_json=raw,
     )
+
+
+def parse_iperf_output(
+    output: str,
+    mode: Literal["tcp", "udp"],
+    *,
+    client_node: str,
+    iteration: int,
+) -> BenchmarkResult:
+    """Parse a raw iperf3 client log into a :class:`BenchmarkResult`.
+
+    Wraps :class:`json.JSONDecodeError` (and any other ``ValueError``
+    raised by :func:`json.loads`) as
+    :class:`ResultValidationError` so the benchmark runner's retry loop
+    treats malformed JSON the same as semantically degenerate payloads.
+
+    Args:
+        output: Raw container log body from an iperf3 client pod.
+        mode: ``"tcp"`` or ``"udp"``; forwarded to
+            :func:`parse_iperf_json`.
+        client_node: Name of the node that ran this iperf3 client.
+        iteration: Zero-based iteration index.
+
+    Returns:
+        The parsed :class:`BenchmarkResult`.
+
+    Raises:
+        ResultValidationError: ``output`` is not valid JSON, or the
+            decoded document is degenerate per :func:`parse_iperf_json`.
+    """
+    try:
+        raw = json.loads(output)
+    except ValueError as exc:
+        msg = f"iperf3 log is not valid JSON: {exc}"
+        raise ResultValidationError(msg) from exc
+    return parse_iperf_json(raw, mode, client_node=client_node, iteration=iteration)
