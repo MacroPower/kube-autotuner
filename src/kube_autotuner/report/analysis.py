@@ -1155,6 +1155,99 @@ def refinement_stats(
     return out
 
 
+def _summarize_iteration_values(
+    values: list[float],
+) -> dict[str, float | int | None]:
+    """Return ``{n, mean, stdev, min, max}`` for a finite-valued sample.
+
+    ``stdev`` is ``None`` for single-element samples (``statistics.stdev``
+    requires ``n >= 2``). Every numeric cell routes through
+    :func:`_finite_or_none` so :func:`json.dumps` with ``allow_nan=False``
+    in :func:`render._embed_json` stays safe.
+    """
+    n = len(values)
+    stdev = _finite_or_none(statistics.stdev(values)) if n >= 2 else None  # noqa: PLR2004 - stdev needs >= 2 samples
+    return {
+        "n": n,
+        "mean": _finite_or_none(statistics.mean(values)),
+        "stdev": stdev,
+        "min": _finite_or_none(min(values)),
+        "max": _finite_or_none(max(values)),
+    }
+
+
+def _group_arms(trials: list[TrialResult]) -> dict[str, list[TrialResult]]:
+    """Group ``trials`` into arms keyed by primary ``trial_id``.
+
+    Primaries register their own group; refinement children whose
+    ``parent_trial_id`` matches a primary attach onto that group.
+    Orphan children (parent absent from the input) are dropped, so
+    every emitted key matches a primary ``trial_id`` the report will
+    look up.
+
+    Args:
+        trials: Combined primary + refinement population.
+
+    Returns:
+        A dict keyed by primary ``trial_id``, mapping to that primary
+        plus its matching refinement children.
+    """
+    groups: dict[str, list[TrialResult]] = {}
+    for t in trials:
+        if is_primary(t):
+            groups[t.trial_id] = [t]
+    for t in trials:
+        if is_primary(t) or t.parent_trial_id is None:
+            continue
+        if t.parent_trial_id in groups:
+            groups[t.parent_trial_id].append(t)
+    return groups
+
+
+def iteration_distribution(
+    trials: list[TrialResult],
+) -> dict[str, dict[str, dict[str, float | int | None]]]:
+    """Return per-arm pooled-iteration distribution stats per metric.
+
+    Pools per-iteration metric values across each primary trial and the
+    refinement children whose ``parent_trial_id`` matches the primary's
+    ``trial_id``, then emits ``{n, mean, stdev, min, max}`` per metric
+    in :data:`~kube_autotuner.scoring.METRIC_TO_DF_COLUMN`.
+
+    Children whose parent is absent from the input are dropped -- a
+    deliberate divergence from :func:`refinement_stats`, which keys
+    directly on ``parent_trial_id`` and tolerates orphans. Unlike
+    :func:`refinement_stats`, single-iteration arms still emit a metric
+    entry with ``stdev = None`` and ``min == max == mean``: the panel
+    exists to surface best/worst per arm, so the entry must survive at
+    ``n == 1``.
+
+    Args:
+        trials: The combined primary + refinement population.
+
+    Returns:
+        A dict keyed by primary ``trial_id``, mapping to a dict keyed by
+        metric column name, mapping to a ``{n, mean, stdev, min, max}``
+        cell. Metrics with an empty pooled list are omitted; arms with
+        no usable metric are omitted entirely.
+    """
+    out: dict[str, dict[str, dict[str, float | int | None]]] = {}
+    for parent_id, members in _group_arms(trials).items():
+        per_metric: dict[str, dict[str, float | int | None]] = {}
+        for col in METRIC_TO_DF_COLUMN.values():
+            values = [
+                v
+                for m in members
+                for v in _per_iteration_metric_values(m, col)
+                if math.isfinite(v)
+            ]
+            if values:
+                per_metric[col] = _summarize_iteration_values(values)
+        if per_metric:
+            out[parent_id] = per_metric
+    return out
+
+
 def _per_iteration_cells(  # noqa: PLR0914 - one-pass projection over many independent metrics
     t: TrialResult,
 ) -> dict[int, dict[str, float | None]]:

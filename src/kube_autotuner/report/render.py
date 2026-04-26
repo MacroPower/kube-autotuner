@@ -549,6 +549,41 @@ def _clean_per_iteration_samples(
     return out
 
 
+def _clean_iteration_distribution(
+    stats: dict[str, dict[str, dict[str, float | int | None]]] | None,
+) -> dict[str, dict[str, dict[str, float | int | None]]]:
+    """Coerce numeric cells in ``stats`` to a finite float or ``None``.
+
+    Belt-and-braces: ``iteration_distribution`` already routes every
+    numeric cell through ``_finite_or_none``, so this scrub is a no-op
+    in practice. It guards against future drift that could leak ``nan``
+    into ``json.dumps(allow_nan=False)`` in :func:`_embed_json`.
+
+    Args:
+        stats: Mapping from recommendation/parent ``trial_id`` to a
+            per-metric ``{n, mean, stdev, min, max}`` dict.
+
+    Returns:
+        A scrubbed copy of ``stats``; empty dict when ``stats`` is
+        falsy.
+    """
+    if not stats:
+        return {}
+    out: dict[str, dict[str, dict[str, float | int | None]]] = {}
+    for parent, per_metric in stats.items():
+        out[parent] = {
+            metric: {
+                "n": entry.get("n"),
+                "mean": _finite_or_none(entry.get("mean")),
+                "stdev": _finite_or_none(entry.get("stdev")),
+                "min": _finite_or_none(entry.get("min")),
+                "max": _finite_or_none(entry.get("max")),
+            }
+            for metric, entry in per_metric.items()
+        }
+    return out
+
+
 def _clean_baseline_comparison(
     entries: list[dict[str, Any]] | None,
 ) -> list[dict[str, Any]] | None:
@@ -687,6 +722,9 @@ def _section_payload(section: dict[str, Any]) -> dict[str, Any]:
         ),
         "perIterationSamples": _clean_per_iteration_samples(
             section.get("per_iteration_samples"),
+        ),
+        "iterationDistribution": _clean_iteration_distribution(
+            section.get("iteration_distribution"),
         ),
         "trajectoryRows": _clean_trajectory_rows(
             section.get("trajectory_rows"),
@@ -1533,6 +1571,13 @@ function buildRankedTable(wrapper, state, visibleCols) {
 
   const tbody = document.createElement("tbody");
   const rowRefs = new Map();
+  // Section-stable: hoisted so the iteration-distribution panel below
+  // can look up direction by metric column without rebuilding per row.
+  const dirByMetric = Object.fromEntries(
+    (state.section.objectives || [])
+      .map(o => [METRIC_TO_DF_COLUMN[o.metric], o.direction])
+      .filter(([col]) => col !== undefined)
+  );
   for (let i = 0; i < state.section.paretoRows.length; i++) {
     const row = state.section.paretoRows[i];
     const tr = document.createElement("tr");
@@ -1604,6 +1649,55 @@ function buildRankedTable(wrapper, state, visibleCols) {
       verifWrapper.appendChild(verifTable);
       verifDetails.appendChild(verifWrapper);
       details.appendChild(verifDetails);
+    }
+
+    const iterDist =
+      (state.section.iterationDistribution || {})[row.trial_id];
+    if (iterDist && Object.keys(iterDist).length > 0) {
+      const distDetails = document.createElement("details");
+      const distSummary = document.createElement("summary");
+      distSummary.textContent = "iteration distribution";
+      distDetails.appendChild(distSummary);
+      const distWrapper = document.createElement("div");
+      distWrapper.className = "decomposition-wrapper";
+      const distTable = document.createElement("table");
+      distTable.className = "report-table decomposition-table";
+      let distBody = "<thead><tr><th>metric</th><th>n</th>"
+        + "<th>best</th><th>worst</th><th>mean</th><th>± stdev</th>"
+        + "</tr></thead><tbody>";
+      let anyRow = false;
+      const fmtCell = (metric, v) =>
+        v === null || v === undefined ? "—" : formatMetric(metric, v);
+      for (const [metric, entry] of Object.entries(iterDist)) {
+        const direction = dirByMetric[metric];
+        if (direction !== "maximize" && direction !== "minimize") continue;
+        if (!METRIC_DISPLAY[metric]) continue;
+        anyRow = true;
+        const isMax = direction === "maximize";
+        const nCell = entry.n === null || entry.n === undefined
+          ? "—" : String(entry.n);
+        const bestCell = fmtCell(metric, isMax ? entry.max : entry.min);
+        const worstCell = fmtCell(metric, isMax ? entry.min : entry.max);
+        const meanCell = fmtCell(metric, entry.mean);
+        const stdevCell = entry.stdev === null || entry.stdev === undefined
+          ? "—" : "± " + formatMetric(metric, entry.stdev);
+        const label = METRIC_DISPLAY[metric].label
+          + (METRIC_DISPLAY[metric].unit
+            ? " (" + METRIC_DISPLAY[metric].unit + ")" : "");
+        distBody += `<tr><td class="metric-col">${label}</td>`
+          + `<td class="numeric">${nCell}</td>`
+          + `<td class="numeric">${bestCell}</td>`
+          + `<td class="numeric">${worstCell}</td>`
+          + `<td class="numeric">${meanCell}</td>`
+          + `<td class="numeric">${stdevCell}</td></tr>`;
+      }
+      distBody += "</tbody>";
+      if (anyRow) {
+        distTable.innerHTML = distBody;
+        distWrapper.appendChild(distTable);
+        distDetails.appendChild(distWrapper);
+        details.appendChild(distDetails);
+      }
     }
 
     const samples =

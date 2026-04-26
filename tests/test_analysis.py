@@ -5,6 +5,8 @@ from __future__ import annotations
 from datetime import UTC, datetime
 import json
 import math
+import re
+import statistics
 from typing import TYPE_CHECKING, Any, Literal
 
 import pytest
@@ -39,6 +41,7 @@ from kube_autotuner.report.analysis import (  # noqa: E402
     category_importance_rollup,
     host_state_issues,
     host_state_series,
+    iteration_distribution,
     parameter_importance,
     pareto_front,
     per_iteration_samples,
@@ -947,6 +950,90 @@ class TestCLIAnalyze:
 
         recs = json.loads((out_dir / "10g" / "recommendations.json").read_text())
         assert recs[0]["trial_id"] == "lo-retx"
+
+    def test_analyze_iteration_distribution_pools_refinement_children(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """End-to-end: refinement children pool with parent in the report payload."""
+        primary_iters = [5e9, 6e9, 7e9]
+        child_iters = [8e9, 9e9, 10e9]
+
+        def _mk_trial(
+            *,
+            trial_id: str,
+            bps_per_iter: list[float],
+            phase: Literal["sobol", "bayesian", "refinement"] | None = None,
+            parent_trial_id: str | None = None,
+        ) -> TrialResult:
+            kw: dict[str, Any] = {
+                "trial_id": trial_id,
+                "node_pair": NodePair(
+                    source="a",
+                    target="b",
+                    hardware_class="10g",
+                ),
+                "sysctl_values": {"net.core.rmem_max": 212992},
+                "config": BenchmarkConfig(iterations=len(bps_per_iter)),
+                "results": [
+                    _bench(
+                        mode="tcp",
+                        iteration=i,
+                        bps=bps,
+                        retransmits=0,
+                        bytes_sent=_DEFAULT_BYTES_SENT,
+                    )
+                    for i, bps in enumerate(bps_per_iter)
+                ],
+            }
+            if phase is not None:
+                kw["phase"] = phase
+            if parent_trial_id is not None:
+                kw["parent_trial_id"] = parent_trial_id
+            return TrialResult(**kw)
+
+        trials = [
+            _mk_trial(trial_id="p1", bps_per_iter=primary_iters),
+            _mk_trial(
+                trial_id="p1-v1",
+                bps_per_iter=child_iters,
+                phase="refinement",
+                parent_trial_id="p1",
+            ),
+        ]
+        dataset = tmp_path / "trials"
+        for t in trials:
+            TrialLog.append(dataset, t)
+
+        out_dir = tmp_path / "out"
+        runner = CliRunner()
+        result = runner.invoke(
+            app,
+            ["analyze", str(dataset), "-o", str(out_dir), "--hardware-class", "10g"],
+        )
+        assert result.exit_code == 0, result.output
+
+        html_text = (out_dir / "index.html").read_text()
+        # The "iterationDistribution" payload key reaches the browser keyed by
+        # the primary trial id, with n=6 (3 primary + 3 refinement iterations
+        # pooled).
+        match = re.search(
+            r'<script type="application/json" id="section-data-10g">(.*?)</script>',
+            html_text,
+            re.DOTALL,
+        )
+        assert match is not None
+        payload = json.loads(match.group(1).replace("<\\/", "</"))
+        dist = payload["iterationDistribution"]
+        assert "p1" in dist
+        tp = dist["p1"]["mean_tcp_throughput"]
+        assert tp["n"] == len(primary_iters) + len(child_iters)
+        assert tp["min"] == pytest.approx(min(primary_iters))
+        assert tp["max"] == pytest.approx(max(child_iters))
+        # Lock the rendered-DOM wiring: the JS panel summary text must
+        # appear in the static HTML so the <details> block actually
+        # renders for sections that have distribution data.
+        assert "iteration distribution" in html_text
 
     def test_analyze_empty_dataset(self, tmp_path: Path) -> None:
         empty = tmp_path / "empty"
@@ -1999,3 +2086,145 @@ def test_per_iteration_samples_orphan_refinement_keys_on_parent_id() -> None:
     out = per_iteration_samples([orphan])
     assert list(out.keys()) == ["missing-parent"]
     assert [r["trial_id"] for r in out["missing-parent"]] == ["v1", "v1"]
+
+
+# --- iteration_distribution ----------------------------------------------
+
+
+def test_iteration_distribution_single_primary_no_children() -> None:
+    trial = _multi_iter_trial(
+        trial_id="p1",
+        bps_per_iter=[5e9, 6e9, 7e9, 8e9],
+    )
+    stats = iteration_distribution([trial])
+    assert list(stats.keys()) == ["p1"]
+    tp = stats["p1"]["mean_tcp_throughput"]
+    assert tp["n"] == 4
+    assert tp["mean"] == pytest.approx(6.5e9)
+    assert tp["min"] == pytest.approx(5e9)
+    assert tp["max"] == pytest.approx(8e9)
+    # stdev of [5,6,7,8]e9 == sqrt(10/3)*1e9
+    assert tp["stdev"] == pytest.approx(statistics.stdev([5e9, 6e9, 7e9, 8e9]))
+
+
+def test_iteration_distribution_pools_refinement_children() -> None:
+    primary = _multi_iter_trial(
+        trial_id="p1",
+        bps_per_iter=[5e9, 6e9, 7e9],
+    )
+    children = [
+        _multi_iter_trial(
+            trial_id=f"p1-v{i + 1}",
+            bps_per_iter=[8e9, 9e9, 10e9],
+            phase="refinement",
+            parent_trial_id="p1",
+        )
+        for i in range(2)
+    ]
+    pooled = iteration_distribution([primary, *children])
+    primary_only = iteration_distribution([primary])
+    tp_pooled = pooled["p1"]["mean_tcp_throughput"]
+    tp_primary = primary_only["p1"]["mean_tcp_throughput"]
+    assert tp_pooled["n"] == 9
+    assert tp_primary["n"] == 3
+    # Pooled mean is higher because children push the mean up.
+    pooled_mean = tp_pooled["mean"]
+    primary_mean = tp_primary["mean"]
+    assert pooled_mean is not None
+    assert primary_mean is not None
+    assert pooled_mean > primary_mean
+    assert tp_pooled["min"] == pytest.approx(5e9)
+    assert tp_pooled["max"] == pytest.approx(10e9)
+
+
+def test_iteration_distribution_n_equals_one() -> None:
+    trial = _multi_iter_trial(trial_id="p1", bps_per_iter=[5e9])
+    stats = iteration_distribution([trial])
+    tp = stats["p1"]["mean_tcp_throughput"]
+    assert tp["n"] == 1
+    assert tp["stdev"] is None
+    assert tp["mean"] == pytest.approx(5e9)
+    assert tp["min"] == pytest.approx(5e9)
+    assert tp["max"] == pytest.approx(5e9)
+
+
+def test_iteration_distribution_skips_empty_metrics() -> None:
+    """A trial with TCP-only records emits TCP keys but not UDP keys."""
+    trial = _multi_iter_trial(
+        trial_id="p1",
+        bps_per_iter=[5e9, 6e9, 7e9],
+    )
+    stats = iteration_distribution([trial])
+    metrics = stats["p1"]
+    assert "mean_tcp_throughput" in metrics
+    assert "mean_udp_throughput" not in metrics
+    assert "udp_loss_rate" not in metrics
+    assert "mean_udp_jitter" not in metrics
+
+
+def test_iteration_distribution_skips_all_none_metric() -> None:
+    """Records present but a metric is ``None`` on every iteration -> omitted."""
+    trial = TrialResult(
+        trial_id="p1",
+        node_pair=NodePair(source="a", target="b", hardware_class="10g"),
+        sysctl_values={"net.core.rmem_max": 212992},
+        config=BenchmarkConfig(iterations=3),
+        results=[
+            _bench(
+                mode="udp",
+                iteration=i,
+                bps=4e9,
+                packets=1000,
+                lost_packets=10,
+                jitter=None,
+            )
+            for i in range(3)
+        ],
+    )
+    stats = iteration_distribution([trial])
+    metrics = stats["p1"]
+    assert "mean_udp_throughput" in metrics
+    assert "udp_loss_rate" in metrics
+    assert "mean_udp_jitter" not in metrics
+
+
+def test_iteration_distribution_orphan_child_dropped() -> None:
+    """A child whose ``parent_trial_id`` matches no primary is dropped.
+
+    This is a deliberate divergence from :func:`refinement_stats`, which
+    keys directly on ``parent_trial_id`` and tolerates orphans. The
+    distribution panel only emits keys that match a primary
+    ``trial_id`` the report will look up.
+    """
+    primary = _multi_iter_trial(
+        trial_id="p1",
+        bps_per_iter=[5e9, 6e9, 7e9],
+    )
+    orphan = _multi_iter_trial(
+        trial_id="v-orphan",
+        bps_per_iter=[100e9, 200e9, 300e9],
+        phase="refinement",
+        parent_trial_id="missing-parent",
+    )
+    stats = iteration_distribution([primary, orphan])
+    assert list(stats.keys()) == ["p1"]
+    tp = stats["p1"]["mean_tcp_throughput"]
+    assert tp["n"] == 3
+    # Orphan values would have skewed the max to 300e9 if pooled.
+    assert tp["max"] == pytest.approx(7e9)
+
+
+def test_iteration_distribution_no_nan_in_payload() -> None:
+    """Every numeric cell is a finite float / int / None -- never nan."""
+    trial = _multi_iter_trial(
+        trial_id="p1",
+        bps_per_iter=[5e9, 7e9, 9e9],
+    )
+    out = iteration_distribution([trial])
+    json.dumps(out, allow_nan=False)
+    for per_metric in out.values():
+        for entry in per_metric.values():
+            assert isinstance(entry["n"], int)
+            for key in ("mean", "stdev", "min", "max"):
+                cell = entry[key]
+                assert cell is None or (isinstance(cell, float) and math.isfinite(cell))

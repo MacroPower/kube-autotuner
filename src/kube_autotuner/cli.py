@@ -867,6 +867,7 @@ def _analyze_one_class(  # noqa: PLR0914 - threads many helpers into one section
 
     refine_stats = analysis.refinement_stats(hw_trials)
     per_iter_samples = analysis.per_iteration_samples(hw_trials)
+    iter_dist = analysis.iteration_distribution(hw_trials)
     for row in pareto_rows:
         row["stability_badge"] = analysis.stability_badge(
             refine_stats.get(row["trial_id"]),
@@ -922,6 +923,7 @@ def _analyze_one_class(  # noqa: PLR0914 - threads many helpers into one section
         "baseline_comparison": baseline,
         "refinement_stats": refine_stats,
         "per_iteration_samples": per_iter_samples,
+        "iteration_distribution": iter_dist,
         "trajectory_rows": trajectory,
         "metadata": metadata,
         "correlation_matrix": correlation,

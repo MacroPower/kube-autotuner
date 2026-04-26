@@ -794,6 +794,76 @@ def test_per_iteration_samples_omitted_when_no_data(tmp_path: Path) -> None:
     assert payload["perIterationSamples"] == {}
 
 
+def test_iteration_distribution_payload_and_panel(tmp_path: Path) -> None:
+    """The pooled distribution payload reaches the browser keyed by trial_id.
+
+    Asserts the embedded JSON carries ``iterationDistribution`` with
+    the expected ``{n, mean, stdev, min, max}`` shape, and that the JS
+    module emits the panel's summary text plus the column headers.
+    """
+    section = _minimal_section("10g", n_pareto_rows=1)
+    parent_id = section["pareto_rows"][0]["trial_id"]
+    section["iteration_distribution"] = {
+        parent_id: {
+            "mean_tcp_throughput": {
+                "n": 8,
+                "mean": 9.3e9,
+                "stdev": 7.1e7,
+                "min": 9.18e9,
+                "max": 9.4e9,
+            },
+            "mean_latency_p99": {
+                "n": 8,
+                "mean": 1.6e-3,
+                "stdev": 1.8e-4,
+                "min": 1.4e-3,
+                "max": 1.9e-3,
+            },
+        },
+    }
+
+    path = render.write_index_html(tmp_path, [section])
+    html_text = path.read_text()
+
+    payload = _section_payload_from_html(html_text, "10g")
+    dist = payload["iterationDistribution"]
+    assert parent_id in dist
+    tp = dist[parent_id]["mean_tcp_throughput"]
+    assert tp["n"] == 8
+    assert tp["mean"] == pytest.approx(9.3e9)
+    assert tp["min"] == pytest.approx(9.18e9)
+    assert tp["max"] == pytest.approx(9.4e9)
+
+    js = render._JS_MODULE
+    assert "iteration distribution" in js
+    assert "iterationDistribution" in js
+    assert "<th>best</th>" in js
+    assert "<th>worst</th>" in js
+
+
+def test_iteration_distribution_omitted_when_no_data(tmp_path: Path) -> None:
+    """Sections without distribution data still render; payload defaults to {}."""
+    section = _minimal_section("10g", n_pareto_rows=1)
+    path = render.write_index_html(tmp_path, [section])
+    payload = _section_payload_from_html(path.read_text(), "10g")
+    assert payload["iterationDistribution"] == {}
+
+
+def test_iteration_panel_skips_metrics_without_objective() -> None:
+    """The JS panel filters distribution rows whose metric has no objective.
+
+    We can't execute the JS in a unit test, so we lock the source
+    contract: the panel builds a ``dirByMetric`` lookup from the
+    section's objectives and skips metrics whose direction is neither
+    ``"maximize"`` nor ``"minimize"``. Surfacing best/worst without a
+    known optimization direction would be ambiguous.
+    """
+    js = render._JS_MODULE
+    assert "const dirByMetric = Object.fromEntries(" in js
+    # The skip is the literal guard inside the per-metric loop.
+    assert 'if (direction !== "maximize" && direction !== "minimize") continue;' in js
+
+
 def test_js_score_rows_port_matches_python(tmp_path: Path) -> None:  # noqa: PLR0914 - parity replay needs both JS and Python bookkeeping
     """Replay the JS ``scoreRows`` arithmetic and check it matches Python.
 
