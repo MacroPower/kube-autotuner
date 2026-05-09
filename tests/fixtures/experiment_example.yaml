@@ -26,6 +26,7 @@ iperf:
   duration: 30
   omit: 5
   parallel: 16
+  clients_per_node: 1
   client:
     extraArgs: ["--bidir", "-Z"]
   server:

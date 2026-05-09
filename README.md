@@ -234,6 +234,13 @@ iperf:
   duration: 30  # Seconds of measurement per iteration (iperf3 -t).
   omit: 5       # Warmup seconds to discard from stats (iperf3 -O).
   parallel: 16  # Streams per client (iperf3 -P).
+  # Number of parallel iperf3 client *processes* per source node. Default
+  # 1 keeps one Job per source. Raise it to saturate large NICs
+  # (10/25/40/100 GbE) where a single iperf3 process is CPU-bound on one
+  # core; the server Deployment grows by one container (and one Service
+  # port) per added slot. Independent of `parallel`, which spawns threads
+  # inside each process.
+  clients_per_node: 1
   client:
     extraArgs: ["--bidir", "-Z"]
   server:
@@ -241,9 +248,9 @@ iperf:
   # Job retry budget per client per iteration. Independent of the pod-level
   # backoffLimit baked into the manifest: that controls pod retries inside
   # one Job, this controls how many times the runner rebuilds the Job from
-  # scratch. Worst-case wall time per client is maxAttempts * 180s. Note
-  # the snake_case key: IperfSection does not register a camelCase alias.
-  maxAttempts: 3
+  # scratch. Worst-case wall time per client is max_attempts * 180s. Key
+  # is snake_case; IperfSection registers no camelCase alias.
+  max_attempts: 3
 
 # Fortio drives two request/response sub-stages per iteration, each ~`duration`
 # seconds of wall time:
@@ -257,7 +264,7 @@ fortio:
     extraArgs: []
   server:
     extraArgs: []
-  # Job retry budget per client per iteration; see `iperf.maxAttempts`.
+  # Job retry budget per client per iteration; see `iperf.max_attempts`.
   maxAttempts: 3
 
 objectives:

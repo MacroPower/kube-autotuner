@@ -37,6 +37,7 @@ the primary exception so neither failure is hidden from the operator.
 from __future__ import annotations
 
 import concurrent.futures
+from dataclasses import dataclass
 import logging
 import threading
 import time
@@ -94,6 +95,15 @@ FORTIO_CLIENT_LABEL = "app.kubernetes.io/name=fortio-client"
 FORTIO_SERVER_LABEL = "app.kubernetes.io/name=fortio-server"
 _IPERF_BASE_PORT = 5201
 _CLIENT_WAIT_TIMEOUT_SECONDS = 180
+
+
+@dataclass(frozen=True, slots=True)
+class _IperfSlot:
+    """One iperf3 client process scheduled on a source node."""
+
+    node: str
+    slot_index: int
+    port: int
 
 
 class BenchmarkRunner:
@@ -169,14 +179,21 @@ class BenchmarkRunner:
         self._server_name = f"iperf3-server-{node_pair.target}"
         self._fortio_server_name = f"fortio-server-{node_pair.target}"
         self._clients = list(node_pair.all_sources)
-        self._ports = {c: _IPERF_BASE_PORT + i for i, c in enumerate(self._clients)}
+        self._iperf_slots: list[_IperfSlot] = [
+            _IperfSlot(node=node, slot_index=slot, port=_IPERF_BASE_PORT + i)
+            for i, (node, slot) in enumerate(
+                (n, s)
+                for n in self._clients
+                for s in range(self.iperf_args.clients_per_node)
+            )
+        ]
 
     def setup_server(self) -> None:
         """Deploy the iperf3 + fortio servers on the target node and await rollout."""
         server_yaml = manifests.render_iperf_server(
             node=self.node_pair.target,
             ip_family_policy=self.node_pair.ip_family_policy,
-            ports=list(self._ports.values()),
+            ports=[s.port for s in self._iperf_slots],
             iperf_args=self.iperf_args,
             patches=self.patches,
         )
@@ -187,7 +204,7 @@ class BenchmarkRunner:
         logger.info(
             "iperf3 server ready on %s (ports=%s)",
             self.node_pair.target,
-            sorted(self._ports.values()),
+            sorted(s.port for s in self._iperf_slots),
         )
 
         fortio_server_yaml = manifests.render_fortio_server(
@@ -750,14 +767,20 @@ class BenchmarkRunner:
             host_state_snapshots=snapshots,
         )
 
-    def _stage_barrier(self) -> tuple[int | None, int]:
+    def _stage_barrier(self, num_clients: int) -> tuple[int | None, int]:
         """Compute the per-stage start-time barrier and wait-timeout budget.
 
         The barrier is active only when ``sync_window_seconds > 0`` and
         the stage has more than one client to align. Single-client
-        stages skip the sleep entirely and retain the unpadded
-        ``_CLIENT_WAIT_TIMEOUT_SECONDS`` budget so they do not pay for
-        slack they cannot use.
+        stages skip the sleep and keep the unpadded
+        ``_CLIENT_WAIT_TIMEOUT_SECONDS`` budget.
+
+        Args:
+            num_clients: Number of concurrent client Jobs the calling
+                stage will fan out. The iperf bandwidth stage passes
+                ``len(self._iperf_slots)`` so the barrier fires for a
+                single source node when ``clients_per_node >= 2``; the
+                fortio latency stage passes ``len(self._clients)``.
 
         Returns:
             A tuple ``(start_at_epoch, wait_timeout_seconds)``.
@@ -768,7 +791,7 @@ class BenchmarkRunner:
             :meth:`K8sClient.wait` -- base 180 s when the barrier is
             inactive, padded by ``sync_window_seconds`` otherwise.
         """
-        barrier_active = self.config.sync_window_seconds > 0 and len(self._clients) > 1
+        barrier_active = self.config.sync_window_seconds > 0 and num_clients > 1
         if not barrier_active:
             return (None, _CLIENT_WAIT_TIMEOUT_SECONDS)
         start_at_epoch = int(time.time()) + self.config.sync_window_seconds
@@ -803,25 +826,27 @@ class BenchmarkRunner:
         """
         stage_label = f"bw-{mode}"
         abort = threading.Event()
-        start_at_epoch, wait_timeout_seconds = self._stage_barrier()
+        start_at_epoch, wait_timeout_seconds = self._stage_barrier(
+            len(self._iperf_slots),
+        )
         with concurrent.futures.ThreadPoolExecutor(
-            max_workers=len(self._clients),
+            max_workers=len(self._iperf_slots),
         ) as executor:
-            future_to_client = {
+            future_to_slot = {
                 executor.submit(
                     self._run_one_client,
-                    client,
-                    self._ports[client],
+                    slot.node,
+                    slot.port,
                     mode,
                     iteration,
                     abort,
                     start_at_epoch=start_at_epoch,
                     wait_timeout_seconds=wait_timeout_seconds,
-                ): client
-                for client in self._clients
+                ): slot
+                for slot in self._iperf_slots
             }
             done, not_done = concurrent.futures.wait(
-                future_to_client,
+                future_to_slot,
                 return_when=concurrent.futures.FIRST_EXCEPTION,
             )
 
@@ -880,7 +905,9 @@ class BenchmarkRunner:
         """
         stage_label = f"fortio-{workload}"
         abort = threading.Event()
-        start_at_epoch, wait_timeout_seconds = self._stage_barrier()
+        start_at_epoch, wait_timeout_seconds = self._stage_barrier(
+            len(self._clients),
+        )
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=len(self._clients),
         ) as executor:

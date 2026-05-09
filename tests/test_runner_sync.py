@@ -19,6 +19,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from kube_autotuner.benchmark.runner import BenchmarkRunner
+from kube_autotuner.experiment import IperfSection
 from kube_autotuner.models import BenchmarkConfig, NodePair
 
 if TYPE_CHECKING:
@@ -131,6 +132,7 @@ def _runner(
     *,
     extra_sources: list[str],
     sync_window_seconds: int,
+    iperf_args: IperfSection | None = None,
 ) -> tuple[BenchmarkRunner, MagicMock]:
     """Build a BenchmarkRunner with the given source fan-out and sync window.
 
@@ -151,7 +153,12 @@ def _runner(
         sync_window_seconds=sync_window_seconds,
     )
     k8s = _make_k8s_mock()
-    runner = BenchmarkRunner(node_pair=node_pair, config=config, client=k8s)
+    runner = BenchmarkRunner(
+        node_pair=node_pair,
+        config=config,
+        client=k8s,
+        iperf_args=iperf_args,
+    )
     return runner, k8s
 
 
@@ -224,6 +231,32 @@ def test_single_client_stage_has_no_barrier(
     assert "sleep" not in yamls[0]
     # Unpadded base wait budget.
     assert _wait_timeouts(k8s) == [_BASE_WAIT]
+
+
+def test_single_source_with_two_slots_activates_barrier(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """``clients_per_node=2`` on one source activates the wall-clock barrier."""
+    monkeypatch.setattr(
+        "kube_autotuner.benchmark.runner.time.time",
+        lambda: _FIXED_NOW,
+    )
+    runner, k8s = _runner(
+        tmp_path,
+        extra_sources=[],
+        sync_window_seconds=15,
+        iperf_args=IperfSection(clients_per_node=2),
+    )
+    runner._run_bandwidth_stage("tcp", 0)
+
+    yamls = _client_job_yamls(k8s, kind="iperf3")
+    assert len(yamls) == 2
+    epochs = [_extract_epoch(y) for y in yamls]
+    # Both slots share one shared start_at_epoch.
+    assert epochs[0] == epochs[1] == int(_FIXED_NOW) + 15
+    # And both wait calls use the padded budget.
+    assert _wait_timeouts(k8s) == [_BASE_WAIT + 15, _BASE_WAIT + 15]
 
 
 def test_sync_window_seconds_zero_disables_barrier(

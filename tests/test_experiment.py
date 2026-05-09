@@ -199,6 +199,44 @@ iperf:
         ExperimentConfig.from_yaml(path)
 
 
+def test_iperf_section_default_clients_per_node_is_one():
+    """``clients_per_node`` defaults to 1: one client Job per source."""
+    from kube_autotuner.experiment import IperfSection  # noqa: PLC0415
+
+    section = IperfSection()
+    assert section.clients_per_node == 1
+
+
+def test_iperf_section_clients_per_node_zero_raises():
+    """``ge=1`` rejects ``clients_per_node=0``."""
+    from pydantic import ValidationError  # noqa: PLC0415
+
+    from kube_autotuner.experiment import IperfSection  # noqa: PLC0415
+
+    with pytest.raises(ValidationError):
+        IperfSection.model_validate({"clients_per_node": 0})
+
+
+def test_iperf_section_clients_per_node_negative_raises():
+    """``ge=1`` rejects negative ``clients_per_node`` values."""
+    from pydantic import ValidationError  # noqa: PLC0415
+
+    from kube_autotuner.experiment import IperfSection  # noqa: PLC0415
+
+    with pytest.raises(ValidationError):
+        IperfSection.model_validate({"clients_per_node": -1})
+
+
+def test_iperf_section_camelcase_clients_per_node_rejected():
+    """``IperfSection`` has no alias generator: ``clientsPerNode`` is unknown."""
+    from pydantic import ValidationError  # noqa: PLC0415
+
+    from kube_autotuner.experiment import IperfSection  # noqa: PLC0415
+
+    with pytest.raises(ValidationError):
+        IperfSection.model_validate({"clientsPerNode": 2})
+
+
 def test_invalid_yaml_raises(tmp_path: Path):
     path = _write(tmp_path, "nodes:\n  sources: oops\n: : :\n")
     with pytest.raises(ExperimentConfigError, match="invalid YAML"):

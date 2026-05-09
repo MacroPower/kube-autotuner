@@ -226,6 +226,98 @@ def test_multi_client_concurrent_launch():
     assert "iperf3-server-5202" in server_yaml
 
 
+def test_clients_per_node_fans_out_jobs():
+    """``clients_per_node=3`` on one source emits three Jobs on distinct ports."""
+    node_pair = NodePair(source="kmain07", target="kmain08", hardware_class="10g")
+    config = BenchmarkConfig(iterations=1)
+
+    logs = {
+        "iperf3-client-kmain07-p5201": _fake_iperf_json(3e9),
+        "iperf3-client-kmain07-p5202": _fake_iperf_json(3e9),
+        "iperf3-client-kmain07-p5203": _fake_iperf_json(3e9),
+    }
+    client = _make_client(logs)
+
+    runner = BenchmarkRunner(
+        node_pair,
+        config,
+        client=client,
+        iperf_args=IperfSection(clients_per_node=3),
+    )
+    runner.setup_server()
+    runner.run()
+
+    applied_yamls = [c.args[0] for c in client.apply.call_args_list]
+    # Three iperf3 client Jobs, one per slot, each on its own port.
+    for port in (5201, 5202, 5203):
+        assert any(f"iperf3-client-kmain07-p{port}" in y for y in applied_yamls), (
+            f"missing client Job for port {port}"
+        )
+    # No fourth slot leaked through the comprehension.
+    assert not any("iperf3-client-kmain07-p5204" in y for y in applied_yamls)
+
+
+def test_clients_per_node_with_multi_source_assigns_unique_ports():
+    """Two sources + clients_per_node=2 produces four Jobs across ports 5201..5204."""
+    node_pair = NodePair(
+        source="a",
+        target="t",
+        hardware_class="10g",
+        extra_sources=["b"],
+    )
+    config = BenchmarkConfig(iterations=1)
+
+    logs = {
+        "iperf3-client-a-p5201": _fake_iperf_json(2e9),
+        "iperf3-client-a-p5202": _fake_iperf_json(2e9),
+        "iperf3-client-b-p5203": _fake_iperf_json(2e9),
+        "iperf3-client-b-p5204": _fake_iperf_json(2e9),
+    }
+    client = _make_client(logs)
+
+    runner = BenchmarkRunner(
+        node_pair,
+        config,
+        client=client,
+        iperf_args=IperfSection(clients_per_node=2),
+    )
+    runner.setup_server()
+    runner.run()
+
+    applied_yamls = [c.args[0] for c in client.apply.call_args_list]
+    expected = [
+        ("a", 5201),
+        ("a", 5202),
+        ("b", 5203),
+        ("b", 5204),
+    ]
+    for node, port in expected:
+        assert any(f"iperf3-client-{node}-p{port}" in y for y in applied_yamls), (
+            f"missing client Job for {node}:{port}"
+        )
+
+
+def test_server_yaml_contains_one_container_per_slot_port():
+    """``setup_server`` emits one container per slot port and no off-by-one extras."""
+    node_pair = NodePair(source="kmain07", target="kmain08", hardware_class="10g")
+    config = BenchmarkConfig(iterations=1)
+    client = _make_client({})
+
+    runner = BenchmarkRunner(
+        node_pair,
+        config,
+        client=client,
+        iperf_args=IperfSection(clients_per_node=2),
+    )
+    runner.setup_server()
+
+    # First applied YAML is the iperf3 server Deployment + Service.
+    server_yaml = client.apply.call_args_list[0].args[0]
+    assert "iperf3-server-5201" in server_yaml
+    assert "iperf3-server-5202" in server_yaml
+    assert "iperf3-server-5203" not in server_yaml
+
+
 def test_first_exception_triggers_label_cleanup():
     node_pair = NodePair(
         source="kmain07",

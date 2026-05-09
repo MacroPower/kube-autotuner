@@ -249,6 +249,16 @@ class IperfSection(BaseModel):
     omit: int = Field(default=5, ge=0)
     parallel: int = Field(default=16, ge=1)
     max_attempts: int = Field(default=3, ge=1)
+    clients_per_node: int = Field(
+        default=1,
+        ge=1,
+        description=(
+            "Number of parallel iperf3 client Jobs to launch per source node. "
+            "Default 1 keeps one Job per source. Raise it to saturate large "
+            "NICs (10/25/40/100 GbE) where one iperf3 process is CPU-bound. "
+            "The server Deployment grows one container per slot."
+        ),
+    )
 
 
 class FortioArgs(BaseModel):

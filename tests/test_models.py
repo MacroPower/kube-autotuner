@@ -88,6 +88,39 @@ def test_trial_result_mean_tcp_throughput():
     assert trial.mean_tcp_throughput() == pytest.approx(1_500_000_000)
 
 
+def test_mean_tcp_throughput_sums_records_sharing_client_node_and_iteration():
+    """Two TCP records on the same (client_node, iteration) sum into the mean.
+
+    Locks the aggregation invariant the iperf ``clients_per_node`` fan-out
+    relies on: multiple iperf3 client processes per source node still
+    record one ``BenchmarkResult`` each, and ``mean_tcp_throughput`` sums
+    them within an iteration before averaging across iterations.
+    """
+    results = [
+        BenchmarkResult(
+            timestamp=datetime.now(UTC),
+            mode="tcp",
+            bits_per_second=4_000_000_000,
+            client_node="a",
+            iteration=0,
+        ),
+        BenchmarkResult(
+            timestamp=datetime.now(UTC),
+            mode="tcp",
+            bits_per_second=5_000_000_000,
+            client_node="a",
+            iteration=0,
+        ),
+    ]
+    trial = TrialResult(
+        node_pair=NodePair(source="a", target="b", hardware_class="10g"),
+        sysctl_values={},
+        config=BenchmarkConfig(iterations=1),
+        results=results,
+    )
+    assert trial.mean_tcp_throughput() == pytest.approx(9_000_000_000)
+
+
 def test_trial_log_round_trip(tmp_path: Path):
     path = tmp_path / "trials"
     trial = TrialResult(
