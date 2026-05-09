@@ -241,7 +241,11 @@ class IperfSection(BaseModel):
     9 minutes) when every attempt hits the watch deadline.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(
+        extra="forbid",
+        alias_generator=to_camel,
+        populate_by_name=True,
+    )
 
     client: IperfArgs = Field(default_factory=IperfArgs)
     server: IperfArgs = Field(default_factory=IperfArgs)

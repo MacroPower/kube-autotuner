@@ -240,7 +240,7 @@ iperf:
   # core; the server Deployment grows by one container (and one Service
   # port) per added slot. Independent of `parallel`, which spawns threads
   # inside each process.
-  clients_per_node: 1
+  clientsPerNode: 1
   client:
     extraArgs: ["--bidir", "-Z"]
   server:
@@ -248,9 +248,8 @@ iperf:
   # Job retry budget per client per iteration. Independent of the pod-level
   # backoffLimit baked into the manifest: that controls pod retries inside
   # one Job, this controls how many times the runner rebuilds the Job from
-  # scratch. Worst-case wall time per client is max_attempts * 180s. Key
-  # is snake_case; IperfSection registers no camelCase alias.
-  max_attempts: 3
+  # scratch. Worst-case wall time per client is maxAttempts * 180s.
+  maxAttempts: 3
 
 # Fortio drives two request/response sub-stages per iteration, each ~`duration`
 # seconds of wall time:

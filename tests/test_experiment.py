@@ -227,14 +227,13 @@ def test_iperf_section_clients_per_node_negative_raises():
         IperfSection.model_validate({"clients_per_node": -1})
 
 
-def test_iperf_section_camelcase_clients_per_node_rejected():
-    """``IperfSection`` has no alias generator: ``clientsPerNode`` is unknown."""
-    from pydantic import ValidationError  # noqa: PLC0415
-
+def test_iperf_section_camelcase_clients_per_node_accepted():
+    """``IperfSection`` accepts both ``clients_per_node`` and ``clientsPerNode``."""
     from kube_autotuner.experiment import IperfSection  # noqa: PLC0415
 
-    with pytest.raises(ValidationError):
-        IperfSection.model_validate({"clientsPerNode": 2})
+    section = IperfSection.model_validate({"clientsPerNode": 2, "maxAttempts": 5})
+    assert section.clients_per_node == 2
+    assert section.max_attempts == 5
 
 
 def test_invalid_yaml_raises(tmp_path: Path):
