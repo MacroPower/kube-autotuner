@@ -707,10 +707,14 @@ class OptimizationLoop:
         ``tcp_max_tw_buckets``, ``nf_conntrack_max``,
         ``nf_conntrack_tcp_timeout_established``,
         ``tcp_slow_start_after_idle``, ``tcp_autocorking``) whose
-        response is ~flat under the default fortio shape. Without
-        an anchor the Sobol phase picks random values on those axes and
-        the GP regresses noise; attaching the production-reasonable
-        point once gives the surrogate a known-good observation.
+        response is ~flat under the default fortio shape. Without an
+        anchor, the Sobol phase picks random values on those axes
+        and the GP regresses noise. Attaching the stock Ubuntu 24.04
+        kernel-default point once gives the surrogate a concrete
+        observation on those axes. The Sobol phase still explores
+        nearby rungs, but the GP no longer starts from pure noise on
+        flat dimensions, and the same point doubles as the baseline
+        used by ``baseline_comparison()`` in the analysis report.
 
         Called lazily from :meth:`_suggest` so a failed seed trial can
         be re-attached on the next iteration with a fresh trial_index.

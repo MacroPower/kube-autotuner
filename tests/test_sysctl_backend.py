@@ -97,18 +97,18 @@ def test_build_param_space_canonical_validates():
     assert ps is not PARAM_SPACE  # builder returns a fresh instance each call
 
 
-# Drift guard: the README "Parameter space" section advertises a 28-sysctl
+# Drift guard: the README "Parameter space" section advertises a 38-sysctl
 # default broken down into seven categories. If these counts change,
 # update the README table in the same commit.
 def test_param_space_counts_match_readme():
-    assert len(PARAM_SPACE.params) == 28
+    assert len(PARAM_SPACE.params) == 38
     expected_counts = {
-        "tcp_buffer": 5,
-        "congestion": 7,
-        "napi": 3,
+        "tcp_buffer": 7,
+        "congestion": 11,
+        "napi": 6,
         "memory": 1,
         "connection": 7,
-        "udp": 2,
+        "udp": 3,
         "conntrack": 3,
     }
     actual_counts = {cat: len(names) for cat, names in PARAM_CATEGORIES.items()}
@@ -116,14 +116,18 @@ def test_param_space_counts_match_readme():
 
 
 def test_param_categories_includes_conntrack_excludes_dropped():
-    # Knobs dropped in the sysctl parameter-space review:
-    # - busy_poll / busy_read: require app SO_BUSY_POLL opt-in.
-    # - tcp_no_metrics_save: methodology, not tuning -- pinned to 1 per
-    #   trial in the optimizer bootstrap instead of searched.
-    # conntrack is the single biggest gap for a K8s-focused tuner.
+    # busy_poll / busy_read require app SO_BUSY_POLL opt-in via
+    # setsockopt to take effect, but the kernel-default `0` is the
+    # seeded prior so apps that don't opt in pay no cost on the
+    # dimension while the optimizer can still find a non-zero rung
+    # when an opted-in app shows a measurable win. Conntrack is the
+    # single biggest gap for a K8s-focused tuner.
+    # tcp_no_metrics_save is methodology, not tuning -- pinned to 1
+    # per trial in the optimizer bootstrap instead of searched.
     param_names = set(PARAM_SPACE.param_names())
     assert "conntrack" in PARAM_CATEGORIES
-    assert "busy_poll" not in PARAM_CATEGORIES
+    assert "net.core.busy_poll" in param_names
+    assert "net.core.busy_read" in param_names
     assert "net.ipv4.tcp_no_metrics_save" not in param_names
 
 

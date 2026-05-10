@@ -21,20 +21,45 @@ from kube_autotuner.models import MemoryCost, ParamSpace, SysctlParam
 _TCP_BUFFER_PARAMS: list[SysctlParam] = [
     # System-wide SO_RCVBUF ceiling. Low rungs cap the TCP receive
     # window on fat pipes and throttle throughput on long-BDP paths;
-    # high rungs trade node memory headroom under many flows.
-    # Memory cost == rung value (per-socket SO_RCVBUF ceiling).
+    # high rungs trade node memory headroom under many flows. Top rung
+    # 128 MiB covers 100G long-BDP paths (BDP at 100 Gbps with ~10 ms
+    # RTT exceeds 64 MiB). Memory cost == rung value (per-socket
+    # SO_RCVBUF ceiling).
     SysctlParam(
         name="net.core.rmem_max",
-        values=[212992, 4194304, 16777216, 67108864],
+        values=[212992, 67108864, 134217728],
         param_type="int",
         memory_cost=MemoryCost(kind="identity"),
     ),
     # System-wide SO_SNDBUF ceiling. Mirror of rmem_max on the send
     # path: low rungs cap the send window and throughput, high rungs
-    # raise memory pressure. Memory cost == rung value (per-socket).
+    # raise memory pressure. Top rung 128 MiB covers 100G long-BDP.
+    # Memory cost == rung value (per-socket).
     SysctlParam(
         name="net.core.wmem_max",
-        values=[212992, 4194304, 16777216, 67108864],
+        values=[212992, 67108864, 134217728],
+        param_type="int",
+        memory_cost=MemoryCost(kind="identity"),
+    ),
+    # Default SO_RCVBUF when an app does not call setsockopt. Raising
+    # the default lifts the receive window for every socket on the
+    # node, including infrastructure traffic that never opts in via
+    # setsockopt. Distinct from rmem_max (the cap an app can opt up to)
+    # and from tcp_rmem's middle field (the autotuning starting point
+    # for TCP specifically). Memory cost == rung value (per-socket
+    # SO_RCVBUF default).
+    SysctlParam(
+        name="net.core.rmem_default",
+        values=[212992, 16777216, 33554432],
+        param_type="int",
+        memory_cost=MemoryCost(kind="identity"),
+    ),
+    # Default SO_SNDBUF when an app does not call setsockopt. Mirror
+    # of rmem_default on the send path. Memory cost == rung value
+    # (per-socket SO_SNDBUF default).
+    SysctlParam(
+        name="net.core.wmem_default",
+        values=[212992, 16777216, 33554432],
         param_type="int",
         memory_cost=MemoryCost(kind="identity"),
     ),
@@ -42,26 +67,29 @@ _TCP_BUFFER_PARAMS: list[SysctlParam] = [
     # Governs the peak receive window. Under-sized max caps iperf3
     # throughput on high-BDP links and can raise tcp_retransmit_rate
     # when the window collapses; over-sized max raises node memory
-    # under many concurrent flows. Memory cost == max field of the triple.
+    # under many concurrent flows. Top triple's 64 MiB max-field gives
+    # autotuning enough headroom on 100G long-BDP paths. Memory cost
+    # == max field of the triple.
     SysctlParam(
         name="net.ipv4.tcp_rmem",
         values=[
-            "4096 87380 6291456",
-            "4096 131072 16777216",
-            "4096 87380 33554432",
+            "4096 131072 6291456",
+            "4096 131072 33554432",
+            "4096 131072 67108864",
         ],
         param_type="choice",
         memory_cost=MemoryCost(kind="triple_max"),
     ),
     # Autotuning triple for TCP send buffers. Same trade-off as
-    # tcp_rmem on the send path: throughput vs. memory footprint.
-    # Memory cost == max field of the triple.
+    # tcp_rmem on the send path: throughput vs. memory footprint. Top
+    # triple's 64 MiB max-field covers 100G long-BDP. Memory cost ==
+    # max field of the triple.
     SysctlParam(
         name="net.ipv4.tcp_wmem",
         values=[
             "4096 16384 4194304",
-            "4096 65536 16777216",
             "4096 65536 33554432",
+            "4096 65536 67108864",
         ],
         param_type="choice",
         memory_cost=MemoryCost(kind="triple_max"),
@@ -69,11 +97,20 @@ _TCP_BUFFER_PARAMS: list[SysctlParam] = [
     # Global TCP memory pressure thresholds in pages (min pressure max).
     # Too small and the kernel prunes/throttles under load (throughput
     # drops, tcp_retransmit_rate rises); too large and node memory climbs.
-    # Represented as the canonical three-integer string form.
-    # Memory cost == max-field pages x 4096 bytes/page.
+    # Represented as the canonical three-integer string form. Triples
+    # whose max-field crosses ~100 GiB of pages are reachable only
+    # through an `optimize.paramSpace` override -- including them in
+    # the canonical rung set would inflate triple_max_pages cost by
+    # an order of magnitude over the next rung and dominate
+    # recommendation ranking on every run. Memory cost == max-field
+    # pages x 4096 bytes/page.
     SysctlParam(
         name="net.ipv4.tcp_mem",
-        values=["393216 524288 786432", "786432 1048576 1572864"],
+        values=[
+            "196608 262144 393216",
+            "393216 524288 786432",
+            "786432 1048576 1572864",
+        ],
         param_type="choice",
         memory_cost=MemoryCost(kind="triple_max_pages"),
     ),
@@ -112,19 +149,23 @@ _CONGESTION_PARAMS: list[SysctlParam] = [
         values=[0, 1],
         param_type="choice",
     ),
-    # Explicit Congestion Notification. 0 disabled; 1 accept-and-
-    # request (both directions, so iperf3 / fortio clients will
-    # negotiate ECN on outbound connections). Rung 2 (responder-only)
-    # is omitted because the clients initiate every flow in this
-    # harness, making it equivalent to 0. On fabrics that honour ECN
-    # marks (DCTCP, BBRv2+, most modern DC switches), 1 substitutes
-    # marks for drops and lowers tcp_retransmit_rate without hurting
-    # throughput; on fabrics that don't (Talos Docker, most
-    # internet-facing paths), it's a no-op. Benchmark-flat under the
-    # default backend / production-live for DC deployments: kept.
+    # Explicit Congestion Notification. 0 disables it; 1 accepts and
+    # requests ECN in both directions, so iperf3 / fortio clients
+    # negotiate ECN on outbound connections; 2 is accept-only and has
+    # been the kernel default since Linux 4.1 (the host honours ECN
+    # marks on incoming flows but does not request ECN on outgoing
+    # ones). The benchmark clients initiate every flow, so rung 2
+    # behaves like 0 under this harness; the seed therefore lands on
+    # the kernel default. Rung 1 stays in the search space for
+    # fabrics that honour ECN marks (DCTCP, BBRv2+, most modern DC
+    # switches), where 1 substitutes marks for drops and lowers
+    # tcp_retransmit_rate without hurting throughput. On fabrics
+    # that don't (Talos Docker, most internet-facing paths), it's a
+    # no-op. Benchmark-flat under the default backend, production-
+    # live for DC deployments, so we keep it.
     SysctlParam(
         name="net.ipv4.tcp_ecn",
-        values=[0, 1],
+        values=[0, 1, 2],
         param_type="choice",
     ),
     # Disable the idle-to-slow-start reset. When 0 (kernel default),
@@ -157,8 +198,60 @@ _CONGESTION_PARAMS: list[SysctlParam] = [
     # latency. Direct lever on the throughput vs. p99 trade-off.
     SysctlParam(
         name="net.ipv4.tcp_limit_output_bytes",
-        values=[262144, 4194304],
+        values=[1048576, 4194304],
         param_type="int",
+    ),
+    # Pacing rate multiplier during slow start, percentage of the
+    # cwnd-derived rate. Kernel default 200 (pace at 2x to allow
+    # ramp-up). Only takes effect when the egress qdisc supports
+    # pacing (fq / fq_codel) -- couples directly with
+    # net.core.default_qdisc. The 300 rung accelerates ramp-up on
+    # clean fat pipes at the cost of more aggressive bursts that can
+    # raise tcp_retransmit_rate on policer-shaped egress paths.
+    SysctlParam(
+        name="net.ipv4.tcp_pacing_ss_ratio",
+        values=[100, 200, 300],
+        param_type="int",
+    ),
+    # Pacing rate multiplier during congestion avoidance, percentage
+    # form. Kernel default 120 (pace 20% above the cwnd-derived rate
+    # to leave probing headroom). Same qdisc coupling as
+    # tcp_pacing_ss_ratio. The 150 and 200 rungs probe harder on
+    # clean fat pipes for higher throughput at the cost of policer
+    # drops on shaped egress paths.
+    SysctlParam(
+        name="net.ipv4.tcp_pacing_ca_ratio",
+        values=[120, 150, 200],
+        param_type="int",
+    ),
+    # RFC 7323 PAWS / RTT-measurement timestamps. Kernel default 1
+    # (enabled). Setting this to 0 only makes sense behind a middlebox
+    # (L4 load balancer, some NATs) that strips TCP timestamps from
+    # inbound packets -- in that case PAWS protection is already
+    # broken on the inbound path and the local cost of leaving
+    # timestamps on is wasted bytes per segment plus useless RTT
+    # measurement. Pair with `tcp_tw_reuse=2` when timestamps are
+    # stripped, since that combination lets a stripping middlebox
+    # still reuse TIME_WAIT sockets safely. This is a binary 0/1
+    # sysctl in mainline kernels; do not add a `2` rung.
+    SysctlParam(
+        name="net.ipv4.tcp_timestamps",
+        values=[0, 1],
+        param_type="choice",
+    ),
+    # Forward-RTO recovery (F-RTO) behaviour. Kernel default 2 (the
+    # SACK-enhanced variant from RFC 5682 -- distinguishes spurious
+    # retransmissions from genuine loss when the original ACK ordering
+    # implies a delay rather than a drop). 0 disables F-RTO entirely;
+    # 1 is the basic non-SACK variant. Wired DC paths see
+    # spurious-retx detection adding latency without payoff (0 is the
+    # right pick); the kernel default 2 wins on lossy/jittery paths
+    # (Wi-Fi, mobile, long-haul). Benchmark-flat for clean Talos
+    # Docker; live for policy tuning.
+    SysctlParam(
+        name="net.ipv4.tcp_frto",
+        values=[0, 1, 2],
+        param_type="choice",
     ),
 ]
 
@@ -166,11 +259,12 @@ _NAPI_PARAMS: list[SysctlParam] = [
     # Per-CPU input queue length before drops under RX bursts. Low
     # rungs cause packet drops on bursty workloads (visible as
     # tcp_retransmit_rate spikes); very high rungs add queuing latency
-    # once the system is already overloaded. Memory cost: entries x 256
-    # bytes (sk_buff head ~232 B on x86_64 plus per-slot pointer slack).
+    # once the system is already overloaded. Memory cost: entries x
+    # 256 bytes (sk_buff head ~232 B on x86_64 plus per-slot pointer
+    # slack).
     SysctlParam(
         name="net.core.netdev_max_backlog",
-        values=[1000, 5000, 30000, 250000],
+        values=[1000, 32768, 250000],
         param_type="int",
         memory_cost=MemoryCost(kind="per_entry", per_entry_bytes=256),
     ),
@@ -179,7 +273,7 @@ _NAPI_PARAMS: list[SysctlParam] = [
     # fairness and higher cpu under the bulk sub-stage.
     SysctlParam(
         name="net.core.netdev_budget",
-        values=[300, 600, 1000, 2000],
+        values=[300, 1000, 2000],
         param_type="int",
     ),
     # Packets GRO coalesces before flushing up the stack. Larger
@@ -191,6 +285,43 @@ _NAPI_PARAMS: list[SysctlParam] = [
         values=[8, 16, 32],
         param_type="int",
     ),
+    # RX busy-poll budget in microseconds. Kernel default 0 (disabled).
+    # Latency-sensitive workloads can spin on the NIC in poll mode
+    # for up to this many microseconds before falling back to the
+    # softirq path, cutting wakeup latency on the hot path.
+    # SO_BUSY_POLL caveat: the effect requires every participating
+    # socket to opt in via setsockopt(SO_BUSY_POLL, ...); apps that
+    # don't enable it pay no cost on this dimension but also see no
+    # benefit, so the kernel default 0 is the seeded prior and the
+    # optimizer reaches non-zero rungs only when an opted-in app
+    # shows a measurable win.
+    SysctlParam(
+        name="net.core.busy_poll",
+        values=[0, 50, 100],
+        param_type="int",
+    ),
+    # System-wide default for the per-socket SO_BUSY_POLL budget,
+    # paired with net.core.busy_poll on the read path. Same
+    # SO_BUSY_POLL caveat applies: effective only for sockets that
+    # opt in via setsockopt; default 0 is a no-op for everyone else.
+    SysctlParam(
+        name="net.core.busy_read",
+        values=[0, 50, 100],
+        param_type="int",
+    ),
+    # Per-socket ancillary buffer ceiling (control messages and
+    # auxiliary sk_buffs). Kernel default 20480 bytes. Apps that
+    # heavily use SCM_RIGHTS, IP_PKTINFO, or large cmsg payloads
+    # exhaust the default and start dropping packets at the socket
+    # boundary. The 1 MiB rung covers DPDK-style high-throughput
+    # envelopes. Memory cost == rung value (per-socket ancillary
+    # buffer cap).
+    SysctlParam(
+        name="net.core.optmem_max",
+        values=[65535, 131072, 1048576],
+        param_type="int",
+        memory_cost=MemoryCost(kind="identity"),
+    ),
 ]
 
 _MEMORY_PARAMS: list[SysctlParam] = [
@@ -200,7 +331,7 @@ _MEMORY_PARAMS: list[SysctlParam] = [
     # node memory. Memory cost == rung x 1024 bytes/KiB.
     SysctlParam(
         name="vm.min_free_kbytes",
-        values=[65536, 131072, 262144],
+        values=[16384, 131072, 262144],
         param_type="int",
         memory_cost=MemoryCost(kind="kib"),
     ),
@@ -209,12 +340,13 @@ _MEMORY_PARAMS: list[SysctlParam] = [
 _CONNECTION_PARAMS: list[SysctlParam] = [
     # listen() accept queue cap. Under-sized values drop SYNs during
     # fortio saturation, showing up as rps regressions and
-    # connection-establishment latency spikes. Memory cost: entries x
-    # 256 bytes (same sk_buff-head upper bound used by the backlog
-    # params; request_sock is slightly smaller but rounding up is safe).
+    # connection-establishment latency spikes. Memory cost: entries
+    # x 256 bytes (same sk_buff-head upper bound used by the backlog
+    # params; request_sock is slightly smaller but rounding up is
+    # safe).
     SysctlParam(
         name="net.core.somaxconn",
-        values=[128, 4096, 16384, 65535],
+        values=[4096, 32768, 65535],
         param_type="int",
         memory_cost=MemoryCost(kind="per_entry", per_entry_bytes=256),
     ),
@@ -229,10 +361,14 @@ _CONNECTION_PARAMS: list[SysctlParam] = [
     ),
     # Allows outbound reuse of TIME_WAIT sockets. Mitigates ephemeral
     # port exhaustion under fortio connection churn; couples with
-    # ip_local_port_range and tcp_fin_timeout.
+    # ip_local_port_range and tcp_fin_timeout. 0 disables reuse, 1
+    # enables it for all destinations, and 2 (the kernel default
+    # since Linux 4.12) restricts reuse to loopback so the host-local
+    # case stays fast while non-loopback flows keep TIME_WAIT
+    # semantics.
     SysctlParam(
         name="net.ipv4.tcp_tw_reuse",
-        values=[0, 1],
+        values=[0, 1, 2],
         param_type="choice",
     ),
     # FIN-WAIT-2 timeout. Shorter values reclaim sockets faster under
@@ -289,12 +425,25 @@ _UDP_PARAMS: list[SysctlParam] = [
     # udp_loss_rate / udp_jitter spikes).
     SysctlParam(
         name="net.ipv4.udp_rmem_min",
-        values=[4096, 65536],
+        values=[4096, 16384, 65536],
+        param_type="int",
+    ),
+    # Per-socket send-buffer floor for UDP. Mirror of udp_rmem_min on
+    # the send path: too small and bursty senders see EAGAIN /
+    # head-of-line stalls in the socket queue. A symmetric envelope
+    # with udp_rmem_min is the usual pairing.
+    SysctlParam(
+        name="net.ipv4.udp_wmem_min",
+        values=[4096, 16384, 65536],
         param_type="int",
     ),
     # Global UDP memory pressure thresholds (pages). Too small and
     # the kernel prunes under load; too large and node memory climbs.
-    # Memory cost == max-field pages x 4096 bytes/page.
+    # As with tcp_mem, triples whose max-field crosses ~100 GiB of
+    # pages are reachable only through an `optimize.paramSpace`
+    # override -- the canonical rung set deliberately omits them so
+    # triple_max_pages cost stays balanced. Memory cost == max-field
+    # pages x 4096 bytes/page.
     SysctlParam(
         name="net.ipv4.udp_mem",
         values=["393216 524288 786432", "786432 1048576 1572864"],
@@ -338,7 +487,7 @@ _CONNTRACK_PARAMS: list[SysctlParam] = [
     # Benchmark-flat / production-live: kept.
     SysctlParam(
         name="net.netfilter.nf_conntrack_tcp_timeout_established",
-        values=[600, 3600, 86400, 432000],
+        values=[3600, 86400, 432000],
         param_type="int",
     ),
     # TIME_WAIT tail inside conntrack. Shorter values free table slots
@@ -350,7 +499,7 @@ _CONNTRACK_PARAMS: list[SysctlParam] = [
     # though intra-cluster loss makes that caveat mostly theoretical.
     SysctlParam(
         name="net.netfilter.nf_conntrack_tcp_timeout_time_wait",
-        values=[30, 60, 120, 300],
+        values=[60, 120, 240],
         param_type="int",
     ),
 ]
@@ -431,55 +580,84 @@ PARAM_TO_CATEGORY: dict[str, str] = {
     param: cat for cat, params in PARAM_CATEGORIES.items() for param in params
 }
 
-# Production-reasonable defaults covering every knob in the search
-# space. Seeded into the optimizer via ``_seed_prior_trials`` so the
-# GP has a concrete known-good anchor on benchmark-flat dimensions
-# (tcp_mtu_probing, tcp_ecn, nf_conntrack_*, tcp_max_tw_buckets,
-# tcp_slow_start_after_idle, tcp_autocorking). Without this anchor
-# the optimizer recommends Sobol-random values on flat axes.
+# Stock Ubuntu 24.04 sysctl defaults covering every knob in the search
+# space. ``_attach_recommended_defaults`` seeds these into the
+# optimizer so the GP has a concrete observation on benchmark-flat
+# dimensions (tcp_mtu_probing, tcp_ecn, nf_conntrack_*,
+# tcp_max_tw_buckets, tcp_slow_start_after_idle, tcp_autocorking).
+# Without the anchor, Sobol picks random rungs on those axes and the
+# GP regresses noise.
 #
-# Every value here must match one of the rungs declared above --
-# Ax rejects seeded points outside the choice set.
+# Sourced from Linux 6.8 (the kernel Ubuntu 24.04 GA ships) plus
+# systemd 255's ``/usr/lib/sysctl.d/50-default.conf``, which overrides
+# the kernel-literal ``default_qdisc`` to ``fq_codel``. RAM-dependent
+# kernel defaults (``tcp_mem``, ``udp_mem``, ``vm.min_free_kbytes``,
+# the ``tcp_rmem``/``tcp_wmem`` max fields, ``tcp_max_tw_buckets``,
+# ``tcp_max_syn_backlog``, ``nf_conntrack_max``) are evaluated for a
+# 16 GB node with ``nr_free_buffer_pages == totalram_pages``. Real
+# installs may report values a few percent lower (lowmem reserves) or
+# off by a power-of-two for hash-table-derived knobs; the dict is the
+# formula sample, not a measured snapshot. That way
+# ``baseline_comparison()`` in ``report/analysis.py`` reports uplift
+# over the no-tuning reference point a user would have if they
+# touched nothing.
 #
-# Targeted at 10G intra-DC as the "most common" deployment; 1G edge
-# nodes survive these values, 100G long-BDP clusters will want a
-# follow-up expert profile once the search space extends past 64 MB
-# buffer ceilings.
+# Every value here must match one of the rungs declared above. Ax
+# rejects seeded points outside the choice set, and the
+# ``_validate_recommended_defaults()`` drift guard catches both
+# missing knobs and off-rung values at import time.
+#
+# Extreme ``tcp_mem`` / ``udp_mem`` page-count triples (max-fields
+# above ~100 GiB) stay out of the canonical rung set on purpose.
+# Their magnitude would inflate the ``triple_max_pages`` cost term
+# by an order of magnitude over the next-highest rung and dominate
+# recommendation ranking on every run. Users who need those literal
+# page counts can override ``optimize.paramSpace`` (see ``examples/``).
 RECOMMENDED_DEFAULTS: dict[str, str | int] = {
     # tcp_buffer
-    "net.core.rmem_max": 67108864,
-    "net.core.wmem_max": 67108864,
-    "net.ipv4.tcp_rmem": "4096 87380 33554432",
-    "net.ipv4.tcp_wmem": "4096 65536 33554432",
-    "net.ipv4.tcp_mem": "786432 1048576 1572864",
+    "net.core.rmem_max": 212992,
+    "net.core.wmem_max": 212992,
+    "net.core.rmem_default": 212992,
+    "net.core.wmem_default": 212992,
+    "net.ipv4.tcp_rmem": "4096 131072 6291456",
+    "net.ipv4.tcp_wmem": "4096 16384 4194304",
+    "net.ipv4.tcp_mem": "196608 262144 393216",
     # congestion
-    "net.ipv4.tcp_congestion_control": "bbr",
-    "net.core.default_qdisc": "fq",
-    "net.ipv4.tcp_mtu_probing": 1,
-    "net.ipv4.tcp_ecn": 1,
-    "net.ipv4.tcp_slow_start_after_idle": 0,
+    "net.ipv4.tcp_congestion_control": "cubic",
+    "net.core.default_qdisc": "fq_codel",
+    "net.ipv4.tcp_mtu_probing": 0,
+    "net.ipv4.tcp_ecn": 2,
+    "net.ipv4.tcp_slow_start_after_idle": 1,
     "net.ipv4.tcp_autocorking": 1,
-    "net.ipv4.tcp_limit_output_bytes": 262144,
+    "net.ipv4.tcp_limit_output_bytes": 1048576,
+    "net.ipv4.tcp_pacing_ss_ratio": 200,
+    "net.ipv4.tcp_pacing_ca_ratio": 120,
+    "net.ipv4.tcp_timestamps": 1,
+    "net.ipv4.tcp_frto": 2,
     # napi
-    "net.core.netdev_max_backlog": 5000,
-    "net.core.netdev_budget": 600,
+    "net.core.netdev_max_backlog": 1000,
+    "net.core.netdev_budget": 300,
     "net.core.gro_normal_batch": 8,
+    "net.core.busy_poll": 0,
+    "net.core.busy_read": 0,
+    "net.core.optmem_max": 131072,
     # memory
-    "vm.min_free_kbytes": 131072,
+    "vm.min_free_kbytes": 16384,
     # connection
     "net.core.somaxconn": 4096,
     "net.ipv4.tcp_max_syn_backlog": 4096,
-    "net.ipv4.tcp_tw_reuse": 1,
+    "net.ipv4.tcp_tw_reuse": 2,
     "net.ipv4.tcp_fin_timeout": 60,
     "net.ipv4.tcp_max_tw_buckets": 262144,
     "net.ipv4.tcp_notsent_lowat": 4294967295,
-    "net.ipv4.ip_local_port_range": "15000 65535",
+    "net.ipv4.ip_local_port_range": "32768 60999",
     # udp
-    "net.ipv4.udp_rmem_min": 65536,
-    "net.ipv4.udp_mem": "786432 1048576 1572864",
+    "net.ipv4.udp_rmem_min": 4096,
+    "net.ipv4.udp_wmem_min": 4096,
+    "net.ipv4.udp_mem": "393216 524288 786432",
     # conntrack
     "net.netfilter.nf_conntrack_max": 262144,
-    "net.netfilter.nf_conntrack_tcp_timeout_established": 86400,
+    "net.netfilter.nf_conntrack_tcp_timeout_established": 432000,
     "net.netfilter.nf_conntrack_tcp_timeout_time_wait": 120,
 }
 
