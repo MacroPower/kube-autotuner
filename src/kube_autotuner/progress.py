@@ -627,6 +627,18 @@ class RichProgressObserver:
     The observer must be entered as a context manager. It is safe to
     re-enter sequentially (construct, enter, exit, enter again) but
     not nested.
+
+    Live ranking uses
+    :class:`~kube_autotuner.experiment.ObjectivesSection.tolerances`
+    as the noise floor but does **not** thread SEM through
+    :func:`~kube_autotuner.scoring.score_rows`. Pre-refinement every
+    primary trial has ``n=1`` so SEM is ``0.0`` anyway, and the live
+    and post-hoc rankings agree exactly. Post-refinement, the
+    post-hoc
+    :func:`~kube_autotuner.report.analysis.pareto_recommendation_rows`
+    path may snap a few tightly-bunched parents the live panel does
+    not. Any disagreement is one-sided: post-hoc declares more ties,
+    it never picks a different winner.
     """
 
     def __init__(
@@ -1088,6 +1100,7 @@ class RichProgressObserver:
             self._objectives.recommendation_weights,
             memory_costs=[r.memory_cost for r in self._all_rows],
             memory_cost_weight=self._objectives.memory_cost_weight,
+            tolerances=self._objectives.tolerances,
         )
         # Rank by score desc, break ties by trial_id ascending to
         # match recommend_configs (kube_autotuner.report.analysis) and
@@ -1162,6 +1175,7 @@ class RichProgressObserver:
             self._objectives.recommendation_weights,
             memory_costs=memory_costs,
             memory_cost_weight=self._objectives.memory_cost_weight,
+            tolerances=self._objectives.tolerances,
         )
 
         order = sorted(

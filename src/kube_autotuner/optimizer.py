@@ -1403,6 +1403,9 @@ class OptimizationLoop:
                 return []
             rows = [row for row, _ in usable]
             parents = [parent for _, parent in usable]
+            # Thread SEM so parent selection here matches the post-hoc
+            # recommendation gate; the aggregated rows already carry
+            # ``<col>_sem`` keys score_rows picks up directly.
             scores = score_rows(
                 rows,
                 self.objectives.pareto,
@@ -1411,6 +1414,8 @@ class OptimizationLoop:
                     config_memory_cost(p.sysctl_values, PARAM_SPACE) for p in parents
                 ],
                 memory_cost_weight=self.objectives.memory_cost_weight,
+                sems=rows,
+                tolerances=self.objectives.tolerances,
             )
             ranking = sorted(
                 range(len(parents)),

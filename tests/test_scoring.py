@@ -4,8 +4,12 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 import math
+from typing import TYPE_CHECKING
 
 import pytest
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 from kube_autotuner.experiment import ObjectivesSection, ParetoObjective
 from kube_autotuner.models import (
@@ -303,6 +307,148 @@ def test_score_rows_memory_cost_respects_dominant_performance() -> None:
     assert scores[0] > scores[1]
 
 
+def test_score_rows_within_tolerance_metric_is_neutral() -> None:
+    """Two rows differing only on retx by less than tolerance score equally.
+
+    With ``tolerances={"tcp_retransmit_rate": 0.10}``, a 1% retx gap
+    snaps both rows to the same endpoint on that axis, so the only
+    remaining axis (throughput) drives the score.
+    """
+    objectives = [
+        ParetoObjective(metric="tcp_throughput", direction="maximize"),
+        ParetoObjective(metric="tcp_retransmit_rate", direction="minimize"),
+    ]
+    rows = [
+        {_col("tcp_throughput"): 1.0e9, _col("tcp_retransmit_rate"): 1.0},
+        {_col("tcp_throughput"): 1.0e9, _col("tcp_retransmit_rate"): 1.005},
+    ]
+    scores = score_rows(
+        rows,
+        objectives,
+        {"tcp_retransmit_rate": 0.3},
+        tolerances={"tcp_retransmit_rate": 0.10},
+    )
+    assert scores[0] == pytest.approx(scores[1])
+
+
+def test_score_rows_user_example_throughput_beats_noise_regression() -> None:
+    """1000 vs 1200 Mbps throughput with a 1% retx blip: B should win.
+
+    Captures the user's complaint: under defaults a real 20%
+    throughput improvement was being cancelled by a sub-noise retx
+    "regression". With the default tolerances both rows tie on retx
+    and the throughput winner ranks higher.
+    """
+    objectives = [
+        ParetoObjective(metric="tcp_throughput", direction="maximize"),
+        ParetoObjective(metric="tcp_retransmit_rate", direction="minimize"),
+    ]
+    rows = [
+        {_col("tcp_throughput"): 1.0e3, _col("tcp_retransmit_rate"): 1.0},
+        {_col("tcp_throughput"): 1.2e3, _col("tcp_retransmit_rate"): 1.01},
+    ]
+    section = ObjectivesSection()
+    scores = score_rows(
+        rows,
+        objectives,
+        section.recommendation_weights,
+        tolerances=section.tolerances,
+    )
+    assert scores[1] > scores[0]
+
+
+def test_score_rows_zero_tolerance_zero_sem_matches_legacy() -> None:
+    """Regression guard: empty tolerances + None SEM reduces bit-for-bit.
+
+    Reuses the fixture from
+    :func:`test_score_rows_matches_recommend_configs_formula`; calls
+    with ``tolerances={}`` and ``sems=None``; asserts per-row scores
+    match the hand-computed legacy values to ``abs=1e-15``.
+    """
+    objectives = [
+        ParetoObjective(metric="tcp_throughput", direction="maximize"),
+        ParetoObjective(metric="udp_jitter", direction="minimize"),
+    ]
+    rows = [
+        {_col("tcp_throughput"): 2.0e9, _col("udp_jitter"): 8.0},
+        {_col("tcp_throughput"): 1.5e9, _col("udp_jitter"): 5.0},
+        {_col("tcp_throughput"): 1.0e9, _col("udp_jitter"): 2.0},
+    ]
+    scores = score_rows(
+        rows,
+        objectives,
+        {"udp_jitter": 0.15},
+        tolerances={},
+        sems=None,
+    )
+    assert scores[0] == pytest.approx(0.85, abs=1e-15)
+    assert scores[1] == pytest.approx(0.425, abs=1e-15)
+    assert scores[2] == pytest.approx(0.0, abs=1e-15)
+
+
+def test_score_rows_sem_widens_threshold_above_relative() -> None:
+    """SEM dominates a small relative tolerance and ties the rows.
+
+    Two rows 1000 vs 1010 throughput with
+    ``tolerances={"tcp_throughput": 0.005}``: the relative term is
+    ``0.005 * 1010 = 5.05``, far below the 10-unit gap. With
+    ``sems=[50, 50]`` (column endpoints have SEM 0 by definition of
+    where the snap happens, but the *row* SEM is what's used) the
+    SEM term ``1.0 * 50 = 50`` covers the gap; both rows snap and
+    tie.
+    """
+    objectives = [ParetoObjective(metric="tcp_throughput", direction="maximize")]
+    rows = [
+        {_col("tcp_throughput"): 1000.0},
+        {_col("tcp_throughput"): 1010.0},
+    ]
+    sems = [
+        {f"{_col('tcp_throughput')}_sem": 50.0},
+        {f"{_col('tcp_throughput')}_sem": 50.0},
+    ]
+    scores_no_sem = score_rows(
+        rows,
+        objectives,
+        {},
+        tolerances={"tcp_throughput": 0.005},
+    )
+    # Without SEM the gap is decisive; row 1 outscores row 0.
+    assert scores_no_sem[1] > scores_no_sem[0]
+    scores_with_sem = score_rows(
+        rows,
+        objectives,
+        {},
+        tolerances={"tcp_throughput": 0.005},
+        sems=sems,
+    )
+    assert scores_with_sem[0] == pytest.approx(scores_with_sem[1])
+
+
+def test_score_rows_memory_cost_tolerance_snaps() -> None:
+    """Memory cost tolerance ties tightly-bunched costs on the cost axis.
+
+    Two rows with identical perf metrics and memory costs 100 vs 105:
+    a 10% tolerance on ``memory_cost`` snaps the 5-unit gap, leaving
+    the rows tied. The existing
+    :func:`test_score_rows_memory_cost_flips_tied_rows` (without a
+    tolerance) keeps its expected behavior.
+    """
+    objectives = [ParetoObjective(metric="tcp_throughput", direction="maximize")]
+    rows = [
+        {_col("tcp_throughput"): 1.0e9},
+        {_col("tcp_throughput"): 1.0e9},
+    ]
+    scores = score_rows(
+        rows,
+        objectives,
+        {},
+        memory_costs=[100.0, 105.0],
+        memory_cost_weight=0.1,
+        tolerances={"memory_cost": 0.10},
+    )
+    assert scores[0] == pytest.approx(scores[1])
+
+
 def test_config_memory_cost_rules_derive_per_rung() -> None:
     """Every rule kind derives the expected bytes from the selected rung."""
     space = ParamSpace(
@@ -438,12 +584,18 @@ def test_pareto_recommendation_rows_score_matches_score_rows() -> None:
         {col: row[col] for col in METRIC_TO_DF_COLUMN.values()} for row in analysis_rows
     ]
     memory_costs = [row["memory_cost"] for row in analysis_rows]
+    sem_records = [
+        {f"{col}_sem": row.get(f"{col}_sem") for col in METRIC_TO_DF_COLUMN.values()}
+        for row in analysis_rows
+    ]
     direct_scores = score_rows(
         records,
         section.pareto,
         section.recommendation_weights,
         memory_costs=memory_costs,
         memory_cost_weight=section.memory_cost_weight,
+        sems=sem_records,
+        tolerances=section.tolerances,
     )
 
     direct_by_id = {
@@ -451,3 +603,49 @@ def test_pareto_recommendation_rows_score_matches_score_rows() -> None:
     }
     analysis_by_id = {row["trial_id"]: row["score"] for row in analysis_rows}
     assert direct_by_id == pytest.approx(analysis_by_id, abs=1e-12)
+
+
+def test_cli_analyze_one_class_threads_tolerances(tmp_path: Path) -> None:
+    """Reverting ``cli.py``'s ``tolerances=`` kwarg must break this test.
+
+    Regression guard for ``cli.analyze``: ``_analyze_one_class`` calls
+    :func:`pareto_recommendation_rows` and must thread the user's
+    :attr:`ObjectivesSection.tolerances` through, including the
+    ``tolerances: {}`` opt-out. The fixture pins A barely below B on
+    throughput (within the 3% default tolerance) and far above B on
+    retx. Default tolerances snap throughput to a tie so A dominates B
+    by retx alone; ``tolerances={}`` leaves both mutually
+    non-dominated. The recommendation list length then differs
+    precisely when the CLI honors the user's tolerances.
+    """
+    pytest.importorskip("pandas")
+    pytest.importorskip("sklearn")
+    from kube_autotuner.cli import _analyze_one_class  # noqa: PLC0415, PLC2701
+    from kube_autotuner.models import ALL_STAGES  # noqa: PLC0415
+    from kube_autotuner.report import analysis as analysis_mod  # noqa: PLC0415
+
+    trials = [
+        _trial(bps=1.0e9, retransmits=100),
+        _trial(bps=1.029e9, retransmits=130),
+    ]
+
+    def _run(objectives: ObjectivesSection, sub: str) -> int:
+        sub_out = tmp_path / sub
+        sub_out.mkdir()
+        section = _analyze_one_class(
+            trials,
+            hardware_class="10g",
+            topology=None,
+            top_n=3,
+            output_dir=sub_out,
+            analysis=analysis_mod,
+            explicit_class=True,
+            objectives=objectives,
+            stages=ALL_STAGES,
+        )
+        assert section is not None
+        return len(section["pareto_rows"])
+
+    with_defaults = _run(ObjectivesSection(), "defaults")
+    without = _run(ObjectivesSection(tolerances={}), "empty")
+    assert with_defaults != without

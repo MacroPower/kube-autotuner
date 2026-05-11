@@ -321,6 +321,28 @@ objectives:
   # alongside the other minimize terms. Set to 0.0 to disable. Applies
   # only at recommendation-ranking time; Ax exploration stays untouched.
   memoryCostWeight: 0.1
+  # Per-metric relative noise floor for the ranking. Each value is a
+  # fraction of `max(|val_i|, |val_j|)`: a row whose value differs
+  # from a peer's by less than that fraction is treated as tied on
+  # that metric. When refinement runs, the per-metric SEM (from
+  # `aggregate_by_parent`) widens the gate further. The frontier uses
+  # epsilon-dominance so a sub-noise loss on one axis does not knock
+  # a real winner out, and the soft score snaps tied rows to column
+  # endpoints before normalization. Set `tolerances: {}` to reproduce
+  # the pre-noise-aware ranking bit-for-bit (the math reduces exactly
+  # when every tolerance is `0.0` and SEM is `0`). The `memory_cost`
+  # sentinel tolerances the memory-cost term. Entries for metrics
+  # absent from `pareto` are silently ignored at scoring time.
+  tolerances:
+    tcp_throughput: 0.03
+    udp_throughput: 0.03
+    rps: 0.03
+    tcp_retransmit_rate: 0.10
+    udp_loss_rate: 0.10
+    udp_jitter: 0.20
+    latency_p50: 0.05
+    latency_p90: 0.05
+    latency_p99: 0.05
 
 # Kustomize patches layered onto the generated client/server manifests.
 # Accepts a Strategic Merge Patch body (dict), a JSON6902 op list,

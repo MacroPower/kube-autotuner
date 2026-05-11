@@ -817,7 +817,16 @@ def _analyze_one_class(  # noqa: PLR0914 - threads many helpers into one section
         (analysis.METRIC_TO_DF_COLUMN[obj.metric], obj.direction)
         for obj in objectives.pareto
     ]
-    front = analysis.pareto_front(df, objectives=tuple_objectives)
+    # df here is per-trial (one sample per row), so only the relative
+    # tolerances act as a noise floor -- SEM is 0 by construction.
+    # The recommendation table below runs on the parent-aggregated
+    # frontier with SEM, so the two views can disagree on which
+    # trials survive the frontier.
+    front = analysis.pareto_front(
+        df,
+        objectives=tuple_objectives,
+        tolerances=analysis.tolerances_by_df_column(objectives.tolerances),
+    )
     pareto_mask = df["trial_id"].isin(front["trial_id"])
     # Importance is computed per potential target metric so the browser
     # can answer "which sysctls drive throughput vs p99 vs retx rate?".
@@ -844,6 +853,7 @@ def _analyze_one_class(  # noqa: PLR0914 - threads many helpers into one section
         objectives=objectives.pareto,
         weights=objectives.recommendation_weights,
         memory_cost_weight=objectives.memory_cost_weight,
+        tolerances=dict(objectives.tolerances),
     )
     _null_disabled_stage_metrics(pareto_rows, stages)
     recs: list[dict[str, Any]] = [
@@ -910,6 +920,7 @@ def _analyze_one_class(  # noqa: PLR0914 - threads many helpers into one section
         "objectives": objective_dicts,
         "default_weights": dict(objectives.recommendation_weights),
         "memory_cost_weight": objectives.memory_cost_weight,
+        "tolerances": dict(objectives.tolerances),
         "top_n": top_n,
         "importance": importance,
         "importance_by_target": importance_by_target,

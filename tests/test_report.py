@@ -864,6 +864,47 @@ def test_iteration_panel_skips_metrics_without_objective() -> None:
     assert 'if (direction !== "maximize" && direction !== "minimize") continue;' in js
 
 
+def _replay_js_normalize(
+    values: list[float | None],
+    tol: float,
+    direction: str,
+) -> list[float]:
+    """Stdlib-only port of ``scoreRows``' ``normalizeColumnWithNoise``.
+
+    SEM is wired in at ``0.0`` -- the JS payload from
+    :func:`_minimal_section` does not ship ``<col>_sem`` keys, so the
+    JS path's SEM branch is dormant on the fixture.
+
+    Returns:
+        The per-row noise-aware normalized values aligned with
+        ``values``. NaN-bearing rows and degenerate columns collapse
+        to ``0.5`` to match the JS path.
+    """
+    finite_idx = [i for i, v in enumerate(values) if v is not None]
+    if not finite_idx:
+        return [0.5] * len(values)
+    finite = [values[i] for i in finite_idx if values[i] is not None]
+    lo, hi = min(finite), max(finite)
+    if lo == hi:
+        return [0.5] * len(values)
+    snapped: list[float | None] = list(values)
+    win = hi if direction == "maximize" else lo
+    lose = lo if direction == "maximize" else hi
+    for endpoint in (win, lose):
+        for i in finite_idx:
+            vi = values[i]
+            if vi is None:
+                continue
+            rel_term = tol * max(abs(vi), abs(endpoint))
+            s_i = snapped[i]
+            if s_i is None:
+                continue
+            if abs(s_i - endpoint) <= rel_term:
+                snapped[i] = endpoint
+    span = hi - lo
+    return [0.5 if v is None else (v - lo) / span for v in snapped]
+
+
 def test_js_score_rows_port_matches_python(tmp_path: Path) -> None:  # noqa: PLR0914 - parity replay needs both JS and Python bookkeeping
     """Replay the JS ``scoreRows`` arithmetic and check it matches Python.
 
@@ -872,6 +913,11 @@ def test_js_score_rows_port_matches_python(tmp_path: Path) -> None:  # noqa: PLR
     that must match the Python scorer for the same embedded payload.
     We recompute the JS formula here against the embedded JSON and
     assert the ranking agrees with Python's ``score_rows``.
+
+    Contract: JS port ranks identically to Python under the same
+    ``tolerances``, with SEM disabled on both sides. The minimal
+    fixture does not carry SEM columns, so the test pins the
+    SEM-disabled parity contract.
     """
     from kube_autotuner.experiment import ParetoObjective as Obj  # noqa: PLC0415
     from kube_autotuner.scoring import METRIC_TO_DF_COLUMN, score_rows  # noqa: PLC0415
@@ -884,6 +930,12 @@ def test_js_score_rows_port_matches_python(tmp_path: Path) -> None:  # noqa: PLR
         row["tcp_retransmit_rate"] = 1.0 * (5 - i)
         row["memory_cost"] = float((i + 1) * 1_000_000_000)
     section["memory_cost_weight"] = 0.1
+    tolerances = {
+        "tcp_throughput": 0.03,
+        "tcp_retransmit_rate": 0.10,
+        "memory_cost": 0.10,
+    }
+    section["tolerances"] = tolerances
 
     path = render.write_index_html(tmp_path, [section])
     payload = _section_payload_from_html(path.read_text(), "10g")
@@ -892,25 +944,15 @@ def test_js_score_rows_port_matches_python(tmp_path: Path) -> None:  # noqa: PLR
     objectives = payload["objectives"]
     weights = payload["defaultWeights"]
     mw = payload["memoryCostWeight"]
+    tol_map = payload["tolerances"]
 
-    def _normalize(values: list[float]) -> list[float]:
-        finite = [v for v in values if v is not None]
-        if not finite:
-            return [0.5] * len(values)
-        lo, hi = min(finite), max(finite)
-        if lo == hi:
-            return [0.5] * len(values)
-        span = hi - lo
-        return [0.5 if v is None else (v - lo) / span for v in values]
-
-    # JS port arithmetic, stdlib-only. Mirrors the post-fa45690
-    # direction-sensitive weight defaults (maximize -> 1.0, minimize -> 0.0).
     n = len(rows)
     js_scores = [0.0] * n
     for obj in objectives:
         col = METRIC_TO_DF_COLUMN[obj["metric"]]
         raw = [r.get(col) for r in rows]
-        norm = _normalize(raw)
+        tol = tol_map.get(obj["metric"], 0.0)
+        norm = _replay_js_normalize(raw, tol, obj["direction"])
         if obj["direction"] == "maximize":
             w = weights.get(obj["metric"], 1.0)
             for i, v in enumerate(norm):
@@ -919,11 +961,15 @@ def test_js_score_rows_port_matches_python(tmp_path: Path) -> None:  # noqa: PLR
             w = weights.get(obj["metric"], 0.0)
             for i, v in enumerate(norm):
                 js_scores[i] -= w * v
-    cost_norm = _normalize([r.get("memory_cost") for r in rows])
+    cost_tol = tol_map.get("memory_cost", 0.0)
+    cost_norm = _replay_js_normalize(
+        [r.get("memory_cost") for r in rows],
+        cost_tol,
+        "minimize",
+    )
     for i, v in enumerate(cost_norm):
         js_scores[i] -= mw * v
 
-    # Python scorer over the same payload.
     py_objectives = [Obj.model_validate(o) for o in objectives]
     py_scores = score_rows(
         rows,
@@ -931,8 +977,8 @@ def test_js_score_rows_port_matches_python(tmp_path: Path) -> None:  # noqa: PLR
         weights,
         memory_costs=[r["memory_cost"] for r in rows],
         memory_cost_weight=mw,
+        tolerances=tolerances,
     )
-    # Rankings must match even if absolute scores differ by rounding.
     js_order = sorted(range(n), key=lambda i: (-js_scores[i], i))
     py_order = sorted(range(n), key=lambda i: (-py_scores[i], i))
     assert js_order == py_order

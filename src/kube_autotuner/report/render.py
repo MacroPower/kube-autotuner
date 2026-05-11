@@ -703,6 +703,7 @@ def _section_payload(section: dict[str, Any]) -> dict[str, Any]:
         "objectives": section["objectives"],
         "defaultWeights": section["default_weights"],
         "memoryCostWeight": section["memory_cost_weight"],
+        "tolerances": section.get("tolerances", {}),
         "paretoRows": section["pareto_rows"],
         "allRows": section["all_rows"],
         "axisColumns": section["axis_columns"],
@@ -1334,31 +1335,67 @@ function toFloatOrNaN(v) {
 }
 
 function normalizeColumn(values) {
-  const finite = values.filter(v => !Number.isNaN(v));
-  if (finite.length === 0) return values.map(() => DEGENERATE);
+  return normalizeColumnWithNoise(values, null, 0.0, "maximize");
+}
+
+// Port of kube_autotuner.scoring._normalize_column_with_noise. SEM is
+// passed as a parallel array (null = "no SEM data, only the relative
+// tolerance applies"); endpoints have SEM 0 by construction.
+const SEM_K = 1.0;
+function normalizeColumnWithNoise(values, sems, tol, direction) {
+  const n = values.length;
+  const finiteIdx = [];
+  for (let i = 0; i < n; i++) {
+    if (!Number.isNaN(values[i])) finiteIdx.push(i);
+  }
+  if (finiteIdx.length === 0) return values.map(() => DEGENERATE);
   let lo = Infinity, hi = -Infinity;
-  for (const v of finite) {
+  for (const i of finiteIdx) {
+    const v = values[i];
     if (v < lo) lo = v;
     if (v > hi) hi = v;
   }
   if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi === lo) {
     return values.map(() => DEGENERATE);
   }
+  const snapped = values.slice();
+  const [win, lose] = direction === "maximize" ? [hi, lo] : [lo, hi];
+  for (const endpoint of [win, lose]) {
+    for (const i of finiteIdx) {
+      const semI = sems ? sems[i] : 0.0;
+      const semTerm = SEM_K * semI;
+      const relTerm = tol * Math.max(Math.abs(values[i]), Math.abs(endpoint));
+      const threshold = semTerm > relTerm ? semTerm : relTerm;
+      if (Math.abs(snapped[i] - endpoint) <= threshold) {
+        snapped[i] = endpoint;
+      }
+    }
+  }
   const span = hi - lo;
-  return values.map(v => Number.isNaN(v) ? DEGENERATE : (v - lo) / span);
+  return snapped.map(v => Number.isNaN(v) ? DEGENERATE : (v - lo) / span);
 }
 
 // Port of kube_autotuner.scoring.score_rows with per-metric contribution
 // bookkeeping for the decomposition panel.
-function scoreRows(rows, objectives, weights, memoryCostWeight) {
+function scoreRows(rows, objectives, weights, memoryCostWeight, tolerances, sems) {
   const n = rows.length;
   const scores = new Array(n).fill(0);
   const contributions = Array.from({length: n}, () => ({}));
   if (n === 0) return {scores, contributions};
+  const tolMap = tolerances ?? {};
   for (const obj of objectives) {
     const col = METRIC_TO_DF_COLUMN[obj.metric];
     const raw = rows.map(r => toFloatOrNaN(r[col]));
-    const norm = normalizeColumn(raw);
+    const semKey = `${col}_sem`;
+    let semVals = null;
+    if (sems) {
+      semVals = sems.map(s => {
+        const f = toFloatOrNaN(s[semKey]);
+        return Number.isNaN(f) ? 0.0 : f;
+      });
+    }
+    const tol = tolMap[obj.metric] ?? 0.0;
+    const norm = normalizeColumnWithNoise(raw, semVals, tol, obj.direction);
     if (obj.direction === "maximize") {
       const w = weights[obj.metric] ?? 1.0;
       for (let i = 0; i < n; i++) {
@@ -1385,7 +1422,8 @@ function scoreRows(rows, objectives, weights, memoryCostWeight) {
   const mw = memoryCostWeight ?? 0.0;
   if (mw > 0) {
     const raw = rows.map(r => toFloatOrNaN(r.memory_cost));
-    const norm = normalizeColumn(raw);
+    const costTol = tolMap.memory_cost ?? 0.0;
+    const norm = normalizeColumnWithNoise(raw, null, costTol, "minimize");
     for (let i = 0; i < n; i++) {
       const c = -mw * norm[i];
       scores[i] += c;
@@ -2154,11 +2192,15 @@ function renderSection(panel, section) {
   state.rowRefs = rowRefs;
 
   function rerank() {
+    // paretoRows doubles as the SEM bundle: pareto_recommendation_rows
+    // ships <col>_sem fields on each row.
     const {scores, contributions} = scoreRows(
       section.paretoRows,
       section.objectives,
       state.weights,
-      state.memoryCostWeight);
+      state.memoryCostWeight,
+      section.tolerances,
+      section.paretoRows);
     const ranked = section.paretoRows
       .map((row, i) => ({row, score: scores[i], contributions: contributions[i]}))
       .sort((a, b) => {

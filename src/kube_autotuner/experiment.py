@@ -438,6 +438,31 @@ _DEFAULT_WEIGHTS: dict[str, float] = {
     "latency_p99": 0.15,
 }
 
+# Per-metric relative tolerances acting as the floor on the noise gate
+# in :func:`kube_autotuner.scoring._noise_threshold`. Values are
+# fractions of ``max(|val_i|, |val_j|)`` -- a 0.03 entry means "treat
+# differences under 3% of the larger value as a tie on this metric".
+# The SEM term (from :func:`aggregate_by_parent`) widens the gate
+# further when refinement supplies it; without refinement only the
+# relative term applies. See :class:`ObjectivesSection.tolerances`.
+_DEFAULT_TOLERANCES: dict[str, float] = {
+    "tcp_throughput": 0.03,
+    "udp_throughput": 0.03,
+    "rps": 0.03,
+    "tcp_retransmit_rate": 0.10,
+    "udp_loss_rate": 0.10,
+    "udp_jitter": 0.20,
+    "latency_p50": 0.05,
+    "latency_p90": 0.05,
+    "latency_p99": 0.05,
+}
+
+# Non-metric keys :attr:`ObjectivesSection.tolerances` accepts alongside
+# the nine real metrics. ``"memory_cost"`` tolerances the synthetic
+# minimize term :func:`~kube_autotuner.scoring.score_rows` derives from
+# sysctl values.
+_ALLOWED_TOL_EXTRAS: set[str] = {"memory_cost"}
+
 
 def _normalize_constraint(constraint: str, match: re.Match[str]) -> str:
     """Rewrite a suffixed constraint to bare numeric form.
@@ -543,6 +568,32 @@ class ObjectivesSection(BaseModel):
     when performance is near-tied. Set to ``0.0`` to disable. The term
     is applied only at recommendation-ranking time; Ax exploration
     remains untouched.
+
+    ``tolerances`` (YAML key ``tolerances``) is a per-metric relative
+    noise floor applied at recommendation-ranking time. Each entry is
+    a fraction of ``max(|val_i|, |val_j|)``: a row whose value differs
+    from a peer's by less than that fraction counts as tied on that
+    metric. When refinement runs and
+    :func:`~kube_autotuner.scoring.aggregate_by_parent` produces a
+    per-metric SEM column, the gate widens further to absorb the
+    sampling noise. The gate fires in two places.
+    :func:`~kube_autotuner.report.analysis.pareto_front` runs
+    epsilon-dominance so a sub-noise loss on one axis cannot drop a
+    real winner.
+    :func:`~kube_autotuner.scoring.score_rows` snaps tied rows to
+    column endpoints before normalizing so the soft ranking does not
+    flip on within-noise differences. Defaults are tuned for the
+    iperf3/fortio noise floor: 3% on bandwidth/throughput metrics,
+    10% on retransmit/loss rates, 20% on UDP jitter, and 5% on
+    latency percentiles. Add the sentinel key ``"memory_cost"`` to
+    tolerance the deterministic memory-cost term. Validation here is
+    asymmetric to ``recommendation_weights``: entries for metrics
+    absent from ``pareto`` are silently ignored at scoring time
+    rather than rejected, so the default factory can ship every known
+    metric without coupling to per-experiment ``pareto`` membership.
+    Set to an empty dict (``tolerances: {}`` in YAML) to reproduce
+    the pre-noise-aware ranking bit-for-bit; the math reduces
+    exactly when ``tol == 0`` and SEM is ``0`` everywhere.
     """
 
     model_config = ConfigDict(
@@ -560,6 +611,9 @@ class ObjectivesSection(BaseModel):
         default_factory=lambda: dict(_DEFAULT_WEIGHTS),
     )
     memory_cost_weight: float = Field(default=0.1, ge=0.0)
+    tolerances: dict[str, float] = Field(
+        default_factory=lambda: dict(_DEFAULT_TOLERANCES),
+    )
 
     @model_validator(mode="after")
     def _validate_objectives(self) -> ObjectivesSection:
@@ -570,9 +624,11 @@ class ObjectivesSection(BaseModel):
 
         Raises:
             ValueError: A weight targets an unknown metric or has a
-                negative value; or a constraint does not parse as
+                negative value; a constraint does not parse as
                 ``"<metric> <op> <quantity>"`` against the known
-                metric set.
+                metric set; or a tolerance targets a metric outside
+                the known set (plus the ``"memory_cost"`` sentinel)
+                or has a negative value.
         """
         pareto_metrics: set[str] = {obj.metric for obj in self.pareto}
         for metric, weight in self.recommendation_weights.items():
@@ -597,6 +653,17 @@ class ObjectivesSection(BaseModel):
             "latency_p90",
             "latency_p99",
         }
+        for metric, tol in self.tolerances.items():
+            if tol < 0:
+                msg = f"tolerances[{metric!r}]={tol} must be non-negative"
+                raise ValueError(msg)
+            if metric not in known and metric not in _ALLOWED_TOL_EXTRAS:
+                allowed = sorted(known | _ALLOWED_TOL_EXTRAS)
+                msg = (
+                    f"tolerances key {metric!r} is not a known metric; "
+                    f"expected one of {allowed}"
+                )
+                raise ValueError(msg)
         rewritten: list[str] = []
         for constraint in self.constraints:
             match = _CONSTRAINT_RE.match(constraint)
@@ -616,6 +683,71 @@ class ObjectivesSection(BaseModel):
             rewritten.append(_normalize_constraint(constraint, match))
         self.constraints = rewritten
         return self
+
+
+def _prune_constraints(
+    constraints: list[str],
+    supported: frozenset[str] | set[str],
+) -> list[str]:
+    """Drop constraint strings whose metric is not produced by enabled stages.
+
+    Args:
+        constraints: Constraint strings previously normalized by
+            :meth:`ObjectivesSection._validate_objectives`.
+        supported: Metrics produced by the enabled benchmark stages.
+
+    Returns:
+        The filtered subset, preserving order. Constraints whose
+        ``<metric>`` falls outside ``supported`` are logged at INFO
+        and dropped.
+    """
+    kept: list[str] = []
+    for constraint in constraints:
+        match = _CONSTRAINT_RE.match(constraint)
+        if match is None:
+            continue
+        if match.group("metric") in supported:
+            kept.append(constraint)
+        else:
+            logger.info(
+                "constraint %r excluded: produced only by disabled stages",
+                constraint,
+            )
+    return kept
+
+
+def _prune_keyed_metrics(
+    items: dict[str, float],
+    supported: frozenset[str] | set[str],
+    field_name: str,
+    *,
+    sentinel_keep: frozenset[str] | set[str] | None = None,
+) -> dict[str, float]:
+    """Drop metric-keyed entries whose metric is not produced by enabled stages.
+
+    Args:
+        items: Map keyed by short metric name.
+        supported: Metrics produced by the enabled benchmark stages.
+        field_name: Label used in the per-dropped-key INFO log line.
+        sentinel_keep: Optional whitelist of non-metric keys to keep
+            regardless of stage support (e.g. ``"memory_cost"`` in
+            :attr:`ObjectivesSection.tolerances`).
+
+    Returns:
+        The filtered subset, preserving the original iteration order.
+    """
+    keep_extra: frozenset[str] | set[str] = sentinel_keep or set[str]()
+    kept: dict[str, float] = {}
+    for metric, value in items.items():
+        if metric in keep_extra or metric in supported:
+            kept[metric] = value
+        else:
+            logger.info(
+                "%s[%r] excluded: produced only by disabled stages",
+                field_name,
+                metric,
+            )
+    return kept
 
 
 class ExperimentConfig(BaseModel):
@@ -639,16 +771,18 @@ class ExperimentConfig(BaseModel):
 
         When ``benchmark.stages`` is a strict subset of the full stage
         set, any metric in :attr:`ObjectivesSection.pareto`,
-        :attr:`ObjectivesSection.constraints`, or
-        :attr:`ObjectivesSection.recommendation_weights` that is only
-        produced by a disabled stage would never receive a real
-        observation. Rather than surface Ax warnings about zero-variance
-        metrics and zero-valued frontier entries, the offending entries
-        are filtered out here. The default objective set mentions every
+        :attr:`ObjectivesSection.constraints`,
+        :attr:`ObjectivesSection.recommendation_weights`, or
+        :attr:`ObjectivesSection.tolerances` that is only produced by
+        a disabled stage would never receive a real observation.
+        Rather than surface Ax warnings about zero-variance metrics
+        and zero-valued frontier entries, the offending entries are
+        filtered out here. The default objective set mentions every
         metric, so users who skip a stage do not need to hand-prune
-        every objective field.
+        every objective field. ``tolerances`` keeps the
+        ``"memory_cost"`` sentinel regardless of enabled stages.
 
-        The three fields must move in lockstep:
+        The four fields must move in lockstep:
         :meth:`ObjectivesSection._validate_objectives` enforces that
         every ``recommendation_weights`` key is a metric in ``pareto``,
         so dropping a pareto metric requires dropping its weight too.
@@ -677,29 +811,22 @@ class ExperimentConfig(BaseModel):
                 "stage whose metrics are referenced by the pareto list"
             )
             raise ValueError(msg)
-        kept_constraints = []
-        for constraint in self.objectives.constraints:
-            match = _CONSTRAINT_RE.match(constraint)
-            if match is not None and match.group("metric") in supported:
-                kept_constraints.append(constraint)
-            elif match is not None:
-                logger.info(
-                    "constraint %r excluded: produced only by disabled stages",
-                    constraint,
-                )
-        kept_weights: dict[str, float] = {}
-        for metric, weight in self.objectives.recommendation_weights.items():
-            if metric in supported:
-                kept_weights[metric] = weight
-            else:
-                logger.info(
-                    "recommendation_weights[%r] excluded: "
-                    "produced only by disabled stages",
-                    metric,
-                )
         self.objectives.pareto = kept_pareto
-        self.objectives.constraints = kept_constraints
-        self.objectives.recommendation_weights = kept_weights
+        self.objectives.constraints = _prune_constraints(
+            self.objectives.constraints,
+            supported,
+        )
+        self.objectives.recommendation_weights = _prune_keyed_metrics(
+            self.objectives.recommendation_weights,
+            supported,
+            "recommendation_weights",
+        )
+        self.objectives.tolerances = _prune_keyed_metrics(
+            self.objectives.tolerances,
+            supported,
+            "tolerances",
+            sentinel_keep=_ALLOWED_TOL_EXTRAS,
+        )
         return self
 
     @classmethod

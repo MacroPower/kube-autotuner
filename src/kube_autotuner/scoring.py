@@ -30,7 +30,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
-    from kube_autotuner.experiment import ParetoObjective
+    from kube_autotuner.experiment import Direction, ParetoObjective
     from kube_autotuner.models import MemoryCost, ParamSpace, TrialResult
 
 
@@ -47,6 +47,55 @@ METRIC_TO_DF_COLUMN: dict[str, str] = {
 }
 
 _DEGENERATE_NORM = 0.5
+
+# Multiplier on the SEM-based noise term in :func:`_noise_threshold`. At
+# ``k = 1.0`` the SEM term equals the standard error of the difference of
+# two independent sample means (``sqrt(sem_i**2 + sem_j**2)``), so the
+# gate fires when the observed gap is within one such standard error.
+# ``1.96`` (a 95% CI) gated too aggressively on real data: clear winners
+# kept landing inside the band and getting called ties.
+_SEM_K: float = 1.0
+
+
+def _noise_threshold(
+    val_i: float,
+    val_j: float,
+    sem_i: float,
+    sem_j: float,
+    tol: float,
+) -> float:
+    """Return the per-pair noise tolerance for comparing two metric values.
+
+    The threshold is the larger of a data-driven SEM term and a
+    config-driven relative-tolerance floor:
+
+    * ``_SEM_K * sqrt(sem_i**2 + sem_j**2)`` -- the standard error of
+      the difference of two independent sample means (``sem_i`` and
+      ``sem_j`` are :func:`statistics.stdev` / ``sqrt(n)`` from
+      :func:`aggregate_by_parent`).
+    * ``tol * max(|val_i|, |val_j|, 1e-12)`` -- a relative-to-value
+      floor. The ``1e-12`` keeps a both-zero pair from collapsing the
+      threshold into a degenerate ``abs(0 - 0) <= 0`` compare (which
+      is just identity, so harmless, but cleaner to avoid).
+
+    Pass ``0.0`` for missing SEMs; the SEM term then vanishes and the
+    relative term decides.
+
+    Args:
+        val_i: Metric value for row ``i``.
+        val_j: Metric value for row ``j``.
+        sem_i: SEM of ``val_i`` (``0.0`` for single-sample rows).
+        sem_j: SEM of ``val_j`` (``0.0`` for single-sample rows).
+        tol: Per-metric relative tolerance from
+            :attr:`ObjectivesSection.tolerances`.
+
+    Returns:
+        A non-negative float threshold. Differences ``|val_j - val_i|``
+        at or below this value count as ties on this metric.
+    """
+    sem_term = _SEM_K * math.sqrt(sem_i * sem_i + sem_j * sem_j)
+    rel_term = tol * max(abs(val_i), abs(val_j), 1e-12)
+    return max(sem_term, rel_term)
 
 
 def _to_float_or_nan(v: object) -> float:
@@ -79,27 +128,93 @@ def _to_float_or_nan(v: object) -> float:
 def _normalize_column(values: list[float]) -> list[float]:
     """Min-max normalize ``values``, mapping NaN and degenerate to ``0.5``.
 
-    Canonical implementation: the analysis path consumes this through
-    :func:`score_rows`. When the column has no finite values or
-    ``min == max`` the entire column collapses to ``0.5``; finite
-    values are mapped linearly to ``[0, 1]``; NaN rows fall back to
-    ``0.5`` (the equivalent of ``.fillna(0.5)`` after division).
+    Thin wrapper over :func:`_normalize_column_with_noise` with
+    ``tol = 0.0`` and ``sems = None``, for callers that do not pass
+    noise-aware scoring data. Scale-invariant: ranking is preserved
+    under any positive linear rescale of ``values``. Scale-invariance
+    does not hold for :func:`_normalize_column_with_noise` once
+    ``tol`` is non-zero, since relative tolerances depend on the
+    input magnitude.
 
     Args:
         values: Per-row raw values for a single metric column.
 
     Returns:
         A list of normalized floats the same length as ``values``.
+        When the column has no finite values or ``min == max``, every
+        entry collapses to ``0.5``. Finite values map linearly to
+        ``[0, 1]``; NaN rows fall back to ``0.5``.
     """
-    finite = [v for v in values if not math.isnan(v)]
-    if not finite:
-        return [_DEGENERATE_NORM] * len(values)
+    return _normalize_column_with_noise(values, None, 0.0, "maximize")
+
+
+def _normalize_column_with_noise(
+    values: list[float],
+    sems: list[float] | None,
+    tol: float,
+    direction: Direction,
+) -> list[float]:
+    """Noise-aware min-max normalization with per-row endpoint snapping.
+
+    Each finite row is snapped to the column's winning (best) or losing
+    (worst) endpoint when its raw value lies within the per-pair noise
+    threshold of that endpoint. The threshold combines a data-driven
+    SEM term (``_SEM_K * sem_i``; the column endpoint has SEM 0 by
+    construction, since it *is* the extremum) and a config-driven
+    relative-tolerance floor (``tol * max(|values[i]|, |endpoint|)``).
+    Snapping at *both* endpoints stops a thin gradient near a
+    minimize metric's column min from accumulating across many
+    metrics. The denominator stays the *original* span, so the snap
+    does not narrow it.
+
+    Reduces to :func:`_normalize_column` bit-for-bit when ``tol == 0``
+    and every ``sems[i] == 0`` (regression test in
+    ``tests/test_scoring.py``).
+
+    Args:
+        values: Per-row raw values for a single metric column.
+        sems: Optional per-row SEM aligned with ``values``. ``None``
+            (or a missing SEM column) disables SEM-driven snapping;
+            only the relative term applies in that case.
+        tol: Per-metric relative tolerance. ``0.0`` disables the
+            config-driven floor entirely.
+        direction: ``"maximize"`` or ``"minimize"``. Picks which
+            extremum is the winning endpoint for the snap.
+
+    Returns:
+        A list of normalized floats the same length as ``values``.
+        Degenerate paths match :func:`_normalize_column`: all-NaN or
+        ``hi == lo`` collapses to ``[0.5] * len(values)``.
+    """
+    n = len(values)
+    finite_idx = [i for i, v in enumerate(values) if not math.isnan(v)]
+    if not finite_idx:
+        return [_DEGENERATE_NORM] * n
+    finite = [values[i] for i in finite_idx]
     lo = min(finite)
     hi = max(finite)
     if not math.isfinite(lo) or not math.isfinite(hi) or hi == lo:
-        return [_DEGENERATE_NORM] * len(values)
+        return [_DEGENERATE_NORM] * n
     span = hi - lo
-    return [_DEGENERATE_NORM if math.isnan(v) else (v - lo) / span for v in values]
+    # Fast path: with no noise gate, skip the snap-then-rescale and
+    # emit the same min-max output as the legacy _normalize_column.
+    if not tol and sems is None:
+        return [_DEGENERATE_NORM if math.isnan(v) else (v - lo) / span for v in values]
+
+    snapped = list(values)
+    win, lose = (hi, lo) if direction == "maximize" else (lo, hi)
+    for i in finite_idx:
+        sem_i = sems[i] if sems is not None else 0.0
+        for endpoint in (win, lose):
+            if abs(snapped[i] - endpoint) <= _noise_threshold(
+                values[i],
+                endpoint,
+                sem_i,
+                0.0,
+                tol,
+            ):
+                snapped[i] = endpoint
+    return [_DEGENERATE_NORM if math.isnan(v) else (v - lo) / span for v in snapped]
 
 
 def score_rows(
@@ -108,6 +223,9 @@ def score_rows(
     weights: Mapping[str, float],
     memory_costs: Sequence[float] | None = None,
     memory_cost_weight: float = 0.0,
+    *,
+    sems: Sequence[Mapping[str, object]] | None = None,
+    tolerances: Mapping[str, float] | None = None,
 ) -> list[float]:
     """Return per-row weighted scores using the shared recommendation formula.
 
@@ -117,22 +235,26 @@ def score_rows(
          sum(weights.get(m, 0.0) * norm(m) for m in minimize-direction)
          - memory_cost_weight * norm(memory_cost)``
 
-    Each ``norm`` is a min-max normalization across the supplied
-    ``rows``. ``weights`` applies to both directions, with
-    direction-sensitive defaults: an omitted maximize-metric weight
-    falls back to ``1.0`` (preserving that metric's full +norm
-    contribution), while an omitted minimize-metric weight falls back
-    to ``0.0`` (the metric participates in frontier selection upstream
-    but does not bias the score).
+    Each ``norm`` is a noise-aware min-max normalization across the
+    supplied ``rows`` (see :func:`_normalize_column_with_noise`).
+    ``weights`` applies to both directions, with direction-sensitive
+    defaults: an omitted maximize-metric weight falls back to ``1.0``
+    (preserving that metric's full +norm contribution), while an
+    omitted minimize-metric weight falls back to ``0.0`` (the metric
+    still participates in upstream frontier selection but does not
+    bias the score).
 
     The optional ``memory_costs`` / ``memory_cost_weight`` pair adds a
     synthetic minimize term for static kernel/CNI memory footprint; see
-    :func:`config_memory_cost`. When both are supplied, the cost column
-    is min-max normalized across ``rows`` and
-    ``memory_cost_weight * norm`` is subtracted from each row's score
-    mirroring the minimize branch above. Single-row inputs collapse to
-    ``norm = 0.5`` (uniform offset, no rank change); ``memory_costs``
-    omitted or ``memory_cost_weight = 0.0`` yields the cost-free score.
+    :func:`config_memory_cost`. When both are supplied, the cost
+    column runs through the same helper with ``direction="minimize"``
+    and ``sems=None`` (memory cost is deterministic from sysctl
+    values, so SEM does not apply) and ``memory_cost_weight * norm``
+    is subtracted from each row's score. The memory-cost term reads
+    its tolerance from ``tolerances["memory_cost"]`` (default
+    ``0.0``). Single-row inputs collapse to ``norm = 0.5`` (uniform
+    offset, no rank change). ``memory_costs`` omitted or
+    ``memory_cost_weight = 0.0`` yields the cost-free score.
 
     Both call sites pass their own idiomatic row shape and the helper
     is tolerant of both:
@@ -146,18 +268,23 @@ def score_rows(
     The lookup key for each objective is
     ``METRIC_TO_DF_COLUMN[objective.metric]`` -- the DataFrame column
     name, not the short metric label. Both call sites therefore key
-    their rows by the DataFrame column naming.
+    their rows by the DataFrame column naming. ``sems`` rows are
+    keyed by ``f"{col}_sem"`` (the form
+    :func:`aggregate_by_parent` emits).
 
     A row missing an objective's column, or an objective missing from
     the rows, resolves to NaN for that metric. NaN + the
-    degenerate-column fallback in :func:`_normalize_column` collapses
-    the column to ``0.5`` uniformly across rows, so the contribution
-    is identical across rows and does not change the ranking.
+    degenerate-column fallback in :func:`_normalize_column_with_noise`
+    collapses the column to ``0.5`` uniformly across rows, so the
+    contribution is identical across rows and does not change the
+    ranking.
 
-    Ranking is scale-invariant under min-max normalization, so
-    callers may feed values in their native units (bits/sec, bytes,
-    Mbps, MiB) without affecting the rank order. Score magnitudes
-    differ; ranks do not.
+    Scale-invariance under min-max normalization breaks once
+    ``tolerances`` is non-empty, since relative tolerances depend on
+    input magnitude. With ``tolerances`` omitted (or all-zero) and
+    ``sems`` omitted (or all-zero), the math reduces bit-for-bit to
+    the pre-tolerance formula and ranking is scale-invariant as
+    before.
 
     Args:
         rows: Per-trial metric bundles keyed by DataFrame column name
@@ -175,6 +302,18 @@ def score_rows(
         memory_cost_weight: Non-negative multiplier applied to the
             normalized memory-cost column. ``0.0`` (or ``None`` costs)
             disables the term entirely.
+        sems: Optional per-row SEM bundles aligned with ``rows``.
+            Each entry maps the SEM column name (``f"{col}_sem"`` for
+            every entry in :data:`METRIC_TO_DF_COLUMN`) to the
+            standard error of the mean as produced by
+            :func:`aggregate_by_parent`. ``None`` (or a missing SEM
+            key) means SEM-driven snapping is disabled for that
+            metric.
+        tolerances: Optional per-metric relative tolerances keyed by
+            the short metric name and (for the memory-cost term) the
+            sentinel ``"memory_cost"``. Missing keys default to
+            ``0.0``. See :class:`ObjectivesSection.tolerances` for
+            the default map.
 
     Returns:
         A list of raw float scores in ``rows`` order. Rounding and
@@ -184,11 +323,23 @@ def score_rows(
     if n == 0:
         return []
 
+    tol_map: Mapping[str, float] = tolerances if tolerances is not None else {}
+
     scores = [0.0] * n
     for obj in objectives:
         col = METRIC_TO_DF_COLUMN[obj.metric]
         raw = [_to_float_or_nan(row.get(col)) for row in rows]
-        norm = _normalize_column(raw)
+        sem_vals: list[float] | None
+        if sems is None:
+            sem_vals = None
+        else:
+            sem_key = f"{col}_sem"
+            sem_vals = [
+                0.0 if math.isnan(f := _to_float_or_nan(s.get(sem_key))) else f
+                for s in sems
+            ]
+        tol = tol_map.get(obj.metric, 0.0)
+        norm = _normalize_column_with_noise(raw, sem_vals, tol, obj.direction)
         if obj.direction == "maximize":
             weight = weights.get(obj.metric, 1.0)
             for i, value in enumerate(norm):
@@ -199,7 +350,13 @@ def score_rows(
                 scores[i] -= weight * value
 
     if memory_costs is not None and memory_cost_weight > 0.0:
-        cost_norm = _normalize_column([_to_float_or_nan(c) for c in memory_costs])
+        cost_tol = tol_map.get("memory_cost", 0.0)
+        cost_norm = _normalize_column_with_noise(
+            [_to_float_or_nan(c) for c in memory_costs],
+            None,
+            cost_tol,
+            "minimize",
+        )
         for i, value in enumerate(cost_norm):
             scores[i] -= memory_cost_weight * value
     return scores

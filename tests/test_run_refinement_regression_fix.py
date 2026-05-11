@@ -87,6 +87,8 @@ def test_un_refined_parent_cannot_outrank_refined_and_regressed_one() -> None:
         rows,
         objectives.pareto,
         objectives.recommendation_weights,
+        sems=rows,
+        tolerances=objectives.tolerances,
     )
     score_by_id = {str(r["trial_id"]): s for r, s in zip(rows, scores, strict=True)}
     # A's combined mean is (12 + 8 + 8 + 8) / 4 = 9 Gbps; B is 10 Gbps.

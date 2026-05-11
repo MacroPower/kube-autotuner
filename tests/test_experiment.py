@@ -395,6 +395,33 @@ benchmark:
     )
 
 
+def test_stages_subset_prunes_tolerances(tmp_path: Path) -> None:
+    """Disabled-stage metric tolerances are pruned the same way weights are."""
+    path = _write(
+        tmp_path,
+        """\
+nodes:
+  sources: [a]
+  target: b
+benchmark:
+  stages: ["bw-tcp"]
+objectives:
+  tolerances:
+    tcp_throughput: 0.03
+    udp_throughput: 0.03
+    udp_jitter: 0.20
+    memory_cost: 0.10
+""",
+    )
+    exp = ExperimentConfig.from_yaml(path)
+    # bw-tcp only produces ``tcp_throughput`` and ``tcp_retransmit_rate``;
+    # everything else gets pruned. The ``memory_cost`` sentinel is exempt.
+    assert "tcp_throughput" in exp.objectives.tolerances
+    assert "udp_throughput" not in exp.objectives.tolerances
+    assert "udp_jitter" not in exp.objectives.tolerances
+    assert exp.objectives.tolerances.get("memory_cost") == pytest.approx(0.10)
+
+
 def test_stages_prune_error_when_pareto_empties(tmp_path: Path):
     path = _write(
         tmp_path,
@@ -1123,6 +1150,57 @@ class TestObjectivesSection:
         )
         assert len(section.pareto) == 2
         assert section.recommendation_weights == {"udp_jitter": 0.5}
+
+    def test_default_tolerances_match_constant(self) -> None:
+        """Default-constructed section ships every known metric's tolerance."""
+        section = ObjectivesSection()
+        assert section.tolerances == {
+            "tcp_throughput": 0.03,
+            "udp_throughput": 0.03,
+            "rps": 0.03,
+            "tcp_retransmit_rate": 0.10,
+            "udp_loss_rate": 0.10,
+            "udp_jitter": 0.20,
+            "latency_p50": 0.05,
+            "latency_p90": 0.05,
+            "latency_p99": 0.05,
+        }
+
+    def test_negative_tolerance_rejected(self) -> None:
+        with pytest.raises(ValueError, match="non-negative"):
+            ObjectivesSection(tolerances={"tcp_throughput": -0.01})
+
+    def test_unknown_tolerance_metric_rejected(self) -> None:
+        with pytest.raises(ValueError, match="not a known metric"):
+            ObjectivesSection(tolerances={"latency_p42": 0.05})
+
+    def test_memory_cost_tolerance_accepted(self) -> None:
+        """The ``memory_cost`` sentinel passes validation."""
+        section = ObjectivesSection(tolerances={"memory_cost": 0.10})
+        assert section.tolerances == {"memory_cost": 0.10}
+
+    def test_tolerance_for_metric_outside_pareto_accepted(self) -> None:
+        """Tolerances are validated against the known set, not pareto.
+
+        This is asymmetric with ``recommendation_weights`` (which
+        requires pareto membership) and intentionally so: the default
+        factory ships every known metric, so users who narrow
+        ``pareto`` would otherwise crash on construction.
+        """
+        section = ObjectivesSection(
+            pareto=[
+                ParetoObjective(metric="tcp_throughput", direction="maximize"),
+            ],
+            constraints=[],
+            recommendation_weights={},
+            tolerances={"latency_p99": 0.05},
+        )
+        assert section.tolerances == {"latency_p99": 0.05}
+
+    def test_empty_tolerances_opt_out(self) -> None:
+        """``tolerances={}`` is the explicit opt-out for legacy ranking."""
+        section = ObjectivesSection(tolerances={})
+        assert section.tolerances == {}
 
 
 class TestObjectivesSectionConstraintUnits:

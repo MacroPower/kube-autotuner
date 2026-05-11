@@ -110,10 +110,12 @@ def test_seed_history_top_matches_aggregate_score_rows() -> None:
     # Expected top = aggregated rows scored then sorted by
     # (-score, trial_id) ascending.
     agg = aggregate_by_parent(prior)
+    section = ObjectivesSection()
     scores = score_rows(
         agg,
-        ObjectivesSection().pareto,
-        ObjectivesSection().recommendation_weights,
+        section.pareto,
+        section.recommendation_weights,
+        tolerances=section.tolerances,
     )
     expected_order = sorted(
         range(len(agg)),

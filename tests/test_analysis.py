@@ -387,6 +387,114 @@ class TestParetoFront:
         )
         assert pareto_front(df).empty
 
+    def test_within_tolerance_keeps_both(self) -> None:
+        """A sub-tolerance loss on one axis no longer drops the row.
+
+        Without tolerances B strictly dominates A: equal throughput,
+        slightly better retx. With a 10% tolerance on retx the
+        per-axis comparison reports a tie and neither row strictly
+        dominates, so both survive the frontier.
+        """
+        df = pd.DataFrame(
+            {
+                "trial_id": ["A", "B"],
+                "mean_tcp_throughput": [100.0, 100.0],
+                "tcp_retransmit_rate": [1.00, 0.99],
+                **_pad_latency_cols(2),
+            },
+        )
+        baseline = pareto_front(df)
+        assert set(baseline["trial_id"]) == {"B"}
+        widened = pareto_front(
+            df,
+            tolerances={"tcp_retransmit_rate": 0.10},
+        )
+        assert set(widened["trial_id"]) == {"A", "B"}
+
+    def test_better_by_threshold_dominates(self) -> None:
+        """A clear winner beyond the threshold still dominates a near-tie peer."""
+        df = pd.DataFrame(
+            {
+                "trial_id": ["A", "B"],
+                "mean_tcp_throughput": [200.0, 100.0],
+                "tcp_retransmit_rate": [1.0, 1.005],
+                **_pad_latency_cols(2),
+            },
+        )
+        front = pareto_front(
+            df,
+            tolerances={
+                "tcp_retransmit_rate": 0.10,
+                "mean_tcp_throughput": 0.03,
+            },
+        )
+        # A's throughput is 200; retx is essentially tied at 0.5% rel
+        # gap (< 10%). A dominates B by the throughput axis.
+        assert set(front["trial_id"]) == {"A"}
+
+    def test_user_example_default_tolerances(self) -> None:
+        """The user's complaint case: 20% throughput beats a 1% retx blip.
+
+        Without tolerances both survive (neither strictly dominates).
+        With the default tolerances A is dominated by B's clear
+        throughput win since retx is tied within noise.
+        """
+        df = pd.DataFrame(
+            {
+                "trial_id": ["A", "B"],
+                "mean_tcp_throughput": [1000.0, 1200.0],
+                "tcp_retransmit_rate": [1.00, 1.01],
+                **_pad_latency_cols(2),
+            },
+        )
+        baseline = pareto_front(df)
+        assert set(baseline["trial_id"]) == {"A", "B"}
+        widened = pareto_front(
+            df,
+            tolerances={
+                "mean_tcp_throughput": 0.03,
+                "tcp_retransmit_rate": 0.10,
+            },
+        )
+        assert set(widened["trial_id"]) == {"B"}
+
+    def test_zero_tolerance_matches_legacy(self) -> None:
+        """``tolerances=None`` and ``tolerances={}`` produce the strict frontier."""
+        df = pd.DataFrame(
+            {
+                "trial_id": ["A", "B", "C"],
+                "mean_tcp_throughput": [100.0, 80.0, 50.0],
+                "tcp_retransmit_rate": [1.0, 2.0, 5.0],
+                **_pad_latency_cols(3),
+            },
+        )
+        baseline = set(pareto_front(df)["trial_id"])
+        assert set(pareto_front(df, tolerances=None)["trial_id"]) == baseline
+        assert set(pareto_front(df, tolerances={})["trial_id"]) == baseline
+
+    def test_degenerate_column_with_tolerance(self) -> None:
+        """All-NaN column plus a non-zero tolerance for it still drops the column.
+
+        ``mean_udp_jitter`` is filtered by :func:`_objectives_with_data`
+        before the dominance scan starts, so a tolerance on it is
+        simply ignored. A and B each win on one of the remaining axes,
+        so both survive.
+        """
+        df = pd.DataFrame(
+            {
+                "trial_id": ["A", "B"],
+                "mean_tcp_throughput": [100.0, 50.0],
+                "tcp_retransmit_rate": [2.0, 1.0],
+                "mean_udp_jitter": [float("nan"), float("nan")],
+                "mean_rps": [1000.0, 1000.0],
+                "mean_latency_p50": [1.0, 1.0],
+                "mean_latency_p90": [5.0, 5.0],
+                "mean_latency_p99": [10.0, 10.0],
+            },
+        )
+        front = pareto_front(df, tolerances={"mean_udp_jitter": 0.20})
+        assert set(front["trial_id"]) == {"A", "B"}
+
 
 # --- parameter_importance -----------------------------------------------
 

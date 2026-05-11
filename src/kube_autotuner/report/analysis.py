@@ -33,6 +33,7 @@ from kube_autotuner.models import (
 )
 from kube_autotuner.scoring import (
     METRIC_TO_DF_COLUMN,
+    _noise_threshold,
     aggregate_by_parent,
     config_memory_cost,
     score_rows,
@@ -46,6 +47,7 @@ from kube_autotuner.sysctl.params import (
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
     from datetime import datetime
 
     import pandas as pd
@@ -468,9 +470,198 @@ def _objectives_with_data(
     return kept
 
 
-def pareto_front(
+def _dominates_eps(
+    j: int,
+    i: int,
+    vals: list[list[float]],
+    sems: list[list[float]],
+    tol_per_col: list[float],
+    signs: list[float],
+    n_cols: int,
+) -> bool:
+    """Return whether row ``j`` epsilon-dominates row ``i``.
+
+    ``j`` dominates ``i`` iff ``j`` is not worse-by-threshold than
+    ``i`` on any axis and is better-by-threshold than ``i`` on at
+    least one axis. ``signs[k]`` is ``+1`` for minimize axes and
+    ``-1`` for maximize: signing both rows by it reduces the
+    comparison to "smaller on the signed axis is better" in either
+    direction. Per-axis thresholds come from :func:`_noise_threshold`.
+
+    Args:
+        j: Candidate dominator row index.
+        i: Candidate dominated row index.
+        vals: Per-row metric values, row-major (``vals[i][k]``).
+        sems: Per-row SEM values, row-major and parallel to ``vals``.
+            All-zero rows when SEM data is unavailable.
+        tol_per_col: Per-column relative tolerance.
+        signs: Per-column direction sign (``+1`` minimize, ``-1``
+            maximize). Multiplied into ``vals`` and ``sems`` to give
+            a uniform "smaller is better" axis.
+        n_cols: Length of ``tol_per_col`` / ``signs``.
+
+    Returns:
+        ``True`` iff ``j`` epsilon-dominates ``i``.
+    """
+    strictly_better = False
+    for k in range(n_cols):
+        threshold = _noise_threshold(
+            vals[i][k],
+            vals[j][k],
+            sems[i][k],
+            sems[j][k],
+            tol_per_col[k],
+        )
+        diff = signs[k] * (vals[i][k] - vals[j][k])
+        if diff < -threshold:
+            return False
+        if diff > threshold:
+            strictly_better = True
+    return strictly_better
+
+
+def _strict_dominance_mask(vals: Any, signs: Any) -> Any:  # noqa: ANN401 - numpy arrays
+    """Return a boolean array marking rows strictly dominated by another row.
+
+    The pre-noise-aware dominance rule: row ``j`` dominates row ``i``
+    iff ``j <= i`` on every axis and ``j < i`` on at least one. Used
+    as the fast path in :func:`pareto_front` when neither tolerances
+    nor SEMs are supplied.
+
+    Args:
+        vals: ``(n, k)`` numpy array of per-row metric values, in
+            input order.
+        signs: ``(k,)`` numpy array of per-axis direction signs
+            (``+1`` minimize, ``-1`` maximize). After multiplying,
+            dominance reduces to "smaller is better on every axis".
+
+    Returns:
+        A ``(n,)`` boolean numpy array. ``True`` at index ``i`` means
+        another row strictly dominates row ``i``.
+    """
+    np = _require_numpy()
+    minimized = vals * signs
+    n = len(minimized)
+    is_dominated = np.zeros(n, dtype=bool)
+    for i in range(n):
+        if is_dominated[i]:
+            continue
+        for j in range(n):
+            if i == j or is_dominated[j]:
+                continue
+            if np.all(minimized[j] <= minimized[i]) and np.any(
+                minimized[j] < minimized[i],
+            ):
+                is_dominated[i] = True
+                break
+    return is_dominated
+
+
+def _eps_dominance_mask(
+    vals_list: list[list[float]],
+    sems_list: list[list[float]],
+    tol_per_col: list[float],
+    signs_list: list[float],
+) -> Any:  # noqa: ANN401 - numpy array
+    """Return a boolean array marking rows epsilon-dominated by another row.
+
+    Noise-aware counterpart to :func:`_strict_dominance_mask`. Each
+    pairwise comparison runs :func:`_dominates_eps`, which gates on
+    the per-pair :func:`_noise_threshold`. ``O(n**2 * k)``.
+
+    Args:
+        vals_list: ``n x k`` row-major per-row metric values.
+        sems_list: ``n x k`` row-major per-row SEM values, parallel
+            to ``vals_list``. All-zero rows when SEM is unavailable.
+        tol_per_col: Per-column relative tolerance.
+        signs_list: Per-column direction sign (``+1`` minimize,
+            ``-1`` maximize).
+
+    Returns:
+        A ``(n,)`` boolean numpy array. ``True`` at index ``i`` means
+        another row epsilon-dominates row ``i``.
+    """
+    np = _require_numpy()
+    n = len(vals_list)
+    n_cols = len(tol_per_col)
+    is_dominated = np.zeros(n, dtype=bool)
+    for i in range(n):
+        if is_dominated[i]:
+            continue
+        for j in range(n):
+            if i == j or is_dominated[j]:
+                continue
+            if _dominates_eps(
+                j,
+                i,
+                vals_list,
+                sems_list,
+                tol_per_col,
+                signs_list,
+                n_cols,
+            ):
+                is_dominated[i] = True
+                break
+    return is_dominated
+
+
+def tolerances_by_df_column(
+    tolerances: Mapping[str, float] | None,
+) -> dict[str, float]:
+    """Project metric-keyed tolerances onto DataFrame column names.
+
+    Args:
+        tolerances: Map keyed by short metric name (e.g.
+            ``"tcp_throughput"``). Keys outside
+            :data:`~kube_autotuner.scoring.METRIC_TO_DF_COLUMN` (such
+            as the ``"memory_cost"`` sentinel) are silently dropped --
+            :func:`pareto_front` only consumes column-keyed entries.
+
+    Returns:
+        A dict keyed by DataFrame column name (e.g.
+        ``"mean_tcp_throughput"``) suitable for :func:`pareto_front`.
+    """
+    if not tolerances:
+        return {}
+    return {
+        METRIC_TO_DF_COLUMN[m]: t
+        for m, t in tolerances.items()
+        if m in METRIC_TO_DF_COLUMN
+    }
+
+
+def _sems_list_from_df(
+    sems_df: pd.DataFrame | None,
+    cols: list[str],
+    finite_df_index: Any,  # noqa: ANN401 - pandas Index
+    n: int,
+) -> list[list[float]]:
+    """Project ``sems_df`` to a row-major list aligned with ``finite_df_index``.
+
+    When ``sems_df`` is ``None`` the result is an all-zero matrix so
+    :func:`_noise_threshold` falls through to the relative term.
+
+    Returns:
+        An ``n x len(cols)`` row-major nested list of finite floats.
+        Rows in ``sems_df`` that lack a particular ``f"{col}_sem"``
+        column or have NaN there contribute ``0.0`` for that column.
+    """
+    np = _require_numpy()
+    if sems_df is None:
+        return [[0.0] * len(cols) for _ in range(n)]
+    sem_cols = [f"{col}_sem" for col in cols]
+    sems_aligned = sems_df.reindex(finite_df_index)
+    sem_arr = sems_aligned.reindex(columns=sem_cols).to_numpy(dtype=float)
+    sem_arr = np.where(np.isnan(sem_arr), 0.0, sem_arr)
+    return sem_arr.tolist()
+
+
+def pareto_front(  # noqa: PLR0914 - column / sign / SEM bookkeeping needs the locals
     df: pd.DataFrame,
     objectives: list[tuple[str, str]] | None = None,
+    *,
+    tolerances: Mapping[str, float] | None = None,
+    sems_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Return the non-dominated rows from ``df``.
 
@@ -483,13 +674,30 @@ def pareto_front(
     dominated nor dominates, and would otherwise survive the frontier
     and poison downstream normalization.
 
+    With ``tolerances`` ``None`` or empty *and* ``sems_df`` ``None``
+    the strict numpy fast path runs; otherwise the scan switches to
+    epsilon-dominance, gating each pairwise comparison through
+    :func:`~kube_autotuner.scoring._noise_threshold`. The epsilon
+    path is ``O(n**2 * k)``, fine in practice (``n`` < ~100 Pareto
+    candidates after refinement, ``k`` ~9 objectives).
+
     Lazy-imports ``numpy`` and raises :exc:`RuntimeError` with the
     ``uv sync --group analysis`` hint when the group is missing.
 
     Args:
-        df: Frame produced by :func:`trials_to_dataframe`.
+        df: Frame produced by :func:`trials_to_dataframe` or
+            :func:`aggregate_by_parent`.
         objectives: List of ``(column, "maximize"|"minimize")`` tuples.
             Defaults to :data:`DEFAULT_OBJECTIVES`.
+        tolerances: Optional per-column relative tolerances keyed by
+            DataFrame column name (e.g. ``"mean_tcp_throughput"``).
+            Missing keys default to ``0.0``. ``None`` or ``{}``
+            together with ``sems_df=None`` selects the strict
+            (pre-tolerance) fast path.
+        sems_df: Optional per-row SEM frame aligned with ``df``, with
+            columns ``f"{col}_sem"`` for every objective column.
+            ``None`` means SEM-driven gating is disabled and only the
+            relative-tolerance term contributes.
 
     Returns:
         A new DataFrame containing only Pareto-optimal rows, indexed
@@ -526,24 +734,23 @@ def pareto_front(
         return finite_df.reset_index(drop=True)
 
     vals = finite_df[cols].to_numpy(dtype=float)
-
     signs = np.array([1.0 if d == "minimize" else -1.0 for _, d in objectives])
-    minimized = vals * signs
 
-    n = len(minimized)
-    is_dominated = np.zeros(n, dtype=bool)
-    for i in range(n):
-        if is_dominated[i]:
-            continue
-        for j in range(n):
-            if i == j or is_dominated[j]:
-                continue
-            if np.all(minimized[j] <= minimized[i]) and np.any(
-                minimized[j] < minimized[i],
-            ):
-                is_dominated[i] = True
-                break
+    if not (bool(tolerances) or sems_df is not None):
+        is_dominated = _strict_dominance_mask(vals, signs)
+        return finite_df.loc[~is_dominated].reset_index(drop=True)
 
+    tol_map = dict(tolerances) if tolerances else {}
+    tol_per_col = [tol_map.get(col, 0.0) for col in cols]
+    vals_list: list[list[float]] = vals.tolist()
+    signs_list: list[float] = signs.tolist()
+    sems_list = _sems_list_from_df(sems_df, cols, finite_df.index, len(vals))
+    is_dominated = _eps_dominance_mask(
+        vals_list,
+        sems_list,
+        tol_per_col,
+        signs_list,
+    )
     return finite_df.loc[~is_dominated].reset_index(drop=True)
 
 
@@ -678,7 +885,7 @@ def _rf_importance_scores(
     return dict(zip(sysctl_cols, rf.feature_importances_, strict=True))
 
 
-def pareto_recommendation_rows(  # noqa: PLR0914 - one-pass build over many intermediate frames
+def pareto_recommendation_rows(  # noqa: PLR0914, C901 - one-pass build over many intermediate frames
     trials: list[TrialResult],
     hardware_class: str,
     topology: str | None = None,
@@ -686,8 +893,12 @@ def pareto_recommendation_rows(  # noqa: PLR0914 - one-pass build over many inte
     objectives: list[ParetoObjective] | None = None,
     weights: dict[str, float] | None = None,
     memory_cost_weight: float | None = None,
+    tolerances: dict[str, float] | None = None,
 ) -> list[dict[str, Any]]:
     """Return every Pareto-frontier row for a class, scored and sorted.
+
+    Ranking gates on per-metric noise; see
+    :class:`~kube_autotuner.experiment.ObjectivesSection.tolerances`.
 
     The full-frontier counterpart to :func:`recommend_configs`.
     Aggregates refinement samples back into their parents, computes
@@ -717,6 +928,10 @@ def pareto_recommendation_rows(  # noqa: PLR0914 - one-pass build over many inte
             :func:`kube_autotuner.scoring.score_rows`. ``None`` picks
             up the :class:`ObjectivesSection` default (``0.1``); set
             ``0.0`` to disable.
+        tolerances: Per-metric relative noise floors applied at
+            scoring time. ``None`` picks up the
+            :class:`ObjectivesSection` defaults; pass an empty dict
+            (``{}``) to reproduce the pre-noise-aware ranking.
 
     Lazy-imports ``pandas`` and raises :exc:`RuntimeError` with the
     ``uv sync --group analysis`` hint when the group is missing.
@@ -752,6 +967,8 @@ def pareto_recommendation_rows(  # noqa: PLR0914 - one-pass build over many inte
         weights = defaults.recommendation_weights
     if memory_cost_weight is None:
         memory_cost_weight = defaults.memory_cost_weight
+    if tolerances is None:
+        tolerances = defaults.tolerances
 
     agg_rows = aggregate_by_parent(filtered)
     if not agg_rows:
@@ -768,7 +985,18 @@ def pareto_recommendation_rows(  # noqa: PLR0914 - one-pass build over many inte
     # Suppress the log here so the CLI's direct pareto_front call is
     # the single source of truth for "excluded" INFO lines.
     tuple_objectives = _objectives_with_data(agg_df, tuple_objectives, log=False)
-    front = pareto_front(agg_df, objectives=tuple_objectives)
+    sem_cols = [
+        f"{col}_sem"
+        for col in METRIC_TO_DF_COLUMN.values()
+        if f"{col}_sem" in agg_df.columns
+    ]
+    sems_df = agg_df[sem_cols] if sem_cols else None
+    front = pareto_front(
+        agg_df,
+        objectives=tuple_objectives,
+        tolerances=tolerances_by_df_column(tolerances),
+        sems_df=sems_df,
+    )
     if front.empty:
         return []
 
@@ -781,12 +1009,17 @@ def pareto_recommendation_rows(  # noqa: PLR0914 - one-pass build over many inte
     }
     memory_costs = [cost_by_trial.get(tid, 0.0) for tid in front["trial_id"].tolist()]
     records = front[list(METRIC_TO_DF_COLUMN.values())].to_dict(orient="records")
+    sem_records: list[dict[str, Any]] | None = (
+        front[sem_cols].to_dict(orient="records") if sem_cols else None
+    )
     raw_scores = score_rows(
         records,
         objectives,
         weights,
         memory_costs=memory_costs,
         memory_cost_weight=memory_cost_weight,
+        sems=sem_records,
+        tolerances=tolerances,
     )
     front = front.assign(score=raw_scores, memory_cost=memory_costs)
     front = front.sort_values(
@@ -805,27 +1038,29 @@ def pareto_recommendation_rows(  # noqa: PLR0914 - one-pass build over many inte
         # or trial_id``) so it always resolves to the primary trial,
         # not a refinement sample.
         trial = next(t for t in filtered if t.trial_id == row["trial_id"])
-        rows.append(
-            {
-                "trial_id": row["trial_id"],
-                "sysctl_values": trial.sysctl_values,
-                "mean_tcp_throughput": _maybe(row, "mean_tcp_throughput"),
-                "mean_udp_throughput": _maybe(row, "mean_udp_throughput"),
-                "tcp_retransmit_rate": _maybe(row, "tcp_retransmit_rate"),
-                "udp_loss_rate": _maybe(row, "udp_loss_rate"),
-                "mean_udp_jitter": _maybe(row, "mean_udp_jitter"),
-                "mean_rps": _maybe(row, "mean_rps"),
-                "mean_latency_p50": _maybe(row, "mean_latency_p50"),
-                "mean_latency_p90": _maybe(row, "mean_latency_p90"),
-                "mean_latency_p99": _maybe(row, "mean_latency_p99"),
-                "memory_cost": float(row["memory_cost"]),
-                "score": float(row["score"]),
-            },
-        )
+        out: dict[str, Any] = {
+            "trial_id": row["trial_id"],
+            "sysctl_values": trial.sysctl_values,
+            "mean_tcp_throughput": _maybe(row, "mean_tcp_throughput"),
+            "mean_udp_throughput": _maybe(row, "mean_udp_throughput"),
+            "tcp_retransmit_rate": _maybe(row, "tcp_retransmit_rate"),
+            "udp_loss_rate": _maybe(row, "udp_loss_rate"),
+            "mean_udp_jitter": _maybe(row, "mean_udp_jitter"),
+            "mean_rps": _maybe(row, "mean_rps"),
+            "mean_latency_p50": _maybe(row, "mean_latency_p50"),
+            "mean_latency_p90": _maybe(row, "mean_latency_p90"),
+            "mean_latency_p99": _maybe(row, "mean_latency_p99"),
+            "memory_cost": float(row["memory_cost"]),
+            "score": float(row["score"]),
+        }
+        # SEM is carried through for the browser-side scoreRows port.
+        for sem_col in sem_cols:
+            out[sem_col] = _maybe(row, sem_col)
+        rows.append(out)
     return rows
 
 
-def recommend_configs(
+def recommend_configs(  # noqa: PLR0913 - thin wrapper over an already-wide function
     trials: list[TrialResult],
     hardware_class: str,
     n: int = 3,
@@ -834,8 +1069,12 @@ def recommend_configs(
     objectives: list[ParetoObjective] | None = None,
     weights: dict[str, float] | None = None,
     memory_cost_weight: float | None = None,
+    tolerances: dict[str, float] | None = None,
 ) -> list[dict[str, Any]]:
     """Return the top ``n`` recommended sysctl configurations for a class.
+
+    Ranking gates on per-metric noise; see
+    :class:`~kube_autotuner.experiment.ObjectivesSection.tolerances`.
 
     Thin wrapper over :func:`pareto_recommendation_rows`: slices the
     first ``n`` rows, prepends a ``rank`` field, and rounds ``score``
@@ -866,6 +1105,10 @@ def recommend_configs(
             memory-footprint term. ``None`` picks up the
             :class:`ObjectivesSection` default (``0.1``); set
             ``0.0`` to disable.
+        tolerances: Per-metric relative noise floors applied at
+            scoring time. ``None`` picks up the
+            :class:`ObjectivesSection` defaults; pass an empty dict
+            (``{}``) to reproduce the pre-noise-aware ranking.
 
     Lazy-imports ``pandas`` (via :func:`trials_to_dataframe`) and
     raises :exc:`RuntimeError` with the ``uv sync --group analysis``
@@ -889,6 +1132,7 @@ def recommend_configs(
         objectives=objectives,
         weights=weights,
         memory_cost_weight=memory_cost_weight,
+        tolerances=tolerances,
     )
     results: list[dict[str, Any]] = []
     for rank, row in enumerate(rows[:n], start=1):
