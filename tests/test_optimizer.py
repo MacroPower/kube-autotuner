@@ -27,6 +27,8 @@ from kube_autotuner.models import (
     IterationResults,
     LatencyResult,
     NodePair,
+    ParamSpace,
+    SysctlParam,
     TrialResult,
 )
 from kube_autotuner.optimizer import (
@@ -1422,6 +1424,177 @@ class TestSeededPriorAndPin:
         for name, value in RECOMMENDED_DEFAULTS.items():
             if name in PARAM_SPACE.param_names():
                 assert str(recorded[name]) == str(value), name
+
+    @patch("kube_autotuner.optimizer.NodeLease")
+    @patch("kube_autotuner.optimizer.BenchmarkRunner")
+    @patch("kube_autotuner.optimizer.make_sysctl_setter_from_env")
+    def test_choice_override_excluding_default_skips_seed(
+        self,
+        mock_setter_cls,
+        mock_runner_cls,
+        mock_lease_cls,  # noqa: ARG002
+        node_pair,
+        config,
+        tmp_path,
+        caplog,
+    ):
+        """Choice override that excludes the recommended default must skip the seed."""
+        mock_setter = MagicMock()
+        mock_setter.snapshot.side_effect = _mock_snapshot
+        mock_setter_cls.return_value = mock_setter
+
+        mock_runner = MagicMock()
+        mock_runner.run.return_value = IterationResults(
+            bench=_make_results(),
+            latency=_make_latency_results(),
+        )
+        mock_runner_cls.return_value = mock_runner
+
+        override = ParamSpace(
+            params=[
+                SysctlParam(
+                    name="net.ipv4.tcp_congestion_control",
+                    values=["bbr"],
+                    param_type="choice",
+                ),
+            ],
+        )
+        loop = OptimizationLoop(
+            node_pair=node_pair,
+            config=config,
+            param_space=override,
+            output=tmp_path / "results",
+            n_trials=1,
+            n_sobol=1,
+            objectives=ObjectivesSection(),
+        )
+        caplog.set_level("INFO", logger="kube_autotuner.optimizer")
+        trials = loop.run()
+
+        assert len(trials) == 1
+        recorded = trials[0].sysctl_values
+        assert recorded["net.ipv4.tcp_congestion_control"] == "bbr"
+        skip_messages = [
+            r.message
+            for r in caplog.records
+            if "skipping seeded prior" in r.message
+            and "net.ipv4.tcp_congestion_control" in r.message
+        ]
+        assert len(skip_messages) == 1, skip_messages
+        assert "cubic" in skip_messages[0]
+
+    @patch("kube_autotuner.optimizer.NodeLease")
+    @patch("kube_autotuner.optimizer.BenchmarkRunner")
+    @patch("kube_autotuner.optimizer.make_sysctl_setter_from_env")
+    def test_int_override_excluding_default_skips_seed_once(
+        self,
+        mock_setter_cls,
+        mock_runner_cls,
+        mock_lease_cls,  # noqa: ARG002
+        node_pair,
+        config,
+        tmp_path,
+        caplog,
+    ):
+        """Int override excluding the recommended default skips seeding exactly once."""
+        mock_setter = MagicMock()
+        mock_setter.snapshot.side_effect = _mock_snapshot
+        mock_setter_cls.return_value = mock_setter
+
+        mock_runner = MagicMock()
+        mock_runner.run.return_value = IterationResults(
+            bench=_make_results(),
+            latency=_make_latency_results(),
+        )
+        mock_runner_cls.return_value = mock_runner
+
+        override = ParamSpace(
+            params=[
+                SysctlParam(
+                    name="net.core.somaxconn",
+                    values=[32768, 65535],
+                    param_type="int",
+                ),
+            ],
+        )
+        loop = OptimizationLoop(
+            node_pair=node_pair,
+            config=config,
+            param_space=override,
+            output=tmp_path / "results",
+            n_trials=2,
+            n_sobol=2,
+            objectives=ObjectivesSection(),
+        )
+        caplog.set_level("INFO", logger="kube_autotuner.optimizer")
+        trials = loop.run()
+
+        assert len(trials) == 2
+        for trial in trials:
+            assert int(trial.sysctl_values["net.core.somaxconn"]) in {
+                32768,
+                65535,
+            }, trial.sysctl_values
+        skip_messages = [
+            r.message
+            for r in caplog.records
+            if "skipping seeded prior" in r.message
+            and "net.core.somaxconn" in r.message
+        ]
+        assert len(skip_messages) == 1, skip_messages
+
+    @patch("kube_autotuner.optimizer.NodeLease")
+    @patch("kube_autotuner.optimizer.BenchmarkRunner")
+    @patch("kube_autotuner.optimizer.make_sysctl_setter_from_env")
+    def test_override_keeping_default_value_seeds_normally(
+        self,
+        mock_setter_cls,
+        mock_runner_cls,
+        mock_lease_cls,  # noqa: ARG002
+        node_pair,
+        config,
+        tmp_path,
+        caplog,
+    ):
+        """Override that narrows rungs but keeps the recommended default still seeds."""
+        mock_setter = MagicMock()
+        mock_setter.snapshot.side_effect = _mock_snapshot
+        mock_setter_cls.return_value = mock_setter
+
+        mock_runner = MagicMock()
+        mock_runner.run.return_value = IterationResults(
+            bench=_make_results(),
+            latency=_make_latency_results(),
+        )
+        mock_runner_cls.return_value = mock_runner
+
+        override = ParamSpace(
+            params=[
+                SysctlParam(
+                    name="net.ipv4.tcp_congestion_control",
+                    values=["cubic"],
+                    param_type="choice",
+                ),
+            ],
+        )
+        loop = OptimizationLoop(
+            node_pair=node_pair,
+            config=config,
+            param_space=override,
+            output=tmp_path / "results",
+            n_trials=1,
+            n_sobol=1,
+            objectives=ObjectivesSection(),
+        )
+        caplog.set_level("INFO", logger="kube_autotuner.optimizer")
+        trials = loop.run()
+
+        assert len(trials) == 1
+        assert trials[0].sysctl_values["net.ipv4.tcp_congestion_control"] == "cubic"
+        skip_messages = [
+            r.message for r in caplog.records if "skipping seeded prior" in r.message
+        ]
+        assert skip_messages == [], skip_messages
 
     @patch("kube_autotuner.optimizer.NodeLease")
     @patch("kube_autotuner.optimizer.BenchmarkRunner")

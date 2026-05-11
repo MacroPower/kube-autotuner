@@ -719,11 +719,15 @@ class OptimizationLoop:
         Called lazily from :meth:`_suggest` so a failed seed trial can
         be re-attached on the next iteration with a fresh trial_index.
         Returns ``None`` when the configured :attr:`param_space` is an
-        override that does not line up with
-        :data:`RECOMMENDED_DEFAULTS`, or when Ax itself rejects the
-        parameterization (e.g. the override changed a knob's rungs).
-        Either failure mode is non-fatal: the run proceeds without the
-        anchor.
+        override that does not cover every :data:`RECOMMENDED_DEFAULTS`
+        knob, or when any recommended-default value falls outside its
+        param's rung set in the override (the primary mechanism --
+        ``ax.core.experiment.Experiment.attach_trial`` downgrades a
+        membership ``ValueError`` to a ``RuntimeWarning`` and attaches
+        the trial anyway, so the rung check must run *before*
+        ``attach_trial``), or when Ax rejects the parameterization for
+        an unrelated reason (defence-in-depth). Every failure mode is
+        non-fatal: the run proceeds without the anchor.
 
         Returns:
             ``(trial_index, parameterization)`` to return from
@@ -741,12 +745,29 @@ class OptimizationLoop:
                 "search space; skipping seeded prior",
             )
             return None
+        allowed_values: dict[str, set[str]] = {
+            p.name: {str(v) for v in p.values} for p in self.param_space.params
+        }
+        for raw_name in space_names:
+            seed_value = str(RECOMMENDED_DEFAULTS[raw_name])
+            if seed_value not in allowed_values[raw_name]:
+                logger.info(
+                    "RECOMMENDED_DEFAULTS[%s] = %s is not in the configured "
+                    "param_space override rungs %s; skipping seeded prior "
+                    "(the GP will start without the production-default anchor)",
+                    raw_name,
+                    seed_value,
+                    sorted(allowed_values[raw_name]),
+                )
+                return None
+        # The pre-check above is the primary guard. The except is kept as
+        # defence-in-depth for future Ax internal changes, programming
+        # errors in adjacent code, or unrelated client-state errors.
         try:
             trial_index = self.client.attach_trial(parameters=seed)
         except (ValueError, KeyError, TypeError) as e:
             logger.warning(
-                "Ax rejected the RECOMMENDED_DEFAULTS seed "
-                "(likely a param_space override with mismatched rungs); "
+                "Ax rejected the RECOMMENDED_DEFAULTS seed; "
                 "continuing without anchor: %s",
                 e,
             )
